@@ -13,6 +13,8 @@ use std::fmt::Write as _;
 
 pub type TypeVarId = u32;
 pub type StructId = u32;
+/// Index into [`wsharp_runtime::builtins::abstract_types`].
+pub type AbstractId = u32;
 
 /// A type. Everything is either a variable or a constructor applied to
 /// arguments -- there is no separate case for functions or optionals, so
@@ -41,6 +43,11 @@ pub enum TyCon {
     /// The type of an error value, as bound by `catch |e|`.
     Error,
     Struct(StructId),
+    /// A name for a set of concrete types, such as `Number`. It classifies
+    /// values for dispatch and is never the type of one, so it appears only in
+    /// a parameter's declared type -- inference replaces it with a variable in
+    /// the type it actually checks against. See [`abstract_members`].
+    Abstract(AbstractId),
 }
 
 impl Type {
@@ -86,6 +93,24 @@ impl Type {
         Type::Con(TyCon::Struct(id), Vec::new())
     }
 
+    pub fn abstrakt(id: AbstractId) -> Type {
+        Type::Con(TyCon::Abstract(id), Vec::new())
+    }
+
+    /// The type a builtin signature's type stands for. The runtime describes
+    /// its own tables with a small enum of its own, so that it stays a leaf
+    /// crate; this is the single place that translates it.
+    pub fn from_builtin(t: wsharp_runtime::BuiltinTy) -> Type {
+        use wsharp_runtime::BuiltinTy as B;
+        match t {
+            B::I64 => Type::i64(),
+            B::F64 => Type::f64(),
+            B::Bool => Type::bool(),
+            B::Void => Type::void(),
+            B::Str => Type::str(),
+        }
+    }
+
     /// For a function type, its parameter types and return type.
     pub fn as_fn(&self) -> Option<(&[Type], &Type)> {
         match self {
@@ -97,6 +122,30 @@ impl Type {
     pub fn is_numeric(&self) -> bool {
         matches!(self, Type::Con(TyCon::I64 | TyCon::F64, _))
     }
+}
+
+/// The abstract type of this name, if there is one.
+///
+/// Abstract types come from a table in the runtime rather than from the
+/// program, so this is a lookup rather than a scope: a struct of the same name
+/// shadows it, which is why every caller consults the struct table first.
+pub fn lookup_abstract(name: &str) -> Option<AbstractId> {
+    let table = wsharp_runtime::builtins::abstract_types();
+    table.iter().position(|(n, _)| *n == name).map(|i| i as u32)
+}
+
+pub fn abstract_name(id: AbstractId) -> &'static str {
+    wsharp_runtime::builtins::abstract_types()[id as usize].0
+}
+
+/// The concrete types an abstract type classifies, in table order. The first
+/// is the one a program means when it says nothing more.
+pub fn abstract_members(id: AbstractId) -> Vec<Type> {
+    wsharp_runtime::builtins::abstract_types()[id as usize]
+        .1
+        .iter()
+        .map(|t| Type::from_builtin(*t))
+        .collect()
 }
 
 /// A generalised type: `vars` are universally quantified in `ty`.
@@ -267,14 +316,23 @@ impl TypeStore {
         depth
     }
 
-    /// The subtype relation lifted to whole types. Only struct types have a
-    /// non-trivial relation; everything else is subtyping-by-equality, which
-    /// keeps `?T`, `!T` and `fn` invariant and so avoids needing variance.
+    /// The subtype relation lifted to whole types. Structs have the declared
+    /// lattice and abstract types have the table's; everything else is
+    /// subtyping-by-equality, which keeps `?T`, `!T` and `fn` invariant and so
+    /// avoids needing variance.
+    ///
+    /// This is the only place the lattice reaches past structs. An abstract
+    /// type is above exactly the concrete types it lists, which is what lets
+    /// specificity order `i64` under `Number` -- and it is a flat extension:
+    /// the table has no nesting, so two abstract types are related only when
+    /// they are the same one.
     pub fn is_sub_ty(&mut self, sub: &Type, sup: &Type) -> bool {
         match (self.resolve(sub), self.resolve(sup)) {
             (Type::Con(TyCon::Struct(a), _), Type::Con(TyCon::Struct(b), _)) => {
                 self.is_subtype(a, b)
             }
+            (Type::Con(TyCon::Abstract(a), _), Type::Con(TyCon::Abstract(b), _)) => a == b,
+            (a, Type::Con(TyCon::Abstract(id), _)) => abstract_members(id).contains(&a),
             (a, b) => a == b,
         }
     }
@@ -477,6 +535,7 @@ impl TypeStore {
                 TyCon::Str => "str".into(),
                 TyCon::Error => "error".into(),
                 TyCon::Struct(id) => self.struct_name(id).to_string(),
+                TyCon::Abstract(id) => abstract_name(id).to_string(),
                 TyCon::Optional => format!("?{}", self.write_ty(&args[0], names)),
                 TyCon::ErrUnion => format!("!{}", self.write_ty(&args[0], names)),
                 TyCon::Fn => {
@@ -670,6 +729,24 @@ mod tests {
         s.exit_level();
         // The level adjustment was undone, so `inner` is generalisable again.
         assert_eq!(s.generalize(&inner).vars.len(), 1);
+    }
+
+    #[test]
+    fn an_abstract_type_is_above_the_types_it_lists() {
+        let mut s = TypeStore::new();
+        let number = lookup_abstract("Number").expect("`Number` is in the table");
+        let num = Type::abstrakt(number);
+        assert_eq!(s.show(&num), "Number");
+        assert!(s.is_sub_ty(&Type::i64(), &num));
+        assert!(s.is_sub_ty(&Type::f64(), &num));
+        // Only downwards, and only for what the table lists.
+        assert!(!s.is_sub_ty(&num, &Type::i64()));
+        assert!(!s.is_sub_ty(&Type::str(), &num));
+        // Flat: an abstract type is comparable only with itself.
+        assert!(s.is_sub_ty(&num, &num));
+        // And a variable is nothing's subtype until it is resolved.
+        let v = s.fresh();
+        assert!(!s.is_sub_ty(&v, &num));
     }
 
     #[test]

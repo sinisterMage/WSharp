@@ -63,6 +63,7 @@ everywhere.** They are checked when written and inferred when not.
 | Types | `i64` `f64` `bool` `void` `str`, `?T` optional, `!T` error union, `fn(A) B` |
 | Functions | `fn add(a, b) { return a + b; }`, `fn add(a: i64, b: i64) i64 { ... }` |
 | Overloads | several `fn`s may share a name; the call picks the most specific |
+| Abstract types | `Number` stands for `i64` and `f64`, so an overload can claim "any number" while another claims `i64` |
 | Control flow | `if (c) { } else { }`, `while (c) : (i += 1) { }`, `break`, `continue` |
 | Expressions | `if (c) a else b`, `fn (a, b) { ... }` closures |
 | Literals | `42`, `0xff`, `0b1010`, `0o17`, `1_000_000`, `2.5`, `"text"` with `\n \t \r \0 \\ \"` |
@@ -97,6 +98,25 @@ An overload set is several top-level functions sharing a name. Every parameter
 of an overloaded function must be annotated — dispatch chooses *by* parameter
 type, so those types cannot themselves be inferred from the calls being
 resolved.
+
+Overloading is not limited to struct types. An **abstract type** stands for a
+set of concrete ones -- `Number` for `i64` and `f64` -- so a general case can
+be written alongside a specific one:
+
+```zig
+fn show(x: i64)    str { return "an integer"; }
+fn show(x: Number) str { return "a number"; }   // catches f64
+```
+
+An abstract type classifies values for dispatch and is never one itself: a
+parameter annotated with it is a *generic* parameter constrained to the
+members, compiled once per type it is used at, exactly as an unannotated
+parameter is. Nothing is tested at run time, because a scalar's type is always
+known at compile time.
+
+An overload set can also be named. `const g: fn(i64) i64 = f;` picks the member
+with that signature and gives you an ordinary function value; `const g = f;`
+binds an alias that dispatches just as `f` does.
 
 Selection is Julia's rule: an overload wins if it is at least as specific as
 every other applicable one in every argument, and strictly more in at least
@@ -140,30 +160,49 @@ High-Throughput Garbage Collection*, PLDI 2022).
 - **A concurrent mark trace for cycles.** Two objects pointing at each other
   keep each other's counts above zero for ever; only reachability reclaims
   them, and reachability is a walk over the whole live heap. That walk runs on
-  a collector thread while the program continues. It is bracketed by two short
-  pauses on the program's thread, at a safepoint: the first takes a snapshot
-  of the roots, the second finishes the mark, evacuates, and repoints
-  references. Marking is snapshot-at-the-beginning: the barrier's snapshot of
-  overwritten references is exactly the record the marker needs, objects
-  allocated during the mark are born marked (the mark bit is a parity that
-  flips per trace, so nothing is ever cleared), and nothing is freed while the
-  marker runs. The sweep afterwards runs on the collector thread too, a block
-  at a time.
-- **Compaction.** Freeing works a line at a time, so one survivor pins the
-  free lines around it. In the final pause the trace copies the survivors out
-  of the sparsest blocks and repoints every reference at the copy — the stack,
-  every live object, the collector's own lists — which is what makes moving
-  safe without a load barrier. Under `--gc-stress` that fix-up is checked
-  rather than trusted.
+  a collector thread while the program continues. Marking is
+  snapshot-at-the-beginning: the barrier's snapshot of overwritten references
+  is exactly the record the marker needs, objects allocated during the mark are
+  born marked (the mark bit is a parity that flips per trace, so nothing is
+  ever cleared), and nothing is freed while the marker runs. The sweep
+  afterwards runs on the collector thread too, a block at a time.
+- **Compaction, also concurrent.** Freeing works a line at a time, so a block
+  pinned by a few scattered survivors stays mostly unusable. The trace copies
+  those survivors out and releases the block. The copying runs while the
+  program does, which is what the **load barrier** is for: every reference read
+  out of a heap object is resolved to wherever that object lives now, so the
+  program can never hold an address the collector has abandoned. Whoever
+  reaches an object first -- the collector, or the program through the barrier
+  -- moves it, and one compare-and-swap on the header decides whose copy wins.
+  When nothing is moving the barrier costs a load, a test, and a branch that
+  falls through.
+- **Holes are refilled.** A block with free lines is allocated into again
+  rather than waiting for a trace to come and evacuate it. On a heap of 300
+  survivors scattered through 33,000 allocations, that is the difference
+  between holding 28 blocks and holding 8.
+- **Allocation takes no lock.** Each thread bumps through a buffer of its own,
+  publishing the object-start bit and the line counts atomically and batching
+  the statistics until the buffer is replaced. The heap lock is for handing out
+  a new buffer, freeing, sweeping and evacuating -- so an allocating thread and
+  a sweeping collector no longer queue behind each other on every object.
+- **Three short pauses, and they do not grow with the heap.** Only the mutator
+  can walk its own stack, so the parts that need the stack run on it: take a
+  root snapshot; finish marking and move what the roots point at; repoint the
+  references the marker noted. That last one visits a *list* -- the marker
+  records every reference it sees into a block being emptied -- rather than the
+  live heap, so the pause is proportional to what the program did, not to what
+  it holds. On 120,000 live objects the longest pause measured 40 microseconds,
+  the same as on 15,000; the previous stop-the-world collector took 1.2
+  milliseconds on 30,000 and did not finish 60,000 at all. What is left in the
+  pause and *does* grow is the counting collection: reconciling the write
+  barrier's buffers costs what the program has modified since the last one, so
+  a program that rewrites a large structure between traces will see
+  milliseconds rather than microseconds there. Under `--gc-stress` the whole
+  heap is walked afterwards and the run aborts if the list missed anything.
 - **Interruptible loops.** Cranelift makes every call a safepoint and nothing
   else, so a loop that calls nothing would be uninterruptible. Each back edge
   carries a three-instruction poll, which is also how the collector thread
-  asks the program to stop for the final pause.
-
-What is still stop-the-world: copying, and the fix-up walk over the live heap
-that follows it. A remembered set built during the mark would bound that walk
-by what the program did rather than by what it holds; that, and the load
-barrier concurrent copying would need, are items in [ROADMAP.md](ROADMAP.md).
+  asks the program to stop for its next pause.
 
 `--gc-stress` collects at every allocation and checks every root the maps
 describe. The end-to-end suite runs twice, once under it, and traces start on
@@ -312,7 +351,8 @@ Sessions are numbered by the original feature list:
 - [x] **3.** Garbage collector — reference counting, a concurrent mark trace
       for cycles, and compaction
 - [x] **4.** Multiple dispatch over a subtype lattice, with the HTTP status
-      types as its standard-library instance
+      types as its standard-library instance, abstract types for scalars, and
+      overload sets as values
 - [ ] **5.** Arrays (generics are done: inferred, checked and monomorphised)
 - [ ] **6.** Standard library and a module system
 

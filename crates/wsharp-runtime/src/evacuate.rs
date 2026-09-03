@@ -1,22 +1,32 @@
 //! Evacuation: moving survivors out of sparse blocks, and repointing every
 //! reference at the copies.
 //!
-//! Freeing works a line at a time, so one survivor pins the free lines around
-//! it, and over time a heap fills with mostly-empty blocks it cannot reuse.
-//! The trace's final pause copies the survivors of the sparsest blocks out,
-//! leaves a forwarding word in each old header, and then visits every place a
-//! reference can live and rewrites it. The blocks are then free, whole.
+//! Refilling holes reclaims the space around a survivor, but not the
+//! survivor's own line, and a block pinned by a handful of objects scattered
+//! through it stays mostly unusable. Moving those few out is what recovers it.
 //!
-//! Because all of this happens with the program stopped, and the fix-up
-//! visits everything, no load barrier is needed: by the time the program
-//! resumes, nothing points into an evacuated block any more. Under
-//! `--gc-stress` that claim is checked rather than trusted.
+//! **The copying runs while the program does.** That is what the load barrier
+//! ([`ws_resolve`]) is for: a reference read out of a heap object is resolved
+//! to wherever the object lives now, so the program can never be holding an
+//! address the collector has abandoned. Whoever reaches an object first --
+//! the collector, or a program thread through the barrier -- copies it, and a
+//! single compare-and-swap on the header decides which copy everyone else
+//! will use.
+//!
+//! **The repointing does not**, because a reference can be sitting in a field
+//! nobody is about to read, and those have to be found rather than waited
+//! for. It runs in a short pause, and it visits a *list* of places rather than
+//! the whole heap: the slots the marker saw pointing into the blocks being
+//! emptied, the objects the trace touched afterwards, and the collector's own
+//! lists. [`fix_references`] sets out why that list is complete, and under
+//! `--gc-stress` the whole heap is walked afterwards to check that it was.
 
 use crate::gc::with_buffers;
 use crate::header::{
     FLAG_IMMORTAL, flags_of_meta, forwarding_target, is_forwarded_meta, is_marked, load_meta,
     type_id_of,
 };
+
 use crate::heap;
 use crate::stackwalk::walk_roots;
 use crate::types;
@@ -24,6 +34,70 @@ use crate::types;
 /// Blocks with at most this many occupied lines are worth evacuating: mostly
 /// empty, but pinned by a handful of survivors.
 pub(crate) const EVACUATE_BELOW_LINES: u16 = (heap::LINES_PER_BLOCK / 4) as u16;
+
+/// The load barrier's slow path: where this reference lives now.
+///
+/// Reached only while a trace is moving objects. Three cases: the object has
+/// already been moved and the header says where; it is not in a block being
+/// emptied, so it is staying put; or it is in one and nobody has moved it yet
+/// -- in which case this thread moves it, rather than waiting for the
+/// collector to get there. Moving it here is what lets the program *write* to
+/// it: a write to a copy the collector is about to abandon would be lost.
+///
+/// # Safety
+/// Called from JIT-compiled code across an FFI boundary; `p` must be null or a
+/// reference the program holds.
+pub unsafe extern "C" fn ws_resolve(p: *mut u8) -> *mut u8 {
+    if p.is_null() {
+        return p;
+    }
+    let meta = unsafe { load_meta(p) };
+    if is_forwarded_meta(meta) {
+        return forwarding_target(meta);
+    }
+    if !heap::is_evacuating(p) {
+        return p;
+    }
+    unsafe { evacuate_one(p) }
+}
+
+/// Copy one object out of a block being emptied and publish where it went.
+///
+/// Exactly one caller wins the forwarding word; a loser's copy is handed
+/// straight back to the heap, because nothing will ever reference it. Losing
+/// is rare -- it takes the collector and the program reaching the same object
+/// at the same moment -- and wasting a copy is much cheaper than a lock.
+///
+/// # Safety
+/// `p` must be a live object in a block being evacuated.
+pub(crate) unsafe fn evacuate_one(p: *mut u8) -> *mut u8 {
+    let Some(size) = (unsafe { crate::types::object_size(p) }) else {
+        return p;
+    };
+    let type_id = unsafe { type_id_of(p) };
+    let copy = heap::alloc_copy_shared(type_id, size);
+    if copy.is_null() {
+        return p;
+    }
+    // The header goes with it: the copy keeps the original's mark bit, its
+    // reference count and its flags, and only its address is different.
+    unsafe { std::ptr::copy_nonoverlapping(p, copy, size as usize) };
+    match unsafe { crate::header::try_forward(p, copy) } {
+        Ok(()) => {
+            // The program is holding this reference, so the object is live
+            // whatever the marker concluded; say so, because the sweep that
+            // follows frees exactly what is unmarked.
+            unsafe { crate::header::claim_mark(copy) };
+            heap::note_forwarded(size);
+            crate::gc::note_copy(copy);
+            copy
+        }
+        Err(existing) => {
+            unsafe { heap::free_object(copy, size) };
+            existing
+        }
+    }
+}
 
 /// Where `value` lives now: its copy if it was moved, itself if not, and
 /// `None` if it is not a collectable reference at all.
@@ -72,42 +146,60 @@ unsafe fn fix_fields(obj: *mut u8) {
     }
 }
 
-/// Repoint every reference in the program at the copies.
+/// Repoint every reference that still points into a block being emptied.
 ///
-/// The places a reference can live, and why this is all of them:
+/// This runs with the program stopped, and it is what makes releasing those
+/// blocks safe. The places such a reference can be, and why this is all of
+/// them:
 ///
 /// * a **root slot** -- the stack maps hand over slot addresses precisely so
-///   a moving collector can write them;
-/// * a **field of a live object** in a block that is not being emptied --
-///   which includes the copies themselves, since they went into the open
-///   block. Unmarked objects are skipped: they are garbage the sweep is about
-///   to free, and nothing will read their fields again;
-/// * the **nursery**, the one collector list a counting collection leaves
-///   populated. The others were emptied by the collection that ran just
-///   before evacuation, and a debug build checks that.
+///   a moving collector can write them. Roots were already resolved when the
+///   evacuation began, and every reference the program has loaded since came
+///   through the load barrier, so this is a formality; it is cheap, and it is
+///   the one place the argument would be hard to check.
+/// * a **slot the marker saw pointing into an evacuating block**. The marker
+///   scans every live object exactly once, so this catches every reference
+///   that existed at the snapshot and was not overwritten.
+/// * a **field of an object the trace touched afterwards**: anything the write
+///   barrier logged, anything allocated while the trace ran (whose fields the
+///   marker never scanned, because a new object is born marked), and every
+///   copy made during the evacuation (whose fields are a snapshot of an
+///   original's, and so may point at objects that had not moved yet).
+/// * an entry in one of the **collector's own lists**.
 ///
-/// Registers hold nothing: at a safepoint every live value is in its slot.
+/// Under `--gc-stress` the whole heap is walked afterwards and the run aborts
+/// if any of this missed something, which is what keeps the argument above
+/// honest rather than merely plausible.
 ///
 /// # Safety
-/// The final pause, after `heap::evacuate` and before `release_evacuated`.
-pub(crate) unsafe fn fix_references() {
+/// The evacuation pause, after the copying and before the blocks are released.
+pub(crate) unsafe fn fix_references(remembered: &[*mut *mut u8], scan: &[*mut u8]) {
     unsafe { walk_roots(|slot| fix_slot(slot)) };
-    heap::for_each_object(true, |obj| {
-        if unsafe { is_marked(obj) } {
-            unsafe { fix_fields(obj) };
-        }
-    });
+    for &slot in remembered {
+        unsafe { fix_slot(slot) };
+    }
+    for &obj in scan {
+        unsafe { fix_fields(obj) };
+    }
     with_buffers(|b| {
-        for entry in b.nursery.iter_mut() {
-            unsafe { fix_slot(entry) };
+        for list in [
+            &mut b.nursery,
+            &mut b.fresh,
+            &mut b.logged,
+            &mut b.decrements,
+            &mut b.satb,
+            &mut b.deferred_dead,
+        ] {
+            for entry in list.iter_mut() {
+                unsafe { fix_slot(entry) };
+            }
         }
-        debug_assert!(b.logged.is_empty() && b.decrements.is_empty());
-        debug_assert!(b.fresh.is_empty() && b.satb.is_empty() && b.deferred_dead.is_empty());
     });
 }
 
-/// Walk the same places [`fix_references`] does and abort if any of them still
-/// points into a block about to be released. Under `--gc-stress` only.
+/// Walk the whole heap and abort if anything live still points into a block
+/// about to be released. Under `--gc-stress` only: this is the check that the
+/// list of places in [`fix_references`] is complete.
 ///
 /// # Safety
 /// As [`fix_references`].
@@ -131,8 +223,17 @@ pub(crate) unsafe fn verify_no_stale_references() {
         }
     });
     with_buffers(|b| {
-        for &entry in &b.nursery {
-            check(entry);
+        for list in [
+            &b.nursery,
+            &b.fresh,
+            &b.logged,
+            &b.decrements,
+            &b.satb,
+            &b.deferred_dead,
+        ] {
+            for &entry in list {
+                check(entry);
+            }
         }
     });
     if stale > 0 {

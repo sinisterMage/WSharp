@@ -56,6 +56,12 @@ pub fn slot_types(store: &mut TypeStore, ty: &Type) -> SlotTypes {
             out.extend(slot_types(store, &args[0]));
             out
         }
+        // An abstract type classifies values but never describes one, which is
+        // why inference turns a parameter annotated with one into an ordinary
+        // variable: nothing downstream of it can carry this constructor.
+        Type::Con(TyCon::Abstract(_), _) => {
+            unreachable!("an abstract type reached code generation")
+        }
         // Monomorphisation replaces every variable and reports the ones it
         // cannot; reaching here means that pass let something through.
         Type::Var(v) => unreachable!("type variable ?{v} survived monomorphisation"),

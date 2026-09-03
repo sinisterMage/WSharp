@@ -169,6 +169,21 @@ pub fn status_types() -> &'static [(&'static str, Option<&'static str>)] {
     ]
 }
 
+/// The abstract types, as `(name, members)` pairs.
+///
+/// An abstract type is a name for a set of concrete types. It is not a type a
+/// value can have -- there is no machine representation for "a number" -- so it
+/// may only be written as a parameter's annotation, where it says which types
+/// that parameter accepts. That is what gives the dispatcher something to order
+/// scalars by: `i64` is more specific than `Number` in the same way `NotFound404`
+/// is more specific than `Status`, and for the same reason.
+///
+/// A table for the same reason [`builtins`] and [`status_types`] are: sema reads
+/// it to seed the lattice, and adding a classifier is one row.
+pub fn abstract_types() -> &'static [(&'static str, &'static [BuiltinTy])] {
+    &[("Number", &[BuiltinTy::I64, BuiltinTy::F64])]
+}
+
 /// Runtime support routines that generated code calls but that are not
 /// callable from W# source: the allocator and the panic handler.
 pub fn runtime_symbols() -> Vec<(&'static str, *const u8)> {
@@ -177,6 +192,7 @@ pub fn runtime_symbols() -> Vec<(&'static str, *const u8)> {
         ("ws_panic", ws_panic as *const u8),
         ("ws_log_object", crate::gc::ws_log_object as *const u8),
         ("ws_gc_poll", crate::gc::ws_gc_poll as *const u8),
+        ("ws_resolve", crate::evacuate::ws_resolve as *const u8),
     ]
 }
 
@@ -239,6 +255,10 @@ pub extern "C" fn ws_assert(cond: i8) {
 /// the stack maps describe the caller's roots -- which is exactly what a
 /// collection needs.
 pub extern "C" fn ws_gc_collect() {
+    // Not while a trace is moving objects: see `gc::on_allocation`.
+    if crate::gc::evacuating() {
+        return;
+    }
     unsafe { crate::gc::collect() };
 }
 

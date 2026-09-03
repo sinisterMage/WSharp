@@ -560,12 +560,23 @@ fn overload_sets_have_rules_of_their_own() {
         "declared more than once",
     );
 
-    // An overload set is not a value: there is no single code pointer.
+    // An overload set is still not a value: there is no single code pointer.
+    // `const g = f;` alone no longer says so, because it now *binds* an alias
+    // for the set, so the mistake has to be made by using one -- here by
+    // passing it where a function value is wanted.
+    let take = "fn take(h: fn(Base) i64) i64 { return h(Base); }";
     assert_error(
         &format!(
-            "{common} fn f(x: Base) i64 {{ return 1; }} fn f(x: Sub) i64 {{ return 2; }} fn main() i64 {{ const g = f; return 0; }}"
+            "{common} fn f(x: Base) i64 {{ return 1; }} fn f(x: Sub) i64 {{ return 2; }} {take} fn main() i64 {{ return take(f); }}"
         ),
         "names 2 functions",
+    );
+    // And through an alias, which says which kind of name it is.
+    assert_error(
+        &format!(
+            "{common} fn f(x: Base) i64 {{ return 1; }} fn f(x: Sub) i64 {{ return 2; }} {take} fn main() i64 {{ const g = f; return take(g); }}"
+        ),
+        "`g` is an alias for an overload set",
     );
 
     // `main` is the entry point, not a dispatch target.
@@ -580,6 +591,211 @@ fn overload_sets_have_rules_of_their_own() {
             "{common} fn f(x: Base) i64 {{ return 1; }} fn f(x: Sub) bool {{ return true; }} fn g(x: Base) i64 {{ return f(x); }} fn main() i64 {{ return g(Sub); }}"
         ),
         "disagree about the return type",
+    );
+}
+
+// ---- abstract types -----------------------------------------------------
+
+/// The overload a static call in `caller`'s body resolved to, as the callee's
+/// rendered scheme. Dispatch is decided at compile time, so this is the choice.
+fn chosen_overload(src: &str, caller: &str) -> String {
+    let mut a = analysis(src);
+    assert!(
+        a.diags.is_empty(),
+        "unexpected type errors: {:?}",
+        a.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let body = a
+        .program
+        .funcs
+        .iter()
+        .find(|f| f.name == caller)
+        .unwrap_or_else(|| panic!("no function `{caller}`"))
+        .body
+        .clone();
+    let func = static_callee(&body).unwrap_or_else(|| panic!("no static call in `{caller}`"));
+    let scheme = a.program.funcs[func as usize].scheme.clone();
+    a.store.show_scheme(&scheme)
+}
+
+/// The callee of the first `return <call>;` in a block.
+fn static_callee(block: &wsharp_sema::hir::Block) -> Option<wsharp_sema::hir::FuncId> {
+    use wsharp_sema::hir::{Callee, ExprKind, Stmt};
+    for stmt in &block.stmts {
+        let Stmt::Return(Some(expr)) = stmt else {
+            continue;
+        };
+        if let ExprKind::Call {
+            callee: Callee::Static { func, .. },
+            ..
+        } = &expr.kind
+        {
+            return Some(*func);
+        }
+    }
+    None
+}
+
+#[test]
+fn an_abstract_type_makes_a_scalar_dispatchable() {
+    let src = r#"
+        fn f(x: i64) str { return "int"; }
+        fn f(x: Number) str { return "number"; }
+        fn pick_int() str { return f(1); }
+        fn pick_float() str { return f(1.5); }
+    "#;
+    // `i64` is the more specific of the two, so it claims the integer.
+    assert_eq!(chosen_overload(src, "pick_int"), "fn(i64) str");
+    // The `Number` overload is the generic one -- an abstract annotation is a
+    // constrained generic parameter -- so its scheme still shows a variable.
+    assert_eq!(chosen_overload(src, "pick_float"), "fn(T) str");
+
+    // But what the program wrote is what it is shown as.
+    let a = analysis(src);
+    let mut sigs: Vec<&str> = a
+        .signatures
+        .iter()
+        .filter(|(n, _)| n == "f")
+        .map(|(_, t)| t.as_str())
+        .collect();
+    sigs.sort();
+    assert_eq!(sigs, vec!["fn(Number) str", "fn(i64) str"]);
+}
+
+#[test]
+fn an_abstract_parameter_accepts_only_its_members() {
+    // `str` is not one of the types `Number` lists, so nothing applies.
+    assert_error(
+        r#"
+        fn f(x: i64) str { return "int"; }
+        fn f(x: Number) str { return "number"; }
+        fn main() i64 { print(f("nope")); return 0; }
+        "#,
+        "no overload of `f` accepts",
+    );
+    // And on its own, where the constraint is checked at the use site.
+    assert_error(
+        "fn f(x: Number) str { return \"n\"; } fn main() i64 { print(f(\"nope\")); return 0; }",
+        "`Number` accepts `i64` and `f64`, but this is `str`",
+    );
+}
+
+#[test]
+fn an_abstract_parameter_is_specialised_per_argument_type() {
+    let src = r#"
+        fn bigger(a: Number, b: Number) { if (a > b) { return a; } return b; }
+        fn main() i64 {
+            print_int(bigger(3, 7));
+            print_float(bigger(1.5, 0.5));
+            return 0;
+        }
+    "#;
+    // The annotation keeps `>` from defaulting the parameter to `i64`: the
+    // members are all numeric, so the operator is answered without deciding.
+    assert_eq!(sig(src, "bigger"), "fn(Number, Number) Number");
+
+    let mut a = analysis(src);
+    assert!(a.diags.is_empty(), "{:?}", a.diags);
+    let m = wsharp_sema::monomorphize(&a.program, &mut a.store);
+    assert!(m.diags.is_empty(), "{:?}", m.diags);
+    let mut copies: Vec<String> = m
+        .program
+        .funcs
+        .iter()
+        .filter(|f| f.name == "bigger")
+        .map(|f| {
+            let ty = f.scheme.ty.clone();
+            a.store.show(&ty)
+        })
+        .collect();
+    copies.sort();
+    assert_eq!(copies, vec!["fn(f64, f64) f64", "fn(i64, i64) i64"]);
+}
+
+#[test]
+fn an_abstract_type_is_not_a_type_of_a_value() {
+    let rule = "`Number` is an abstract type";
+    // As a return type, a local's annotation, and a field's.
+    assert_error("fn f(x: i64) Number { return x; }", rule);
+    assert_error("fn f() i64 { const n: Number = 1; return n; }", rule);
+    assert_error("const P = struct { n: Number };", rule);
+    // As a supertype, as a value, and instantiated.
+    assert_error("const P = struct : Number { };", rule);
+    assert_error("fn f() i64 { const n = Number; return 0; }", rule);
+    assert_error("fn f() i64 { return Number{}.x; }", rule);
+    // Nested inside a parameter's type is not "a parameter's type" either:
+    // there is nothing for the variable it becomes to be a variable of.
+    assert_error("fn f(x: ?Number) i64 { return 0; }", rule);
+}
+
+#[test]
+fn an_operator_no_member_supports_is_rejected_at_the_declaration() {
+    // Every member has to work, because the caller is the one who picks: `%`
+    // has no float form and `Number` includes `f64`.
+    assert_error(
+        "fn f(a: Number, b: Number) { return a % b; }",
+        "`%` needs an integer, but `Number` includes `f64`",
+    );
+}
+
+// ---- overload sets as values --------------------------------------------
+
+#[test]
+fn an_annotation_selects_one_member_of_an_overload_set() {
+    let src = r#"
+        const Base = struct { };
+        const Sub = struct : Base { };
+        fn size(x: Base) i64 { return 1; }
+        fn size(x: Sub) i64 { return 2; }
+        const wide: fn(Base) i64 = size;
+        fn apply(f: fn(Sub) i64) i64 { return f(Sub); }
+        fn main() i64 {
+            const narrow: fn(Sub) i64 = size;
+            return wide(Sub) + apply(narrow);
+        }
+    "#;
+    assert!(errors(src).is_empty(), "{:?}", errors(src));
+
+    // An annotation matching no member, and one matching none because the
+    // return type is wrong rather than the parameter.
+    let common = r#"
+        const Base = struct { };
+        const Sub = struct : Base { };
+        fn size(x: Base) i64 { return 1; }
+        fn size(x: Sub) i64 { return 2; }
+    "#;
+    assert_error(
+        &format!("{common} const bad: fn(Base) str = size; fn main() i64 {{ return 0; }}"),
+        "no overload of `size` has type `fn(Base) str`",
+    );
+    assert_error(
+        &format!("{common} fn main() i64 {{ const bad: fn(i64) i64 = size; return 0; }}"),
+        "no overload of `size` has type `fn(i64) i64`",
+    );
+}
+
+#[test]
+fn an_unannotated_const_aliases_the_whole_overload_set() {
+    // `measure` dispatches exactly as `size` does, at top level and locally.
+    let src = r#"
+        const Base = struct { };
+        const Sub = struct : Base { };
+        fn size(x: Base) i64 { return 1; }
+        fn size(x: Sub) i64 { return 2; }
+        const measure = size;
+        fn main() i64 {
+            const m = size;
+            return measure(Base) + m(Sub);
+        }
+    "#;
+    assert!(errors(src).is_empty(), "{:?}", errors(src));
+
+    // The alias is not a second overload set to be checked over again.
+    let a = analysis(src);
+    assert!(
+        !a.diags.iter().any(|d| d.message.contains("measure")),
+        "{:?}",
+        a.diags
     );
 }
 

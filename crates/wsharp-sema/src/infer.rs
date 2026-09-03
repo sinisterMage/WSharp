@@ -26,7 +26,10 @@ use wsharp_syntax::diag::Label;
 use wsharp_syntax::span::{Ident, Span};
 
 use crate::hir::{self, UNRESOLVED};
-use crate::ty::{Scheme, StructId, TyCon, Type, TypeStore, UnifyError};
+use crate::ty::{
+    AbstractId, Scheme, StructId, TyCon, Type, TypeStore, TypeVarId, UnifyError, abstract_members,
+    abstract_name, lookup_abstract,
+};
 
 pub struct Analysis {
     pub program: hir::Program,
@@ -48,6 +51,7 @@ pub fn analyze(module: &ast::Module) -> Analysis {
     inf.collect_globals();
     inf.infer_all();
     inf.check_overloads();
+    inf.check_function_consts();
     inf.check_entry();
     // Last, because inference is what materialises the status types a program
     // actually mentions, and numbering must see the final lattice.
@@ -74,6 +78,33 @@ enum GlobalRef {
     /// `NotFound404` is a value as well as a type. Emitted once into the data
     /// section, so mentioning it costs nothing.
     Singleton(StructId),
+    /// A `const` bound to a function name *and* annotated with a signature,
+    /// which is what picks one member out of an overload set. Indexes
+    /// [`Inferencer::fn_consts`]; see [`FuncConst`] for why the member cannot
+    /// be chosen here.
+    FuncValue(usize),
+}
+
+/// A `const` bound to one member of an overload set by its type annotation.
+///
+/// The annotation cannot pick the member where the `const` is written: the
+/// members' signatures are not known until their bodies have been inferred. So
+/// the whole set is kept, and the choice is made at the first use -- or, for a
+/// `const` nothing uses, by [`Inferencer::check_function_consts`], so that an
+/// annotation matching nothing is still reported.
+struct FuncConst {
+    ids: Vec<hir::FuncId>,
+    /// The annotation, resolved. Also the type of every use, so the annotation
+    /// is enforced and not merely consulted.
+    ty: Type,
+    span: Span,
+    /// The name being bound, for diagnostics.
+    name: String,
+    /// The member the annotation selected, once that has been worked out.
+    chosen: Option<hir::FuncId>,
+    /// Set when selection has failed, so it is reported once and later uses
+    /// fall back to behaving like an unannotated alias.
+    failed: bool,
 }
 
 /// A top-level `const` bound to a literal value.
@@ -85,10 +116,18 @@ struct ConstDef {
 /// One overload being considered at a call site.
 struct Candidate {
     id: hir::FuncId,
-    /// The declared parameter types. Overloaded functions must annotate every
-    /// parameter, so these are always concrete -- which is what makes
-    /// specificity decidable here rather than after constraint solving.
+    /// The parameter types this use instantiates the overload at. These are
+    /// what the arguments unify with, and what records the type arguments
+    /// monomorphisation needs.
     params: Vec<Type>,
+    /// The parameter types *as written*, with abstract constructors intact.
+    /// Identical to `params` unless a parameter is annotated with an abstract
+    /// type, which becomes a variable in `params` -- and a variable orders
+    /// against nothing, so specificity has to read the annotation instead.
+    /// Overloaded functions must annotate every parameter, so these are always
+    /// concrete, which is what makes specificity decidable here rather than
+    /// after constraint solving.
+    decl_params: Vec<Type>,
     ret: Type,
     targs: Vec<Type>,
     /// Per argument, the runtime test this case needs, or `None` if the static
@@ -110,6 +149,18 @@ enum Constraint {
     },
     /// Must be a type `==` can compare.
     Equatable { ty: Type, span: Span },
+    /// Must be one of the concrete types an abstract type lists.
+    ///
+    /// Written by a parameter annotated with an abstract type, which is a
+    /// *constrained generic* parameter rather than a type of its own, and by
+    /// every use of such a function, on the type that use instantiates it at.
+    /// Both are needed: the declaration is where the constraint is stated and
+    /// exactly where it cannot be checked.
+    Member {
+        ty: Type,
+        id: AbstractId,
+        span: Span,
+    },
     /// `obj` must be a struct with field `field`, whose type is `result`.
     HasField {
         obj: Type,
@@ -125,6 +176,17 @@ enum Constraint {
 // variable, so by the time anything asks "is this a subtype?" both sides are
 // already concrete and the lattice answers immediately. See `coerce`.
 
+/// What a name bound inside a function body means.
+///
+/// An overload set bound by `const g = f;` is not a value -- there is no single
+/// code pointer for a set -- so it is a name that resolves to the same
+/// functions `f` does rather than a local holding something.
+#[derive(Debug, Clone)]
+enum Binding {
+    Local(hir::LocalId),
+    Overloads(Vec<hir::FuncId>),
+}
+
 /// One function being inferred. A stack of these models nesting: a `fn` literal
 /// pushes a frame, and a name resolved past a frame boundary becomes a capture.
 struct Frame {
@@ -136,15 +198,15 @@ struct Frame {
     /// copied from.
     capture_sources: Vec<hir::LocalId>,
     captured_names: HashMap<String, hir::LocalId>,
-    scopes: Vec<Vec<(String, hir::LocalId)>>,
+    scopes: Vec<Vec<(String, Binding)>>,
     ret: Type,
 }
 
 impl Frame {
-    fn find(&self, name: &str) -> Option<hir::LocalId> {
+    fn find(&self, name: &str) -> Option<Binding> {
         for scope in self.scopes.iter().rev() {
-            if let Some((_, id)) = scope.iter().rev().find(|(n, _)| n == name) {
-                return Some(*id);
+            if let Some((_, binding)) = scope.iter().rev().find(|(n, _)| n == name) {
+                return Some(binding.clone());
             }
         }
         None
@@ -161,11 +223,15 @@ impl Frame {
         id
     }
 
-    fn bind(&mut self, name: &str, id: hir::LocalId) {
+    fn bind(&mut self, name: &str, binding: Binding) {
         self.scopes
             .last_mut()
             .expect("a scope is open")
-            .push((name.to_string(), id));
+            .push((name.to_string(), binding));
+    }
+
+    fn bind_local(&mut self, name: &str, id: hir::LocalId) {
+        self.bind(name, Binding::Local(id));
     }
 }
 
@@ -185,6 +251,8 @@ struct Inferencer<'a> {
     /// and lazily materialised status types have no entry.
     global_spans: HashMap<String, Span>,
     consts: Vec<ConstDef>,
+    /// `const`s bound to a function name and pinned by an annotation.
+    fn_consts: Vec<FuncConst>,
 
     /// Per `FuncId`: the source function, absent for nothing in session 1 but
     /// kept as an option so generated functions can be added later.
@@ -194,6 +262,12 @@ struct Inferencer<'a> {
     fn_is_closure: Vec<bool>,
     /// The monomorphic type of each function while its group is being inferred.
     fn_types: Vec<Type>,
+    /// Per function, its parameter types *as written*. See
+    /// [`Candidate::decl_params`] for why an inferred type will not do.
+    fn_decl_params: Vec<Vec<Type>>,
+    /// Per function, the parameters annotated with an abstract type: the
+    /// variable standing in for each, and which abstract type constrains it.
+    fn_member_vars: Vec<Vec<(Type, AbstractId, Span)>>,
     /// Filled in when the function's group is generalised.
     schemes: Vec<Option<Scheme>>,
     funcs: Vec<Option<hir::FuncDef>>,
@@ -220,11 +294,14 @@ impl<'a> Inferencer<'a> {
             globals: HashMap::new(),
             global_spans: HashMap::new(),
             consts: Vec::new(),
+            fn_consts: Vec::new(),
             fn_asts: Vec::new(),
             fn_names: Vec::new(),
             fn_spans: Vec::new(),
             fn_is_closure: Vec::new(),
             fn_types: Vec::new(),
+            fn_decl_params: Vec::new(),
+            fn_member_vars: Vec::new(),
             schemes: Vec::new(),
             funcs: Vec::new(),
             strings: Vec::new(),
@@ -251,7 +328,10 @@ impl<'a> Inferencer<'a> {
             let name = self.fn_names[id].clone();
             let scheme = self.schemes[id].clone();
             let rendered = match scheme {
-                Some(scheme) => self.store.show_scheme(&scheme),
+                Some(scheme) => {
+                    let scheme = self.display_scheme(id as hir::FuncId, scheme);
+                    self.store.show_scheme(&scheme)
+                }
                 None => {
                     let ty = self.fn_types[id].clone();
                     self.store.show(&ty)
@@ -298,6 +378,35 @@ impl<'a> Inferencer<'a> {
             diags: self.diags,
             signatures,
         }
+    }
+
+    /// A function's scheme as it should be *shown*: with the variables that
+    /// stand in for abstract annotations put back as the annotations they came
+    /// from, and no longer quantified.
+    ///
+    /// `fn(Number) str` is what the program says, and `fn(T) str` -- which is
+    /// what the scheme holds -- tells the reader nothing about which types `T`
+    /// may be. A variable is substituted everywhere it occurs, including in the
+    /// return type: `fn bigger(a: Number, b: Number)` really does return one of
+    /// the numbers it was handed.
+    fn display_scheme(&mut self, id: hir::FuncId, scheme: Scheme) -> Scheme {
+        let members = self.fn_member_vars[id as usize].clone();
+        if members.is_empty() {
+            return scheme;
+        }
+        let mut map = HashMap::new();
+        for (var, abstract_id, _) in members {
+            if let Type::Var(v) = self.store.resolve(&var) {
+                map.insert(v, Type::abstrakt(abstract_id));
+            }
+        }
+        let ty = self.store.subst_vars(&scheme.ty, &map);
+        let vars = scheme
+            .vars
+            .into_iter()
+            .filter(|v| !map.contains_key(v))
+            .collect();
+        Scheme { vars, ty }
     }
 
     // -----------------------------------------------------------------------
@@ -431,13 +540,16 @@ impl<'a> Inferencer<'a> {
                 continue;
             };
             let Some(parent) = self.lookup_struct(parent_name.as_str()) else {
-                self.error(
-                    parent_name.span,
-                    format!("unknown supertype `{parent_name}`"),
-                )
-                .help = Some(
-                    "a supertype must be a struct declared in this file, or a status type".into(),
-                );
+                if !self.reject_abstract(parent_name.as_str(), parent_name.span) {
+                    self.error(
+                        parent_name.span,
+                        format!("unknown supertype `{parent_name}`"),
+                    )
+                    .help = Some(
+                        "a supertype must be a struct declared in this file, or a status type"
+                            .into(),
+                    );
+                }
                 continue;
             };
             self.structs[id as usize].parent = Some(parent);
@@ -601,6 +713,9 @@ impl<'a> Inferencer<'a> {
             }
         }
 
+        // A `const` bound to a bare name may be naming a function declared
+        // further down, so those wait for the whole file to be declared.
+        let mut aliases: Vec<&'a ast::ConstDecl> = Vec::new();
         for item in &self.module.items {
             match item {
                 ast::Item::Struct(_) => {}
@@ -618,12 +733,58 @@ impl<'a> Inferencer<'a> {
                             );
                         }
                         self.declare_function(&decl.name, func, decl.span, false);
+                    } else if matches!(decl.value, ast::Expr::Ident(_)) {
+                        aliases.push(decl);
                     } else {
                         self.declare_const(decl);
                     }
                 }
             }
         }
+
+        for decl in aliases {
+            self.declare_func_const(decl);
+        }
+    }
+
+    /// A top-level `const` bound to a bare name.
+    ///
+    /// When the name means functions this binds a second name for them: with no
+    /// annotation, an alias for the whole set, which dispatches at every call
+    /// exactly as the original does; with one, the single member that signature
+    /// names. Anything else is a computed global, which W# does not have, and
+    /// falls back to the message that says so.
+    fn declare_func_const(&mut self, decl: &'a ast::ConstDecl) {
+        let ast::Expr::Ident(source) = &decl.value else {
+            unreachable!("only `const x = name;` is queued")
+        };
+        let Some(GlobalRef::Func(ids)) = self.globals.get(source.as_str()).cloned() else {
+            self.declare_const(decl);
+            return;
+        };
+        if self.globals.contains_key(decl.name.as_str()) {
+            self.report_redeclaration(&decl.name);
+            return;
+        }
+
+        let global = match &decl.ty {
+            Some(annot) => {
+                let ty = self.resolve_type_expr(annot);
+                self.fn_consts.push(FuncConst {
+                    ids,
+                    ty,
+                    span: decl.span,
+                    name: source.to_string(),
+                    chosen: None,
+                    failed: false,
+                });
+                GlobalRef::FuncValue(self.fn_consts.len() - 1)
+            }
+            None => GlobalRef::Func(ids),
+        };
+        self.globals.insert(decl.name.to_string(), global);
+        self.global_spans
+            .insert(decl.name.to_string(), decl.name.span);
     }
 
     fn declare_function(
@@ -659,6 +820,8 @@ impl<'a> Inferencer<'a> {
         self.fn_spans.push(span);
         self.fn_is_closure.push(is_closure);
         self.fn_types.push(Type::void());
+        self.fn_decl_params.push(Vec::new());
+        self.fn_member_vars.push(Vec::new());
         self.schemes.push(None);
         self.funcs.push(None);
         id
@@ -748,7 +911,9 @@ impl<'a> Inferencer<'a> {
                 name => match self.lookup_struct(name) {
                     Some(sid) => Type::strukt(sid),
                     None => {
-                        self.error(id.span, format!("unknown type `{name}`"));
+                        if !self.reject_abstract(name, id.span) {
+                            self.error(id.span, format!("unknown type `{name}`"));
+                        }
                         // Recover with a fresh variable so one bad annotation
                         // does not cascade into every use of the function.
                         self.store.fresh()
@@ -765,6 +930,31 @@ impl<'a> Inferencer<'a> {
         }
     }
 
+    /// Report `name` if it is an abstract type, and say so.
+    ///
+    /// Returns whether it was one, so a caller can skip its own "unknown type"
+    /// message: the name does exist, it is just not a name for a type of a
+    /// value. Every position other than a parameter's annotation ends up here
+    /// -- a supertype, a return type, a local's or a field's annotation, a
+    /// value -- because none of them can be given a machine representation.
+    fn reject_abstract(&mut self, name: &str, span: Span) -> bool {
+        if lookup_abstract(name).is_none() {
+            return false;
+        }
+        self.error(
+            span,
+            format!(
+                "`{name}` is an abstract type: it classifies values for dispatch \
+                 and cannot itself be one"
+            ),
+        )
+        .help = Some(format!(
+            "write it as a whole parameter's type, as in `fn f(x: {name})`, and name a \
+             concrete type such as `i64` everywhere else"
+        ));
+        true
+    }
+
     // -----------------------------------------------------------------------
     // Binding groups
     // -----------------------------------------------------------------------
@@ -779,12 +969,17 @@ impl<'a> Inferencer<'a> {
             let mut names = HashSet::new();
             collect_deps_func(func, &mut names);
             for name in names {
-                if let Some(GlobalRef::Func(callees)) = self.globals.get(&name) {
-                    // Every member of an overload set is a dependency: the call
-                    // could resolve to any of them, and they must all be
-                    // generalised together.
-                    deps.extend(callees.iter().map(|c| *c as usize));
-                }
+                // Every member of an overload set is a dependency: the call
+                // could resolve to any of them, and they must all be
+                // generalised together. A `const` bound to a set depends on the
+                // same functions -- including one pinned by an annotation,
+                // whose member is not known until they have been inferred.
+                let callees = match self.globals.get(&name) {
+                    Some(GlobalRef::Func(ids)) => ids,
+                    Some(GlobalRef::FuncValue(index)) => &self.fn_consts[*index].ids,
+                    _ => continue,
+                };
+                deps.extend(callees.iter().map(|c| *c as usize));
             }
         }
 
@@ -804,7 +999,7 @@ impl<'a> Inferencer<'a> {
             let Some(func) = self.fn_asts[id] else {
                 continue;
             };
-            let ty = self.signature_type(func);
+            let ty = self.signature_type(id as hir::FuncId, func);
             self.fn_types[id] = ty;
         }
 
@@ -827,20 +1022,67 @@ impl<'a> Inferencer<'a> {
     }
 
     /// The function's type as written: annotated parts fixed, the rest fresh.
-    fn signature_type(&mut self, func: &ast::Func) -> Type {
-        let params: Vec<Type> = func
-            .params
-            .iter()
-            .map(|p| match &p.ty {
-                Some(t) => self.resolve_type_expr(t),
-                None => self.store.fresh(),
-            })
-            .collect();
+    ///
+    /// Records what the parameters were annotated with, which is not always
+    /// what the type says: an abstract annotation becomes a variable here.
+    fn signature_type(&mut self, id: hir::FuncId, func: &ast::Func) -> Type {
+        let mut decl = Vec::with_capacity(func.params.len());
+        let mut params = Vec::with_capacity(func.params.len());
+        for p in &func.params {
+            let (ty, written) = match &p.ty {
+                Some(t) => self.resolve_param_type_expr(id, t),
+                None => {
+                    let v = self.store.fresh();
+                    (v.clone(), v)
+                }
+            };
+            params.push(ty);
+            decl.push(written);
+        }
+        self.fn_decl_params[id as usize] = decl;
         let ret = match &func.ret {
             Some(t) => self.resolve_type_expr(t),
             None => self.store.fresh(),
         };
         Type::func(params, ret)
+    }
+
+    /// Resolve a parameter's annotation, which is the one place an abstract
+    /// type may be written.
+    ///
+    /// It does not name the parameter's type there -- it constrains it. `x` in
+    /// `fn area(x: Number)` gets a fresh variable plus a [`Constraint::Member`],
+    /// so the function generalises to `fn(T) ...` and is monomorphised per
+    /// concrete argument like any other generic. That is what gives `x` a
+    /// machine representation: there is none for "a number", but there is for
+    /// each type the function is used at.
+    ///
+    /// Returns the type to check against and the type as written.
+    fn resolve_param_type_expr(&mut self, id: hir::FuncId, t: &ast::TypeExpr) -> (Type, Type) {
+        let ast::TypeExpr::Named(name) = t else {
+            return self.resolve_value_type_expr(t);
+        };
+        if self.struct_ids.contains_key(name.as_str()) {
+            return self.resolve_value_type_expr(t);
+        }
+        let Some(abstract_id) = lookup_abstract(name.as_str()) else {
+            return self.resolve_value_type_expr(t);
+        };
+        let var = self.store.fresh();
+        self.constraints.push(Constraint::Member {
+            ty: var.clone(),
+            id: abstract_id,
+            span: name.span,
+        });
+        self.fn_member_vars[id as usize].push((var.clone(), abstract_id, name.span));
+        (var, Type::abstrakt(abstract_id))
+    }
+
+    /// [`Inferencer::resolve_type_expr`], paired with itself: everywhere but a
+    /// parameter, what is written is what is checked.
+    fn resolve_value_type_expr(&mut self, t: &ast::TypeExpr) -> (Type, Type) {
+        let ty = self.resolve_type_expr(t);
+        (ty.clone(), ty)
     }
 
     /// Infer one function's body. Returns the locals *in the enclosing frame*
@@ -867,7 +1109,7 @@ impl<'a> Inferencer<'a> {
         };
         for (param, ty) in func.params.iter().zip(&params) {
             let local = frame.add_local(param.name.as_str(), ty.clone(), false, param.span);
-            frame.bind(param.name.as_str(), local);
+            frame.bind_local(param.name.as_str(), local);
             frame.params.push(local);
         }
         self.frames.push(frame);
@@ -928,6 +1170,9 @@ impl<'a> Inferencer<'a> {
     fn infer_stmt(&mut self, stmt: &'a ast::Stmt) -> Option<hir::Stmt> {
         match stmt {
             ast::Stmt::Let(let_stmt) => {
+                if let Some(stmt) = self.infer_let_of_overloads(let_stmt) {
+                    return stmt;
+                }
                 let annotated = let_stmt.ty.as_ref().map(|t| self.resolve_type_expr(t));
                 let mut init = self.infer_expr(&let_stmt.init);
                 if let Some(expected) = &annotated {
@@ -940,7 +1185,7 @@ impl<'a> Inferencer<'a> {
                     let_stmt.mutable,
                     let_stmt.name.span,
                 );
-                self.frame().bind(let_stmt.name.as_str(), local);
+                self.frame().bind_local(let_stmt.name.as_str(), local);
                 Some(hir::Stmt::Let { local, init })
             }
 
@@ -983,7 +1228,7 @@ impl<'a> Inferencer<'a> {
                     self.infer_condition(&while_stmt.cond, while_stmt.capture.as_ref());
                 self.frame().scopes.push(Vec::new());
                 if let (Some(name), Some(local)) = (&while_stmt.capture, capture) {
-                    self.frame().bind(name.as_str(), local);
+                    self.frame().bind_local(name.as_str(), local);
                 }
                 self.loop_depth += 1;
                 let body = self.infer_block(&while_stmt.body);
@@ -1019,11 +1264,74 @@ impl<'a> Inferencer<'a> {
         }
     }
 
+    /// `const g = f;` and `const g: fn(Base) i64 = f;`, where `f` names several
+    /// functions.
+    ///
+    /// Without an annotation `g` is a second name for the whole set and emits
+    /// no statement at all -- there is nothing to store, since which member a
+    /// call means is decided per call. With one, the annotation picks a member
+    /// and `g` is an ordinary function value.
+    ///
+    /// The outer `Option` says whether this took the statement over.
+    fn infer_let_of_overloads(&mut self, let_stmt: &'a ast::LetStmt) -> Option<Option<hir::Stmt>> {
+        let ast::Expr::Ident(source) = &let_stmt.init else {
+            return None;
+        };
+        // `var g = f;` is not an alias: a set is not a value, so there would be
+        // nothing to reassign. It falls through to the ordinary path, whose
+        // error explains that.
+        if let_stmt.mutable {
+            return None;
+        }
+        let ids = self.overload_set(source.as_str())?;
+        if ids.len() < 2 {
+            // One function is a value already, and takes the ordinary path.
+            return None;
+        }
+        let span = let_stmt.name.span;
+        let Some(annot) = &let_stmt.ty else {
+            self.frame()
+                .bind(let_stmt.name.as_str(), Binding::Overloads(ids));
+            return Some(None);
+        };
+
+        let want = self.resolve_type_expr(annot);
+        let init = match self.select_overload(source.as_str(), &ids, &want, let_stmt.span) {
+            Some(chosen) => {
+                let (ty, targs) = self.func_type(chosen);
+                // Selection proved these unify; doing it again is what binds
+                // the type arguments this value is taken at.
+                let _ = self.store.try_unify(&ty, &want);
+                self.note_member_constraints(chosen, &targs, span);
+                hir::ExprKind::Closure {
+                    func: chosen,
+                    targs,
+                    captures: Vec::new(),
+                }
+            }
+            // Reported; carry on with a well-formed local so that uses of `g`
+            // do not each add "cannot find `g` in this scope".
+            None => hir::ExprKind::Null,
+        };
+        let local = self
+            .frame()
+            .add_local(let_stmt.name.as_str(), want.clone(), false, span);
+        self.frame().bind_local(let_stmt.name.as_str(), local);
+        Some(Some(hir::Stmt::Let {
+            local,
+            init: hir::Expr {
+                kind: init,
+                ty: want,
+                span,
+            },
+        }))
+    }
+
     fn infer_if_stmt(&mut self, if_stmt: &'a ast::IfStmt) -> Option<hir::Stmt> {
         let (cond, capture) = self.infer_condition(&if_stmt.cond, if_stmt.capture.as_ref());
         self.frame().scopes.push(Vec::new());
         if let (Some(name), Some(local)) = (&if_stmt.capture, capture) {
-            self.frame().bind(name.as_str(), local);
+            self.frame().bind_local(name.as_str(), local);
         }
         let then = self.infer_block(&if_stmt.then);
         self.frame().scopes.pop();
@@ -1218,7 +1526,7 @@ impl<'a> Inferencer<'a> {
                 let (cond, capture) = self.infer_condition(&if_expr.cond, if_expr.capture.as_ref());
                 self.frame().scopes.push(Vec::new());
                 if let (Some(name), Some(local)) = (&if_expr.capture, capture) {
-                    self.frame().bind(name.as_str(), local);
+                    self.frame().bind_local(name.as_str(), local);
                 }
                 let then = self.infer_expr(&if_expr.then);
                 self.frame().scopes.pop();
@@ -1282,7 +1590,7 @@ impl<'a> Inferencer<'a> {
                     let local =
                         self.frame()
                             .add_local(name.as_str(), Type::error(), false, name.span);
-                    self.frame().bind(name.as_str(), local);
+                    self.frame().bind_local(name.as_str(), local);
                     local
                 });
                 let alt = self.infer_expr(alt);
@@ -1356,39 +1664,15 @@ impl<'a> Inferencer<'a> {
                 span,
             };
         }
+        // Functions come first, so that a `const` alias for an overload set
+        // reads exactly as the name it aliases does.
+        if let Some(ids) = self.overload_set(name.as_str()) {
+            return self.func_value(name, &ids);
+        }
         match self.globals.get(name.as_str()).cloned() {
-            Some(GlobalRef::Func(ids)) if ids.len() == 1 => {
-                // A named function used as a value becomes a closure with an
-                // empty environment, so calls through it look like any other.
-                let (ty, targs) = self.func_type(ids[0]);
-                hir::Expr {
-                    kind: hir::ExprKind::Closure {
-                        func: ids[0],
-                        targs,
-                        captures: Vec::new(),
-                    },
-                    ty,
-                    span,
-                }
-            }
-            Some(GlobalRef::Func(ids)) => {
-                // A closure value is one code pointer; an overload set is not.
-                let n = ids.len();
-                self.error(
-                    span,
-                    format!("`{name}` names {n} functions, so it is not a single value"),
-                )
-                .help = Some(
-                    "an overload set can only be called, not passed around -- wrap it in a \
-                     `fn` literal to take one member"
-                        .into(),
-                );
-                let ty = self.store.fresh();
-                hir::Expr {
-                    kind: hir::ExprKind::Null,
-                    ty,
-                    span,
-                }
+            // Both are handled by `overload_set` above.
+            Some(GlobalRef::Func(_) | GlobalRef::FuncValue(_)) => {
+                unreachable!("a name meaning functions was resolved above")
             }
             Some(GlobalRef::Singleton(id)) => hir::Expr {
                 kind: hir::ExprKind::Singleton(id),
@@ -1428,7 +1712,9 @@ impl<'a> Inferencer<'a> {
                         span,
                     };
                 }
-                self.error(span, format!("cannot find `{name}` in this scope"));
+                if !self.reject_abstract(name.as_str(), span) {
+                    self.error(span, format!("cannot find `{name}` in this scope"));
+                }
                 let ty = self.store.fresh();
                 hir::Expr {
                     kind: hir::ExprKind::Null,
@@ -1452,11 +1738,223 @@ impl<'a> Inferencer<'a> {
         }
     }
 
+    /// Register, on the types *this use* instantiates `id` at, the abstract-type
+    /// constraints its parameters were annotated with.
+    ///
+    /// The constraint travels with the instantiation because the declaration is
+    /// exactly where it cannot be checked: the parameter is generic there, and
+    /// deciding it then would mean picking one member and losing the genericity
+    /// the annotation exists to create. Only a use that keeps its instantiation
+    /// may call this -- a speculative one that is rolled back would leave a
+    /// constraint on a variable that no longer means anything.
+    fn note_member_constraints(&mut self, id: hir::FuncId, targs: &[Type], span: Span) {
+        let Some(scheme) = self.schemes[id as usize].clone() else {
+            // Still inside its own binding group, so this use shares the very
+            // variable the signature recorded a constraint on.
+            return;
+        };
+        for (var, abstract_id, _) in self.fn_member_vars[id as usize].clone() {
+            let Type::Var(v) = self.store.resolve(&var) else {
+                // The body pinned it to a concrete type, which the constraint
+                // recorded at the declaration has already checked.
+                continue;
+            };
+            if let Some(pos) = scheme.vars.iter().position(|q| *q == v)
+                && let Some(targ) = targs.get(pos)
+            {
+                self.constraints.push(Constraint::Member {
+                    ty: targ.clone(),
+                    id: abstract_id,
+                    span,
+                });
+            }
+        }
+    }
+
+    /// Instantiate function `id` for a use written as `name`, holding the
+    /// instantiation to whatever that name was pinned to.
+    ///
+    /// A `const` annotated with a signature does not merely *select* a member:
+    /// the annotation is the type of every use of it, so a member that is still
+    /// generic -- one with an abstract parameter -- is used at the types the
+    /// annotation names and at no others.
+    fn func_use(&mut self, name: &str, id: hir::FuncId, span: Span) -> (Type, Vec<Type>) {
+        let (ty, targs) = self.func_type(id);
+        // A binding in scope shadows the global, pin and all.
+        let pinned = match self.lookup_binding(name) {
+            Some(_) => None,
+            None => match self.globals.get(name) {
+                Some(GlobalRef::FuncValue(index)) => Some(*index),
+                _ => None,
+            },
+        };
+        if let Some(index) = pinned {
+            // `select_overload` already proved these unify; this use only needs
+            // the type arguments that doing it again produces.
+            let want = self.fn_consts[index].ty.clone();
+            let _ = self.store.try_unify(&ty, &want);
+        }
+        self.note_member_constraints(id, &targs, span);
+        (ty, targs)
+    }
+
+    /// The functions a name refers to: a `const` alias for an overload set in
+    /// scope, or a top-level name. `None` if it means anything else.
+    ///
+    /// An annotated alias is narrowed to the one member its annotation selects,
+    /// so everything downstream sees a set of one and takes the ordinary path.
+    fn overload_set(&mut self, name: &str) -> Option<Vec<hir::FuncId>> {
+        match self.lookup_binding(name) {
+            // A local shadows the global of the same name, value or not.
+            Some(Binding::Local(_)) => return None,
+            Some(Binding::Overloads(ids)) => return Some(ids),
+            None => {}
+        }
+        match self.globals.get(name) {
+            Some(GlobalRef::Func(ids)) => Some(ids.clone()),
+            Some(GlobalRef::FuncValue(index)) => Some(self.resolve_func_const(*index)),
+            _ => None,
+        }
+    }
+
+    /// The member a `const`'s annotation selected, worked out on first use and
+    /// remembered. Falls back to the whole set once the choice has failed, so
+    /// the failure is reported once and later uses behave like a plain alias.
+    fn resolve_func_const(&mut self, index: usize) -> Vec<hir::FuncId> {
+        if let Some(chosen) = self.fn_consts[index].chosen {
+            return vec![chosen];
+        }
+        if self.fn_consts[index].failed {
+            return self.fn_consts[index].ids.clone();
+        }
+        let c = &self.fn_consts[index];
+        let (ids, want, span, name) = (c.ids.clone(), c.ty.clone(), c.span, c.name.clone());
+        match self.select_overload(&name, &ids, &want, span) {
+            Some(chosen) => {
+                self.fn_consts[index].chosen = Some(chosen);
+                vec![chosen]
+            }
+            None => {
+                self.fn_consts[index].failed = true;
+                ids
+            }
+        }
+    }
+
+    /// The member of an overload set whose signature is `want`.
+    ///
+    /// "Whose signature is", not "which accepts": a function value is one code
+    /// pointer, so the annotation has to name a signature some member *has*.
+    /// Selecting by subtyping would let `fn(Sub) i64` answer to `fn(Base) i64`,
+    /// and a call through the value would then hand a `Base` to a body compiled
+    /// to read `Sub`'s fields.
+    fn select_overload(
+        &mut self,
+        name: &str,
+        ids: &[hir::FuncId],
+        want: &Type,
+        span: Span,
+    ) -> Option<hir::FuncId> {
+        let mut matches = Vec::new();
+        for &id in ids {
+            // Speculative: a trial must not pin anything for the next one, and
+            // the winner is instantiated again by whoever uses it.
+            let snapshot = self.store.snapshot();
+            let (ty, _) = self.func_type(id);
+            if self.store.try_unify(&ty, want) {
+                matches.push(id);
+            }
+            self.store.rollback_to(snapshot);
+        }
+        if let [only] = matches[..] {
+            return Some(only);
+        }
+        let shown = self.store.show(want);
+        let listed: Vec<String> = ids
+            .iter()
+            .map(|&id| {
+                let ty = match &self.schemes[id as usize] {
+                    Some(s) => s.ty.clone(),
+                    None => self.fn_types[id as usize].clone(),
+                };
+                self.store.show(&ty)
+            })
+            .collect();
+        let listed = listed.join("`, `");
+        if matches.is_empty() {
+            self.error(span, format!("no overload of `{name}` has type `{shown}`"))
+                .help = Some(format!(
+                "the annotation must be one member's signature exactly; `{name}` has \
+                 `{listed}`"
+            ));
+        } else {
+            let n = matches.len();
+            self.error(
+                span,
+                format!("`{shown}` matches {n} overloads of `{name}`, so it selects none"),
+            )
+            .help = Some(format!(
+                "annotate the overloads' return types so they can be told apart; `{name}` has \
+                 `{listed}`"
+            ));
+        }
+        None
+    }
+
+    /// A name that means functions, used as a value.
+    fn func_value(&mut self, name: &Ident, ids: &[hir::FuncId]) -> hir::Expr {
+        let span = name.span;
+        if let [id] = ids[..] {
+            // A named function used as a value becomes a closure with an empty
+            // environment, so calls through it look like any other.
+            let (ty, targs) = self.func_use(name.as_str(), id, span);
+            return hir::Expr {
+                kind: hir::ExprKind::Closure {
+                    func: id,
+                    targs,
+                    captures: Vec::new(),
+                },
+                ty,
+                span,
+            };
+        }
+        // A closure value is one code pointer; an overload set is not.
+        let n = ids.len();
+        let message = if self.is_alias(name.as_str(), ids) {
+            format!("`{name}` is an alias for an overload set, so it is not a single value")
+        } else {
+            format!("`{name}` names {n} functions, so it is not a single value")
+        };
+        // Show a signature the set really has, so the suggestion can be copied.
+        let example = match &self.schemes[ids[0] as usize] {
+            Some(s) => s.ty.clone(),
+            None => self.fn_types[ids[0] as usize].clone(),
+        };
+        let example = self.store.show(&example);
+        self.error(span, message).help = Some(format!(
+            "a set can only be called, not passed around -- annotate the binding with one \
+             member's signature, as in `const one: {example} = {name};`"
+        ));
+        let ty = self.store.fresh();
+        hir::Expr {
+            kind: hir::ExprKind::Null,
+            ty,
+            span,
+        }
+    }
+
+    /// Whether `name` reaches these functions under a name of its own, i.e. is
+    /// a `const` bound to the set rather than the name they were declared with.
+    fn is_alias(&self, name: &str, ids: &[hir::FuncId]) -> bool {
+        ids.first()
+            .is_some_and(|&id| self.fn_names[id as usize] != name)
+    }
+
     fn builtin_type(&mut self, id: hir::BuiltinId) -> Type {
         let builtins = wsharp_runtime::builtins();
         let b = &builtins[id as usize];
-        let params = b.params.iter().map(|t| builtin_ty(*t)).collect();
-        Type::func(params, builtin_ty(b.ret))
+        let params = b.params.iter().map(|t| Type::from_builtin(*t)).collect();
+        Type::func(params, Type::from_builtin(b.ret))
     }
 
     fn infer_binary(&mut self, op: BinOp, lhs: hir::Expr, rhs: hir::Expr, span: Span) -> hir::Expr {
@@ -1518,40 +2016,46 @@ impl<'a> Inferencer<'a> {
         args: &'a [ast::Expr],
         span: Span,
     ) -> hir::Expr {
+        // A `const` alias for a set resolves exactly as the name it aliases.
+        let named = match callee {
+            ast::Expr::Ident(name) => self.overload_set(name.as_str()).map(|ids| (name, ids)),
+            _ => None,
+        };
+
         // An overload set needs its arguments inferred before the callee can be
         // chosen at all, so it takes a separate path.
-        if let ast::Expr::Ident(name) = callee
-            && self.lookup_local(name.as_str()).is_none()
-            && let Some(GlobalRef::Func(ids)) = self.globals.get(name.as_str())
+        if let Some((name, ids)) = &named
             && ids.len() > 1
         {
-            let ids = ids.clone();
+            let (name, ids) = (*name, ids.clone());
             return self.infer_dispatched_call(name, &ids, args, span);
         }
 
         // A call to a name that resolves to a known function or builtin is
         // lowered as a direct call; anything else goes through a closure value.
-        let (callee_ty, hir_callee) = match callee {
-            ast::Expr::Ident(name) if self.lookup_local(name.as_str()).is_none() => {
-                match self.globals.get(name.as_str()).cloned() {
-                    Some(GlobalRef::Func(ids)) => {
-                        let id = ids[0];
-                        let (ty, targs) = self.func_type(id);
-                        (ty, hir::Callee::Static { func: id, targs })
-                    }
-                    Some(GlobalRef::Builtin(id)) => {
-                        (self.builtin_type(id), hir::Callee::Builtin(id))
-                    }
-                    _ => {
-                        let e = self.infer_expr(callee);
-                        (e.ty.clone(), hir::Callee::Indirect(Box::new(e)))
+        let (callee_ty, hir_callee) = match named {
+            Some((name, ids)) => {
+                let id = ids[0];
+                let (ty, targs) = self.func_use(name.as_str(), id, span);
+                (ty, hir::Callee::Static { func: id, targs })
+            }
+            None => match callee {
+                ast::Expr::Ident(name) if self.lookup_local(name.as_str()).is_none() => {
+                    match self.globals.get(name.as_str()).cloned() {
+                        Some(GlobalRef::Builtin(id)) => {
+                            (self.builtin_type(id), hir::Callee::Builtin(id))
+                        }
+                        _ => {
+                            let e = self.infer_expr(callee);
+                            (e.ty.clone(), hir::Callee::Indirect(Box::new(e)))
+                        }
                     }
                 }
-            }
-            other => {
-                let e = self.infer_expr(other);
-                (e.ty.clone(), hir::Callee::Indirect(Box::new(e)))
-            }
+                other => {
+                    let e = self.infer_expr(other);
+                    (e.ty.clone(), hir::Callee::Indirect(Box::new(e)))
+                }
+            },
         };
 
         let mut hir_args: Vec<hir::Expr> = args.iter().map(|a| self.infer_expr(a)).collect();
@@ -1645,10 +2149,20 @@ impl<'a> Inferencer<'a> {
             // Keep a candidate when every parameter cone overlaps its
             // argument's, in either direction. Disjoint cones can never both
             // hold of one value, so such a candidate is impossible here.
+            let params: Vec<Type> = params.to_vec();
+            let ret = ret.clone();
+            // Fall back to the instantiated type wherever nothing was written,
+            // so the two lists always line up with the arguments.
+            let written = self.fn_decl_params[id as usize].clone();
+            let decl_params: Vec<Type> = params
+                .iter()
+                .enumerate()
+                .map(|(i, p)| written.get(i).cloned().unwrap_or_else(|| p.clone()))
+                .collect();
             let mut tests = Vec::with_capacity(params.len());
             let mut possible = true;
-            for (param, arg) in params.iter().zip(&arg_tys) {
-                match self.overlap(arg, param) {
+            for ((param, decl), arg) in params.iter().zip(&decl_params).zip(&arg_tys) {
+                match self.overlap(arg, param, decl) {
                     Some(test) => tests.push(test),
                     None => {
                         possible = false;
@@ -1656,13 +2170,12 @@ impl<'a> Inferencer<'a> {
                     }
                 }
             }
-            let params: Vec<Type> = params.to_vec();
-            let ret = ret.clone();
             self.store.rollback_to(snapshot);
             if possible {
                 cands.push(Candidate {
                     id,
                     params,
+                    decl_params,
                     ret,
                     targs,
                     tests,
@@ -1766,6 +2279,22 @@ impl<'a> Inferencer<'a> {
             *arg = self.coerce(taken, &want, "this argument");
         }
 
+        // Bind each surviving case's abstract parameters to the types it will
+        // actually be called with. The trial unifications were undone so that
+        // one candidate could not pin an argument for the next, but a case with
+        // an abstract parameter is generic, and every case in the table must
+        // reach monomorphisation with concrete type arguments. Only abstract
+        // positions: anywhere else, re-unifying could pin an argument to one
+        // arbitrary case's parameter type.
+        for cand in &cands {
+            let positions = cand.decl_params.iter().zip(&cand.params).zip(&arg_tys);
+            for ((decl, param), arg) in positions {
+                if matches!(self.store.resolve(decl), Type::Con(TyCon::Abstract(_), _)) {
+                    let _ = self.store.try_unify(param, arg);
+                }
+            }
+        }
+
         // If the most specific case needs no runtime test then it applies to
         // every value the arguments can take, so it always wins and the call is
         // static -- costing exactly what an ordinary call does. That covers the
@@ -1802,12 +2331,26 @@ impl<'a> Inferencer<'a> {
     }
 
     /// How a runtime value of static type `arg` can satisfy parameter type
-    /// `param`.
+    /// `param`, declared as `decl`.
     ///
     /// `None` means it never can. `Some(None)` means it always does, so the
     /// dispatcher need not test this position. `Some(Some(id))` means it does
     /// exactly when the runtime value is an instance of `id` or a subtype.
-    fn overlap(&mut self, arg: &Type, param: &Type) -> Option<Option<StructId>> {
+    fn overlap(&mut self, arg: &Type, param: &Type, decl: &Type) -> Option<Option<StructId>> {
+        // An abstract parameter is a constrained generic one: the constraint is
+        // on what was *declared*, while what a call site binds is the variable
+        // standing in for it. Membership is decided here and now, because a
+        // scalar's type is always statically known -- there is no header to
+        // read and so no runtime test to emit, which is why a dispatch case
+        // still only ever carries struct ids.
+        if let Type::Con(TyCon::Abstract(_), _) = self.store.resolve(decl) {
+            if !self.store.is_sub_ty(arg, decl) {
+                return None;
+            }
+            // Records the type argument this case would be called at.
+            let _ = self.store.try_unify(arg, param);
+            return Some(None);
+        }
         // Anything the ordinary rules already accept needs no test.
         if self.store.is_sub_ty(arg, param) || self.store.try_unify(arg, param) {
             return Some(None);
@@ -1825,11 +2368,15 @@ impl<'a> Inferencer<'a> {
     }
 
     /// True if `a` is at least as specific as `b` in every argument position.
+    ///
+    /// On the declared types, not the instantiated ones: an abstract annotation
+    /// becomes a variable in the latter, and a variable is ordered against
+    /// nothing, so `fn(i64)` would not come out narrower than `fn(Number)`.
     fn at_least_as_specific(&mut self, a: &Candidate, b: &Candidate) -> bool {
-        a.params.len() == b.params.len()
-            && a.params
+        a.decl_params.len() == b.decl_params.len()
+            && a.decl_params
                 .iter()
-                .zip(&b.params)
+                .zip(&b.decl_params)
                 .all(|(x, y)| self.store.is_sub_ty(x, y))
     }
 
@@ -1900,8 +2447,8 @@ impl<'a> Inferencer<'a> {
     /// The narrowest argument tuple both candidates accept, or `None` if no
     /// value satisfies both.
     fn meet(&mut self, a: &Candidate, b: &Candidate) -> Option<Vec<Type>> {
-        let mut meet = Vec::with_capacity(a.params.len());
-        for (x, y) in a.params.iter().zip(&b.params) {
+        let mut meet = Vec::with_capacity(a.decl_params.len());
+        for (x, y) in a.decl_params.iter().zip(&b.decl_params) {
             if self.store.is_sub_ty(x, y) {
                 meet.push(x.clone());
             } else if self.store.is_sub_ty(y, x) {
@@ -1930,7 +2477,7 @@ impl<'a> Inferencer<'a> {
             }
             if meet
                 .iter()
-                .zip(&c.params)
+                .zip(&c.decl_params)
                 .all(|(m, p)| self.store.is_sub_ty(m, p))
             {
                 return true;
@@ -1940,7 +2487,11 @@ impl<'a> Inferencer<'a> {
     }
 
     fn show_params(&mut self, cand: &Candidate) -> String {
-        let shown: Vec<String> = cand.params.iter().map(|t| self.store.show(t)).collect();
+        let shown: Vec<String> = cand
+            .decl_params
+            .iter()
+            .map(|t| self.store.show(t))
+            .collect();
         format!("({})", shown.join(", "))
     }
 
@@ -1963,7 +2514,7 @@ impl<'a> Inferencer<'a> {
                     "a struct literal names a type declared as `const Name = struct { ... }`"
                         .into(),
                 );
-            } else {
+            } else if !self.reject_abstract(name.as_str(), name.span) {
                 self.error(name.span, format!("unknown struct `{name}`"));
             }
             for init in inits {
@@ -2046,7 +2597,7 @@ impl<'a> Inferencer<'a> {
     fn infer_closure(&mut self, func: &'a ast::Func, span: Span) -> hir::Expr {
         let name = Ident::new(format!("closure@{}", span.start), span);
         let id = self.declare_function(&name, func, span, true);
-        let fn_ty = self.signature_type(func);
+        let fn_ty = self.signature_type(id, func);
         self.fn_types[id as usize] = fn_ty.clone();
 
         let capture_sources = self.infer_function(id);
@@ -2085,21 +2636,34 @@ impl<'a> Inferencer<'a> {
     // -----------------------------------------------------------------------
 
     fn lookup_local(&mut self, name: &str) -> Option<hir::LocalId> {
+        match self.lookup_binding(name)? {
+            Binding::Local(id) => Some(id),
+            Binding::Overloads(_) => None,
+        }
+    }
+
+    fn lookup_binding(&mut self, name: &str) -> Option<Binding> {
         let depth = self.frames.len().checked_sub(1)?;
         self.lookup_at(depth, name)
     }
 
     /// Look `name` up in frame `depth`, threading a capture through every
     /// intervening closure if it is found further out.
-    fn lookup_at(&mut self, depth: usize, name: &str) -> Option<hir::LocalId> {
-        if let Some(id) = self.frames[depth].find(name) {
-            return Some(id);
+    fn lookup_at(&mut self, depth: usize, name: &str) -> Option<Binding> {
+        if let Some(binding) = self.frames[depth].find(name) {
+            return Some(binding);
         }
         if let Some(&id) = self.frames[depth].captured_names.get(name) {
-            return Some(id);
+            return Some(Binding::Local(id));
         }
         let outer = depth.checked_sub(1)?;
-        let source = self.lookup_at(outer, name)?;
+        // An overload set is decided at compile time, so a closure that names
+        // one reaches straight past the frame boundary: there is no value to
+        // copy in, and capturing it would invent a local with no type.
+        let source = match self.lookup_at(outer, name)? {
+            Binding::Local(id) => id,
+            overloads @ Binding::Overloads(_) => return Some(overloads),
+        };
         let ty = self.frames[outer].locals[source as usize].ty.clone();
         let span = self.frames[outer].locals[source as usize].span;
 
@@ -2108,7 +2672,7 @@ impl<'a> Inferencer<'a> {
         frame.captures.push(id);
         frame.capture_sources.push(source);
         frame.captured_names.insert(name.to_string(), id);
-        Some(id)
+        Some(Binding::Local(id))
     }
 
     // -----------------------------------------------------------------------
@@ -2246,7 +2810,22 @@ impl<'a> Inferencer<'a> {
     // -----------------------------------------------------------------------
 
     fn solve_constraints(&mut self) {
-        for constraint in std::mem::take(&mut self.constraints) {
+        let constraints = std::mem::take(&mut self.constraints);
+        // Which variables an abstract type already holds to a set of concrete
+        // types. `Numeric` and `Equatable` on one of those are answered by the
+        // set, and -- more importantly -- must not default it to `i64`: the
+        // whole point of the annotation is that the function stays generic over
+        // the members, and `x + x` in the body must not decide for the caller.
+        let mut constrained: HashMap<TypeVarId, AbstractId> = HashMap::new();
+        for constraint in &constraints {
+            if let Constraint::Member { ty, id, .. } = constraint
+                && let Type::Var(v) = self.store.resolve(ty)
+            {
+                constrained.insert(v, *id);
+            }
+        }
+
+        for constraint in constraints {
             match constraint {
                 Constraint::Numeric {
                     ty,
@@ -2255,6 +2834,12 @@ impl<'a> Inferencer<'a> {
                     integers_only,
                 } => {
                     let resolved = self.store.resolve(&ty);
+                    if let Type::Var(v) = resolved
+                        && let Some(&abstract_id) = constrained.get(&v)
+                    {
+                        self.check_members_support(abstract_id, span, op, integers_only);
+                        continue;
+                    }
                     match resolved {
                         // Unconstrained by anything else: default to i64.
                         Type::Var(_) => {
@@ -2283,6 +2868,12 @@ impl<'a> Inferencer<'a> {
                 }
                 Constraint::Equatable { ty, span } => {
                     let resolved = self.store.resolve(&ty);
+                    if let Type::Var(v) = resolved
+                        && let Some(&abstract_id) = constrained.get(&v)
+                    {
+                        self.check_members_equatable(abstract_id, span);
+                        continue;
+                    }
                     match resolved {
                         Type::Var(_) => {
                             let _ = self.store.unify(&ty, &Type::i64());
@@ -2334,6 +2925,99 @@ impl<'a> Inferencer<'a> {
                         self.error(span, format!("`{shown}` has no fields"));
                     }
                 },
+
+                Constraint::Member { ty, id, span } => match self.store.resolve(&ty) {
+                    // Still a variable, which here means a parameter of the
+                    // scheme about to be generalised -- exactly the constrained
+                    // generic the annotation asks for. Defaulting it the way
+                    // `Numeric` defaults to `i64` would destroy the genericity
+                    // the annotation exists to create, so it is left alone; a
+                    // variable nothing ever pins is monomorphisation's to
+                    // report, at the use site that failed to pin it.
+                    Type::Var(_) => {}
+                    resolved if abstract_members(id).contains(&resolved) => {}
+                    resolved => {
+                        let name = abstract_name(id);
+                        let shown = self.store.show(&resolved);
+                        let members = self.list_members(id);
+                        self.error(
+                            span,
+                            format!("`{name}` accepts {members}, but this is `{shown}`"),
+                        )
+                        .help = Some(format!(
+                            "`{name}` is the set of those types; use one of them here, or a \
+                             parameter with no annotation to accept any type at all"
+                        ));
+                    }
+                },
+            }
+        }
+    }
+
+    /// The members of an abstract type, as a phrase: "`i64` and `f64`".
+    fn list_members(&mut self, id: AbstractId) -> String {
+        let shown: Vec<String> = abstract_members(id)
+            .iter()
+            .map(|m| self.store.show(m))
+            .map(|m| format!("`{m}`"))
+            .collect();
+        match shown.split_last() {
+            Some((last, [])) => last.clone(),
+            Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+            None => "nothing".into(),
+        }
+    }
+
+    /// An arithmetic operator applied to a value an abstract type constrains.
+    ///
+    /// The question is decidable without knowing which member it will be: the
+    /// operator has to work for *every* one of them, because the caller picks.
+    fn check_members_support(
+        &mut self,
+        id: AbstractId,
+        span: Span,
+        op: &'static str,
+        integers_only: bool,
+    ) {
+        let name = abstract_name(id);
+        for member in abstract_members(id) {
+            let bad = if integers_only {
+                member != Type::i64()
+            } else {
+                !member.is_numeric()
+            };
+            if bad {
+                let shown = self.store.show(&member);
+                let article = if integers_only {
+                    "an integer"
+                } else {
+                    "a number"
+                };
+                self.error(
+                    span,
+                    format!("`{op}` needs {article}, but `{name}` includes `{shown}`"),
+                )
+                .help = Some(format!(
+                    "a parameter annotated `{name}` must work for every type `{name}` lists"
+                ));
+                return;
+            }
+        }
+    }
+
+    fn check_members_equatable(&mut self, id: AbstractId, span: Span) {
+        let name = abstract_name(id);
+        for member in abstract_members(id) {
+            if !matches!(member, Type::Con(TyCon::I64 | TyCon::F64 | TyCon::Bool, _)) {
+                let shown = self.store.show(&member);
+                self.error(
+                    span,
+                    format!(
+                        "`{shown}` values cannot be compared with `==`, and `{name}` includes one"
+                    ),
+                )
+                .help = Some("only `i64`, `f64` and `bool` can be compared so far".into());
+                return;
             }
         }
     }
@@ -2353,7 +3037,12 @@ impl<'a> Inferencer<'a> {
             .globals
             .iter()
             .filter_map(|(name, g)| match g {
-                GlobalRef::Func(ids) if ids.len() > 1 => Some((name.clone(), ids.clone())),
+                // An alias for a set is not a set of its own: its members were
+                // already checked under the name they were declared with, and
+                // checking them twice would say everything twice.
+                GlobalRef::Func(ids) if ids.len() > 1 && !self.is_alias(name, ids) => {
+                    Some((name.clone(), ids.clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -2383,23 +3072,14 @@ impl<'a> Inferencer<'a> {
             }
 
             // Two overloads that accept exactly the same arguments are a
-            // duplicate definition, not a choice.
+            // duplicate definition, not a choice. On the declared types, so
+            // that `Number` reads as `Number` and is told apart from `i64`.
             let rendered: Vec<String> = ids
                 .iter()
                 .map(|&id| {
-                    let ty = match &self.schemes[id as usize] {
-                        Some(s) => s.ty.clone(),
-                        None => self.fn_types[id as usize].clone(),
-                    };
-                    match ty.as_fn() {
-                        Some((params, _)) => {
-                            let params: Vec<Type> = params.to_vec();
-                            let shown: Vec<String> =
-                                params.iter().map(|p| self.store.show(p)).collect();
-                            shown.join(", ")
-                        }
-                        None => String::new(),
-                    }
+                    let params = self.fn_decl_params[id as usize].clone();
+                    let shown: Vec<String> = params.iter().map(|p| self.store.show(p)).collect();
+                    shown.join(", ")
                 })
                 .collect();
             for i in 0..ids.len() {
@@ -2415,6 +3095,15 @@ impl<'a> Inferencer<'a> {
                     }
                 }
             }
+        }
+    }
+
+    /// Force the choice for every `const` pinned to a signature that nothing
+    /// used, so an annotation naming no member is reported whether or not the
+    /// program went on to call it.
+    fn check_function_consts(&mut self) {
+        for index in 0..self.fn_consts.len() {
+            self.resolve_func_const(index);
         }
     }
 
@@ -2484,17 +3173,6 @@ fn is_place_base(expr: &ast::Expr) -> bool {
         ast::Expr::Ident(_) => true,
         ast::Expr::Field { obj, .. } => is_place_base(obj),
         _ => false,
-    }
-}
-
-fn builtin_ty(t: wsharp_runtime::BuiltinTy) -> Type {
-    use wsharp_runtime::BuiltinTy as B;
-    match t {
-        B::I64 => Type::i64(),
-        B::F64 => Type::f64(),
-        B::Bool => Type::bool(),
-        B::Void => Type::void(),
-        B::Str => Type::str(),
     }
 }
 

@@ -99,9 +99,22 @@ Things in this version that differ from older tutorials, each of which cost time
   marker, counting and the barrier use; `in_heap` is an address-range test
   for finding a block and its lines. Confusing them either decrements a string
   literal — a write to read-only memory — or forgets every large object.
-- **A fresh object's fields read as null.** Blocks are zeroed when reopened
-  (`open_block`), never assumed clean. The barrier's slow path and the marker
-  both read fields of objects whose initialising stores have not run yet.
+- **A fresh object's fields read as null.** A hole is zeroed when an allocator
+  takes it (`open_hole`), never assumed clean. The barrier's slow path and the
+  marker both read fields of objects whose initialising stores have not run yet.
+- **The object-start bitmap is what makes the heap walkable.** Objects are not
+  laid end to end -- a refilled hole puts new ones among the corpses of old
+  ones, and an allocation buffer leaves an unused tail -- so a walk that
+  stepped by each object's size would lose its place at the first gap, and
+  losing its place means missing live objects. Set the bit *after* stamping
+  the header, and clear it when freeing.
+- **A block an allocator is holding is `Open`**, and that state is what keeps
+  its unused tail unclaimed, keeps it from being recycled under the thread
+  using it, and keeps a trace from choosing it to evacuate. That last one is
+  why `on_allocation` is a safe place to pause: the object in flight is in
+  such a block. It also means a buffer must be retired (`retire_local_buffer`)
+  before the sweep can see into its block, which the pause that finishes
+  marking does.
 - **The mark bit is a parity.** "Marked" means the bit equals
   `header::mark_parity()`, which flips in a trace's initial pause. Nothing
   ever clears mark bits, and `stamp` writes the current parity, so an object
@@ -113,25 +126,37 @@ Things in this version that differ from older tutorials, each of which cost time
   dead, because that object may be the only path the snapshot had to something
   live; so the marker never tests `FLAG_DEAD`, and no block is recycled and no
   large object deallocated underneath it.
-- **Both pauses run on the mutator thread**, inside a runtime call at a
+- **All three pauses run on the mutator thread**, inside a runtime call at a
   safepoint, because only the mutator can walk its own stack. The collector
   thread never touches the stack. The pause sites are exactly `ws_gc_poll`,
   `on_allocation`, the `gc_trace*` builtins and exit — never a builtin such as
   `print`, which holds its argument in a Rust local no stack map describes.
   `on_allocation` is safe because the object in flight is in the open block,
   which is never an evacuation candidate, and on no list, so nothing judges it.
-- **Forwarded headers exist only inside the final pause**, between
-  `heap::evacuate` and `release_evacuated`. A forwarded word's bits are an
-  address, not flags, so nothing may read a flag, a count or a type id from an
-  object in an evacuating block after that point: `evacuate::forward` tests
-  forwarding first, the fix-up walk skips evacuating blocks, every buffer is
-  drained before copying begins, and the sweep never sees those blocks.
-- **The fix-up visits every place a reference can live**: every root slot,
-  every pointer field of every marked live object outside the evacuating
-  blocks (copies included, since they land in the open block), and the
-  nursery. `--gc-stress` re-walks all of it afterwards and aborts on any
-  pointer still into an evacuating block. Anything that adds a place a heap
-  pointer can be stored must be added to both walks.
+- **A forwarded header is an address, not flags.** Anything that reads a flag,
+  a count, a size or a type id from an object in a block being emptied must
+  test forwarding first -- `evacuate::forward`, `heap::evacuate_block` and
+  `note_evacuated_blocks` all do. An object is accounted for at the moment it
+  is forwarded, because afterwards nothing can ask how big it was.
+- **The load barrier is what makes moving objects safe while the program
+  runs.** Every reference loaded out of a heap object goes through
+  `emit_load_barrier`, so nothing the program holds is ever in a block being
+  emptied. Anything that starts reading a reference by some other route --
+  a new instruction, a runtime function reaching into a field -- has to
+  resolve it too, or a write through it will be lost when the block goes.
+  `ws_log_object` is the existing example: it reads fields directly, so it
+  resolves them while objects are moving.
+- **Reference counting stands aside while objects move**, because a header may
+  be a forwarding word rather than a count. `on_allocation` and the
+  `gc_collect` builtin both return early; the window is one evacuation long.
+- **The evacuation pause fixes a list, not the heap**: the slots the marker
+  saw pointing into a block being emptied, plus the objects the trace touched
+  afterwards (everything the write barrier logged, everything allocated while
+  the trace ran, and every copy), plus the roots and the collector's own
+  lists. `evacuate::fix_references` argues why that is all of them, and
+  `--gc-stress` walks the whole heap afterwards to check. Anything that adds a
+  place a heap pointer can be stored must be added to that list *and* to the
+  verifier.
 - **Counting after the final pause never names an unmarked object.** Its
   buffers were drained in the pause and the nursery was filtered by mark, so
   the concurrent sweep, which frees exactly the unmarked, cannot free anything
@@ -179,8 +204,10 @@ nix-shell --run "cargo test --workspace"
   paths run in both passes.
 - **The concurrent collector is tested from W#, not from Rust.** The phase
   machine needs a real mutator with real stack maps, so `gc_concurrent.ws`
-  mutates the heap between `gc_trace_start()` and `gc_trace_finish()` and
-  `gc_auto_trace.ws` allocates enough to trigger traces on its own. Runtime
+  mutates the heap between `gc_trace_start()` and `gc_trace_finish()`,
+  `gc_barrier_concurrent.ws` hammers both barriers across the same window
+  while objects are actually moving, and `gc_auto_trace.ws` allocates enough
+  to trigger traces on its own. Runtime
   unit tests drive private `Heap` instances; the few that touch process-wide
   state (the mark parity, the stress flag) take `test_support::SERIAL`,
   because the test binary runs its tests in parallel on one heap.

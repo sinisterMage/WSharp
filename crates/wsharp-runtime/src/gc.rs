@@ -61,6 +61,12 @@ pub(crate) struct Buffers {
     /// snapshot-at-the-beginning marker must still follow, and the barrier's
     /// snapshot is exactly that set.
     pub satb: Vec<*mut u8>,
+    /// Objects whose every pointer field the evacuation pause must re-examine:
+    /// everything the write barrier logged while the trace ran, everything
+    /// allocated while it ran (a new object is born marked, so the marker
+    /// never scans it), and every copy evacuation made. See
+    /// `evacuate::fix_references`.
+    pub to_scan: Vec<*mut u8>,
     /// Objects counting found dead while a trace was marking.
     ///
     /// The marker reads any object it is handed, so nothing may be freed --
@@ -81,6 +87,7 @@ static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
     nursery: Vec::new(),
     fresh: Vec::new(),
     satb: Vec::new(),
+    to_scan: Vec::new(),
     deferred_dead: Vec::new(),
 });
 
@@ -114,22 +121,46 @@ pub unsafe extern "C" fn ws_log_object(obj: *mut u8) {
         return;
     }
     let tracing = mark::tracing();
+    let moving = evacuating();
+
+    // Read the fields before taking the buffers lock, not inside it. While
+    // objects are moving, a field may name one that has gone, and recording
+    // where it went means resolving it -- which may move it, which takes the
+    // buffers lock to note the copy. The lock does not nest.
+    let mut snapshot: SmallSnapshot = SmallSnapshot::new();
+    for &offset in info.ptr_offsets {
+        let field = unsafe { (obj.add(offset as usize) as *const *mut u8).read() };
+        // A string literal or a singleton is a legal field value but not a
+        // counted one: it lives in read-only memory, and decrementing it
+        // would fault.
+        if !unsafe { is_collectable(field) } {
+            continue;
+        }
+        // Record where the object lives now: these lists outlive the blocks
+        // being emptied, and adjusting a count through a stale address would
+        // be a write into released memory.
+        snapshot.push(if moving {
+            unsafe { crate::evacuate::ws_resolve(field) }
+        } else {
+            field
+        });
+    }
+
     with_buffers(|buffers| {
-        for &offset in info.ptr_offsets {
-            let field = unsafe { (obj.add(offset as usize) as *const *mut u8).read() };
-            // A string literal or a singleton is a legal field value but not a
-            // counted one: it lives in read-only memory, and decrementing it
-            // would fault.
-            if unsafe { is_collectable(field) } {
-                buffers.decrements.push(field);
-                if tracing {
-                    buffers.satb.push(field);
-                }
+        for &field in &snapshot {
+            buffers.decrements.push(field);
+            if tracing {
+                buffers.satb.push(field);
             }
         }
         buffers.logged.push(obj);
     });
 }
+
+/// An object's outgoing references, gathered before the buffers lock is taken.
+/// A `Vec` rather than anything cleverer: this is the barrier's slow path,
+/// reached once per object per collection cycle.
+type SmallSnapshot = Vec<*mut u8>;
 
 /// Set when the collector wants the program to stop at its next safepoint.
 ///
@@ -161,6 +192,27 @@ pub extern "C" fn ws_gc_poll() {
         return;
     }
     unsafe { mark::safepoint() };
+}
+
+/// Set while a trace is moving objects, and read by the load barrier in front
+/// of every reference the program loads out of a heap object.
+///
+/// One byte rather than a phase comparison because generated code tests it on
+/// a path that is taken on every field read: while it is zero the barrier
+/// costs a load, a test and a branch that falls through.
+static EVACUATING: AtomicU8 = AtomicU8::new(0);
+
+/// The address generated code reads to see whether objects are moving.
+pub fn evacuating_flag_address() -> usize {
+    &EVACUATING as *const AtomicU8 as usize
+}
+
+pub(crate) fn set_evacuating(on: bool) {
+    EVACUATING.store(u8::from(on), Ordering::Release);
+}
+
+pub fn evacuating() -> bool {
+    EVACUATING.load(Ordering::Acquire) != 0
 }
 
 /// Collect at every allocation and check every root found.
@@ -219,6 +271,13 @@ pub(crate) fn note_trace_started() {
 
 pub(crate) fn note_moved(n: usize) {
     MOVED.fetch_add(n, Ordering::Relaxed);
+}
+
+/// A copy the program made for itself through the load barrier. Its fields
+/// need the same revisit the collector's own copies get.
+pub(crate) fn note_copy(copy: *mut u8) {
+    MOVED.fetch_add(1, Ordering::Relaxed);
+    with_buffers(|b| b.to_scan.push(copy));
 }
 
 pub(crate) fn note_freed(n: usize) {
@@ -394,6 +453,12 @@ pub unsafe fn on_allocation(object: *mut u8) {
     if !(stress() || due) {
         return;
     }
+    // While objects are moving a header may be a forwarding address rather
+    // than a count, so counting stands aside until the blocks are released.
+    // The window is one evacuation long.
+    if evacuating() {
+        return;
+    }
     if stress() {
         unsafe { validate_roots() };
     }
@@ -441,6 +506,9 @@ fn trace_due(allocations: usize) -> bool {
 /// frame chain intact.
 pub unsafe fn collect() -> Vec<*mut u8> {
     COLLECTIONS.fetch_add(1, Ordering::Relaxed);
+    // Publish this thread's allocations before anything is taken off the live
+    // count, so that a free can never run ahead of the allocation it undoes.
+    crate::heap::flush_local_counters();
 
     let mut roots: Vec<*mut u8> = Vec::new();
     unsafe {
@@ -458,8 +526,15 @@ pub unsafe fn collect() -> Vec<*mut u8> {
 
     let defer_frees = mark::tracing();
     let (logged, decrements, nursery, fresh, deferred) = with_buffers(|b| {
+        let logged = std::mem::take(&mut b.logged);
+        // Everything the barrier logged during a trace is an object whose
+        // fields the evacuation pause must look at again: the marker either
+        // never saw them, or saw them before the program changed them.
+        if defer_frees {
+            b.to_scan.extend_from_slice(&logged);
+        }
         (
-            std::mem::take(&mut b.logged),
+            logged,
             std::mem::take(&mut b.decrements),
             std::mem::take(&mut b.nursery),
             std::mem::take(&mut b.fresh),

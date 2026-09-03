@@ -260,25 +260,31 @@ fn register_layouts(program: &hir::Program, store: &mut TypeStore) {
 /// Closures are heap objects too, and each one has its own shape. Giving every
 /// `fn` literal its own type id means the collector can find the captured
 /// references inside a closure the same way it finds a struct's fields.
+///
+/// *Every* function gets one, not only the `fn` literals: a top-level function
+/// used as a value -- `const g = inc;` -- is also handed to the allocator as a
+/// closure, one with no captures. Leaving those unregistered gave them a type
+/// id with no layout behind it, so the collector could neither size them nor
+/// copy them, and evacuating one truncated it to its header and lost the code
+/// pointer it existed to carry.
 fn register_closure_layouts(program: &hir::Program, store: &mut TypeStore) -> Vec<u32> {
-    let mut ids = vec![0u32; program.funcs.len()];
-    // Struct ids run from TYPE_ID_FIRST_USER; closures continue past them.
-    let mut next = TYPE_ID_FIRST_USER + program.structs.len() as u32;
+    // Struct ids run from TYPE_ID_FIRST_USER; closures continue past them, one
+    // per function, so a function's id is its index.
+    let base = TYPE_ID_FIRST_USER + program.structs.len() as u32;
+    let mut ids = Vec::with_capacity(program.funcs.len());
     for (id, func) in program.funcs.iter().enumerate() {
-        if !func.is_closure {
-            continue;
-        }
+        let type_id = base + id as u32;
         let (size, ptr_offsets) = lower::closure_layout(store, func);
+        let what = if func.is_closure { "closure" } else { "fn" };
         wsharp_runtime::register_type(
-            next,
+            type_id,
             TypeLayout {
-                name: format!("closure {}", func.name),
+                name: format!("{what} {}", func.name),
                 size,
                 ptr_offsets,
             },
         );
-        ids[id] = next;
-        next += 1;
+        ids.push(type_id);
     }
     ids
 }
@@ -336,6 +342,16 @@ fn declare_all(
         .declare_function("ws_log_object", Linkage::Import, &log_sig)
         .map_err(|e| err("could not declare `ws_log_object`", e))?;
 
+    // The load barrier's slow path: hand back where a reference lives now.
+    // Called only while a trace is moving objects, which the flag it tests
+    // says; the rest of the time the barrier is a load and a branch.
+    let mut resolve_sig = ir::Signature::new(call_conv);
+    resolve_sig.params.push(ir::AbiParam::new(repr::PTR));
+    resolve_sig.returns.push(ir::AbiParam::new(repr::PTR));
+    let resolve = module
+        .declare_function("ws_resolve", Linkage::Import, &resolve_sig)
+        .map_err(|e| err("could not declare `ws_resolve`", e))?;
+
     // The loop safepoint: no arguments, no result, called only when the poll
     // byte says a collection is wanted.
     let gc_poll = module
@@ -359,6 +375,7 @@ fn declare_all(
         panic,
         log_object,
         gc_poll,
+        resolve,
     })
 }
 

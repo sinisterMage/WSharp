@@ -33,38 +33,47 @@ object model.
 | Coalescing write barrier — one load, one test, one not-taken branch on the fast path; its snapshot doubles as the concurrent mark's snapshot-at-the-beginning record | `wsharp-codegen/src/lower.rs` — `emit_log_barrier`, and `ws_log_object` in `gc.rs` |
 | Precise roots: every heap pointer the code generator produces is declared to Cranelift, and the maps are harvested per function | `lower.rs` — `gc_root`; `codegen/src/lib.rs` — `harvest_stack_maps` |
 | Frame-pointer stack walker that turns a return address into a set of root slot addresses | `wsharp-runtime/src/stackwalk.rs` |
-| Reference-count collection, with transitive freeing done iteratively, and deferred while a trace is marking | `gc.rs` — `collect` |
-| The collector thread: concurrent marking from a root snapshot, the two pauses around it, the concurrent sweep, and the abandon-at-exit path | `wsharp-runtime/src/mark.rs` |
-| Evacuation of sparse blocks in the final pause, with forwarding, a fix-up of every reference, and a `--gc-stress` check that none was missed | `wsharp-runtime/src/evacuate.rs`; `heap.rs` — `select_evacuation`, `evacuate`, `release_evacuated` |
+| Reference-count collection, with transitive freeing done iteratively, deferred while a trace is marking and suspended while it is moving objects | `gc.rs` — `collect` |
+| The collector thread: concurrent marking from a root snapshot, concurrent evacuation, the concurrent sweep, the three pauses between them, and the abandon-at-exit path | `wsharp-runtime/src/mark.rs` |
+| Hole refilling: a block with free lines is allocated into again rather than waiting for a trace to evacuate it | `heap.rs` — `find_hole`, `reserve` |
+| Thread-local allocation buffers: the common allocation takes no lock at all | `heap.rs` — `tlab_alloc`, `refill_tlab` |
+| An object-start bitmap, which is what makes a heap walkable when objects are not laid end to end | `heap.rs` — `set_start`, `for_each_in_block` |
+| Concurrent evacuation of sparse blocks, with a load barrier so the program can keep running while objects move | `wsharp-runtime/src/evacuate.rs` — `ws_resolve`; `lower.rs` — `emit_load_barrier` |
+| A remembered set: the marker notes every reference into a block being emptied, so the evacuation pause revisits a list rather than the heap | `mark.rs` — `mark_all`; `evacuate.rs` — `fix_references` |
+| `--gc-stress` walks the whole heap afterwards and aborts if the remembered set missed a reference | `evacuate.rs` — `verify_no_stale_references` |
 | Loop back-edge safepoint, three instructions; also the collector thread's way of asking for the final pause | `lower.rs` — `emit_gc_poll` |
 | `--gc-stress`: collect at every allocation and check every root | `gc.rs` — `validate_roots` |
 | Pause accounting: `WSHARP_GC_STATS` reports the number of pauses and the longest | `gc.rs` — `record_pause` |
 
 ### What is left
 
-1. **Concurrent copying** needs a load barrier on every reference load: check
-   whether the loaded pointer is in a block being evacuated and resolve
-   forwarding if so. About four instructions in `load_at`. Evacuation is safe
-   today *without* one only because it happens in the final pause, which
-   visits every reference before the program resumes.
-2. **A remembered set for the final pause.** The fix-up after evacuation walks
-   every live object, so the pause is bounded by the size of the live heap. The
-   marker could instead record every slot it sees pointing into a candidate
-   block, and the pause would then only revisit those, plus the objects
-   modified or allocated during the mark. The argument that this is complete
-   has more moving parts than the walk (the walk *is* the `--gc-stress` check),
-   so it waits for a measured pause that justifies it.
-3. **Partial block reuse.** A block is recycled only when every line in it is
-   free; the free lines of a block that still holds something are not handed
-   back. Evacuation is what recovers those blocks, so this is a throughput
-   improvement rather than a leak.
-4. **Thread-local allocation buffers.** `ws_alloc` still takes a mutex per
-   allocation, and the counting collector's buffers a second one.
-5. **The closure environment is not a root inside the closure's body.** The
-   captures are copied out on entry and the environment pointer is dead from
-   then on, so this is fine today. Anything that re-reads it after a call — a
-   lazily loaded capture, the load barrier above applied to `env` — must first
-   declare it a root.
+Nothing. The collector thread, the load barrier that lets it move objects while
+the program runs, hole refilling, thread-local allocation buffers and the
+remembered set that bounds the evacuation pause are all in. What is worth
+recording instead is where the remaining costs are:
+
+- **The pauses are proportional to what the program is doing, not to what it
+  is holding.** Marking, copying and sweeping all run on the collector thread.
+  The three pauses scan the stack, move whatever the roots point at, and
+  repoint the references the marker noted. On a heap of 120,000 live objects
+  the longest pause measured 40 microseconds, the same as on one of 15,000.
+- **`--gc-stress` still walks the whole heap** in the evacuation pause to check
+  that the remembered set missed nothing. That is deliberate: the fast path is
+  a list, and the slow path is the proof.
+- **Removing the allocation lock bought contention, not raw speed.** On a
+  single thread allocating three million short-lived objects the new path
+  measures about the same as the old mutex-per-allocation one (roughly 250 ms
+  against 240 ms): what the lock cost, the object-start bitmap and the atomic
+  line metadata now cost instead, and those are what hole refilling and a
+  concurrent collector need. The win is that an allocating thread and a
+  sweeping or evacuating collector no longer serialise on every object.
+- **A block is chosen for evacuation by line occupancy alone.** Immix has more
+  to say here -- defragmentation headroom, a budget per collection -- and this
+  takes every sparse block it finds.
+- **Large objects are never moved**, so the large-object space can fragment its
+  address space in a long run. It is served by the system allocator, which does
+  its own coalescing, so this is a theoretical concern rather than a measured
+  one.
 
 ---
 
@@ -109,13 +118,50 @@ status types as its standard-library instance.
 
 ### What is left
 
-- **Dispatch on scalar types.** Only struct types have a lattice, so
-  `fn f(x: i64)` and `fn f(x: f64)` work by exact match, and there is no way to
-  say that one numeric type refines another.
-- **Overload sets as values.** `const g = f;` where `f` names several functions
-  is rejected: a closure is one code pointer and a set is not.
 - **The status types are in the global namespace**, because there is no module
   system. Item 6.
+
+Scalar dispatch and overload-sets-as-values are done; what they turned into is
+worth recording, because both landed differently from the one-line sketches
+that used to sit here.
+
+**Abstract types.** `abstract_types()` sits beside `status_types()` and is the
+same kind of table: one row per type, `("Number", [i64, f64])` so far. A
+concrete scalar is a subtype of an abstract type that lists it, which is the
+one place the lattice reaches past structs. Two consequences fall out of the
+language's own rules rather than being chosen:
+
+- *An abstract parameter is a constrained generic parameter.* There is no
+  machine representation for "a number", so `fn f(x: Number)` cannot be
+  compiled once; it becomes a fresh type variable with a `Member` constraint,
+  generalises, and monomorphises per argument type exactly as an unannotated
+  parameter does. That also means an operator inside such a body has to work
+  for *every* member, since the caller picks: `%` on a `Number` is rejected,
+  because it does not.
+- *No runtime test is ever emitted for one.* A scalar's type is always
+  statically known, so the dispatcher never has to ask. `DispatchCase` is
+  still a struct id or nothing, and the code generator did not change.
+
+Specificity needs the type as *written*, not the variable it became, so
+`Candidate` carries `decl_params` alongside `params`.
+
+**Overload sets as values.** Two forms, because they answer different
+questions. `const g: fn(Base) i64 = f;` selects the member whose signature *is*
+that type -- exactly, not by subtyping, because a value is one code pointer and
+widening would hand a `Base` to a body compiled for `Sub`. `const g = f;`
+binds an alias instead: `g` dispatches exactly as `f` does, and is not a value
+at all. Using an alias as a value is still an error, now one that says so.
+
+### Known limitation, uncovered by the above
+
+A **recursive generic function** fails monomorphisation with `cannot tell what
+type X is being used at`. A call within a binding group records no type
+arguments, so a self-call leaves the group's own variables unresolved. This
+predates abstract types -- `fn pick(x, c: bool) { if (c) { return pick(x,
+false); } return x; }` has always failed -- but abstract parameters make
+generic functions easy to write on purpose, so it is much easier to meet now.
+The fix is to record a group's own variables as the type arguments of its
+in-group calls, which is a change to `mono.rs` rather than to inference.
 
 ---
 

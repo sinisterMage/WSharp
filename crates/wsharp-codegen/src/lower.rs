@@ -20,7 +20,7 @@ use wsharp_runtime::builtins::{
     BuiltinTy, PANIC_DIVIDE_BY_ZERO, PANIC_DIVIDE_OVERFLOW, PANIC_NO_METHOD, PANIC_UNWRAP_NULL,
 };
 use wsharp_runtime::header::{
-    FLAG_LOGGED, FLAG_SHIFT, META_OFFSET, TYPE_ID_CLOSURE, TYPE_ID_MASK, align_up,
+    FLAG_LOGGED, FLAG_SHIFT, META_OFFSET, TYPE_ID_INVALID, TYPE_ID_MASK, align_up,
 };
 use wsharp_sema::hir;
 use wsharp_sema::layout;
@@ -57,6 +57,8 @@ pub struct Decls {
     pub log_object: FuncId,
     /// The loop safepoint's slow path.
     pub gc_poll: FuncId,
+    /// The load barrier's slow path.
+    pub resolve: FuncId,
 }
 
 /// The heap layout of the closure object for a `fn` literal: its total size,
@@ -292,16 +294,68 @@ impl Trans<'_, '_> {
 
     // ---- memory ---------------------------------------------------------
 
+    /// Read a value out of a heap object, resolving any reference among its
+    /// slots to wherever the collector has since put it.
     fn load_at(&mut self, obj: ir::Value, offset: u32, ty: &Type) -> Slots {
         let tys = self.slots_of(ty);
+        let pointers = repr::pointer_slots(self.store, ty);
         let flags = MemFlagsData::trusted();
-        tys.iter()
-            .enumerate()
-            .map(|(i, t)| {
-                let off = (offset + i as u32 * layout::SLOT_SIZE) as i32;
-                self.b.ins().load(*t, flags, obj, off)
-            })
-            .collect()
+        let mut out = Slots::new();
+        for (i, t) in tys.iter().enumerate() {
+            let off = (offset + i as u32 * layout::SLOT_SIZE) as i32;
+            let value = self.b.ins().load(*t, flags, obj, off);
+            out.push(if pointers.contains(&i) {
+                self.emit_load_barrier(value)
+            } else {
+                value
+            });
+        }
+        out
+    }
+
+    /// The load barrier: what makes it safe for the collector to move objects
+    /// while the program is running.
+    ///
+    /// A field can hold a reference to an object the collector has already
+    /// copied elsewhere. Reading it is harmless; *using* it is not, because a
+    /// write through it would land in the copy nobody will look at again. So
+    /// every reference is resolved as it is loaded, which keeps the invariant
+    /// the rest of the collector relies on: everything the program holds
+    /// points at where the object lives now, never where it used to.
+    ///
+    /// The cost when nothing is moving -- which is nearly always -- is a load
+    /// of one byte, a test, and a branch that is not taken. The address of the
+    /// byte is baked in as a constant, sound for the same reason the poll
+    /// flag's is: the JIT resolves everything to absolute addresses in this
+    /// process.
+    fn emit_load_barrier(&mut self, value: ir::Value) -> ir::Value {
+        let addr = self
+            .b
+            .ins()
+            .iconst(PTR, wsharp_runtime::gc::evacuating_flag_address() as i64);
+        let moving = self
+            .b
+            .ins()
+            .load(types::I8, MemFlagsData::trusted(), addr, 0);
+
+        let slow = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, PTR);
+
+        let unchanged = [BlockArg::Value(value)];
+        self.brif(moving, slow, NO_ARGS, done, &unchanged);
+
+        self.switch(slow);
+        let func = self
+            .module
+            .declare_func_in_func(self.decls.resolve, self.b.func);
+        let call = self.b.ins().call(func, &[value]);
+        let resolved = self.b.inst_results(call)[0];
+        let args = [BlockArg::Value(resolved)];
+        self.jump_to(done, &args);
+
+        self.switch(done);
+        self.b.block_params(done)[0]
     }
 
     /// The single place generated code writes a field of a heap object, and so
@@ -456,6 +510,21 @@ impl Trans<'_, '_> {
             let values: Slots = params[next..next + width].iter().copied().collect();
             self.def_local(local, &values);
             next += width;
+        }
+
+        // The environment is a heap reference like any other, so a function
+        // that actually reads it declares it a root.
+        //
+        // It would be safe not to, *today*: the captures below are copied out
+        // before the first call in the body, so nothing re-reads `env` after a
+        // point where a collection could have moved the closure. That is a
+        // property of this prologue rather than of the language, though, and
+        // the two things that would break it -- a capture loaded lazily, and a
+        // load barrier that resolves forwarding with a call -- are both things
+        // the collector already wants. A function with no captures never reads
+        // `env` at all and is left alone.
+        if !self.func.captures.is_empty() {
+            self.b.declare_value_needs_stack_map(env);
         }
 
         // Captured values are copied out of the closure environment on entry.
@@ -1200,7 +1269,10 @@ impl Trans<'_, '_> {
         let program = self.program;
         let (size, _) = closure_layout(self.store, program.func(func));
         let type_id = self.decls.closure_type_ids[func as usize];
-        debug_assert_ne!(type_id, TYPE_ID_CLOSURE, "closures get a per-site type id");
+        debug_assert_ne!(
+            type_id, TYPE_ID_INVALID,
+            "every function has a registered closure layout"
+        );
 
         let ptr = self.alloc(type_id, size);
         let fr = self.func_ref(func);
