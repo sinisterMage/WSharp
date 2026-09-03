@@ -1,0 +1,17 @@
+[package]
+name = "wsharp-codegen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+cranelift-jit.workspace = true
+cranelift-module.workspace = true
+cranelift-native.workspace = true
+smallvec.workspace = true
+wsharp-runtime.workspace = true
+wsharp-sema.workspace = true
+wsharp-syntax.workspace = true

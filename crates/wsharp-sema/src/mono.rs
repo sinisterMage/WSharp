@@ -1,0 +1,337 @@
+//! Monomorphisation: turn a program with generic functions into one where
+//! every function has a concrete type.
+//!
+//! Unboxed values mean a `fn(T) T` cannot be compiled once and shared -- `T`
+//! could be an `i64` in a register or a pointer to a heap object. So inference
+//! records, at every call site, the type arguments that use instantiates the
+//! callee at, and this pass walks the call graph from `main` emitting one
+//! specialised copy per distinct instantiation.
+//!
+//! Two useful side effects: functions never reached from `main` are dropped,
+//! and after this pass no type in the program contains a variable -- which is
+//! precisely the invariant the code generator needs.
+
+use std::collections::HashMap;
+
+use wsharp_syntax::{Diagnostic, Span};
+
+use crate::hir;
+use crate::ty::{Scheme, Type, TypeStore, TypeVarId};
+
+/// A mapping from a function's quantified variables to concrete types.
+type Subst = HashMap<TypeVarId, Type>;
+
+/// Identifies one specialisation: the original function plus the types it was
+/// instantiated at.
+type Key = (hir::FuncId, Vec<(TypeVarId, String)>);
+
+pub struct MonoResult {
+    pub program: hir::Program,
+    pub diags: Vec<Diagnostic>,
+}
+
+/// Specialise `program` starting from its entry point.
+///
+/// Returns the program unchanged if it has no entry point -- there is nothing
+/// to start a reachability walk from, and `wsharp check` does not need this
+/// pass at all.
+pub fn monomorphize(program: &hir::Program, store: &mut TypeStore) -> MonoResult {
+    let Some(entry) = program.entry else {
+        return MonoResult {
+            program: clone_program(program),
+            diags: Vec::new(),
+        };
+    };
+
+    let mut mono = Mono {
+        src: program,
+        store,
+        out: Vec::new(),
+        cache: HashMap::new(),
+        pending: Vec::new(),
+        diags: Vec::new(),
+        current: None,
+    };
+
+    let new_entry = mono.specialize(entry, Subst::new());
+    while let Some((src_id, new_id, subst)) = mono.pending.pop() {
+        mono.build(src_id, new_id, &subst);
+    }
+
+    let funcs = mono
+        .out
+        .into_iter()
+        .map(|f| f.expect("every queued specialisation was built"))
+        .collect();
+
+    MonoResult {
+        program: hir::Program {
+            structs: program.structs.clone(),
+            funcs,
+            strings: program.strings.clone(),
+            errors: program.errors.clone(),
+            entry: Some(new_entry),
+        },
+        diags: mono.diags,
+    }
+}
+
+fn clone_program(p: &hir::Program) -> hir::Program {
+    hir::Program {
+        structs: p.structs.clone(),
+        funcs: p.funcs.clone(),
+        strings: p.strings.clone(),
+        errors: p.errors.clone(),
+        entry: p.entry,
+    }
+}
+
+struct Mono<'a> {
+    src: &'a hir::Program,
+    store: &'a mut TypeStore,
+    out: Vec<Option<hir::FuncDef>>,
+    cache: HashMap<Key, hir::FuncId>,
+    pending: Vec<(hir::FuncId, hir::FuncId, Subst)>,
+    diags: Vec<Diagnostic>,
+    /// The function being specialised: its name, where to point a diagnostic,
+    /// and whether one has already been reported for it.
+    current: Option<(String, Span, bool)>,
+}
+
+impl Mono<'_> {
+    /// Get the id of `src_id` specialised at `subst`, queueing the work if this
+    /// combination has not been seen.
+    fn specialize(&mut self, src_id: hir::FuncId, subst: Subst) -> hir::FuncId {
+        let key = (src_id, self.key_of(&subst));
+        if let Some(&id) = self.cache.get(&key) {
+            return id;
+        }
+        let new_id = self.out.len() as hir::FuncId;
+        self.out.push(None);
+        self.cache.insert(key, new_id);
+        self.pending.push((src_id, new_id, subst));
+        new_id
+    }
+
+    fn key_of(&mut self, subst: &Subst) -> Vec<(TypeVarId, String)> {
+        let mut pairs: Vec<(TypeVarId, String)> = subst
+            .iter()
+            .map(|(var, ty)| {
+                let ty = ty.clone();
+                (*var, self.store.show(&ty))
+            })
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    fn build(&mut self, src_id: hir::FuncId, new_id: hir::FuncId, subst: &Subst) {
+        let mut def = self.src.funcs[src_id as usize].clone();
+        self.current = Some((def.name.clone(), def.span, false));
+
+        def.ret = self.apply(&def.ret, subst);
+        for local in &mut def.locals {
+            let ty = local.ty.clone();
+            let resolved = self.store.resolve_deep(&ty);
+            local.ty = if subst.is_empty() {
+                resolved
+            } else {
+                self.store.subst_vars(&resolved, subst)
+            };
+            let local_ty = local.ty.clone();
+            self.note_if_unresolved(&local_ty);
+        }
+
+        let mut body = std::mem::take(&mut def.body);
+        self.rewrite_block(&mut body, subst);
+        def.body = body;
+
+        // Everything is concrete now, so the scheme is no longer generic.
+        let params: Vec<Type> = def
+            .params
+            .iter()
+            .map(|p| def.locals[*p as usize].ty.clone())
+            .collect();
+        def.scheme = Scheme::mono(Type::func(params, def.ret.clone()));
+
+        self.current = None;
+        self.out[new_id as usize] = Some(def);
+    }
+
+    /// After substitution nothing should still be a type variable -- code
+    /// generation cannot pick a machine representation for one. If something
+    /// is, the program used a generic function at a type nothing pinned down.
+    ///
+    /// Every type in the function passes through here, including the types of
+    /// intermediate expressions, so the invariant holds for the whole body and
+    /// not just its signature.
+    fn note_if_unresolved(&mut self, ty: &Type) {
+        let already_reported = matches!(self.current, Some((_, _, true)) | None);
+        if already_reported || !self.store.has_unbound(ty) {
+            return;
+        }
+        let shown = self.store.show(ty);
+        let (name, span, reported) = self.current.as_mut().expect("inside a function");
+        *reported = true;
+        let name = name.clone();
+        let span = *span;
+
+        let mut diag = Diagnostic::error(
+            span,
+            format!("cannot tell what type `{name}` is being used at"),
+        );
+        diag.primary.message = format!("this involves the unresolved type `{shown}`");
+        diag.help = Some(
+            "add a type annotation at the call site so the generic function can be specialised"
+                .into(),
+        );
+        self.diags.push(diag);
+    }
+
+    fn apply(&mut self, ty: &Type, subst: &Subst) -> Type {
+        let resolved = self.store.resolve_deep(ty);
+        let out = if subst.is_empty() {
+            resolved
+        } else {
+            self.store.subst_vars(&resolved, subst)
+        };
+        self.note_if_unresolved(&out);
+        out
+    }
+
+    /// The substitution to specialise `callee` under, given the type arguments
+    /// recorded at the call site and the caller's own substitution.
+    fn callee_subst(&mut self, callee: hir::FuncId, targs: &[Type], caller: &Subst) -> Subst {
+        // A `fn` literal has no type arguments of its own; its body refers to
+        // the enclosing function's variables, so it inherits that substitution.
+        if self.src.funcs[callee as usize].is_closure {
+            return caller.clone();
+        }
+        let vars = self.src.funcs[callee as usize].scheme.vars.clone();
+        vars.iter()
+            .zip(targs)
+            .map(|(var, ty)| {
+                let concrete = self.apply(ty, caller);
+                (*var, concrete)
+            })
+            .collect()
+    }
+
+    // ---- traversal ------------------------------------------------------
+
+    fn rewrite_block(&mut self, block: &mut hir::Block, subst: &Subst) {
+        for stmt in &mut block.stmts {
+            self.rewrite_stmt(stmt, subst);
+        }
+    }
+
+    fn rewrite_stmt(&mut self, stmt: &mut hir::Stmt, subst: &Subst) {
+        match stmt {
+            hir::Stmt::Let { init, .. } => self.rewrite_expr(init, subst),
+            hir::Stmt::Assign { place, value } => {
+                if let hir::Place::Field { obj, .. } = place {
+                    self.rewrite_expr(obj, subst);
+                }
+                self.rewrite_expr(value, subst);
+            }
+            hir::Stmt::Expr(e) => self.rewrite_expr(e, subst),
+            hir::Stmt::Return(Some(e)) => self.rewrite_expr(e, subst),
+            hir::Stmt::Return(None) | hir::Stmt::Break | hir::Stmt::Continue => {}
+            hir::Stmt::If {
+                cond, then, els, ..
+            } => {
+                self.rewrite_expr(cond, subst);
+                self.rewrite_block(then, subst);
+                if let Some(els) = els {
+                    self.rewrite_block(els, subst);
+                }
+            }
+            hir::Stmt::While {
+                cond, cont, body, ..
+            } => {
+                self.rewrite_expr(cond, subst);
+                self.rewrite_block(body, subst);
+                if let Some(cont) = cont {
+                    self.rewrite_stmt(cont, subst);
+                }
+            }
+            hir::Stmt::Block(b) => self.rewrite_block(b, subst),
+        }
+    }
+
+    fn rewrite_expr(&mut self, expr: &mut hir::Expr, subst: &Subst) {
+        expr.ty = self.apply(&expr.ty, subst);
+        match &mut expr.kind {
+            hir::ExprKind::Call { callee, args } => {
+                match callee {
+                    hir::Callee::Static { func, targs } => {
+                        let inner = self.callee_subst(*func, targs, subst);
+                        *func = self.specialize(*func, inner);
+                        targs.clear();
+                    }
+                    hir::Callee::Dynamic { cases } => {
+                        // Every case must be specialised: a table entry is the
+                        // only thing keeping an overload reachable, and an
+                        // unreached function is dropped.
+                        for case in cases {
+                            let inner = self.callee_subst(case.func, &case.targs, subst);
+                            case.func = self.specialize(case.func, inner);
+                            case.targs.clear();
+                        }
+                    }
+                    hir::Callee::Indirect(inner) => self.rewrite_expr(inner, subst),
+                    hir::Callee::Builtin(_) => {}
+                }
+                for arg in args {
+                    self.rewrite_expr(arg, subst);
+                }
+            }
+            hir::ExprKind::Closure {
+                func,
+                targs,
+                captures,
+            } => {
+                let inner = self.callee_subst(*func, targs, subst);
+                *func = self.specialize(*func, inner);
+                targs.clear();
+                for c in captures {
+                    self.rewrite_expr(c, subst);
+                }
+            }
+            hir::ExprKind::Field { obj, .. } => self.rewrite_expr(obj, subst),
+            hir::ExprKind::Unary { expr, .. }
+            | hir::ExprKind::Some(expr)
+            | hir::ExprKind::Ok(expr)
+            | hir::ExprKind::Try(expr)
+            | hir::ExprKind::Unwrap(expr) => self.rewrite_expr(expr, subst),
+            hir::ExprKind::Binary { lhs, rhs, .. } | hir::ExprKind::Logical { lhs, rhs, .. } => {
+                self.rewrite_expr(lhs, subst);
+                self.rewrite_expr(rhs, subst);
+            }
+            hir::ExprKind::Orelse { expr, alt } | hir::ExprKind::Catch { expr, alt, .. } => {
+                self.rewrite_expr(expr, subst);
+                self.rewrite_expr(alt, subst);
+            }
+            hir::ExprKind::StructNew { fields, .. } => {
+                for f in fields {
+                    self.rewrite_expr(f, subst);
+                }
+            }
+            hir::ExprKind::If {
+                cond, then, els, ..
+            } => {
+                self.rewrite_expr(cond, subst);
+                self.rewrite_expr(then, subst);
+                self.rewrite_expr(els, subst);
+            }
+            hir::ExprKind::Int(_)
+            | hir::ExprKind::Float(_)
+            | hir::ExprKind::Bool(_)
+            | hir::ExprKind::Str(_)
+            | hir::ExprKind::Null
+            | hir::ExprKind::Local(_)
+            | hir::ExprKind::Singleton(_)
+            | hir::ExprKind::Err(_) => {}
+        }
+    }
+}

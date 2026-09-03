@@ -1,0 +1,34 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ofekb/WSharp"
+
+[workspace.dependencies]
+# Pinned to 0.134.3: this exact version is present in the local registry cache,
+# so the workspace builds offline. Cranelift's API changes across minor versions
+# --- when in doubt, read the extracted source under
+# ~/.cargo/registry/src/index.crates.io-*/cranelift-*-0.134.3/ rather than
+# guessing from memory.
+cranelift-codegen = "=0.134.3"
+cranelift-frontend = "=0.134.3"
+cranelift-jit = "=0.134.3"
+cranelift-module = "=0.134.3"
+cranelift-native = "=0.134.3"
+
+clap = { version = "4", features = ["derive"] }
+smallvec = "1"
+thiserror = "2"
+
+wsharp-codegen = { path = "crates/wsharp-codegen" }
+wsharp-runtime = { path = "crates/wsharp-runtime" }
+wsharp-sema = { path = "crates/wsharp-sema" }
+wsharp-syntax = { path = "crates/wsharp-syntax" }
+
+[profile.release]
+lto = "thin"

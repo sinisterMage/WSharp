@@ -1,0 +1,11 @@
+# The garbage collector finds its roots by walking the frame-pointer chain from
+# inside a runtime function that generated code called into (see
+# `wsharp-runtime/src/stackwalk.rs`). Generated code preserves frame pointers
+# because the code generator asks Cranelift to; the Rust frames between the
+# collector and the nearest generated frame must do the same, or the chain
+# breaks at the first one and the walk reads garbage.
+#
+# rustc omits frame pointers by default on release-like profiles, so say so
+# explicitly for the whole workspace.
+[build]
+rustflags = ["-Cforce-frame-pointers=yes"]
