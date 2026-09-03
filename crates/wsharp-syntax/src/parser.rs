@@ -31,19 +31,31 @@ pub fn parse(src: &str) -> (Module, Vec<Diagnostic>) {
         tokens,
         pos: 0,
         diags: Vec::new(),
-        fuel: 0,
+        depth: 0,
+        too_deep: false,
     };
     let module = parser.module();
     diags.append(&mut parser.diags);
     (module, diags)
 }
 
+/// How deeply expressions, types and blocks may nest.
+///
+/// The parser is recursive, so unbounded nesting is a stack overflow -- a
+/// crash with no diagnostic. The limit is far beyond anything written by hand
+/// and well inside what the stack holds, including for the passes downstream,
+/// whose recursion mirrors the tree this one builds.
+pub const MAX_DEPTH: u32 = 256;
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     diags: Vec<Diagnostic>,
-    /// Guards against a recovery loop that fails to consume anything.
-    fuel: u32,
+    /// Current nesting level, bounded by [`MAX_DEPTH`].
+    depth: u32,
+    /// Whether the limit has been reported. Once is enough: every deeper
+    /// level would say the same thing.
+    too_deep: bool,
 }
 
 impl Parser {
@@ -115,11 +127,58 @@ impl Parser {
     }
 
     fn error(&mut self, span: Span, message: impl Into<String>) {
+        self.push_error(Diagnostic::error(span, message));
+    }
+
+    /// An error with a help line. The help goes on this diagnostic only: if
+    /// it is dropped as an echo, the help must not land on whatever was
+    /// reported before it.
+    fn error_with_help(&mut self, span: Span, message: impl Into<String>, help: impl Into<String>) {
+        self.push_error(Diagnostic::error(span, message).help(help));
+    }
+
+    fn push_error(&mut self, diag: Diagnostic) {
         // Only the first error at a given position is useful; the rest are echoes.
-        if self.diags.last().is_some_and(|d| d.primary.span == span) {
+        if self
+            .diags
+            .last()
+            .is_some_and(|d| d.primary.span == diag.primary.span)
+        {
             return;
         }
-        self.diags.push(Diagnostic::error(span, message));
+        self.diags.push(diag);
+    }
+
+    /// Enter one nesting level, or report that the input is too deep and
+    /// refuse.
+    ///
+    /// Levels are released by [`Parser::scoped`] rather than one at a time,
+    /// because a chain of binary or postfix operators nests its *left* operand
+    /// one level per link even though the loop that parses it never recurses.
+    /// Entering once per link and releasing at the end of the chain counts
+    /// that nesting the way every later pass will walk it.
+    fn enter(&mut self, what: &str) -> Option<()> {
+        if self.depth >= MAX_DEPTH {
+            if !self.too_deep {
+                self.too_deep = true;
+                self.error_with_help(
+                    self.span(),
+                    format!("{what} is nested too deeply"),
+                    format!("the limit is {MAX_DEPTH} levels"),
+                );
+            }
+            return None;
+        }
+        self.depth += 1;
+        Some(())
+    }
+
+    /// Run `f`, then release every level it entered.
+    fn scoped<T>(&mut self, f: impl FnOnce(&mut Parser) -> T) -> T {
+        let base = self.depth;
+        let result = f(self);
+        self.depth = base;
+        result
     }
 
     // ---- recovery -------------------------------------------------------
@@ -190,19 +249,20 @@ impl Parser {
             TokenKind::Const => self.const_or_struct(),
             TokenKind::Var => {
                 let span = self.span();
-                self.error(span, "`var` is not allowed at the top level");
-                self.diags.last_mut().unwrap().help =
-                    Some("top-level bindings must be `const`".into());
+                self.error_with_help(
+                    span,
+                    "`var` is not allowed at the top level",
+                    "top-level bindings must be `const`",
+                );
                 None
             }
             other => {
                 let found = other.describe();
-                self.error(
+                self.error_with_help(
                     self.span(),
                     format!("expected a declaration, found {found}"),
+                    "a W# file contains `fn` and `const` declarations",
                 );
-                self.diags.last_mut().unwrap().help =
-                    Some("a W# file contains `fn` and `const` declarations".into());
                 None
             }
         }
@@ -333,6 +393,13 @@ impl Parser {
     // ---- types ----------------------------------------------------------
 
     fn type_expr(&mut self) -> Option<TypeExpr> {
+        self.scoped(|p| {
+            p.enter("type")?;
+            p.type_expr_inner()
+        })
+    }
+
+    fn type_expr_inner(&mut self) -> Option<TypeExpr> {
         let start = self.span();
         match self.peek() {
             TokenKind::Question => {
@@ -381,6 +448,13 @@ impl Parser {
     // ---- statements -----------------------------------------------------
 
     fn block(&mut self) -> Option<Block> {
+        self.scoped(|p| {
+            p.enter("block")?;
+            p.block_inner()
+        })
+    }
+
+    fn block_inner(&mut self) -> Option<Block> {
         let start = self.span();
         self.expect(TokenKind::LBrace)?;
         let mut stmts = Vec::new();
@@ -469,7 +543,6 @@ impl Parser {
                 return Some(Stmt::Expr(target));
             }
         };
-        let op_span = self.span();
         self.bump();
 
         if !matches!(target, Expr::Ident(_) | Expr::Field { .. }) {
@@ -477,7 +550,6 @@ impl Parser {
         }
         let value = self.expr()?;
         self.expect(TokenKind::Semi)?;
-        let _ = op_span;
         Some(Stmt::Assign(AssignStmt {
             target,
             op,
@@ -505,8 +577,14 @@ impl Parser {
         let then = self.block()?;
         let else_ = if self.eat(TokenKind::Else) {
             if self.at(&TokenKind::If) {
-                // `else if` -- recurse, requiring the statement form.
-                match self.if_stmt_or_expr()? {
+                // `else if` -- recurse, requiring the statement form. A chain
+                // of them nests in the tree (and in every later pass), so it
+                // counts against the depth limit like any other nesting.
+                let inner = self.scoped(|p| {
+                    p.enter("`else if` chain")?;
+                    p.if_stmt_or_expr()
+                });
+                match inner? {
                     Stmt::If(inner) => Some(Box::new(ElseBranch::If(inner))),
                     other => {
                         self.error(other.span(), "`else if` must use a block body");
@@ -592,148 +670,167 @@ impl Parser {
     // ---- expressions ----------------------------------------------------
 
     fn expr(&mut self) -> Option<Expr> {
-        self.fuel += 1;
-        if self.fuel > 100_000 {
-            return None;
-        }
-        let e = self.or_expr();
-        self.fuel -= 1;
-        e
+        self.scoped(|p| {
+            p.enter("expression")?;
+            p.or_expr()
+        })
     }
 
     fn or_expr(&mut self) -> Option<Expr> {
-        let mut lhs = self.and_expr()?;
-        while self.at(&TokenKind::Or) {
-            self.bump();
-            let rhs = self.and_expr()?;
-            let span = lhs.span().to(rhs.span());
-            lhs = Expr::Binary {
-                op: BinOp::Or,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                span,
-            };
-        }
-        Some(lhs)
+        self.scoped(|p| {
+            let mut lhs = p.and_expr()?;
+            while p.at(&TokenKind::Or) {
+                p.enter("expression")?;
+                p.bump();
+                let rhs = p.and_expr()?;
+                let span = lhs.span().to(rhs.span());
+                lhs = Expr::Binary {
+                    op: BinOp::Or,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    span,
+                };
+            }
+            Some(lhs)
+        })
     }
 
     fn and_expr(&mut self) -> Option<Expr> {
-        let mut lhs = self.cmp_expr()?;
-        while self.at(&TokenKind::And) {
-            self.bump();
-            let rhs = self.cmp_expr()?;
-            let span = lhs.span().to(rhs.span());
-            lhs = Expr::Binary {
-                op: BinOp::And,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                span,
-            };
-        }
-        Some(lhs)
+        self.scoped(|p| {
+            let mut lhs = p.cmp_expr()?;
+            while p.at(&TokenKind::And) {
+                p.enter("expression")?;
+                p.bump();
+                let rhs = p.cmp_expr()?;
+                let span = lhs.span().to(rhs.span());
+                lhs = Expr::Binary {
+                    op: BinOp::And,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    span,
+                };
+            }
+            Some(lhs)
+        })
     }
 
     /// Comparisons are non-associative, so `a < b < c` is rejected with a hint
     /// rather than silently parsed as `(a < b) < c`.
     fn cmp_expr(&mut self) -> Option<Expr> {
-        let lhs = self.catch_expr()?;
-        let Some(op) = cmp_op(self.peek()) else {
-            return Some(lhs);
-        };
-        self.bump();
-        let rhs = self.catch_expr()?;
-        let span = lhs.span().to(rhs.span());
-        let result = Expr::Binary {
-            op,
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
-            span,
-        };
+        self.scoped(|p| {
+            let lhs = p.catch_expr()?;
+            let Some(op) = cmp_op(p.peek()) else {
+                return Some(lhs);
+            };
+            p.enter("expression")?;
+            p.bump();
+            let rhs = p.catch_expr()?;
+            let span = lhs.span().to(rhs.span());
+            let result = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
 
-        if let Some(second) = cmp_op(self.peek()) {
-            let at = self.span();
-            self.error(at, "comparison operators cannot be chained");
-            self.diags.last_mut().unwrap().help = Some(format!(
-                "split the comparison, e.g. `a {} b and b {} c`",
-                op.text(),
-                second.text()
-            ));
-            return None;
-        }
-        Some(result)
+            if let Some(second) = cmp_op(p.peek()) {
+                let at = p.span();
+                p.error_with_help(
+                    at,
+                    "comparison operators cannot be chained",
+                    format!(
+                        "split the comparison, e.g. `a {} b and b {} c`",
+                        op.text(),
+                        second.text()
+                    ),
+                );
+                return None;
+            }
+            Some(result)
+        })
     }
 
     /// `orelse` and `catch`, which bind tighter than comparison (as in Zig).
     fn catch_expr(&mut self) -> Option<Expr> {
-        let mut lhs = self.add_expr()?;
-        loop {
-            match self.peek() {
-                TokenKind::Orelse => {
-                    self.bump();
-                    let alt = self.add_expr()?;
-                    let span = lhs.span().to(alt.span());
-                    lhs = Expr::Orelse {
-                        expr: Box::new(lhs),
-                        alt: Box::new(alt),
-                        span,
-                    };
+        self.scoped(|p| {
+            let mut lhs = p.add_expr()?;
+            loop {
+                match p.peek() {
+                    TokenKind::Orelse => {
+                        p.enter("expression")?;
+                        p.bump();
+                        let alt = p.add_expr()?;
+                        let span = lhs.span().to(alt.span());
+                        lhs = Expr::Orelse {
+                            expr: Box::new(lhs),
+                            alt: Box::new(alt),
+                            span,
+                        };
+                    }
+                    TokenKind::Catch => {
+                        p.enter("expression")?;
+                        p.bump();
+                        let capture = p.opt_capture()?;
+                        let alt = p.add_expr()?;
+                        let span = lhs.span().to(alt.span());
+                        lhs = Expr::Catch {
+                            expr: Box::new(lhs),
+                            capture,
+                            alt: Box::new(alt),
+                            span,
+                        };
+                    }
+                    _ => return Some(lhs),
                 }
-                TokenKind::Catch => {
-                    self.bump();
-                    let capture = self.opt_capture()?;
-                    let alt = self.add_expr()?;
-                    let span = lhs.span().to(alt.span());
-                    lhs = Expr::Catch {
-                        expr: Box::new(lhs),
-                        capture,
-                        alt: Box::new(alt),
-                        span,
-                    };
-                }
-                _ => return Some(lhs),
             }
-        }
+        })
     }
 
     fn add_expr(&mut self) -> Option<Expr> {
-        let mut lhs = self.mul_expr()?;
-        loop {
-            let op = match self.peek() {
-                TokenKind::Plus => BinOp::Add,
-                TokenKind::Minus => BinOp::Sub,
-                _ => return Some(lhs),
-            };
-            self.bump();
-            let rhs = self.mul_expr()?;
-            let span = lhs.span().to(rhs.span());
-            lhs = Expr::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                span,
-            };
-        }
+        self.scoped(|p| {
+            let mut lhs = p.mul_expr()?;
+            loop {
+                let op = match p.peek() {
+                    TokenKind::Plus => BinOp::Add,
+                    TokenKind::Minus => BinOp::Sub,
+                    _ => return Some(lhs),
+                };
+                p.enter("expression")?;
+                p.bump();
+                let rhs = p.mul_expr()?;
+                let span = lhs.span().to(rhs.span());
+                lhs = Expr::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    span,
+                };
+            }
+        })
     }
 
     fn mul_expr(&mut self) -> Option<Expr> {
-        let mut lhs = self.unary_expr()?;
-        loop {
-            let op = match self.peek() {
-                TokenKind::Star => BinOp::Mul,
-                TokenKind::Slash => BinOp::Div,
-                TokenKind::Percent => BinOp::Rem,
-                _ => return Some(lhs),
-            };
-            self.bump();
-            let rhs = self.unary_expr()?;
-            let span = lhs.span().to(rhs.span());
-            lhs = Expr::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                span,
-            };
-        }
+        self.scoped(|p| {
+            let mut lhs = p.unary_expr()?;
+            loop {
+                let op = match p.peek() {
+                    TokenKind::Star => BinOp::Mul,
+                    TokenKind::Slash => BinOp::Div,
+                    TokenKind::Percent => BinOp::Rem,
+                    _ => return Some(lhs),
+                };
+                p.enter("expression")?;
+                p.bump();
+                let rhs = p.unary_expr()?;
+                let span = lhs.span().to(rhs.span());
+                lhs = Expr::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    span,
+                };
+            }
+        })
     }
 
     fn unary_expr(&mut self) -> Option<Expr> {
@@ -741,7 +838,7 @@ impl Parser {
         match self.peek() {
             TokenKind::Minus => {
                 self.bump();
-                let expr = self.unary_expr()?;
+                let expr = self.unary_operand()?;
                 Some(Expr::Unary {
                     op: UnOp::Neg,
                     span: start.to(expr.span()),
@@ -750,7 +847,7 @@ impl Parser {
             }
             TokenKind::Bang => {
                 self.bump();
-                let expr = self.unary_expr()?;
+                let expr = self.unary_operand()?;
                 Some(Expr::Unary {
                     op: UnOp::Not,
                     span: start.to(expr.span()),
@@ -759,7 +856,7 @@ impl Parser {
             }
             TokenKind::Try => {
                 self.bump();
-                let expr = self.unary_expr()?;
+                let expr = self.unary_operand()?;
                 Some(Expr::Try {
                     span: start.to(expr.span()),
                     expr: Box::new(expr),
@@ -769,48 +866,63 @@ impl Parser {
         }
     }
 
+    /// The operand of a prefix operator. Prefix operators recurse directly
+    /// into `unary_expr` without passing through `expr`, so they need their
+    /// own depth accounting: `----...-1` is otherwise unbounded.
+    fn unary_operand(&mut self) -> Option<Expr> {
+        self.scoped(|p| {
+            p.enter("expression")?;
+            p.unary_expr()
+        })
+    }
+
     fn postfix_expr(&mut self) -> Option<Expr> {
-        let mut expr = self.primary_expr()?;
-        loop {
-            match self.peek() {
-                TokenKind::LParen => {
-                    self.bump();
-                    let mut args = Vec::new();
-                    while !self.at(&TokenKind::RParen) && !self.at_eof() {
-                        args.push(self.expr()?);
-                        if !self.eat(TokenKind::Comma) {
-                            break;
+        self.scoped(|p| {
+            let mut expr = p.primary_expr()?;
+            loop {
+                match p.peek() {
+                    TokenKind::LParen => {
+                        p.enter("expression")?;
+                        p.bump();
+                        let mut args = Vec::new();
+                        while !p.at(&TokenKind::RParen) && !p.at_eof() {
+                            args.push(p.expr()?);
+                            if !p.eat(TokenKind::Comma) {
+                                break;
+                            }
                         }
+                        p.expect(TokenKind::RParen)?;
+                        let span = expr.span().to(p.prev_span());
+                        expr = Expr::Call {
+                            callee: Box::new(expr),
+                            args,
+                            span,
+                        };
                     }
-                    self.expect(TokenKind::RParen)?;
-                    let span = expr.span().to(self.prev_span());
-                    expr = Expr::Call {
-                        callee: Box::new(expr),
-                        args,
-                        span,
-                    };
+                    TokenKind::Dot => {
+                        p.enter("expression")?;
+                        p.bump();
+                        let name = p.ident()?;
+                        let span = expr.span().to(name.span);
+                        expr = Expr::Field {
+                            obj: Box::new(expr),
+                            name,
+                            span,
+                        };
+                    }
+                    TokenKind::DotQuestion => {
+                        p.enter("expression")?;
+                        p.bump();
+                        let span = expr.span().to(p.prev_span());
+                        expr = Expr::Unwrap {
+                            expr: Box::new(expr),
+                            span,
+                        };
+                    }
+                    _ => return Some(expr),
                 }
-                TokenKind::Dot => {
-                    self.bump();
-                    let name = self.ident()?;
-                    let span = expr.span().to(name.span);
-                    expr = Expr::Field {
-                        obj: Box::new(expr),
-                        name,
-                        span,
-                    };
-                }
-                TokenKind::DotQuestion => {
-                    self.bump();
-                    let span = expr.span().to(self.prev_span());
-                    expr = Expr::Unwrap {
-                        expr: Box::new(expr),
-                        span,
-                    };
-                }
-                _ => return Some(expr),
             }
-        }
+        })
     }
 
     fn primary_expr(&mut self) -> Option<Expr> {
@@ -891,10 +1003,10 @@ impl Parser {
     fn if_expr_tail(&mut self, start: Span, cond: Expr, capture: Option<Ident>) -> Option<Expr> {
         let then = self.expr()?;
         if !self.at(&TokenKind::Else) {
-            self.error(self.span(), "expected `else`");
-            self.diags.last_mut().unwrap().help = Some(
-                "an `if` used as an expression must have an `else`, because it always produces a value"
-                    .into(),
+            self.error_with_help(
+                self.span(),
+                "expected `else`",
+                "an `if` used as an expression must have an `else`, because it always produces a value",
             );
             return None;
         }
@@ -944,4 +1056,141 @@ fn cmp_op(kind: &TokenKind) -> Option<BinOp> {
         TokenKind::GtEq => BinOp::Ge,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parser_for(src: &str) -> Parser {
+        let (tokens, _) = lex(src);
+        Parser {
+            tokens,
+            pos: 0,
+            diags: Vec::new(),
+            depth: 0,
+            too_deep: false,
+        }
+    }
+
+    #[test]
+    fn help_stays_with_the_diagnostic_it_was_written_for() {
+        // Two errors at one position: the second is an echo and is dropped,
+        // and its help must be dropped with it rather than attached to the
+        // first, which is about something else.
+        let mut p = parser_for("x");
+        let span = p.span();
+        p.error(span, "first");
+        p.error_with_help(span, "second", "help for the second");
+        assert_eq!(p.diags.len(), 1);
+        assert_eq!(p.diags[0].message, "first");
+        assert_eq!(p.diags[0].help, None);
+
+        // When it is not an echo, the help lands on its own diagnostic.
+        let mut p = parser_for("x");
+        let span = p.span();
+        p.error_with_help(span, "only", "its help");
+        assert_eq!(p.diags[0].help.as_deref(), Some("its help"));
+    }
+
+    /// Messages of the diagnostics from parsing `src`.
+    ///
+    /// Runs on a thread with a generous stack: the limit is sized for the
+    /// compiler's main thread, and a debug-build parser at the limit does not
+    /// fit in the test harness's 2 MiB threads.
+    fn messages(src: String) -> Vec<String> {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || {
+                let (_, diags) = parse(&src);
+                diags.into_iter().map(|d| d.message).collect()
+            })
+            .expect("spawn")
+            .join()
+            .expect("parse thread panicked")
+    }
+
+    #[test]
+    fn nesting_past_the_limit_is_reported_once() {
+        // Prefix operators recurse without going through `expr`.
+        let src = format!("fn main() i64 {{ return {}1; }}", "-".repeat(1000));
+        let (_, diags) = parse(&src);
+        let deep: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("nested too deeply"))
+            .collect();
+        assert_eq!(
+            deep.len(),
+            1,
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            deep[0].help.as_deref(),
+            Some(format!("the limit is {MAX_DEPTH} levels").as_str())
+        );
+    }
+
+    #[test]
+    fn every_kind_of_nesting_is_bounded() {
+        // Each of these recurses (or accumulates a left-nested tree, which
+        // every later pass recurses on) through a different path.
+        let cases = [
+            (
+                format!(
+                    "fn main() i64 {{ return {}1{}; }}",
+                    "(".repeat(1000),
+                    ")".repeat(1000)
+                ),
+                "expression is nested too deeply",
+            ),
+            (
+                format!("fn main() i64 {{ return {}1; }}", "1 + ".repeat(1000)),
+                "expression is nested too deeply",
+            ),
+            (
+                format!("fn main() i64 {{ return f{}; }}", "()".repeat(1000)),
+                "expression is nested too deeply",
+            ),
+            (
+                format!("fn main() i64 {{ return x{}; }}", ".f".repeat(1000)),
+                "expression is nested too deeply",
+            ),
+            (
+                format!("fn f(x: {}i64) void {{ }}", "?".repeat(1000)),
+                "type is nested too deeply",
+            ),
+            (
+                format!("fn main() void {}{}", "{".repeat(1000), "}".repeat(1000)),
+                "block is nested too deeply",
+            ),
+            (
+                format!(
+                    "fn main() void {{ if (true) {{ }} {}}}",
+                    "else if (true) { } ".repeat(1000)
+                ),
+                "nested too deeply",
+            ),
+        ];
+        for (src, expected) in cases {
+            let got = messages(src);
+            assert!(
+                got.iter().any(|m| m.contains(expected)),
+                "expected {expected:?}, got {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nesting_within_the_limit_is_fine() {
+        let n = (MAX_DEPTH / 2) as usize;
+        let src = format!(
+            "fn main() i64 {{ return {}1{}; }}",
+            "(".repeat(n),
+            ")".repeat(n)
+        );
+        assert!(messages(src).is_empty());
+        let src = format!("fn main() i64 {{ return {}1; }}", "1 + ".repeat(n));
+        assert!(messages(src).is_empty());
+    }
 }

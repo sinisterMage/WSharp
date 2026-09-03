@@ -103,12 +103,6 @@ pub struct FuncDef {
     pub span: Span,
 }
 
-impl FuncDef {
-    pub fn local(&self, id: LocalId) -> &LocalDef {
-        &self.locals[id as usize]
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct LocalDef {
     pub name: String,

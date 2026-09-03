@@ -2,7 +2,8 @@
 //
 // Struct instances and closures are both heap objects with the same 16-byte
 // header, allocated through the same `ws_alloc` entry point. That uniformity is
-// what a garbage collector will need later.
+// what lets the collector trace a closure's captures exactly as it traces a
+// struct's fields.
 
 const Point = struct { x: i64, y: i64 };
 

@@ -1,9 +1,10 @@
 //! The runtime type registry.
 //!
 //! The code generator registers one [`TypeLayout`] per heap type when it sets
-//! the JIT up. One table, two consumers: the collector reads `ptr_offsets` to
-//! trace an object's outgoing references, and multiple dispatch reads a type id
-//! out of an object header to name the type it belongs to.
+//! the JIT up. The collector reads `ptr_offsets` to trace an object's outgoing
+//! references and `size` to walk a block; the diagnostics read `name`.
+//! Multiple dispatch does not come here at all -- it compares the type id in
+//! the header against ranges the compiler baked into the code.
 //!
 //! Registration happens once, before any code runs, and the table never changes
 //! afterwards. That is worth exploiting, because tracing looks a type up *per
@@ -136,15 +137,6 @@ pub fn layout_of(id: TypeId) -> Option<TypeLayout> {
 
 pub fn type_name(id: TypeId) -> Option<String> {
     with_registry(|r| r.layouts.get(&id).map(|l| l.name.clone()))
-}
-
-pub fn registered_type_count() -> usize {
-    with_registry(|r| r.layouts.len())
-}
-
-#[doc(hidden)]
-pub fn reset_types_for_tests() {
-    with_registry(|r| r.layouts.clear());
 }
 
 #[cfg(test)]

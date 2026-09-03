@@ -1,4 +1,5 @@
 // error: is ambiguous
+// error: this overload
 // Neither overload is more specific than the other: the first wins on the
 // first argument, the second on the second, and a call with two `Sub` values
 // matches both. Julia's rule makes this a compile error rather than a coin

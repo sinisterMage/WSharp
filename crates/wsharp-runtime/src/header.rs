@@ -128,6 +128,17 @@ pub unsafe fn load_meta(ptr: *const u8) -> u64 {
     unsafe { meta_cell(ptr) }.load(Ordering::Acquire)
 }
 
+/// Overwrite the whole meta word. Only the allocator does this, on an object
+/// nothing else can see yet; everything afterwards goes through the
+/// read-modify-write operations below.
+///
+/// # Safety
+/// See [`meta_cell`].
+#[inline]
+pub unsafe fn store_meta(ptr: *mut u8, meta: u64) {
+    unsafe { meta_cell(ptr) }.store(meta, Ordering::Release)
+}
+
 /// Read the type id of a live object. Safe to call on any pointer produced by
 /// `ws_alloc` or on a static object emitted by the code generator.
 ///
@@ -213,6 +224,63 @@ unsafe fn rc_update(ptr: *const u8, f: impl Fn(u32) -> u32) -> u32 {
         let updated = (meta & !RC_MASK) | ((next as u64) << RC_SHIFT);
         match cell.compare_exchange_weak(meta, updated, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return next,
+            Err(seen) => meta = seen,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Marking
+// ---------------------------------------------------------------------------
+
+/// What [`FLAG_MARKED`] currently means: the bit in its place in the meta word,
+/// or zero.
+///
+/// Clearing the mark bit on every object before each trace would be a pass
+/// over the whole heap, in a pause. Instead the *meaning* of the bit flips: an
+/// object is marked when its bit equals this value, and a trace begins by
+/// flipping it, which unmarks everything at once. The allocator stamps new
+/// objects with the current value, so anything born during a trace is already
+/// marked -- which a snapshot-at-the-beginning marker requires anyway.
+static MARK_PARITY: AtomicU64 = AtomicU64::new(0);
+const MARKED_BIT: u64 = FLAG_MARKED << FLAG_SHIFT;
+
+/// The current parity, ready to be or-ed into a fresh meta word.
+pub fn mark_parity() -> u64 {
+    MARK_PARITY.load(Ordering::Relaxed)
+}
+
+/// Unmark every object in the heap at once. Only the trace's initial pause
+/// does this, with the program stopped.
+pub fn flip_mark_parity() {
+    MARK_PARITY.fetch_xor(MARKED_BIT, Ordering::AcqRel);
+}
+
+/// # Safety
+/// See [`meta_cell`]. The object must not have been forwarded.
+#[inline]
+pub unsafe fn is_marked(ptr: *const u8) -> bool {
+    (unsafe { load_meta(ptr) }) & MARKED_BIT == mark_parity()
+}
+
+/// Mark `ptr`, returning true if this call is the one that did it.
+///
+/// The marker uses the return value as its "have I been here?" test, so each
+/// object is scanned exactly once no matter how many references lead to it.
+///
+/// # Safety
+/// See [`meta_cell`]. The object must not have been forwarded.
+pub unsafe fn claim_mark(ptr: *const u8) -> bool {
+    let want = mark_parity();
+    let cell = unsafe { meta_cell(ptr) };
+    let mut meta = cell.load(Ordering::Acquire);
+    loop {
+        if meta & MARKED_BIT == want {
+            return false;
+        }
+        let next = (meta & !MARKED_BIT) | want;
+        match cell.compare_exchange_weak(meta, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
             Err(seen) => meta = seen,
         }
     }
@@ -399,6 +467,34 @@ mod tests {
         assert!(!is_forwarded_meta(maxed));
         assert_eq!(rc_of_meta(maxed), RC_MAX);
         assert_eq!(type_id_of_meta(maxed), TYPE_ID_FIRST_USER);
+    }
+
+    #[test]
+    fn marking_is_a_parity_and_flipping_it_unmarks_everything() {
+        let _serial = crate::test_support::SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let o = obj(TYPE_ID_FIRST_USER, 0);
+        let p = ptr_of(&o);
+        unsafe {
+            // A meta word with the bit clear is marked only while parity is 0.
+            let before = is_marked(p);
+            assert_eq!(
+                claim_mark(p),
+                !before,
+                "claiming changes the bit iff it was unmarked"
+            );
+            assert!(is_marked(p));
+            assert!(!claim_mark(p), "a second claim finds it marked");
+            flip_mark_parity();
+            assert!(!is_marked(p), "the flip unmarked it without touching it");
+            assert!(claim_mark(p));
+            assert!(is_marked(p));
+            // The count and the type id are untouched by any of that.
+            assert_eq!(type_id_of(p), TYPE_ID_FIRST_USER);
+            assert_eq!(rc_of(p), 0);
+            flip_mark_parity();
+        }
     }
 
     #[test]

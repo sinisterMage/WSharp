@@ -94,6 +94,57 @@ Things in this version that differ from older tutorials, each of which cost time
   them — the object is new and its fields are null — but `ws_alloc` is a call,
   hence a safepoint, and a collection there clears the logged bit before the
   fields are written. Skipping the barrier loses those references entirely.
+- **The collector's "is this mine?" test is the header, not the address.**
+  `heap::is_collectable` (non-null and not `FLAG_IMMORTAL`) is what the
+  marker, counting and the barrier use; `in_heap` is an address-range test
+  for finding a block and its lines. Confusing them either decrements a string
+  literal — a write to read-only memory — or forgets every large object.
+- **A fresh object's fields read as null.** Blocks are zeroed when reopened
+  (`open_block`), never assumed clean. The barrier's slow path and the marker
+  both read fields of objects whose initialising stores have not run yet.
+- **The mark bit is a parity.** "Marked" means the bit equals
+  `header::mark_parity()`, which flips in a trace's initial pause. Nothing
+  ever clears mark bits, and `stamp` writes the current parity, so an object
+  allocated during a trace is born marked — which snapshot-at-the-beginning
+  marking requires. Evacuation copies carry their header with them.
+- **Nothing is freed while a trace is marking.** Counting keeps running, but
+  its free loop is deferred (`Buffers::deferred_dead`) until the final pause.
+  The marker reads any object it is handed, including one counting has found
+  dead, because that object may be the only path the snapshot had to something
+  live; so the marker never tests `FLAG_DEAD`, and no block is recycled and no
+  large object deallocated underneath it.
+- **Both pauses run on the mutator thread**, inside a runtime call at a
+  safepoint, because only the mutator can walk its own stack. The collector
+  thread never touches the stack. The pause sites are exactly `ws_gc_poll`,
+  `on_allocation`, the `gc_trace*` builtins and exit — never a builtin such as
+  `print`, which holds its argument in a Rust local no stack map describes.
+  `on_allocation` is safe because the object in flight is in the open block,
+  which is never an evacuation candidate, and on no list, so nothing judges it.
+- **Forwarded headers exist only inside the final pause**, between
+  `heap::evacuate` and `release_evacuated`. A forwarded word's bits are an
+  address, not flags, so nothing may read a flag, a count or a type id from an
+  object in an evacuating block after that point: `evacuate::forward` tests
+  forwarding first, the fix-up walk skips evacuating blocks, every buffer is
+  drained before copying begins, and the sweep never sees those blocks.
+- **The fix-up visits every place a reference can live**: every root slot,
+  every pointer field of every marked live object outside the evacuating
+  blocks (copies included, since they land in the open block), and the
+  nursery. `--gc-stress` re-walks all of it afterwards and aborts on any
+  pointer still into an evacuating block. Anything that adds a place a heap
+  pointer can be stored must be added to both walks.
+- **Counting after the final pause never names an unmarked object.** Its
+  buffers were drained in the pause and the nursery was filtered by mark, so
+  the concurrent sweep, which frees exactly the unmarked, cannot free anything
+  counting will touch. `Heap::free` is idempotent (it claims `FLAG_DEAD`) for
+  the benign case where both reach the same object anyway.
+- **Locks never nest.** `Heap::*` never touches the counting buffers; the
+  marker takes only the buffers lock (to drain `satb`) and answers its heap
+  questions from the lock-free directory; the sweeper takes only the heap lock,
+  per block; the phase is an atomic so safepoint checks take no lock at all.
+- **The closure environment is dead after the prologue.** Captures are copied
+  into declared locals before the first safepoint and `env` is never read
+  again, so it is not a root and need not be. Re-reading it after a call would
+  be a use-after-move.
 
 ## Testing
 
@@ -123,12 +174,24 @@ nix-shell --run "cargo test --workspace"
   collects at every allocation and checks every root the stack maps describe.
   This is the collector's main defence, because rooting is spread over every
   expression the code generator lowers and a slot it forgot would otherwise
-  show up as rare corruption rather than a failing test.
-- `WSHARP_GC_STATS=1` prints what the collector did on exit;
+  show up as rare corruption rather than a failing test. Traces start on the
+  same allocation schedule under stress as without it, so the concurrent
+  paths run in both passes.
+- **The concurrent collector is tested from W#, not from Rust.** The phase
+  machine needs a real mutator with real stack maps, so `gc_concurrent.ws`
+  mutates the heap between `gc_trace_start()` and `gc_trace_finish()` and
+  `gc_auto_trace.ws` allocates enough to trigger traces on its own. Runtime
+  unit tests drive private `Heap` instances; the few that touch process-wide
+  state (the mark parity, the stress flag) take `test_support::SERIAL`,
+  because the test binary runs its tests in parallel on one heap.
+- `WSHARP_GC_STATS=1` prints what the collector did on exit, including traces,
+  objects moved, and the number and longest of the pauses;
   `WSHARP_GC_TRACE=1` prints every frame the root walk visits. **Check the
   counts, not just that the tests pass**: a stack walk that finds no roots at
   all makes every root check succeed for the wrong reason, which is exactly how
-  the first version of this looked correct while doing nothing.
+  the first version of this looked correct while doing nothing. Likewise a run
+  of `gc_moving.ws` should report objects moved, and of `gc_auto_trace.ws`
+  traces started.
 
 ## Style
 

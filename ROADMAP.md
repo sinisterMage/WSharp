@@ -7,11 +7,11 @@ where each remaining feature already has a place to plug into.
 
 ---
 
-## 3. Garbage collector — **done, except the collector thread**
+## 3. Garbage collector — **done**
 
-Reference counting combined with a mark trace and compaction, following LXR
-(Zuo, Blackburn, Zigman & Yang, *Low-Latency, High-Throughput Garbage
-Collection*, PLDI 2022).
+Reference counting combined with a concurrent mark trace and compaction,
+following LXR (Zuo, Blackburn, Zigman & Yang, *Low-Latency, High-Throughput
+Garbage Collection*, PLDI 2022).
 
 ### Settled: written by hand, not bound to MMTk
 
@@ -28,38 +28,43 @@ object model.
 |---|---|
 | Immix-style heap: 32 KiB blocks, 256-byte lines, over-aligned reservations so an object's block follows from its address | `wsharp-runtime/src/heap.rs` |
 | Large-object space for anything over 8 KiB; never moved | same |
-| Atomic header: 32-bit type id, 8 flags, 23-bit saturating reference count, and a forwarding encoding in bit 63 | `wsharp-runtime/src/header.rs` |
-| Coalescing write barrier — one load, one test, one not-taken branch on the fast path | `wsharp-codegen/src/lower.rs` — `emit_log_barrier`, and `ws_log_object` in `gc.rs` |
+| A lock-free directory of the spaces and block states, so the marker's per-reference questions take no lock | same |
+| Atomic header: 32-bit type id, 8 flags, 23-bit saturating reference count, a forwarding encoding in bit 63, and a mark bit whose meaning is a parity that flips per trace | `wsharp-runtime/src/header.rs` |
+| Coalescing write barrier — one load, one test, one not-taken branch on the fast path; its snapshot doubles as the concurrent mark's snapshot-at-the-beginning record | `wsharp-codegen/src/lower.rs` — `emit_log_barrier`, and `ws_log_object` in `gc.rs` |
 | Precise roots: every heap pointer the code generator produces is declared to Cranelift, and the maps are harvested per function | `lower.rs` — `gc_root`; `codegen/src/lib.rs` — `harvest_stack_maps` |
 | Frame-pointer stack walker that turns a return address into a set of root slot addresses | `wsharp-runtime/src/stackwalk.rs` |
-| Reference-count collection, with transitive freeing done iteratively | `gc.rs` — `collect` |
-| Mark trace for cycles and for saturated counts | `gc.rs` — `trace` |
-| Evacuation of sparse blocks, with forwarding and in-place reference updates | `gc.rs` — `forward`; `heap.rs` — `select_evacuation`, `release_evacuated` |
-| Loop back-edge safepoint, three instructions | `lower.rs` — `emit_gc_poll` |
+| Reference-count collection, with transitive freeing done iteratively, and deferred while a trace is marking | `gc.rs` — `collect` |
+| The collector thread: concurrent marking from a root snapshot, the two pauses around it, the concurrent sweep, and the abandon-at-exit path | `wsharp-runtime/src/mark.rs` |
+| Evacuation of sparse blocks in the final pause, with forwarding, a fix-up of every reference, and a `--gc-stress` check that none was missed | `wsharp-runtime/src/evacuate.rs`; `heap.rs` — `select_evacuation`, `evacuate`, `release_evacuated` |
+| Loop back-edge safepoint, three instructions; also the collector thread's way of asking for the final pause | `lower.rs` — `emit_gc_poll` |
 | `--gc-stress`: collect at every allocation and check every root | `gc.rs` — `validate_roots` |
+| Pause accounting: `WSHARP_GC_STATS` reports the number of pauses and the longest | `gc.rs` — `record_pause` |
 
 ### What is left
 
-1. **The collector thread.** Marking and evacuation run stop-the-world at a
-   safepoint. Everything concurrency needs is in place — the header is atomic,
-   the reference-count snapshot doubles as a snapshot-at-the-beginning barrier,
-   the safepoint poll exists, and forwarding is published by a single CAS — but
-   no thread runs them. LXR's shape would be: a short pause to scan roots,
-   concurrent marking, then a short pause to sweep and evacuate.
-2. **Concurrent copying** additionally needs a load barrier on every reference
-   load: check whether the loaded pointer is in a block being evacuated and
-   resolve forwarding if so. About four instructions in `load_at`. Evacuation
-   is safe today *without* one only because it happens inside the trace, which
-   visits every reference in the heap before the program resumes.
+1. **Concurrent copying** needs a load barrier on every reference load: check
+   whether the loaded pointer is in a block being evacuated and resolve
+   forwarding if so. About four instructions in `load_at`. Evacuation is safe
+   today *without* one only because it happens in the final pause, which
+   visits every reference before the program resumes.
+2. **A remembered set for the final pause.** The fix-up after evacuation walks
+   every live object, so the pause is bounded by the size of the live heap. The
+   marker could instead record every slot it sees pointing into a candidate
+   block, and the pause would then only revisit those, plus the objects
+   modified or allocated during the mark. The argument that this is complete
+   has more moving parts than the walk (the walk *is* the `--gc-stress` check),
+   so it waits for a measured pause that justifies it.
 3. **Partial block reuse.** A block is recycled only when every line in it is
    free; the free lines of a block that still holds something are not handed
    back. Evacuation is what recovers those blocks, so this is a throughput
    improvement rather than a leak.
-4. **`in_heap` takes the heap lock.** Fine while the collector is
-   stop-the-world; a concurrent marker would contend badly and wants the space
-   ranges published lock-free, the way `types::info` already is.
-5. **Thread-local allocation buffers.** `ws_alloc` still takes a mutex per
-   allocation.
+4. **Thread-local allocation buffers.** `ws_alloc` still takes a mutex per
+   allocation, and the counting collector's buffers a second one.
+5. **The closure environment is not a root inside the closure's body.** The
+   captures are copied out on entry and the environment pointer is dead from
+   then on, so this is fine today. Anything that re-reads it after a call — a
+   lazily loaded capture, the load barrier above applied to `env` — must first
+   declare it a root.
 
 ---
 
@@ -190,6 +195,8 @@ These are deliberate limitations, each with a clear fix:
 - **No block expressions.** `catch`/`orelse` take an expression, not a block.
 - **Integer literals are always `i64`.** No `comptime_int` coercion, so `1.0`
   must be written where an `f64` is wanted.
+- **`%` is integer-only.** Cranelift has no float remainder, and a float `%`
+  is rejected by inference rather than emulated.
 - **No sized integer types**, no unsigned types, no bitwise operators.
 - **x86-64 and aarch64 only.** The collector reads the frame pointer with
   inline assembly; other architectures get a `compile_error!`.

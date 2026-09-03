@@ -4,10 +4,23 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use wsharp_syntax::diag::{Diagnostic, SourceFile, render};
+use wsharp_syntax::diag::{Diagnostic, Severity, SourceFile, render};
+
+/// Printed after the option list, since the collector's switches are
+/// environment variables rather than flags: they are read by the runtime,
+/// which a compiled program reaches without going through this driver.
+const AFTER_HELP: &str = "\
+Environment:
+  WSHARP_GC_STATS=1  print collector statistics on exit
+  WSHARP_GC_TRACE=1  print every frame the root walk visits";
 
 #[derive(Parser)]
-#[command(name = "wsharp", version, about = "The W# compiler")]
+#[command(
+    name = "wsharp",
+    version,
+    about = "The W# compiler",
+    after_help = AFTER_HELP
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -48,7 +61,8 @@ enum Emit {
     Types,
     /// The typed, monomorphised intermediate representation.
     Hir,
-    /// The generated Cranelift IR.
+    /// The generated Cranelift IR. Compiles the program to get it, so this
+    /// works under `check` as well as `run`.
     Clif,
 }
 
@@ -85,9 +99,14 @@ fn drive(
     // ---- syntax ----
     let (module, diags) = wsharp_syntax::parse(&file.text);
     if emit == Some(Emit::Tokens) {
-        let (tokens, _) = wsharp_syntax::lexer::lex(&file.text);
+        let (tokens, lex_diags) = wsharp_syntax::lexer::lex(&file.text);
+        // Tokens first: they are what was asked for, and the lexer recovers
+        // from every error, so the stream is complete even when it has some.
         for token in &tokens {
             println!("{:>12?}  {:?}", token.span, token.kind);
+        }
+        if report(&file, &lex_diags) {
+            return Ok(ExitCode::FAILURE);
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -148,5 +167,5 @@ fn report(file: &SourceFile, diags: &[Diagnostic]) -> bool {
     for diag in diags {
         eprint!("{}", render(file, diag));
     }
-    !diags.is_empty()
+    diags.iter().any(|d| d.severity == Severity::Error)
 }

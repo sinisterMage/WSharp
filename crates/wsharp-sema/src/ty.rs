@@ -195,13 +195,19 @@ impl TypeStore {
     /// Used to test whether a value fits a type before falling back to a
     /// coercion, e.g. `return n;` in a function returning `!i64`.
     pub fn try_unify(&mut self, a: &Type, b: &Type) -> bool {
+        self.try_unify_checked(a, b).is_ok()
+    }
+
+    /// [`TypeStore::try_unify`], but saying *why* it failed, so a caller that
+    /// goes on to report the failure can tell an infinite type from a plain
+    /// mismatch.
+    pub fn try_unify_checked(&mut self, a: &Type, b: &Type) -> Result<(), UnifyError> {
         let snapshot = self.snapshot();
-        if self.unify(a, b).is_ok() {
-            true
-        } else {
+        let result = self.unify(a, b);
+        if result.is_err() {
             self.rollback_to(snapshot);
-            false
         }
+        result
     }
 
     pub fn declare_struct(&mut self, name: impl Into<String>) -> StructId {
@@ -443,7 +449,9 @@ impl TypeStore {
 
     // ---- printing -------------------------------------------------------
 
-    /// Render a type. Unbound variables print as `?0`, `?1`, ...
+    /// Render a type. Unbound variables print as `_`: they are holes inference
+    /// has not filled, and numbering them (`?0`) both reads as optional syntax
+    /// and suggests a distinction the reader cannot use.
     pub fn show(&mut self, ty: &Type) -> String {
         let mut names = HashMap::new();
         self.write_ty(ty, &mut names)
@@ -460,7 +468,7 @@ impl TypeStore {
 
     fn write_ty(&mut self, ty: &Type, names: &mut HashMap<TypeVarId, String>) -> String {
         match self.resolve(ty) {
-            Type::Var(v) => names.get(&v).cloned().unwrap_or_else(|| format!("?{v}")),
+            Type::Var(v) => names.get(&v).cloned().unwrap_or_else(|| "_".into()),
             Type::Con(con, args) => match con {
                 TyCon::I64 => "i64".into(),
                 TyCon::F64 => "f64".into(),

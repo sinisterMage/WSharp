@@ -150,7 +150,7 @@ pub unsafe fn walk_roots(mut visit: impl FnMut(*mut *mut u8)) {
     // depends on whatever libc did below `main`.
     let mut inside = false;
     // Read once: this runs per frame, per collection.
-    let trace = std::env::var_os("WSHARP_GC_TRACE").is_some();
+    let trace = crate::gc::env_flag("WSHARP_GC_TRACE");
 
     for _ in 0..MAX_FRAMES {
         // `[fp]` is the caller's frame pointer and `[fp + 8]` the return

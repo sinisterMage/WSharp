@@ -23,7 +23,6 @@ cranelift-native = "=0.134.3"
 
 clap = { version = "4", features = ["derive"] }
 smallvec = "1"
-thiserror = "2"
 
 wsharp-codegen = { path = "crates/wsharp-codegen" }
 wsharp-runtime = { path = "crates/wsharp-runtime" }

@@ -77,6 +77,26 @@ pub fn builtins() -> Vec<Builtin> {
             ret: BuiltinTy::Void,
             ptr: ws_gc_trace as *const u8,
         },
+        // The two halves of a trace, so a program can mutate the heap while
+        // the collector thread is marking it and then check nothing was lost.
+        Builtin {
+            name: "gc_trace_start",
+            params: &[],
+            ret: BuiltinTy::Void,
+            ptr: ws_gc_trace_start as *const u8,
+        },
+        Builtin {
+            name: "gc_trace_finish",
+            params: &[],
+            ret: BuiltinTy::Void,
+            ptr: ws_gc_trace_finish as *const u8,
+        },
+        Builtin {
+            name: "gc_traces",
+            params: &[],
+            ret: BuiltinTy::I64,
+            ptr: ws_gc_traces as *const u8,
+        },
         Builtin {
             name: "gc_live_objects",
             params: &[],
@@ -222,9 +242,25 @@ pub extern "C" fn ws_gc_collect() {
     unsafe { crate::gc::collect() };
 }
 
-/// Force a backup mark trace, which reclaims cycles.
+/// Run a whole mark trace, synchronously: begin it, wait for the collector
+/// thread to mark, finish it, wait for the sweep. What follows in the program
+/// sees a heap with every cycle reclaimed.
 pub extern "C" fn ws_gc_trace() {
-    unsafe { crate::gc::trace() };
+    unsafe { crate::mark::run_full_trace() };
+}
+
+/// Begin a trace and return while the collector thread marks.
+pub extern "C" fn ws_gc_trace_start() {
+    unsafe { crate::mark::trace_start() };
+}
+
+/// Wait for the trace in flight to be entirely over.
+pub extern "C" fn ws_gc_trace_finish() {
+    unsafe { crate::mark::trace_finish() };
+}
+
+pub extern "C" fn ws_gc_traces() -> i64 {
+    crate::gc::traces() as i64
 }
 
 pub extern "C" fn ws_gc_live_objects() -> i64 {
@@ -241,24 +277,35 @@ pub extern "C" fn ws_gc_collections() -> i64 {
 
 pub const PANIC_UNWRAP_NULL: i64 = 1;
 pub const PANIC_ASSERT: i64 = 2;
-pub const PANIC_UNREACHABLE: i64 = 3;
-pub const PANIC_NO_METHOD: i64 = 4;
+pub const PANIC_NO_METHOD: i64 = 3;
+pub const PANIC_DIVIDE_BY_ZERO: i64 = 4;
+pub const PANIC_DIVIDE_OVERFLOW: i64 = 5;
 
-/// Abort with a message. Called from generated code for failures that the type
-/// system permits but the program must not perform, such as `.?` on a null
-/// optional.
+/// The exit status of a program that panicked: the one a Rust program exits
+/// with on a panic, so it is already familiar. A signal (`abort`) would be the
+/// alternative, but a signal is what a *compiler* bug looks like; a plain exit
+/// status says the program itself asked to stop.
+pub const PANIC_EXIT_STATUS: i32 = 101;
+
+/// Report a failure and end the process. Called from generated code for
+/// failures that the type system permits but the program must not perform,
+/// such as `.?` on a null optional.
 pub extern "C" fn ws_panic(code: i64) {
     let reason = match code {
-        PANIC_UNWRAP_NULL => "unwrapped a null optional",
-        PANIC_ASSERT => "assertion failed",
-        PANIC_UNREACHABLE => "reached unreachable code",
-        PANIC_NO_METHOD => "no overload matched these argument types",
-        _ => "unknown failure",
+        PANIC_UNWRAP_NULL => "unwrapped a null optional".to_string(),
+        PANIC_ASSERT => "assertion failed".to_string(),
+        PANIC_NO_METHOD => "no overload matched these argument types".to_string(),
+        PANIC_DIVIDE_BY_ZERO => "integer division by zero".to_string(),
+        PANIC_DIVIDE_OVERFLOW => "integer overflow in division: i64::MIN / -1".to_string(),
+        _ => format!("unknown failure (code {code})"),
     };
     eprintln!("W# panic: {reason}");
-    // `abort` rather than `panic!`: unwinding out of an `extern "C"` function
-    // called from JIT-compiled frames has no defined behaviour.
-    std::process::abort();
+    crate::gc::report_if_asked();
+    // `exit` rather than `panic!`: unwinding out of an `extern "C"` function
+    // called from JIT-compiled frames has no defined behaviour. `exit` does
+    // not unwind either -- it flushes stdout and leaves -- so whatever the
+    // program printed before it died still arrives.
+    std::process::exit(PANIC_EXIT_STATUS);
 }
 
 #[cfg(test)]

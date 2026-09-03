@@ -16,7 +16,9 @@ use cranelift_frontend::{FunctionBuilder, Variable};
 use cranelift_jit::JITModule;
 use cranelift_module::{DataId, FuncId, Module};
 use smallvec::SmallVec;
-use wsharp_runtime::builtins::{BuiltinTy, PANIC_NO_METHOD, PANIC_UNWRAP_NULL};
+use wsharp_runtime::builtins::{
+    BuiltinTy, PANIC_DIVIDE_BY_ZERO, PANIC_DIVIDE_OVERFLOW, PANIC_NO_METHOD, PANIC_UNWRAP_NULL,
+};
 use wsharp_runtime::header::{
     FLAG_LOGGED, FLAG_SHIFT, META_OFFSET, TYPE_ID_CLOSURE, TYPE_ID_MASK, align_up,
 };
@@ -796,9 +798,7 @@ impl Trans<'_, '_> {
                 BinOp::Add => self.b.ins().iadd(l, r),
                 BinOp::Sub => self.b.ins().isub(l, r),
                 BinOp::Mul => self.b.ins().imul(l, r),
-                // Traps on division by zero and on the i64::MIN / -1 overflow.
-                BinOp::Div => self.b.ins().sdiv(l, r),
-                BinOp::Rem => self.b.ins().srem(l, r),
+                BinOp::Div | BinOp::Rem => self.checked_div(op, l, r),
                 BinOp::Eq => self.b.ins().icmp(IntCC::Equal, l, r),
                 BinOp::Ne => self.b.ins().icmp(IntCC::NotEqual, l, r),
                 BinOp::Lt => self.b.ins().icmp(IntCC::SignedLessThan, l, r),
@@ -807,6 +807,48 @@ impl Trans<'_, '_> {
                 BinOp::Ge => self.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, l, r),
                 BinOp::And | BinOp::Or => unreachable!("logical operators are lowered separately"),
             }
+        }
+    }
+
+    /// Integer `/` and `%`, with the two inputs the hardware cannot answer
+    /// turned into panics: a zero divisor, and `i64::MIN / -1`, whose result
+    /// does not fit. Cranelift's `sdiv` traps on both, but a trap is a SIGILL
+    /// with no message; a panic says what happened. `srem` defines
+    /// `i64::MIN % -1` as 0, so only `/` needs the second check.
+    fn checked_div(&mut self, op: BinOp, l: ir::Value, r: ir::Value) -> ir::Value {
+        use ir::condcodes::IntCC;
+        let ok = self.b.create_block();
+
+        let by_zero = self.b.create_block();
+        let nonzero = if op == BinOp::Div {
+            self.b.create_block()
+        } else {
+            ok
+        };
+        let is_zero = self.b.ins().icmp_imm_s(IntCC::Equal, r, 0);
+        self.brif(is_zero, by_zero, NO_ARGS, nonzero, NO_ARGS);
+        self.switch(by_zero);
+        self.panic_with(PANIC_DIVIDE_BY_ZERO);
+        // `ws_panic` never returns; the jump only gives the block a terminator.
+        self.jump_to(ok, NO_ARGS);
+
+        if op == BinOp::Div {
+            self.switch(nonzero);
+            let is_min = self.b.ins().icmp_imm_s(IntCC::Equal, l, i64::MIN);
+            let is_neg_one = self.b.ins().icmp_imm_s(IntCC::Equal, r, -1);
+            let overflows = self.b.ins().band(is_min, is_neg_one);
+            let overflow = self.b.create_block();
+            self.brif(overflows, overflow, NO_ARGS, ok, NO_ARGS);
+            self.switch(overflow);
+            self.panic_with(PANIC_DIVIDE_OVERFLOW);
+            self.jump_to(ok, NO_ARGS);
+        }
+
+        self.switch(ok);
+        if op == BinOp::Div {
+            self.b.ins().sdiv(l, r)
+        } else {
+            self.b.ins().srem(l, r)
         }
     }
 

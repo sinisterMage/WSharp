@@ -22,10 +22,11 @@ use std::collections::{HashMap, HashSet};
 use wsharp_runtime::header::{HEADER_SIZE, TYPE_ID_FIRST_USER, align_up};
 use wsharp_syntax::Diagnostic;
 use wsharp_syntax::ast::{self, BinOp, UnOp};
+use wsharp_syntax::diag::Label;
 use wsharp_syntax::span::{Ident, Span};
 
 use crate::hir::{self, UNRESOLVED};
-use crate::ty::{Scheme, StructId, TyCon, Type, TypeStore};
+use crate::ty::{Scheme, StructId, TyCon, Type, TypeStore, UnifyError};
 
 pub struct Analysis {
     pub program: hir::Program,
@@ -103,6 +104,9 @@ enum Constraint {
         ty: Type,
         span: Span,
         op: &'static str,
+        /// `f64` is not enough: `%` has no float form, because Cranelift has
+        /// no float remainder and the language does not define one.
+        integers_only: bool,
     },
     /// Must be a type `==` can compare.
     Equatable { ty: Type, span: Span },
@@ -172,8 +176,14 @@ struct Inferencer<'a> {
 
     structs: Vec<hir::StructDef>,
     struct_ids: HashMap<String, StructId>,
+    /// Where each struct's name was written, so a redeclaration can point
+    /// back at the first one. Builtin status types have no entry.
+    struct_spans: HashMap<String, Span>,
 
     globals: HashMap<String, GlobalRef>,
+    /// Where each global was first declared, for the same reason. Builtins
+    /// and lazily materialised status types have no entry.
+    global_spans: HashMap<String, Span>,
     consts: Vec<ConstDef>,
 
     /// Per `FuncId`: the source function, absent for nothing in session 1 but
@@ -206,7 +216,9 @@ impl<'a> Inferencer<'a> {
             diags: Vec::new(),
             structs: Vec::new(),
             struct_ids: HashMap::new(),
+            struct_spans: HashMap::new(),
             globals: HashMap::new(),
+            global_spans: HashMap::new(),
             consts: Vec::new(),
             fn_asts: Vec::new(),
             fn_names: Vec::new(),
@@ -304,15 +316,22 @@ impl<'a> Inferencer<'a> {
             let ast::Item::Struct(decl) = item else {
                 continue;
             };
-            if self.struct_ids.contains_key(decl.name.as_str()) {
+            if let Some(&first) = self.struct_spans.get(decl.name.as_str()) {
                 self.error(
                     decl.name.span,
                     format!("`{}` is declared more than once", decl.name),
-                );
+                )
+                .secondary
+                .push(Label {
+                    span: first,
+                    message: "first declared here".into(),
+                });
                 continue;
             }
             let id = self.store.declare_struct(decl.name.as_str());
             self.struct_ids.insert(decl.name.to_string(), id);
+            self.struct_spans
+                .insert(decl.name.to_string(), decl.name.span);
             self.structs.push(hir::StructDef {
                 name: decl.name.to_string(),
                 parent: None,
@@ -363,7 +382,11 @@ impl<'a> Inferencer<'a> {
                     } else {
                         format!("field `{}` is declared more than once", field.name)
                     };
-                    self.error(field.name.span, message);
+                    let first = fields[index].span;
+                    self.error(field.name.span, message).secondary.push(Label {
+                        span: first,
+                        message: "first declared here".into(),
+                    });
                     continue;
                 }
                 let ty = self.resolve_type_expr(&field.ty);
@@ -571,6 +594,9 @@ impl<'a> Inferencer<'a> {
         for id in 0..self.structs.len() as StructId {
             if self.structs[id as usize].fields.is_empty() {
                 let name = self.structs[id as usize].name.clone();
+                if let Some(&span) = self.struct_spans.get(&name) {
+                    self.global_spans.insert(name.clone(), span);
+                }
                 self.globals.insert(name, GlobalRef::Singleton(id));
             }
         }
@@ -620,13 +646,11 @@ impl<'a> Inferencer<'a> {
                     };
                     ids.push(id);
                 }
-                Some(_) => {
-                    self.error(name.span, format!("`{name}` is declared more than once"))
-                        .help = Some("only functions may share a name, as an overload set".into());
-                }
+                Some(_) => self.report_redeclaration(name),
                 None => {
                     self.globals
                         .insert(name.to_string(), GlobalRef::Func(vec![id]));
+                    self.global_spans.insert(name.to_string(), name.span);
                 }
             }
         }
@@ -674,17 +698,43 @@ impl<'a> Inferencer<'a> {
         }
 
         if self.globals.contains_key(decl.name.as_str()) {
-            self.error(
-                decl.name.span,
-                format!("`{}` is declared more than once", decl.name),
-            );
+            self.report_redeclaration(&decl.name);
         }
         // `null` is the only literal with a free variable, and generalising it
         // makes `const NOTHING = null;` usable at any optional type.
         let scheme = self.store.generalize(&ty);
         self.globals
             .insert(decl.name.to_string(), GlobalRef::Const(self.consts.len()));
+        self.global_spans
+            .insert(decl.name.to_string(), decl.name.span);
         self.consts.push(ConstDef { scheme, kind });
+    }
+
+    /// `name` collides with a global that already exists. Builtins get their
+    /// own message: "declared more than once" would send the reader looking
+    /// for a first declaration that is not in the file.
+    fn report_redeclaration(&mut self, name: &Ident) {
+        let is_builtin = matches!(self.globals.get(name.as_str()), Some(GlobalRef::Builtin(_)));
+        let first = self.global_spans.get(name.as_str()).copied();
+        let (message, help) = if is_builtin {
+            (
+                format!("`{name}` is a builtin and cannot be redeclared"),
+                "builtins cannot be overloaded yet; choose another name",
+            )
+        } else {
+            (
+                format!("`{name}` is declared more than once"),
+                "only functions may share a name, as an overload set",
+            )
+        };
+        let diag = self.error(name.span, message);
+        diag.help = Some(help.into());
+        if let Some(first) = first {
+            diag.secondary.push(Label {
+                span: first,
+                message: "first declared here".into(),
+            });
+        }
     }
 
     fn resolve_type_expr(&mut self, t: &ast::TypeExpr) -> Type {
@@ -1118,6 +1168,7 @@ impl<'a> Inferencer<'a> {
                             ty: inner.ty.clone(),
                             span,
                             op: "-",
+                            integers_only: false,
                         });
                         inner.ty.clone()
                     }
@@ -1430,6 +1481,7 @@ impl<'a> Inferencer<'a> {
                     ty: lhs.ty.clone(),
                     span,
                     op: op.text(),
+                    integers_only: false,
                 });
             } else {
                 self.constraints.push(Constraint::Equatable {
@@ -1439,10 +1491,12 @@ impl<'a> Inferencer<'a> {
             }
             Type::bool()
         } else {
+            // `%=` comes through here too, as `x = x % e`, so it is covered.
             self.constraints.push(Constraint::Numeric {
                 ty: lhs.ty.clone(),
                 span,
                 op: op.text(),
+                integers_only: op == BinOp::Rem,
             });
             lhs.ty.clone()
         };
@@ -1646,15 +1700,25 @@ impl<'a> Inferencer<'a> {
         cands.sort_by(|a, b| self.compare_specificity(a, b));
         if let Some((a, b)) = self.first_ambiguous_pair(&cands) {
             let (x, y) = (self.show_params(&cands[a]), self.show_params(&cands[b]));
-            self.error(
+            let spans = [
+                self.fn_spans[cands[a].id as usize],
+                self.fn_spans[cands[b].id as usize],
+            ];
+            let diag = self.error(
                 span,
                 format!("this call to `{name}` is ambiguous: `{x}` and `{y}` are equally specific"),
-            )
-            .help = Some(
+            );
+            diag.help = Some(
                 "one overload must be at least as specific as the other in every argument -- \
                  add one that is"
                     .into(),
             );
+            for span in spans {
+                diag.secondary.push(Label {
+                    span,
+                    message: "this overload".into(),
+                });
+            }
         }
 
         // Every case must produce the same type, because the call site has one.
@@ -1887,7 +1951,21 @@ impl<'a> Inferencer<'a> {
         span: Span,
     ) -> hir::Expr {
         let Some(id) = self.lookup_struct(name.as_str()) else {
-            self.error(name.span, format!("unknown struct `{name}`"));
+            // A name that exists but is not a type is a different mistake from
+            // a name that does not exist, and "unknown" would send the reader
+            // hunting for a typo. `find` rather than `lookup_local`: this is
+            // only a question, and must not thread a capture through closures.
+            let is_something_else = self.globals.contains_key(name.as_str())
+                || self.frames.iter().any(|f| f.find(name.as_str()).is_some());
+            if is_something_else {
+                self.error(name.span, format!("`{name}` is not a struct"))
+                    .help = Some(
+                    "a struct literal names a type declared as `const Name = struct { ... }`"
+                        .into(),
+                );
+            } else {
+                self.error(name.span, format!("unknown struct `{name}`"));
+            }
             for init in inits {
                 self.infer_expr(&init.value);
             }
@@ -2039,13 +2117,37 @@ impl<'a> Inferencer<'a> {
 
     /// Unify, reporting a readable mismatch on failure.
     fn expect(&mut self, actual: &Type, expected: &Type, span: Span, what: &str) {
-        if self.store.unify(actual, expected).is_err() {
-            let a = self.store.show(actual);
-            let e = self.store.show(expected);
-            self.error(
-                span,
-                format!("type mismatch: {what} has type `{a}`, expected `{e}`"),
-            );
+        if let Err(err) = self.store.unify(actual, expected) {
+            self.report_unify_error(err, actual, expected, span, what);
+        }
+    }
+
+    /// The diagnostic for a failed unification. A plain mismatch is the usual
+    /// case; the occurs check failing means the two types can only agree if
+    /// one contains itself, and "mismatch" would misdescribe that.
+    fn report_unify_error(
+        &mut self,
+        err: UnifyError,
+        actual: &Type,
+        expected: &Type,
+        span: Span,
+        what: &str,
+    ) {
+        let a = self.store.show(actual);
+        let e = self.store.show(expected);
+        match err {
+            UnifyError::Occurs => {
+                self.error(span, "this expression's type would be infinite")
+                    .help = Some(format!(
+                    "a type cannot contain itself, but {what} has type `{a}` where `{e}` is expected"
+                ));
+            }
+            UnifyError::Mismatch => {
+                self.error(
+                    span,
+                    format!("type mismatch: {what} has type `{a}`, expected `{e}`"),
+                );
+            }
         }
     }
 
@@ -2054,9 +2156,9 @@ impl<'a> Inferencer<'a> {
     /// work in a function declared `!i64`, and `return 1;` in one declared
     /// `?i64`.
     fn coerce(&mut self, expr: hir::Expr, target: &Type, what: &str) -> hir::Expr {
-        if self.store.try_unify(&expr.ty, target) {
+        let Err(direct) = self.store.try_unify_checked(&expr.ty, target) else {
             return expr;
-        }
+        };
         // Widening to a supertype. Free at run time: a subtype's layout starts
         // with a copy of its supertype's, and every struct is one pointer slot,
         // so there is nothing to emit.
@@ -2084,12 +2186,7 @@ impl<'a> Inferencer<'a> {
                 span,
             };
         }
-        let a = self.store.show(&expr.ty);
-        let e = self.store.show(target);
-        self.error(
-            expr.span,
-            format!("type mismatch: {what} has type `{a}`, expected `{e}`"),
-        );
+        self.report_unify_error(direct, &expr.ty, target, expr.span, what);
         expr
     }
 
@@ -2151,12 +2248,27 @@ impl<'a> Inferencer<'a> {
     fn solve_constraints(&mut self) {
         for constraint in std::mem::take(&mut self.constraints) {
             match constraint {
-                Constraint::Numeric { ty, span, op } => {
+                Constraint::Numeric {
+                    ty,
+                    span,
+                    op,
+                    integers_only,
+                } => {
                     let resolved = self.store.resolve(&ty);
                     match resolved {
                         // Unconstrained by anything else: default to i64.
                         Type::Var(_) => {
                             let _ = self.store.unify(&ty, &Type::i64());
+                        }
+                        Type::Con(TyCon::F64, _) if integers_only => {
+                            self.error(
+                                span,
+                                format!("`{op}` needs an integer, but this is `f64`"),
+                            )
+                            .help = Some(format!(
+                                "`{op}` works on `i64`; use `f64` subtraction and truncation \
+                                 for a float remainder"
+                            ));
                         }
                         t if t.is_numeric() => {}
                         t => {
@@ -2165,7 +2277,7 @@ impl<'a> Inferencer<'a> {
                                 span,
                                 format!("`{op}` needs a number, but this is `{shown}`"),
                             )
-                            .help = Some("W# has no operator overloading yet".into());
+                            .help = Some("arithmetic works on `i64` and `f64`".into());
                         }
                     }
                 }

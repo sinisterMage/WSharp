@@ -242,6 +242,28 @@ mod tests {
     }
 
     #[test]
+    fn secondary_labels_render_after_the_primary_with_their_own_snippet() {
+        let f = SourceFile::new("t.ws", "const a = 1;\nconst a = 2;\n");
+        let d = Diagnostic::error(Span::new(19, 20), "`a` is declared more than once")
+            .secondary(Span::new(6, 7), "first declared here")
+            .help("pick another name");
+        let s = render(&f, &d);
+        let expected = "\
+error: `a` is declared more than once
+  --> t.ws:2:7
+  |
+2 | const a = 2;
+  |       ^
+  |
+1 | const a = 1;
+  |       ^ first declared here
+  |
+  = help: pick another name
+";
+        assert_eq!(s, expected);
+    }
+
+    #[test]
     fn multiline_span_underline_stops_at_end_of_line() {
         let f = SourceFile::new("t.ws", "fn a() {\n  return 1;\n}\n");
         let d = Diagnostic::error(Span::new(0, 22), "whole fn");

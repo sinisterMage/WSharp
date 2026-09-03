@@ -7,7 +7,13 @@
 //! // expect: 55          one line of expected stdout, in order
 //! // exit: 3             expected exit status (default 0)
 //! // error: <substring>  the program must fail to compile, saying this
+//! // panic: <substring>  the program must die with a W# panic saying this
 //! ```
+//!
+//! `error:` may be given more than once; every substring must then appear.
+//! A `panic:` case must exit with status 101 (the runtime's panic status) and
+//! is still held to its `expect:` lines, so it can check what was printed
+//! before the panic; only for these cases is stderr allowed to be non-empty.
 //!
 //! Running the built binary as a subprocess means stdout is captured for free,
 //! and the test exercises exactly what a user would run.
@@ -15,16 +21,22 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// What `ws_panic` exits with. Spelled out here rather than imported: the
+/// harness should see exactly what a user sees.
+const PANIC_EXIT_STATUS: i32 = 101;
+
 struct Expectations {
     stdout: Vec<String>,
     exit: i32,
-    error: Option<String>,
+    errors: Vec<String>,
+    panic: Option<String>,
 }
 
 fn parse_expectations(source: &str) -> Expectations {
     let mut stdout = Vec::new();
     let mut exit = 0;
-    let mut error = None;
+    let mut errors = Vec::new();
+    let mut panic = None;
     for line in source.lines() {
         let Some(rest) = line.trim_start().strip_prefix("//") else {
             continue;
@@ -35,13 +47,16 @@ fn parse_expectations(source: &str) -> Expectations {
         } else if let Some(v) = rest.strip_prefix("exit:") {
             exit = v.trim().parse().expect("`exit:` needs a number");
         } else if let Some(v) = rest.strip_prefix("error:") {
-            error = Some(v.trim().to_string());
+            errors.push(v.trim().to_string());
+        } else if let Some(v) = rest.strip_prefix("panic:") {
+            panic = Some(v.trim().to_string());
         }
     }
     Expectations {
         stdout,
         exit,
-        error,
+        errors,
+        panic,
     }
 }
 
@@ -68,22 +83,42 @@ fn check_case_with(path: &Path, flags: &[&str]) -> Result<(), String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    if let Some(needle) = &expected.error {
+    if !expected.errors.is_empty() {
         if output.status.success() {
             return Err(format!(
-                "expected a compile error containing {needle:?}, but it ran"
+                "expected a compile error containing {:?}, but it ran",
+                expected.errors
             ));
         }
-        if !stderr.contains(needle.as_str()) {
-            return Err(format!(
-                "expected an error containing {needle:?}, got:\n{stderr}"
-            ));
+        for needle in &expected.errors {
+            if !stderr.contains(needle.as_str()) {
+                return Err(format!(
+                    "expected an error containing {needle:?}, got:\n{stderr}"
+                ));
+            }
         }
         return Ok(());
     }
 
-    if !stderr.is_empty() {
-        return Err(format!("unexpected stderr:\n{stderr}"));
+    let code = output.status.code().unwrap_or(-1);
+    match &expected.panic {
+        Some(needle) => {
+            if code != PANIC_EXIT_STATUS {
+                return Err(format!(
+                    "expected a panic (exit status {PANIC_EXIT_STATUS}), got {code}; stderr:\n{stderr}"
+                ));
+            }
+            if !stderr.contains(needle.as_str()) {
+                return Err(format!(
+                    "expected a panic containing {needle:?}, got:\n{stderr}"
+                ));
+            }
+        }
+        None => {
+            if !stderr.is_empty() {
+                return Err(format!("unexpected stderr:\n{stderr}"));
+            }
+        }
     }
 
     let actual: Vec<&str> = stdout.lines().collect();
@@ -94,8 +129,7 @@ fn check_case_with(path: &Path, flags: &[&str]) -> Result<(), String> {
         ));
     }
 
-    let code = output.status.code().unwrap_or(-1);
-    if code != expected.exit {
+    if expected.panic.is_none() && code != expected.exit {
         return Err(format!(
             "expected exit status {}, got {code}",
             expected.exit
@@ -246,6 +280,40 @@ fn emit_clif_prints_cranelift_ir() {
     );
     assert!(stdout.contains("function u0:"), "{stdout}");
     assert!(stdout.contains("; fib"), "{stdout}");
+}
+
+#[test]
+fn emit_tokens_still_reports_lexer_errors() {
+    // A scratch file: the token dump is the one path that re-lexes on its
+    // own, and it used to drop the lexer's diagnostics on the floor.
+    let path = std::env::temp_dir().join(format!("wsharp-emit-tokens-{}.ws", std::process::id()));
+    std::fs::write(&path, "fn main() i64 { print(\"open; return 0; }\n")
+        .expect("write scratch file");
+    let output = Command::new(env!("CARGO_BIN_EXE_wsharp"))
+        .arg("check")
+        .arg(&path)
+        .arg("--emit=tokens")
+        .output()
+        .expect("could not run the compiler");
+    let _ = std::fs::remove_file(&path);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    // The tokens are still printed; the error follows rather than replaces them.
+    assert!(stdout.contains("Fn"), "{stdout}");
+    assert!(stderr.contains("unterminated"), "{stderr}");
+}
+
+#[test]
+fn help_documents_the_collector_environment_variables() {
+    let output = Command::new(env!("CARGO_BIN_EXE_wsharp"))
+        .arg("--help")
+        .output()
+        .expect("could not run the compiler");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(stdout.contains("WSHARP_GC_STATS"), "{stdout}");
+    assert!(stdout.contains("WSHARP_GC_TRACE"), "{stdout}");
 }
 
 #[test]

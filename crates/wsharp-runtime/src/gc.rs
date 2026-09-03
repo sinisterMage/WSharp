@@ -1,20 +1,25 @@
-//! The collector.
+//! Reference counting, the write barrier's buffers, and when collections
+//! happen.
 //!
 //! LXR: reference counting for the common case, a concurrent mark trace to
 //! reclaim the cycles counting cannot, and evacuation of sparsely occupied
 //! blocks to keep fragmentation down.
 //!
-//! This module owns the policy; [`crate::heap`] owns the memory, and
-//! [`crate::stackwalk`] owns finding roots.
+//! This module owns counting and policy. [`crate::mark`] owns the trace and
+//! the thread that runs it, [`crate::evacuate`] owns moving objects,
+//! [`crate::heap`] owns the memory, and [`crate::stackwalk`] owns finding
+//! roots.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use crate::header::{
-    ALIGN, FLAG_LOGGED, FLAG_MARKED, clear_flag, rc_dec, rc_inc, rc_of, set_flag, test_flag,
+    ALIGN, FLAG_DEAD, FLAG_LOGGED, clear_flag, rc_dec, rc_inc, rc_of, set_flag, test_flag,
     type_id_of,
 };
-use crate::heap::in_heap;
+use crate::heap::{in_heap, is_collectable};
+use crate::mark;
 use crate::stackwalk::walk_roots;
 use crate::types;
 
@@ -23,15 +28,15 @@ use crate::types;
 /// Coalescing reference counting works by *difference*: the barrier snapshots
 /// an object's outgoing references the first time it is modified, and the
 /// collector compares that snapshot against the object's current state.
-/// Everything the barrier needs to say fits in two flat lists.
+/// Everything the barrier needs to say fits in a few flat lists.
 #[derive(Default)]
-struct Buffers {
+pub(crate) struct Buffers {
     /// Objects whose references were snapshotted. Their current references
     /// become increments, and their `FLAG_LOGGED` bit is cleared afterwards.
-    logged: Vec<*mut u8>,
+    pub logged: Vec<*mut u8>,
     /// The snapshotted references themselves, flattened. Each becomes one
     /// decrement.
-    decrements: Vec<*mut u8>,
+    pub decrements: Vec<*mut u8>,
     /// Objects nothing on the heap points at yet.
     ///
     /// Reference counting counts *heap* references, so an object reachable only
@@ -40,7 +45,7 @@ struct Buffers {
     /// collection notice the moment they leave the root set. They graduate off
     /// the list as soon as something on the heap refers to them, after which
     /// the ordinary count tracks them.
-    nursery: Vec<*mut u8>,
+    pub nursery: Vec<*mut u8>,
     /// Objects allocated since the last collection, exempt from it.
     ///
     /// A collection triggered *by* an allocation runs before the allocator has
@@ -48,7 +53,22 @@ struct Buffers {
     /// not in any stack map -- it is unreachable by every test the collector
     /// has, while being about to be used. One cycle of grace is what makes the
     /// object visible before it can be judged.
-    fresh: Vec<*mut u8>,
+    pub fresh: Vec<*mut u8>,
+    /// The references the barrier has recorded since the trace in progress
+    /// took its snapshot: the same values as go into `decrements`, kept apart
+    /// because a different consumer takes them. A reference that existed at
+    /// the snapshot and was overwritten since is exactly what a
+    /// snapshot-at-the-beginning marker must still follow, and the barrier's
+    /// snapshot is exactly that set.
+    pub satb: Vec<*mut u8>,
+    /// Objects counting found dead while a trace was marking.
+    ///
+    /// The marker reads any object it is handed, so nothing may be freed --
+    /// tombstoned, recycled, deallocated -- while it runs. Counting still runs
+    /// during a trace and still settles the counts; it just leaves the
+    /// freeing to the trace's final pause. An object judged dead stays dead:
+    /// nothing on the heap or the stack referred to it, so nothing can again.
+    pub deferred_dead: Vec<*mut u8>,
 }
 
 // The buffers hold raw pointers into the heap, which the collector owns for the
@@ -60,9 +80,11 @@ static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
     decrements: Vec::new(),
     nursery: Vec::new(),
     fresh: Vec::new(),
+    satb: Vec::new(),
+    deferred_dead: Vec::new(),
 });
 
-fn with_buffers<R>(f: impl FnOnce(&mut Buffers) -> R) -> R {
+pub(crate) fn with_buffers<R>(f: impl FnOnce(&mut Buffers) -> R) -> R {
     f(&mut BUFFERS.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
@@ -91,11 +113,18 @@ pub unsafe extern "C" fn ws_log_object(obj: *mut u8) {
     if info.ptr_offsets.is_empty() {
         return;
     }
+    let tracing = mark::tracing();
     with_buffers(|buffers| {
         for &offset in info.ptr_offsets {
             let field = unsafe { (obj.add(offset as usize) as *const *mut u8).read() };
-            if !field.is_null() {
+            // A string literal or a singleton is a legal field value but not a
+            // counted one: it lives in read-only memory, and decrementing it
+            // would fault.
+            if unsafe { is_collectable(field) } {
                 buffers.decrements.push(field);
+                if tracing {
+                    buffers.satb.push(field);
+                }
             }
         }
         buffers.logged.push(obj);
@@ -106,7 +135,8 @@ pub unsafe extern "C" fn ws_log_object(obj: *mut u8) {
 ///
 /// Generated code tests this byte at every loop back edge, which is what makes
 /// a computational loop interruptible at all -- Cranelift's only safepoints are
-/// calls, and a loop need not contain one.
+/// calls, and a loop need not contain one. The collector thread sets it when
+/// marking is done and the trace needs the program stopped to finish.
 static POLL: AtomicU8 = AtomicU8::new(0);
 
 /// The address generated code reads to see whether a collection is wanted.
@@ -114,8 +144,12 @@ pub fn poll_flag_address() -> usize {
     &POLL as *const AtomicU8 as usize
 }
 
-pub fn request_collection() {
+pub(crate) fn request_safepoint() {
     POLL.store(1, Ordering::Release);
+}
+
+pub(crate) fn clear_poll() {
+    POLL.store(0, Ordering::Release);
 }
 
 /// The slow path of the loop safepoint check.
@@ -126,25 +160,34 @@ pub extern "C" fn ws_gc_poll() {
     if POLL.swap(0, Ordering::AcqRel) == 0 {
         return;
     }
-    unsafe { trace() };
+    unsafe { mark::safepoint() };
 }
 
 /// Collect at every allocation and check every root found.
 static STRESS: AtomicBool = AtomicBool::new(false);
 static COLLECTIONS: AtomicUsize = AtomicUsize::new(0);
+static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+/// The allocation count at which the next scheduled trace is due.
+static TRACE_AT: AtomicUsize = AtomicUsize::new(TRACE_EVERY_ALLOCATIONS);
 /// Roots the stack walk has enumerated, in total. Worth having because a walk
 /// that silently finds *nothing* would let every root check pass vacuously.
 static ROOTS_SEEN: AtomicUsize = AtomicUsize::new(0);
 static FREED: AtomicUsize = AtomicUsize::new(0);
 static TRACES: AtomicUsize = AtomicUsize::new(0);
 static MOVED: AtomicUsize = AtomicUsize::new(0);
+static PAUSES: AtomicUsize = AtomicUsize::new(0);
+static MAX_PAUSE_US: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_PAUSE_US: AtomicUsize = AtomicUsize::new(0);
+/// Live bytes when the last trace finished sweeping: the growth trigger's
+/// point of comparison.
+static TRACE_BASELINE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// Objects the collector has relocated.
 pub fn moved() -> usize {
     MOVED.load(Ordering::Relaxed)
 }
 
-/// Backup mark traces run.
+/// Mark traces started.
 pub fn traces() -> usize {
     TRACES.load(Ordering::Relaxed)
 }
@@ -170,6 +213,37 @@ pub fn collections() -> usize {
     COLLECTIONS.load(Ordering::Relaxed)
 }
 
+pub(crate) fn note_trace_started() {
+    TRACES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn note_moved(n: usize) {
+    MOVED.fetch_add(n, Ordering::Relaxed);
+}
+
+pub(crate) fn note_freed(n: usize) {
+    FREED.fetch_add(n, Ordering::Relaxed);
+}
+
+pub(crate) fn set_trace_baseline(live_bytes: usize) {
+    TRACE_BASELINE_BYTES.store(live_bytes, Ordering::Relaxed);
+}
+
+/// Account for a pause that began at `started`. The maximum is the number
+/// that matters for a collector whose point is low latency.
+pub(crate) fn record_pause(started: Instant) {
+    let us = started.elapsed().as_micros() as usize;
+    PAUSES.fetch_add(1, Ordering::Relaxed);
+    TOTAL_PAUSE_US.fetch_add(us, Ordering::Relaxed);
+    MAX_PAUSE_US.fetch_max(us, Ordering::Relaxed);
+}
+
+/// Whether an environment variable is set to something other than `0` or the
+/// empty string. `WSHARP_GC_STATS=0` means off, as anyone would expect.
+pub fn env_flag(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 /// What a root slot may hold.
 ///
 /// A pointer slot is not always a pointer: the payload of a null optional is a
@@ -186,9 +260,10 @@ fn root_is_plausible(value: *mut u8) -> bool {
     if in_heap(value) {
         return true;
     }
-    // Outside the heap it can still be a static object -- a string literal or a
-    // zero-field struct's singleton -- which the code generator emitted into
-    // the module's data section. Those are identifiable by their type id.
+    // Outside the block space it can still be a large object, or a static one
+    // -- a string literal or a zero-field struct's singleton -- which the code
+    // generator emitted into the module's data section. Both are identifiable
+    // by their type id.
     //
     // Dereferencing something that turned out not to be an object would fault,
     // which under a stress run is exactly the loud failure wanted.
@@ -232,15 +307,15 @@ pub unsafe fn validate_roots() {
 /// The counts matter as much as the checks: a stack walk that found no roots at
 /// all would make every root check pass for the wrong reason.
 pub fn report_if_asked() {
-    if std::env::var_os("WSHARP_GC_STATS").is_none() {
+    if !env_flag("WSHARP_GC_STATS") {
         return;
     }
     let heap = crate::heap::heap_stats();
     let (funcs, safepoints) = crate::stackwalk::registered();
     eprintln!(
         "W# gc: {} collections, {} roots seen, {} freed, {} live of {} allocated \
-         ({} live bytes of {}), {} traces, {} moved, {} blocks, {} large, \
-         {funcs} functions, {safepoints} safepoints",
+         ({} live bytes of {}), {} traces, {} moved, {} pauses (max {} us, total {} us), \
+         {} blocks, {} large, {funcs} functions, {safepoints} safepoints",
         collections(),
         roots_seen(),
         freed(),
@@ -250,9 +325,18 @@ pub fn report_if_asked() {
         heap.bytes_allocated,
         traces(),
         moved(),
+        PAUSES.load(Ordering::Relaxed),
+        MAX_PAUSE_US.load(Ordering::Relaxed),
+        TOTAL_PAUSE_US.load(Ordering::Relaxed),
         heap.blocks,
         heap.large_objects,
     );
+}
+
+/// Let a trace in flight finish or stand down, so that the numbers printed at
+/// exit describe a heap nothing is still working on.
+pub fn quiesce() {
+    mark::quiesce();
 }
 
 /// How often to collect: every this many objects allocated.
@@ -260,6 +344,20 @@ pub fn report_if_asked() {
 /// A count rather than a byte threshold, because reclamation here is per object
 /// and the interesting cost is the buffer processing.
 const COLLECT_EVERY: usize = 4096;
+
+/// Start a mark trace every this many allocations, whatever the heap looks
+/// like: counting cannot reclaim a cycle, and a program can make them steadily
+/// without ever growing much. A count of allocations rather than of
+/// collections so that `--gc-stress`, which collects at every allocation,
+/// traces on the same schedule as an ordinary run and the tests stay
+/// deterministic under both.
+const TRACE_EVERY_ALLOCATIONS: usize = 8 * COLLECT_EVERY;
+
+/// ...and sooner than that if the live heap has doubled since the last trace
+/// -- a heap growing that fast is usually one counting is failing to keep up
+/// with -- provided it is at least this big, so a small program that merely
+/// went from nothing to something is not traced for it.
+const TRACE_GROWTH_FLOOR_BYTES: usize = 4 << 20;
 
 /// Called from the allocator once it has handed an object back.
 ///
@@ -270,6 +368,12 @@ const COLLECT_EVERY: usize = 4096;
 /// # Safety
 /// Must be called from `ws_alloc`, with the frame chain intact.
 pub unsafe fn on_allocation(object: *mut u8) {
+    // A trace that has finished marking is waiting for the program to stop so
+    // it can finish. The object just allocated is not on any list yet and not
+    // in any stack map, and neither matters: it is in the open block, which is
+    // never evacuated, and nothing judges an object no list names.
+    unsafe { mark::safepoint() };
+
     // A new object is born logged: its fields are all null, so there is nothing
     // for the barrier to snapshot and its fast path can simply skip. But it
     // must still join the logged list, because that list is what the next
@@ -286,31 +390,36 @@ pub unsafe fn on_allocation(object: *mut u8) {
         }
         b.fresh.len() + b.nursery.len() >= COLLECT_EVERY
     });
-    if stress() {
-        unsafe { validate_roots() };
-        unsafe { collect() };
+    let allocations = ALLOCATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if !(stress() || due) {
         return;
     }
-    if due {
-        unsafe { collect() };
-        // Counting cannot reclaim a cycle, so ask for a mark trace every so
-        // many collections. Requesting rather than running it means the trace
-        // happens at the program's next safepoint, which may be a loop back
-        // edge rather than another allocation -- a program that has stopped
-        // allocating and is spinning on a cycle-laden heap still gets swept.
-        if COLLECTIONS
-            .load(Ordering::Relaxed)
-            .is_multiple_of(TRACE_EVERY)
-        {
-            request_collection();
-        }
+    if stress() {
+        unsafe { validate_roots() };
+    }
+    let roots = unsafe { collect() };
+    // Counting cannot reclaim a cycle, so trace every so often. The trace
+    // begins here, in the same pause: the roots just found are its snapshot,
+    // and the object just allocated is on the nursery list, which is part of
+    // that snapshot.
+    if trace_due(allocations) && mark::phase() == mark::Phase::Idle {
+        TRACE_AT.store(allocations + TRACE_EVERY_ALLOCATIONS, Ordering::Relaxed);
+        unsafe { mark::start_with_roots(roots) };
     }
 }
 
-/// Run a mark trace once every this many counting collections.
-const TRACE_EVERY: usize = 8;
+/// A threshold rather than a modulus, because this is only consulted when a
+/// collection is due, and a due collection need not land on a round number.
+fn trace_due(allocations: usize) -> bool {
+    if allocations >= TRACE_AT.load(Ordering::Relaxed) {
+        return true;
+    }
+    let live = crate::heap::heap_stats().live_bytes;
+    live >= TRACE_GROWTH_FLOOR_BYTES && live >= 2 * TRACE_BASELINE_BYTES.load(Ordering::Relaxed)
+}
 
-/// One reference-counting collection.
+/// One reference-counting collection. Returns the roots it found, so that a
+/// trace started in the same pause need not walk the stack again.
 ///
 /// Three sources of truth are reconciled:
 ///
@@ -324,17 +433,20 @@ const TRACE_EVERY: usize = 8;
 /// way that is easy to miss: the final decrements would drive stack-only
 /// objects to zero and free things that are plainly still live.
 ///
+/// While a trace is marking, the counts are settled but nothing is freed; see
+/// [`Buffers::deferred_dead`].
+///
 /// # Safety
 /// Must be called from a runtime function generated code called into, with the
 /// frame chain intact.
-pub unsafe fn collect() {
+pub unsafe fn collect() -> Vec<*mut u8> {
     COLLECTIONS.fetch_add(1, Ordering::Relaxed);
 
     let mut roots: Vec<*mut u8> = Vec::new();
     unsafe {
         walk_roots(|slot| {
             let value = slot.read();
-            if !value.is_null() && in_heap(value) {
+            if is_collectable(value) {
                 roots.push(value);
             }
         })
@@ -344,12 +456,18 @@ pub unsafe fn collect() {
     roots.dedup();
     let rooted = |p: *mut u8| roots.binary_search(&p).is_ok();
 
-    let (logged, decrements, nursery, fresh) = with_buffers(|b| {
+    let defer_frees = mark::tracing();
+    let (logged, decrements, nursery, fresh, deferred) = with_buffers(|b| {
         (
             std::mem::take(&mut b.logged),
             std::mem::take(&mut b.decrements),
             std::mem::take(&mut b.nursery),
             std::mem::take(&mut b.fresh),
+            if defer_frees {
+                Vec::new()
+            } else {
+                std::mem::take(&mut b.deferred_dead)
+            },
         )
     });
 
@@ -386,20 +504,29 @@ pub unsafe fn collect() {
         }
     }
 
+    if defer_frees {
+        with_buffers(|b| {
+            b.deferred_dead.extend(dead);
+            b.nursery.extend(survivors);
+            b.nursery.extend(fresh);
+        });
+        return roots;
+    }
+    dead.extend(deferred);
+
     // Freeing is iterative, never recursive: a long list is ordinary user data
     // and must not be able to overflow the collector's own stack.
     let mut freed = 0usize;
-    let mut seen: Vec<*mut u8> = Vec::new();
     while let Some(obj) = dead.pop() {
         if unsafe { rc_of(obj) } > 0 || rooted(obj) {
             continue;
         }
-        // Guard against the same object arriving twice -- two fields of two
-        // different objects can both have pointed at it.
-        if seen.contains(&obj) {
+        // The same object can arrive twice -- two fields of two different
+        // objects can both have pointed at it -- and the tombstone the first
+        // free left behind is what says so.
+        if unsafe { test_flag(obj, FLAG_DEAD) } {
             continue;
         }
-        seen.push(obj);
 
         for_each_reference(obj, |child| {
             if unsafe { rc_dec(child) } == 0 && !rooted(child) {
@@ -419,170 +546,17 @@ pub unsafe fn collect() {
         // This cycle's newcomers become next cycle's candidates.
         b.nursery.extend(fresh);
     });
+    roots
 }
 
-/// The backup mark trace: reclaim what reference counting cannot.
-///
-/// A cycle keeps its own counts above zero for ever -- two objects pointing at
-/// each other are each referenced once, so neither ever reaches zero, and
-/// neither is ever freed. No amount of counting fixes that; only reachability
-/// does. LXR runs this trace occasionally alongside counting, and it is also
-/// what recovers objects whose counts saturated.
-///
-/// Marking starts from three places, and missing any of them frees live data:
-/// the stack, via the maps; the objects allocated since the last collection,
-/// which nothing may point at yet; and the objects the counting collector is
-/// still holding as heap-unreferenced but rooted.
-///
-/// # Safety
-/// Must be called from a runtime function generated code called into, with the
-/// frame chain intact.
-pub unsafe fn trace() {
-    TRACES.fetch_add(1, Ordering::Relaxed);
-
-    // Sizes are taken now because forwarding overwrites the type id: once an
-    // object has been moved, nothing can ask how big it was.
-    let all = crate::heap::live_objects();
-    for &(obj, _) in &all {
-        unsafe { clear_flag(obj, FLAG_MARKED) };
-    }
-
-    // Choosing candidates before marking is what makes evacuation safe without
-    // a load barrier: the trace visits every reference in the heap, so by the
-    // time it finishes, nothing points into an evacuated block any more.
-    let evacuating = crate::heap::select_evacuation(EVACUATE_BELOW_LINES);
-
-    let mut work: Vec<*mut u8> = Vec::new();
-    let mut moved = 0usize;
-
-    // Roots are updated in place. `walk_roots` hands over the address of each
-    // slot rather than its value precisely so that a moving collector can.
-    unsafe {
-        walk_roots(|slot| {
-            if let Some(target) = forward(slot.read(), &mut moved) {
-                slot.write(target);
-                work.push(target);
-            }
-        })
-    };
-    // The collector's own lists name objects too, and they move as well.
-    with_buffers(|b| {
-        for list in [&mut b.fresh, &mut b.nursery] {
-            for entry in list.iter_mut() {
-                if let Some(target) = forward(*entry, &mut moved) {
-                    *entry = target;
-                    work.push(target);
-                }
-            }
-        }
-    });
-
-    while let Some(obj) = work.pop() {
-        // `set_flag` reports whether this call is the one that set it, which
-        // doubles as the "have I been here already?" test.
-        if !unsafe { set_flag(obj, FLAG_MARKED) } {
-            continue;
-        }
-        let Some(info) = types::info(unsafe { type_id_of(obj) }) else {
-            continue;
-        };
-        for &offset in info.ptr_offsets {
-            let slot = unsafe { obj.add(offset as usize) as *mut *mut u8 };
-            if let Some(target) = forward(unsafe { slot.read() }, &mut moved) {
-                unsafe { slot.write(target) };
-                work.push(target);
-            }
-        }
-    }
-
-    let mut freed = 0usize;
-    for &(obj, size) in &all {
-        if crate::heap::is_evacuating(obj) {
-            // Gone with its block, whether it was copied out or was garbage.
-            crate::heap::note_evacuated(size);
-            if !unsafe { test_flag(obj, FLAG_MARKED) } {
-                freed += 1;
-            }
-            continue;
-        }
-        if unsafe { test_flag(obj, FLAG_MARKED) } {
-            continue;
-        }
-        unsafe { crate::heap::free_object(obj, size) };
-        freed += 1;
-    }
-    let released = crate::heap::release_evacuated();
-    debug_assert_eq!(released, evacuating);
-    FREED.fetch_add(freed, Ordering::Relaxed);
-    MOVED.fetch_add(moved, Ordering::Relaxed);
-
-    // Reachability has just answered the question the buffers existed to
-    // approximate, and their contents may name objects that have moved or
-    // gone. They start again from empty.
-    with_buffers(|b| {
-        for &obj in &b.logged {
-            if unsafe { test_flag(obj, FLAG_MARKED) } {
-                unsafe { clear_flag(obj, FLAG_LOGGED) };
-            }
-        }
-        b.logged.clear();
-        b.decrements.clear();
-        b.nursery.retain(|&p| unsafe { test_flag(p, FLAG_MARKED) });
-        b.fresh.retain(|&p| unsafe { test_flag(p, FLAG_MARKED) });
-    });
-}
-
-/// Blocks with at most this many occupied lines are worth evacuating: mostly
-/// empty, but pinned by a handful of survivors.
-const EVACUATE_BELOW_LINES: u16 = (crate::heap::LINES_PER_BLOCK / 4) as u16;
-
-/// Resolve a reference for the trace, copying the object out of an evacuating
-/// block if it is in one.
-///
-/// Returns the address to use, or `None` if there is nothing to follow. The
-/// caller writes the result back into whatever slot it came from, which is what
-/// makes the move invisible to the program.
-fn forward(value: *mut u8, moved: &mut usize) -> Option<*mut u8> {
-    if value.is_null() || !in_heap(value) {
-        return None;
-    }
-    // Already moved by an earlier visit: every other reference to it is being
-    // repointed at the same copy.
-    let meta = unsafe { crate::header::load_meta(value) };
-    if crate::header::is_forwarded_meta(meta) {
-        return Some(crate::header::forwarding_target(meta));
-    }
-    if !crate::heap::is_evacuating(value) {
-        return Some(value);
-    }
-
-    let Some(size) = (unsafe { types::object_size(value) }) else {
-        return Some(value);
-    };
-    let copy = unsafe { crate::heap::alloc_copy(size) };
-    if copy.is_null() {
-        return Some(value);
-    }
-    unsafe { std::ptr::copy_nonoverlapping(value, copy, size as usize) };
-    match unsafe { crate::header::try_forward(value, copy) } {
-        Ok(()) => {
-            *moved += 1;
-            Some(copy)
-        }
-        // Someone else got there first; use theirs and let this copy be
-        // reclaimed with its block.
-        Err(existing) => Some(existing),
-    }
-}
-
-/// Visit each non-null heap reference held by `obj`.
-fn for_each_reference(obj: *mut u8, mut visit: impl FnMut(*mut u8)) {
+/// Visit each collectable reference held by `obj`.
+pub(crate) fn for_each_reference(obj: *mut u8, mut visit: impl FnMut(*mut u8)) {
     let Some(info) = types::info(unsafe { type_id_of(obj) }) else {
         return;
     };
     for &offset in info.ptr_offsets {
         let field = unsafe { (obj.add(offset as usize) as *const *mut u8).read() };
-        if !field.is_null() && in_heap(field) {
+        if unsafe { is_collectable(field) } {
             visit(field);
         }
     }
@@ -595,6 +569,10 @@ fn for_each_reference(obj: *mut u8, mut visit: impl FnMut(*mut u8)) {
 /// then. The calls with live references across them are the ordinary ones --
 /// `print(p.name)`, `f(a, b)` -- so checking at every runtime entry point,
 /// not just the allocator, is what actually exercises the maps.
+///
+/// This checks and does nothing else. A builtin may be holding its argument in
+/// a Rust local that no stack map describes, so it is not a place a trace may
+/// finish and move things.
 ///
 /// # Safety
 /// Must be called directly from a function generated code called into.
@@ -610,6 +588,7 @@ mod tests {
     use super::*;
     use crate::header::{TYPE_ID_FIRST_USER, meta_word};
     use crate::heap::ws_alloc;
+    use crate::test_support::SERIAL;
 
     #[test]
     fn a_null_slot_is_a_legal_root() {
@@ -657,11 +636,26 @@ mod tests {
 
     #[test]
     fn stress_can_be_switched_on_and_off() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let was = stress();
         set_stress(true);
         assert!(stress());
         set_stress(false);
         assert!(!stress());
         set_stress(was);
+    }
+
+    #[test]
+    fn env_flags_treat_zero_and_empty_as_unset() {
+        // Serialised because the environment is process-wide.
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let name = "WSHARP_TEST_FLAG";
+        unsafe { std::env::remove_var(name) };
+        assert!(!env_flag(name));
+        for (value, expected) in [("1", true), ("yes", true), ("0", false), ("", false)] {
+            unsafe { std::env::set_var(name, value) };
+            assert_eq!(env_flag(name), expected, "{name}={value:?}");
+        }
+        unsafe { std::env::remove_var(name) };
     }
 }

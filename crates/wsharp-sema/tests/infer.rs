@@ -352,6 +352,92 @@ fn arithmetic_on_a_non_number_is_reported() {
 }
 
 #[test]
+fn remainder_needs_integers() {
+    assert_error("fn f() f64 { return 1.5 % 0.5; }", "`%` needs an integer");
+    assert_error(
+        "fn f(a: f64) f64 { var x = a; x %= 2.0; return x; }",
+        "`%` needs an integer",
+    );
+    // Left unconstrained it defaults to i64, like every other operator.
+    assert_eq!(sig("fn f(a, b) { return a % b; }", "f"), "fn(i64, i64) i64");
+}
+
+#[test]
+fn an_infinite_type_is_named_as_such() {
+    // `f` returned from itself: its return type would have to be `fn(_) R`
+    // with `R` that same type. The occurs check catches it in `coerce`.
+    let errs = errors("fn f(x) { return f; }");
+    assert!(
+        errs.iter().any(|e| e.contains("would be infinite")),
+        "{errs:?}"
+    );
+    // And through `expect`, where an operand must match its partner.
+    let errs = errors("fn f(x) { return x + f; }");
+    assert!(
+        errs.iter().any(|e| e.contains("would be infinite")),
+        "{errs:?}"
+    );
+    assert!(
+        !errs.iter().any(|e| e.contains("type mismatch")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn unsolved_type_variables_render_as_underscores() {
+    // The message shows the still-unknown parts as `_`, never as `?0`, which
+    // would read as an optional.
+    let errs = errors("fn f(g) { return g(g); }");
+    let infinite = errs
+        .iter()
+        .find(|e| e.contains("would be infinite"))
+        .unwrap_or_else(|| panic!("{errs:?}"));
+    assert!(!infinite.contains('?'), "{infinite}");
+}
+
+#[test]
+fn redeclaring_a_builtin_is_its_own_error() {
+    let errs = errors("fn print(s: str) void { }");
+    assert_eq!(
+        errs,
+        vec!["`print` is a builtin and cannot be redeclared".to_string()]
+    );
+    let errs = errors("const assert = 1;");
+    assert!(errs.iter().any(|e| e.contains("is a builtin")), "{errs:?}");
+}
+
+#[test]
+fn a_struct_literal_of_a_non_struct_says_so() {
+    assert_error(
+        "const Point = 1; fn f() i64 { return Point{}.x; }",
+        "`Point` is not a struct",
+    );
+    assert_error("fn f(p: i64) i64 { return p{}.x; }", "`p` is not a struct");
+    assert_error("fn f() i64 { return Nope{}.x; }", "unknown struct `Nope`");
+}
+
+#[test]
+fn duplicates_point_back_at_the_first_declaration() {
+    let a = analysis("fn f() void {} const f = 1;");
+    let dup = a
+        .diags
+        .iter()
+        .find(|d| d.message.contains("declared more than once"))
+        .unwrap_or_else(|| panic!("{:?}", a.diags));
+    assert_eq!(dup.secondary.len(), 1);
+    assert_eq!(dup.secondary[0].message, "first declared here");
+    assert_eq!(dup.secondary[0].span, wsharp_syntax::Span::new(3, 4));
+
+    let a = analysis("const P = struct { x: i64, x: i64 };");
+    let dup = a
+        .diags
+        .iter()
+        .find(|d| d.message.contains("declared more than once"))
+        .unwrap_or_else(|| panic!("{:?}", a.diags));
+    assert_eq!(dup.secondary[0].message, "first declared here");
+}
+
+#[test]
 fn wrong_argument_count_is_reported() {
     let src = "fn f(a, b) { return a + b; } fn main() i64 { return f(1); }";
     assert_error(src, "takes 2 arguments but 1 was given");

@@ -15,10 +15,11 @@ processes.
 
 ```wsharp
 // The status types come from the standard library; nothing is declared here.
-fn render(r: Request, s: Status)      str { return "500 Internal Server Error"; }
-fn render(r: Request, s: Status4xx)   str { return "400 Bad Request"; }
-fn render(r: Request, s: NotFound404) str { return "404 Not Found"; }
-fn render(r: Request, s: Teapot418)   str { return "418 I'm a teapot"; }
+fn render(r: Request, s: Status)      str { return "HTTP/1.1 500 Internal Server Error"; }
+fn render(r: Request, s: Status2xx)   str { return "HTTP/1.1 200 OK"; }
+fn render(r: Request, s: Status4xx)   str { return "HTTP/1.1 400 Bad Request"; }
+fn render(r: Request, s: NotFound404) str { return "HTTP/1.1 404 Not Found"; }
+fn render(r: Request, s: Teapot418)   str { return "HTTP/1.1 418 I'm a teapot"; }
 
 // Resolved at compile time: the argument's type is exactly what it says.
 print(render(req, NotFound404));
@@ -43,7 +44,7 @@ The whole example is in [`examples/status.ws`](examples/status.ws).
 | Generics | one method, specialised at run time | monomorphised at compile time; unreachable copies dropped |
 | Values | boxed by default | unboxed — `i64`, `f64`, `bool`, optionals and error unions live in registers |
 | Errors | exceptions | `?T` optionals and `!T` error unions, Zig-style |
-| Collector | generational, stop-the-world | reference counting with a coalescing barrier, a mark trace for cycles, and compaction |
+| Collector | generational, stop-the-world | reference counting with a coalescing barrier, a concurrent mark trace for cycles, and compaction |
 | Aimed at | arrays, notebooks, science | services, tools, systems |
 
 What Julia still does far better: a vast numerical ecosystem, a mature REPL and
@@ -64,12 +65,18 @@ everywhere.** They are checked when written and inferred when not.
 | Overloads | several `fn`s may share a name; the call picks the most specific |
 | Control flow | `if (c) { } else { }`, `while (c) : (i += 1) { }`, `break`, `continue` |
 | Expressions | `if (c) a else b`, `fn (a, b) { ... }` closures |
+| Literals | `42`, `0xff`, `0b1010`, `0o17`, `1_000_000`, `2.5`, `"text"` with `\n \t \r \0 \\ \"` |
 | Structs | `const P = struct { x: i64 };`, `P{ .x = 1 }`, `p.x` |
 | Subtyping | `const Sub = struct : Base { };` — a subtype widens implicitly |
 | Singletons | a struct with no fields is also a value: its sole instance |
-| Optionals | `null`, `a orelse b`, `a.?`, `if (a) \|v\| { }` |
+| Optionals | `null`, `a orelse b`, `a.?`, `if (a) \|v\| { }`, `while (a) \|v\| { }` |
 | Errors | `error.Name`, `try f()`, `f() catch 0`, `f() catch \|e\| ...` |
-| Operators | `+ - * / %`, `== != < <= > >=` (non-chaining), `and or !` |
+| Operators | `+ - * /`, `%` (integers only), `== != < <= > >=` (non-chaining), `and or !` |
+
+Two limits worth knowing before they surprise you: `==` works on `i64`, `f64`
+and `bool` only, and `str` has no operations yet beyond being stored and
+printed. Both are standard-library work; see [ROADMAP.md](ROADMAP.md). The
+`e` bound by `catch |e|` is likewise opaque for now.
 
 Some things that follow from optional annotations:
 
@@ -112,10 +119,10 @@ test is one subtract and one unsigned compare.
 
 ### The collector
 
-Reference counting for the common case, a mark trace for what counting cannot
-reclaim, and compaction to recover fragmented blocks. The design follows LXR
-(Zuo, Blackburn, Zigman & Yang, *Low-Latency, High-Throughput Garbage
-Collection*, PLDI 2022).
+Reference counting for the common case, a concurrent mark trace for what
+counting cannot reclaim, and compaction to recover fragmented blocks. The
+design follows LXR (Zuo, Blackburn, Zigman & Yang, *Low-Latency,
+High-Throughput Garbage Collection*, PLDI 2022).
 
 - **Immix-style heap.** 32 KiB blocks, 256-byte lines. Blocks come from
   over-aligned reservations, so an object's block and line follow from
@@ -130,27 +137,39 @@ Collection*, PLDI 2022).
   to Cranelift as a stack-map root, and the collector finds them by walking the
   frame-pointer chain and looking each return address up in the emitted maps.
   Because the roots are precise and updatable in place, objects can move.
-- **A mark trace for cycles.** Two objects pointing at each other keep each
-  other's counts above zero for ever; no amount of counting frees them. The
-  trace reclaims them, and objects whose 23-bit counts saturated.
-- **Compaction.** Freeing works a line at a time, so one survivor pins the free
-  lines around it. The trace evacuates survivors out of the sparsest blocks and
-  repoints every reference at the copy — the trace visits every reference in the
-  heap, which is what makes moving safe without a load barrier.
+- **A concurrent mark trace for cycles.** Two objects pointing at each other
+  keep each other's counts above zero for ever; only reachability reclaims
+  them, and reachability is a walk over the whole live heap. That walk runs on
+  a collector thread while the program continues. It is bracketed by two short
+  pauses on the program's thread, at a safepoint: the first takes a snapshot
+  of the roots, the second finishes the mark, evacuates, and repoints
+  references. Marking is snapshot-at-the-beginning: the barrier's snapshot of
+  overwritten references is exactly the record the marker needs, objects
+  allocated during the mark are born marked (the mark bit is a parity that
+  flips per trace, so nothing is ever cleared), and nothing is freed while the
+  marker runs. The sweep afterwards runs on the collector thread too, a block
+  at a time.
+- **Compaction.** Freeing works a line at a time, so one survivor pins the
+  free lines around it. In the final pause the trace copies the survivors out
+  of the sparsest blocks and repoints every reference at the copy — the stack,
+  every live object, the collector's own lists — which is what makes moving
+  safe without a load barrier. Under `--gc-stress` that fix-up is checked
+  rather than trusted.
 - **Interruptible loops.** Cranelift makes every call a safepoint and nothing
   else, so a loop that calls nothing would be uninterruptible. Each back edge
-  carries a three-instruction poll.
+  carries a three-instruction poll, which is also how the collector thread
+  asks the program to stop for the final pause.
 
-**Not yet concurrent.** Marking and evacuation run in a stop-the-world pause at
-a safepoint; there is no collector thread. What concurrency needs is in place —
-an atomic header with a forwarding encoding, a snapshot-at-the-beginning
-barrier (the reference-count snapshot serves as one), and the safepoint
-handshake — but the thread itself, and the load barrier that concurrent
-*copying* would require on every reference load, are not written. Item 3 in
-[ROADMAP.md](ROADMAP.md) says what is left.
+What is still stop-the-world: copying, and the fix-up walk over the live heap
+that follows it. A remembered set built during the mark would bound that walk
+by what the program did rather than by what it holds; that, and the load
+barrier concurrent copying would need, are items in [ROADMAP.md](ROADMAP.md).
 
 `--gc-stress` collects at every allocation and checks every root the maps
-describe. The end-to-end suite runs twice, once under it.
+describe. The end-to-end suite runs twice, once under it, and traces start on
+the same allocation schedule in both runs so the concurrent paths are covered
+both ways. `WSHARP_GC_STATS=1` prints what the collector did on exit, including
+the number of pauses and the longest one.
 
 ## Building and running
 
@@ -181,6 +200,12 @@ wsharp run   <file.ws>    # compile and run main; exits with main's return value
 wsharp check <file.ws>    # type-check only
 ```
 
+The process exits with the low byte of `main`'s return value, as a C program
+does, so `return 256;` exits 0. A compile error exits 1. A failure the type
+system allows but the program must not perform — `.?` on a null optional, a
+failed `assert`, integer division by zero, `i64::MIN / -1`, a call no overload
+matches — prints `W# panic: <reason>` to stderr and exits with status 101.
+
 `--emit` stops after a stage and prints it, which is the fastest way to see what
 the compiler is thinking:
 
@@ -208,7 +233,23 @@ main: fn() i64
 
 Two flags exist for the collector: `--gc-stress` as above, and the
 `WSHARP_GC_STATS` environment variable, which prints what the collector did on
-exit.
+exit. `WSHARP_GC_TRACE` prints every frame the root walk visits. Both are off
+when unset, empty or `0`.
+
+### Builtins
+
+There is no standard library yet, only a table of builtins in
+`wsharp-runtime/src/builtins.rs`. Adding one is one row; the type checker and
+the code generator both read the table.
+
+| | |
+|---|---|
+| `print(s: str)`, `print_int(i64)`, `print_float(f64)`, `print_bool(bool)` | write a line to stdout |
+| `assert(c: bool)` | panic if `c` is false |
+| `gc_collect()` | one reference-counting collection |
+| `gc_trace()` | a whole mark trace, synchronously: cycles are reclaimed when it returns |
+| `gc_trace_start()`, `gc_trace_finish()` | the two halves of a trace, so a program can mutate the heap while the collector thread marks it |
+| `gc_live_objects()`, `gc_live_bytes()`, `gc_collections()`, `gc_traces()` | the collector's counters, for asserting on it |
 
 ## How it works
 
@@ -225,7 +266,7 @@ source ──► wsharp-syntax ──► wsharp-sema ──► wsharp-codegen �
 | `wsharp-syntax` | Lexer, recursive-descent parser with Pratt-style precedence, spans, diagnostic rendering |
 | `wsharp-sema` | Name resolution, Hindley-Milner inference, the subtype lattice, overload selection, typed HIR, monomorphisation, value layout |
 | `wsharp-codegen` | HIR to Cranelift IR, the dispatcher, the write barrier, stack-map harvesting, JIT module setup |
-| `wsharp-runtime` | Object header, block/line heap, collector, stack walker, type registry, builtins — a leaf crate with no dependencies at all |
+| `wsharp-runtime` | Object header, block/line heap, reference counting, the mark trace and its thread, evacuation, stack walker, type registry, builtins — a leaf crate with no dependencies at all |
 | `wsharp-cli` | The `wsharp` binary and the end-to-end test suite |
 
 A few decisions worth knowing about:
@@ -268,11 +309,11 @@ Sessions are numbered by the original feature list:
 
 - [x] **1.** Core language, Zig-style syntax
 - [x] **2.** Hindley-Milner type inference
-- [x] **3.** Garbage collector — reference counting, cycle collection and
-      compaction; the concurrent thread is not written
+- [x] **3.** Garbage collector — reference counting, a concurrent mark trace
+      for cycles, and compaction
 - [x] **4.** Multiple dispatch over a subtype lattice, with the HTTP status
       types as its standard-library instance
-- [ ] **5.** Arrays and generics
+- [ ] **5.** Arrays (generics are done: inferred, checked and monomorphised)
 - [ ] **6.** Standard library and a module system
 
 What is left, and where it plugs in, is in [ROADMAP.md](ROADMAP.md).

@@ -88,63 +88,68 @@ impl<'a> Lexer<'a> {
     }
 
     fn next_token(&mut self) -> Token {
-        self.skip_trivia();
-        let start = self.pos;
-        let Some(b) = self.peek() else {
-            return Token {
-                kind: TokenKind::Eof,
-                span: Span::new(start, start),
+        // A loop rather than a recursive retry after a bad character: a long
+        // run of them is user input, and each one would otherwise cost a stack
+        // frame.
+        loop {
+            self.skip_trivia();
+            let start = self.pos;
+            let Some(b) = self.peek() else {
+                return Token {
+                    kind: TokenKind::Eof,
+                    span: Span::new(start, start),
+                };
             };
-        };
 
-        let kind = match b {
-            b'0'..=b'9' => return self.number(start),
-            b'"' => return self.string(start),
-            b'_' | b'a'..=b'z' | b'A'..=b'Z' => return self.ident(start),
-            _ => {
-                self.bump();
-                match b {
-                    b'(' => TokenKind::LParen,
-                    b')' => TokenKind::RParen,
-                    b'{' => TokenKind::LBrace,
-                    b'}' => TokenKind::RBrace,
-                    b',' => TokenKind::Comma,
-                    b';' => TokenKind::Semi,
-                    b':' => TokenKind::Colon,
-                    b'|' => TokenKind::Pipe,
-                    b'?' => TokenKind::Question,
-                    b'.' => {
-                        if self.eat(b'?') {
-                            TokenKind::DotQuestion
-                        } else {
-                            TokenKind::Dot
+            let kind = match b {
+                b'0'..=b'9' => return self.number(start),
+                b'"' => return self.string(start),
+                b'_' | b'a'..=b'z' | b'A'..=b'Z' => return self.ident(start),
+                _ => {
+                    self.bump();
+                    match b {
+                        b'(' => TokenKind::LParen,
+                        b')' => TokenKind::RParen,
+                        b'{' => TokenKind::LBrace,
+                        b'}' => TokenKind::RBrace,
+                        b',' => TokenKind::Comma,
+                        b';' => TokenKind::Semi,
+                        b':' => TokenKind::Colon,
+                        b'|' => TokenKind::Pipe,
+                        b'?' => TokenKind::Question,
+                        b'.' => {
+                            if self.eat(b'?') {
+                                TokenKind::DotQuestion
+                            } else {
+                                TokenKind::Dot
+                            }
+                        }
+                        b'+' => self.maybe_eq(TokenKind::PlusEq, TokenKind::Plus),
+                        b'-' => self.maybe_eq(TokenKind::MinusEq, TokenKind::Minus),
+                        b'*' => self.maybe_eq(TokenKind::StarEq, TokenKind::Star),
+                        b'/' => self.maybe_eq(TokenKind::SlashEq, TokenKind::Slash),
+                        b'%' => self.maybe_eq(TokenKind::PercentEq, TokenKind::Percent),
+                        b'=' => self.maybe_eq(TokenKind::EqEq, TokenKind::Eq),
+                        b'!' => self.maybe_eq(TokenKind::BangEq, TokenKind::Bang),
+                        b'<' => self.maybe_eq(TokenKind::LtEq, TokenKind::Lt),
+                        b'>' => self.maybe_eq(TokenKind::GtEq, TokenKind::Gt),
+                        _ => {
+                            let span = Span::new(start, self.pos);
+                            let ch = self.src[start..self.pos].chars().next().unwrap_or('?');
+                            self.diags.push(
+                                Diagnostic::error(span, format!("unexpected character `{ch}`"))
+                                    .label("not valid in W# source"),
+                            );
+                            // Skip it and carry on rather than derailing the stream.
+                            continue;
                         }
                     }
-                    b'+' => self.maybe_eq(TokenKind::PlusEq, TokenKind::Plus),
-                    b'-' => self.maybe_eq(TokenKind::MinusEq, TokenKind::Minus),
-                    b'*' => self.maybe_eq(TokenKind::StarEq, TokenKind::Star),
-                    b'/' => self.maybe_eq(TokenKind::SlashEq, TokenKind::Slash),
-                    b'%' => self.maybe_eq(TokenKind::PercentEq, TokenKind::Percent),
-                    b'=' => self.maybe_eq(TokenKind::EqEq, TokenKind::Eq),
-                    b'!' => self.maybe_eq(TokenKind::BangEq, TokenKind::Bang),
-                    b'<' => self.maybe_eq(TokenKind::LtEq, TokenKind::Lt),
-                    b'>' => self.maybe_eq(TokenKind::GtEq, TokenKind::Gt),
-                    _ => {
-                        let span = Span::new(start, self.pos);
-                        let ch = self.src[start..self.pos].chars().next().unwrap_or('?');
-                        self.diags.push(
-                            Diagnostic::error(span, format!("unexpected character `{ch}`"))
-                                .label("not valid in W# source"),
-                        );
-                        // Skip it and carry on rather than derailing the stream.
-                        return self.next_token();
-                    }
                 }
-            }
-        };
-        Token {
-            kind,
-            span: Span::new(start, self.pos),
+            };
+            return Token {
+                kind,
+                span: Span::new(start, self.pos),
+            };
         }
     }
 
@@ -177,6 +182,10 @@ impl<'a> Lexer<'a> {
         self.pos = digits_start;
 
         let mut is_float = false;
+        // The first digit that does not belong to this radix, if any. It is
+        // consumed with the rest so the literal stays one token, and reported
+        // by itself: `0b12` is a stray `2`, not an out-of-range number.
+        let mut bad_digit: Option<usize> = None;
         while let Some(b) = self.peek() {
             match b {
                 b'_' => self.pos += 1,
@@ -191,9 +200,10 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 _ if (b as char).is_digit(radix) => self.pos += 1,
-                // Digits invalid for this radix are consumed so the error points
-                // at the whole bad literal instead of splitting it in two.
-                b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' if radix != 10 => self.pos += 1,
+                b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' if radix != 10 => {
+                    bad_digit.get_or_insert(self.pos);
+                    self.pos += 1;
+                }
                 _ => break,
             }
         }
@@ -201,6 +211,26 @@ impl<'a> Lexer<'a> {
         let span = Span::new(start, self.pos);
         let text = &self.src[digits_start..self.pos];
         let cleaned: String = text.chars().filter(|&c| c != '_').collect();
+
+        if let Some(at) = bad_digit {
+            let digit = self.bytes[at] as char;
+            let (name, digits) = match radix {
+                2 => ("binary", "`0` and `1`"),
+                8 => ("octal", "`0` to `7`"),
+                _ => ("hexadecimal", "`0` to `9` and `a` to `f`"),
+            };
+            self.diags.push(
+                Diagnostic::error(
+                    Span::new(at, at + 1),
+                    format!("digit `{digit}` is not valid in a {name} literal"),
+                )
+                .help(format!("{name} digits are {digits}")),
+            );
+            return Token {
+                kind: TokenKind::Int(0),
+                span,
+            };
+        }
 
         if cleaned.is_empty() {
             self.diags.push(
@@ -295,13 +325,16 @@ impl<'a> Lexer<'a> {
                             self.pos += 1;
                         }
                         _ => {
-                            let span = Span::new(esc_start, (self.pos + 1).min(self.src.len()));
+                            // `bump`, not `pos += 1`: the character after the
+                            // backslash may be several bytes long, and stopping
+                            // inside it would make the next slice panic.
+                            self.bump();
+                            let span = Span::new(esc_start, self.pos);
                             self.diags.push(
                                 Diagnostic::error(span, "unknown escape sequence")
                                     .label("not a recognised escape")
                                     .help("valid escapes are \\n \\t \\r \\0 \\\\ \\\""),
                             );
-                            self.pos += 1;
                         }
                     }
                 }
@@ -472,6 +505,49 @@ mod tests {
         let (_, diags) = lex("99999999999999999999");
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("out of range"));
+    }
+
+    #[test]
+    fn a_digit_from_the_wrong_radix_is_named_not_reported_as_overflow() {
+        let src = "0b12";
+        let (tokens, diags) = lex(src);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(
+            diags[0].message,
+            "digit `2` is not valid in a binary literal"
+        );
+        // The caret sits on the offending digit, not the whole literal.
+        assert_eq!(&src[diags[0].primary.span.range()], "2");
+        // The literal is still one token, so the parser sees no split.
+        assert_eq!(tokens[0].kind, TokenKind::Int(0));
+        assert_eq!(&src[tokens[0].span.range()], "0b12");
+
+        let (_, diags) = lex("0o9");
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("octal"), "{}", diags[0].message);
+    }
+
+    #[test]
+    fn bad_escape_before_a_multibyte_character_does_not_panic() {
+        // The byte after `\` starts a two-byte character; skipping only one
+        // byte used to leave `pos` inside it and panic on the next slice.
+        let src = "\"\\é\"";
+        let (tokens, diags) = lex(src);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("unknown escape"));
+        assert_eq!(&src[diags[0].primary.span.range()], "\\é");
+        assert!(matches!(tokens[0].kind, TokenKind::Str(_)));
+        assert_eq!(tokens[1].kind, TokenKind::Eof);
+    }
+
+    #[test]
+    fn a_long_run_of_bad_characters_does_not_overflow_the_stack() {
+        // Each bad byte used to recurse once, so this would overflow.
+        let src = "#".repeat(100_000);
+        let (tokens, diags) = lex(&src);
+        assert_eq!(diags.len(), 100_000);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::Eof);
     }
 
     #[test]

@@ -54,11 +54,11 @@ pub struct Jit {
 }
 
 impl Jit {
-    /// Run `main`.
+    /// Run `main` and return its result.
     ///
-    /// # Safety
-    /// The compiled code is trusted: it came from this compiler, and the type
-    /// checker has already rejected anything that could misbehave.
+    /// Safe to call because the compiled code is trusted: it came from this
+    /// compiler, and the type checker has already rejected anything that could
+    /// misbehave.
     pub fn run(&self) -> i64 {
         // The leading argument is the environment pointer every W# function
         // takes; `main` is a top-level function, so it is null.
@@ -70,6 +70,8 @@ impl Jit {
             entry(0);
             0
         };
+        // A trace may still be in flight; settle it so the report is stable.
+        wsharp_runtime::gc::quiesce();
         wsharp_runtime::gc::report_if_asked();
         code
     }
