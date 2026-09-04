@@ -6,8 +6,8 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/ofekb/WSharp"
+license = "MIT"
+repository = "https://forgejo-hagc.srv1954822.hstgr.cloud/ofekbickel/WSharp"
 
 [workspace.dependencies]
 # Pinned to 0.134.3: this exact version is present in the local registry cache,
