@@ -80,7 +80,7 @@ impl Printer {
                 self.line(&format!(
                     "(fn {}{} {}",
                     f.name,
-                    generics(&f.generics),
+                    generics(&f.func.generics),
                     sig(&f.func)
                 ));
                 self.indent += 1;
@@ -297,7 +297,7 @@ pub fn expr(e: &Expr) -> String {
             let path: Vec<String> = path.iter().map(|p| p.to_string()).collect();
             format!("(lit {} {})", path.join("."), fs.join(" "))
         }
-        Expr::Fn(f) => format!("(fn {} ...)", sig(f)),
+        Expr::Fn(f) => format!("(fn{} {} ...)", generics(&f.generics), sig(f)),
         Expr::If(i) => {
             let cap = i
                 .capture

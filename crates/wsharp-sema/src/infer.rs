@@ -206,6 +206,24 @@ enum Constraint {
     },
 }
 
+impl Constraint {
+    /// Every type this constraint still has an opinion about.
+    ///
+    /// Used to decide what a definition may generalise over: a variable a
+    /// constraint owns is one the solver is about to pin, and quantifying it
+    /// would give the same body two different types depending on whether it
+    /// was written as a `fn` declaration or as a `fn` literal.
+    fn types(&self) -> [&Type; 2] {
+        match self {
+            Constraint::Numeric { ty, .. }
+            | Constraint::Equatable { ty, .. }
+            | Constraint::Member { ty, .. } => [ty, ty],
+            Constraint::Indexable { obj, elem, .. } => [obj, elem],
+            Constraint::HasField { obj, result, .. } => [obj, result],
+        }
+    }
+}
+
 // Subtyping deliberately has no `Constraint` of its own, despite being the
 // obvious candidate for one. A constraint is for a question that cannot be
 // answered where it is met -- but `try_unify` binds whichever side is still a
@@ -214,13 +232,23 @@ enum Constraint {
 
 /// What a name bound inside a function body means.
 ///
-/// An overload set bound by `const g = f;` is not a value -- there is no single
-/// code pointer for a set -- so it is a name that resolves to the same
-/// functions `f` does rather than a local holding something.
+/// Two of these are not values. An overload set bound by `const g = f;` is not
+/// one because there is no single code pointer for a set; a generic `fn`
+/// literal is not one because a closure value is a single code pointer and two
+/// instantiations need two. Both are names that resolve to functions rather
+/// than locals holding something.
 #[derive(Debug, Clone)]
 enum Binding {
     Local(hir::LocalId),
     Overloads(Vec<hir::FuncId>),
+    /// A `const` bound to a generic `fn` literal. Each use materialises a
+    /// closure at the type that use needs; `captures` names the hidden locals
+    /// the definition snapshotted its captured values into, in the order the
+    /// closure's own capture locals expect them.
+    Definition {
+        func: hir::FuncId,
+        captures: Vec<String>,
+    },
 }
 
 /// One function being inferred. A stack of these models nesting: a `fn` literal
@@ -1042,7 +1070,7 @@ impl<'a> Inferencer<'a> {
             match item {
                 ast::Item::Struct(_) => {}
                 ast::Item::Fn(decl) => {
-                    self.declare_function(&decl.name, &decl.generics, &decl.func, decl.span, false);
+                    self.declare_function(&decl.name, &decl.func, decl.span, false);
                 }
                 ast::Item::Const(decl) => {
                     // Already bound by `collect_imports`.
@@ -1058,9 +1086,7 @@ impl<'a> Inferencer<'a> {
                                 "a `const` bound to a `fn` cannot have a type annotation",
                             );
                         }
-                        // A `const` bound to a `fn` literal names no type
-                        // parameters of its own; a literal is monomorphic.
-                        self.declare_function(&decl.name, &[], func, decl.span, false);
+                        self.declare_function(&decl.name, func, decl.span, false);
                     } else if matches!(decl.value, ast::Expr::Ident(_)) {
                         aliases.push(decl);
                     } else {
@@ -1141,11 +1167,11 @@ impl<'a> Inferencer<'a> {
     fn declare_function(
         &mut self,
         name: &Ident,
-        generics: &[Ident],
         func: &'a ast::Func,
         span: Span,
         is_closure: bool,
     ) -> hir::FuncId {
+        let generics = &func.generics[..];
         let id = self.fn_names.len() as hir::FuncId;
         if !is_closure {
             // A second `fn` of the same name extends an overload set rather
@@ -1720,6 +1746,9 @@ impl<'a> Inferencer<'a> {
                 if let Some(stmt) = self.infer_let_of_overloads(let_stmt) {
                     return stmt;
                 }
+                if let Some(stmt) = self.infer_let_of_fn_literal(let_stmt) {
+                    return stmt;
+                }
                 let annotated = let_stmt.ty.as_ref().map(|t| self.resolve_type_expr(t));
                 // A struct literal is told what it is being checked against
                 // before its fields are inferred. Its type arguments otherwise
@@ -1885,6 +1914,100 @@ impl<'a> Inferencer<'a> {
                 span,
             },
         }))
+    }
+
+    /// `const f = fn (x) { .. };`, which may be a definition rather than a
+    /// value.
+    ///
+    /// A `fn` literal bound to a `const` is inferred at a level of its own and
+    /// generalised there -- ordinary let-polymorphism. If that yields type
+    /// variables, `f` cannot be a local: a closure value is one code pointer,
+    /// and two instantiations need two. So the name binds a *definition*, as
+    /// `const g = f;` does for an overload set, and each use materialises a
+    /// closure at the type it needs.
+    ///
+    /// Two forms stay values, and both for the same reason -- they name one
+    /// type. `var f = fn ...` is a storage location holding one function value;
+    /// `const f: fn(i64) i64 = fn ...` says which one it is.
+    ///
+    /// The outer `Option` says whether this took the statement over.
+    fn infer_let_of_fn_literal(&mut self, let_stmt: &'a ast::LetStmt) -> Option<Option<hir::Stmt>> {
+        let ast::Expr::Fn(func) = &let_stmt.init else {
+            return None;
+        };
+        if let_stmt.mutable || let_stmt.ty.is_some() {
+            return None;
+        }
+        let span = let_stmt.init.span();
+
+        // A level of its own: the literal's fresh variables sit one deeper than
+        // the enclosing binding group, so generalising quantifies exactly them.
+        // Anything that escapes into the enclosing frame -- a capture's type, a
+        // type parameter of the function this sits in -- has had its level
+        // lowered by `occurs_and_adjust` on the way out, and is left alone.
+        self.store.enter_level();
+        let (id, fn_ty, capture_sources) = self.infer_fn_literal(func, span);
+        self.store.exit_level();
+
+        let scheme = self.generalize_definition(&fn_ty);
+        self.schemes[id as usize] = Some(scheme.clone());
+        if let Some(def) = &mut self.funcs[id as usize] {
+            def.scheme = scheme.clone();
+        }
+
+        if !scheme.is_generic() {
+            // Nothing to quantify, so this is an ordinary function value and
+            // takes the path every `fn` literal took before definitions
+            // existed.
+            let init = self.closure_value(id, fn_ty, &capture_sources, span);
+            let local = self.frame().add_local(
+                let_stmt.name.as_str(),
+                init.ty.clone(),
+                false,
+                let_stmt.name.span,
+            );
+            self.frame().bind_local(let_stmt.name.as_str(), local);
+            return Some(Some(hir::Stmt::Let { local, init }));
+        }
+
+        // Captured values are snapshotted here rather than read at each use, so
+        // a captured `var` assigned afterwards cannot change what the closure
+        // sees. Captures are by value, and this is where that value is.
+        let mut stmts = Vec::new();
+        let mut names = Vec::new();
+        for (i, &source) in capture_sources.iter().enumerate() {
+            let ty = self.frames.last().expect("in a function").locals[source as usize]
+                .ty
+                .clone();
+            // Bracketed, as the `for` desugaring's locals are: no source name
+            // can collide with one, so a definition cannot shadow anything.
+            let name = format!("[{}#{i}]", let_stmt.name);
+            let local = self
+                .frame()
+                .add_local(&name, ty.clone(), false, let_stmt.name.span);
+            self.frame().bind_local(&name, local);
+            stmts.push(hir::Stmt::Let {
+                local,
+                init: hir::Expr {
+                    kind: hir::ExprKind::Local(source),
+                    ty,
+                    span,
+                },
+            });
+            names.push(name);
+        }
+
+        self.frame().bind(
+            let_stmt.name.as_str(),
+            Binding::Definition {
+                func: id,
+                captures: names,
+            },
+        );
+        if stmts.is_empty() {
+            return Some(None);
+        }
+        Some(Some(hir::Stmt::Block(hir::Block { stmts })))
     }
 
     /// `for (xs) |x| { .. }` becomes the `while` it stands for.
@@ -2078,6 +2201,22 @@ impl<'a> Inferencer<'a> {
     /// there.
     fn infer_place(&mut self, target: &'a ast::Expr) -> Option<(hir::Place, Type)> {
         match target {
+            ast::Expr::Ident(name) if matches!(
+                self.lookup_binding(name.as_str()),
+                Some(Binding::Definition { .. })
+            ) =>
+            {
+                self.error(
+                    name.span,
+                    format!("cannot assign to `{name}`, which is a generic `fn`"),
+                )
+                .help = Some(
+                    "a generic `fn` is a definition rather than a value, so there is nothing \
+                     to reassign -- bind it with `var` to get one function value instead"
+                        .into(),
+                );
+                None
+            }
             ast::Expr::Ident(name) => match self.lookup_local(name.as_str()) {
                 Some(local) => {
                     let frame = self.frames.last().expect("in a function");
@@ -2535,6 +2674,9 @@ impl<'a> Inferencer<'a> {
                 span,
             };
         }
+        if let Some(Binding::Definition { func, captures }) = self.lookup_binding(name.as_str()) {
+            return self.definition_use(func, &captures, span);
+        }
         // Functions come first, so that a `const` alias for an overload set
         // reads exactly as the name it aliases does.
         if let Some(ids) = self.overload_set(name.as_str()) {
@@ -2695,8 +2837,9 @@ impl<'a> Inferencer<'a> {
     /// so everything downstream sees a set of one and takes the ordinary path.
     fn overload_set(&mut self, name: &str) -> Option<Vec<hir::FuncId>> {
         match self.lookup_binding(name) {
-            // A local shadows the global of the same name, value or not.
-            Some(Binding::Local(_)) => return None,
+            // A local or a definition shadows the global of the same name,
+            // value or not.
+            Some(Binding::Local(_) | Binding::Definition { .. }) => return None,
             Some(Binding::Overloads(ids)) => return Some(ids),
             None => {}
         }
@@ -2949,7 +3092,11 @@ impl<'a> Inferencer<'a> {
                 (ty, hir::Callee::Static { func: id, targs })
             }
             None => match callee {
-                ast::Expr::Ident(name) if self.lookup_local(name.as_str()).is_none() => {
+                // `lookup_binding` rather than `lookup_local`: a definition
+                // is not a local, but it still shadows the global whose name
+                // it shares. It falls through to the indirect arm below, which
+                // materialises it at the type this call needs.
+                ast::Expr::Ident(name) if self.lookup_binding(name.as_str()).is_none() => {
                     match self.global(name.as_str()).cloned() {
                         Some(GlobalRef::Builtin(id)) => {
                             (self.builtin_type(id), hir::Callee::Builtin(id))
@@ -3560,28 +3707,53 @@ impl<'a> Inferencer<'a> {
         }
     }
 
-    /// A `fn` literal. Its body is inferred in a fresh frame; names it uses
-    /// from enclosing frames become captures, copied in by value.
+    /// A `fn` literal in expression position. Its body is inferred in a fresh
+    /// frame; names it uses from enclosing frames become captures, copied in by
+    /// value.
+    ///
+    /// A literal written where a value is wanted *is* a value -- one code
+    /// pointer, and so one type -- so it stays monomorphic. Only a `const`
+    /// bound to one is a definition, and only a definition can generalise; see
+    /// [`Inferencer::infer_let_of_fn_literal`].
     fn infer_closure(&mut self, func: &'a ast::Func, span: Span) -> hir::Expr {
+        let (id, fn_ty, capture_sources) = self.infer_fn_literal(func, span);
+        self.schemes[id as usize] = Some(Scheme::mono(fn_ty.clone()));
+        self.closure_value(id, fn_ty, &capture_sources, span)
+    }
+
+    /// Declare and infer a `fn` literal, returning its id, the type its
+    /// signature and body worked out, and the locals *in the enclosing frame*
+    /// it captures.
+    fn infer_fn_literal(
+        &mut self,
+        func: &'a ast::Func,
+        span: Span,
+    ) -> (hir::FuncId, Type, Vec<hir::LocalId>) {
         let name = Ident::new(format!("closure@{}", span.start), span);
-        let id = self.declare_function(&name, &[], func, span, true);
+        let id = self.declare_function(&name, func, span, true);
         let fn_ty = self.signature_type(id, func);
         self.fn_types[id as usize] = fn_ty.clone();
-
         let capture_sources = self.infer_function(id);
-        // `fn` literals stay monomorphic: generalising them would mean
-        // specialising closure bodies, which session 1 does not do.
-        self.schemes[id as usize] = Some(Scheme::mono(fn_ty.clone()));
+        (id, fn_ty, capture_sources)
+    }
 
-        // Captures are copied by value out of the enclosing frame, in the same
-        // order the closure's own capture locals expect them.
+    /// The closure a `fn` literal evaluates to: its captures read straight out
+    /// of the enclosing frame, in the order the closure's own capture locals
+    /// expect them.
+    fn closure_value(
+        &mut self,
+        id: hir::FuncId,
+        fn_ty: Type,
+        capture_sources: &[hir::LocalId],
+        span: Span,
+    ) -> hir::Expr {
         let enclosing = self
             .frames
             .last()
             .expect("a `fn` literal is inside a function");
         let captures = capture_sources
-            .into_iter()
-            .map(|source| hir::Expr {
+            .iter()
+            .map(|&source| hir::Expr {
                 kind: hir::ExprKind::Local(source),
                 ty: enclosing.locals[source as usize].ty.clone(),
                 span,
@@ -3599,6 +3771,69 @@ impl<'a> Inferencer<'a> {
         }
     }
 
+    /// A generic `fn` literal's name, used. Materialise a closure at the type
+    /// this use needs, over the values the definition snapshotted.
+    fn definition_use(
+        &mut self,
+        func: hir::FuncId,
+        capture_names: &[String],
+        span: Span,
+    ) -> hir::Expr {
+        let (ty, targs) = self.func_type(func);
+        self.note_member_constraints(func, &targs, span);
+
+        let mut captures = Vec::with_capacity(capture_names.len());
+        for name in capture_names {
+            let local = self
+                .lookup_local(name)
+                .expect("a definition's captures are in scope wherever its name is");
+            let ty = self.frames.last().expect("in a function").locals[local as usize]
+                .ty
+                .clone();
+            captures.push(hir::Expr {
+                kind: hir::ExprKind::Local(local),
+                ty,
+                span,
+            });
+        }
+
+        hir::Expr {
+            kind: hir::ExprKind::Closure {
+                func,
+                targs,
+                captures,
+            },
+            ty,
+            span,
+        }
+    }
+
+    /// Generalise a definition's type, leaving alone anything a constraint
+    /// still has an opinion about.
+    ///
+    /// `solve_constraints` runs once per binding group, after that group's
+    /// level closes, which is why `fn add(a, b) { return a + b; }` is
+    /// `fn(i64, i64) i64` rather than generic: `Numeric` defaults it before
+    /// anything is quantified. A `fn` literal generalised at its own binding
+    /// closes its level *first*, so quantifying a variable the solver is about
+    /// to pin would give the same body two different types depending on which
+    /// of the two ways it was written. Such a variable stays where it is and is
+    /// defaulted with the rest of the group.
+    fn generalize_definition(&mut self, ty: &Type) -> Scheme {
+        let mut scheme = self.store.generalize(ty);
+        if scheme.vars.is_empty() {
+            return scheme;
+        }
+        let mut owned = Vec::new();
+        for constraint in &self.constraints {
+            for ty in constraint.types() {
+                self.store.collect_vars(ty, &mut owned);
+            }
+        }
+        scheme.vars.retain(|v| !owned.contains(v));
+        scheme
+    }
+
     // -----------------------------------------------------------------------
     // Names and captures
     // -----------------------------------------------------------------------
@@ -3606,7 +3841,7 @@ impl<'a> Inferencer<'a> {
     fn lookup_local(&mut self, name: &str) -> Option<hir::LocalId> {
         match self.lookup_binding(name)? {
             Binding::Local(id) => Some(id),
-            Binding::Overloads(_) => None,
+            Binding::Overloads(_) | Binding::Definition { .. } => None,
         }
     }
 
@@ -3625,12 +3860,15 @@ impl<'a> Inferencer<'a> {
             return Some(Binding::Local(id));
         }
         let outer = depth.checked_sub(1)?;
-        // An overload set is decided at compile time, so a closure that names
-        // one reaches straight past the frame boundary: there is no value to
-        // copy in, and capturing it would invent a local with no type.
+        // An overload set and a generic `fn` literal are both decided at
+        // compile time, so a closure that names one reaches straight past the
+        // frame boundary: there is no value to copy in, and capturing it would
+        // invent a local with no type. A definition's captured values are
+        // reached through its hidden locals, each of which threads a capture of
+        // its own when this runs on it.
         let source = match self.lookup_at(outer, name)? {
             Binding::Local(id) => id,
-            overloads @ Binding::Overloads(_) => return Some(overloads),
+            found @ (Binding::Overloads(_) | Binding::Definition { .. }) => return Some(found),
         };
         let ty = self.frames[outer].locals[source as usize].ty.clone();
         let span = self.frames[outer].locals[source as usize].span;

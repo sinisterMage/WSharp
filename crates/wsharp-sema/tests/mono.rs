@@ -255,6 +255,65 @@ fn a_closure_inside_a_generic_function_is_specialised_per_instantiation() {
 }
 
 #[test]
+fn a_generic_fn_literal_specialises_per_type_argument() {
+    // A `const` bound to a `fn` literal is a definition, so one is enough for
+    // both uses -- and monomorphisation owes each of them a copy of its own,
+    // because a `fn(T) T` cannot be compiled once when `T` may be a register
+    // or a pointer.
+    let src = r#"
+        fn main() i64 {
+            const id = fn (x) { return x; };
+            print(id("two"));
+            return id(1);
+        }
+    "#;
+    let (program, mut store) = mono(src);
+    let closures: Vec<&hir::FuncDef> = program.funcs.iter().filter(|f| f.is_closure).collect();
+    let mut rendered: Vec<String> = closures
+        .iter()
+        .map(|f| store.show(&f.scheme.ty.clone()))
+        .collect();
+    rendered.sort();
+    assert_eq!(rendered, vec!["fn(i64) i64", "fn(str) str"]);
+}
+
+#[test]
+fn a_generic_fn_literal_composes_with_its_enclosing_instantiation() {
+    // Two substitutions at once: the enclosing function's, which says what `U`
+    // is, and this use's, which says what `T` is. Composing them is also what
+    // keeps the cache key right -- four copies, not two.
+    let src = r#"
+        fn outer[U](v: U) U {
+            const wrap = fn [T](x: T) T { return x; };
+            print_bool(wrap(true));
+            return wrap(v);
+        }
+        fn main() i64 {
+            print(outer("a"));
+            return outer(1);
+        }
+    "#;
+    let (program, mut store) = mono(src);
+    assert_eq!(copies_of(&program, "outer").len(), 2);
+    let closures: Vec<&hir::FuncDef> = program.funcs.iter().filter(|f| f.is_closure).collect();
+    let mut rendered: Vec<String> = closures
+        .iter()
+        .map(|f| store.show(&f.scheme.ty.clone()))
+        .collect();
+    rendered.sort();
+    assert_eq!(
+        rendered,
+        vec![
+            "fn(bool) bool",
+            "fn(bool) bool",
+            "fn(i64) i64",
+            "fn(str) str"
+        ],
+        "one copy per (enclosing instantiation, type argument) pair"
+    );
+}
+
+#[test]
 fn every_overload_in_a_dispatch_table_survives_monomorphisation() {
     // A dispatch table entry is the only thing keeping an overload reachable,
     // so a `Dynamic` arm that forgot to specialise its cases would drop them

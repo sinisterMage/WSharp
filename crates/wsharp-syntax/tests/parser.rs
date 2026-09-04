@@ -194,6 +194,18 @@ fn fn_literal_is_an_expression() {
 }
 
 #[test]
+fn fn_literal_may_name_type_parameters() {
+    // `fn` is followed by `[` or `(` and never a value, so the bracket can
+    // only start a type parameter list -- the same argument that makes it
+    // unambiguous after a declaration's name.
+    let out = body("const first = fn [T](a: []T) T { return a[0]; };");
+    assert!(
+        out.contains("(const first (fn [T] (params (a []T)) (ret T) ...))"),
+        "{out}"
+    );
+}
+
+#[test]
 fn error_literals_and_error_union_types() {
     let dump = ast("fn f(n) !i64 { return error.Negative; }");
     assert!(dump.contains("(ret !i64)"), "{dump}");

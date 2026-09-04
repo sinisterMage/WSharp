@@ -280,22 +280,18 @@ impl Parser {
         self.expect(TokenKind::Fn)?;
         let name = self.ident()?;
         let generics = self.generic_params()?;
-        let func = self.func_rest(start)?;
+        let func = self.func_rest(start, generics)?;
         let span = start.to(func.span);
-        Some(FnDecl {
-            name,
-            generics,
-            func,
-            span,
-        })
+        Some(FnDecl { name, func, span })
     }
 
-    /// `[T, U]` after a declaration's name, naming its type parameters.
+    /// `[T, U]` naming a declaration's or a literal's type parameters.
     ///
-    /// Unambiguous wherever it appears: a declaration is always followed by
+    /// Unambiguous wherever it appears: what precedes it is always followed by
     /// something fixed -- `(` for a function, `{` for a struct body -- so a `[`
     /// here can only start a type parameter list. Indexing is an *expression*,
-    /// and no expression is expected at either position.
+    /// and no expression is expected at any of those positions. That holds for
+    /// a `fn` literal too: `fn` is followed by `[` or `(`, never a value.
     fn generic_params(&mut self) -> Option<Vec<Ident>> {
         if !self.at(&TokenKind::LBracket) {
             return Some(Vec::new());
@@ -323,8 +319,9 @@ impl Parser {
     }
 
     /// The `(params) RetType { body }` tail shared by `fn` declarations and
-    /// `fn` literals. `start` is the span of the `fn` keyword.
-    fn func_rest(&mut self, start: Span) -> Option<Func> {
+    /// `fn` literals. `start` is the span of the `fn` keyword, and `generics`
+    /// whatever [`Parser::generic_params`] found before it.
+    fn func_rest(&mut self, start: Span, generics: Vec<Ident>) -> Option<Func> {
         self.expect(TokenKind::LParen)?;
         let mut params = Vec::new();
         while !self.at(&TokenKind::RParen) && !self.at_eof() {
@@ -356,6 +353,7 @@ impl Parser {
         let body = self.block()?;
         let span = start.to(body.span);
         Some(Func {
+            generics,
             params,
             ret,
             body,
@@ -1133,7 +1131,11 @@ impl Parser {
             }
             TokenKind::Fn => {
                 self.bump();
-                let func = self.func_rest(span)?;
+                // `fn [T](..)` names type parameters exactly as a declaration
+                // does; a `const` bound to such a literal is a definition, and
+                // generalises.
+                let generics = self.generic_params()?;
+                let func = self.func_rest(span, generics)?;
                 Some(Expr::Fn(Box::new(func)))
             }
             TokenKind::If => {

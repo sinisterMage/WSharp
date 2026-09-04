@@ -510,6 +510,26 @@ impl TypeStore {
         }
     }
 
+    /// Every variable still unbound anywhere in `ty`, at any level.
+    ///
+    /// [`TypeStore::generalize`] asks a narrower question -- which variables
+    /// belong to the level being closed. This one is for deciding what a
+    /// *constraint* still has an opinion about, where the level is irrelevant.
+    pub fn collect_vars(&mut self, ty: &Type, out: &mut Vec<TypeVarId>) {
+        match self.resolve(ty) {
+            Type::Var(v) => {
+                if !out.contains(&v) {
+                    out.push(v);
+                }
+            }
+            Type::Con(_, args) => {
+                for arg in &args {
+                    self.collect_vars(arg, out);
+                }
+            }
+        }
+    }
+
     fn collect_generalizable(&mut self, ty: &Type, out: &mut Vec<TypeVarId>) {
         match self.resolve(ty) {
             Type::Var(v) => {

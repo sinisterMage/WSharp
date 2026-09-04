@@ -68,10 +68,11 @@ everywhere.** They are checked when written and inferred when not.
 | Abstract types | `Number` stands for `i64` and `f64`, so an overload can claim "any number" while another claims `i64` |
 | Control flow | `if (c) { } else { }`, `while (c) : (i += 1) { }`, `for (xs) \|x\| { }`, `break`, `continue` |
 | Expressions | `if (c) a else b`, `fn (a, b) { ... }` closures |
+| Closures | `const id = fn (x) { return x; };` generalises, and `fn [T](a: []T) T` writes the parameters out |
 | Literals | `42`, `0xff`, `0b1010`, `0o17`, `1_000_000`, `2.5`, `"text"` with `\n \t \r \0 \\ \"` |
 | Arrays | `[]i64{ 1, 2, 3 }`, `a[i]`, `for (a) \|v, i\| { }`; an index out of range panics |
 | Growable | `std/list` — a backing array plus a count, so `push` is amortised constant time |
-| Generics | `fn first[T](a: []T) T`, `const Box = struct[T] { value: T };` — inferred when not written |
+| Generics | `fn first[T](a: []T) T`, `const Box = struct[T] { value: T };`, `fn [T](x: T) T` — inferred when not written |
 | Modules | `const http = @import("std/http");`, then `http.NotFound404` |
 | Structs | `const P = struct { x: i64 };`, `P{ .x = 1 }`, `p.x` |
 | Subtyping | `const Sub = struct : Base { };` — a subtype widens implicitly |
@@ -398,8 +399,8 @@ Sessions are numbered by the original feature list:
 - [x] **4.** Multiple dispatch over a subtype lattice, with the HTTP status
       types as its standard-library instance, abstract types for scalars, and
       overload sets as values
-- [x] **5.** Arrays, `for` loops, and explicit generic parameters on functions
-      and structs
+- [x] **5.** Arrays, `for` loops, a growable array, and explicit generic
+      parameters on functions, structs and `fn` literals
 - [x] **6.** Standard library — strings, arrays, math and I/O — behind a module
       system
 - [ ] **7.** Multithreading: workers with their own heaps, talking by typed RPC

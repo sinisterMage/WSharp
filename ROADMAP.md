@@ -4,6 +4,8 @@ Sessions 1–2 delivered the core language and Hindley-Milner type inference on 
 Cranelift JIT. Sessions 3–4 delivered the garbage collector and multiple
 dispatch. Session 5 delivered arrays, explicit generics, the standard library
 and the module system — everything the original feature list asked for.
+Session 6 closed what item 5 had left open: a growable array, and `fn` literals
+that generalise.
 
 This file records what was built and why it was built that way, the limitations
 that were chosen rather than stumbled into, and — for the items still ahead —
@@ -195,6 +197,12 @@ in-group calls, once the group has generalised. See item 5.
   put their fields in different places, because a `?T` field is two slots or
   three, so a generic struct's offsets are computed by code generation, where
   every type is concrete, through the same `layout::place` inference uses.
+- **Generic `fn` literals.** `const id = fn (x) { return x; };` is
+  generalised at its binding and usable at two types; `fn [T](a: []T) T`
+  writes the parameters out, exactly as a declaration does. What made this
+  reachable was that every piece already existed: Rémy levels, `generalize`
+  and `instantiate`, and the `targs` field a `Closure` node was already
+  carrying for a named generic function used as a value.
 - **A growable array**, `std/list`. The last version of this file said one
   "wants a second object holding a capacity and a length", and that is exactly
   what `List[T] = struct[T] { items: []T, count: i64 }` is: the backing
@@ -231,6 +239,40 @@ in-group calls, once the group has generalised. See item 5.
   Inference now fills those in with the callee's own quantified variables after
   the group generalises, which is sound because Hindley-Milner holds a group
   monomorphic.
+- **A generic `fn` literal is a definition, not a value.** A closure value is
+  one code pointer, and two instantiations need two -- so a `const` bound to a
+  generic literal binds a *name*, and each use materialises a closure at the
+  type that use needs. This is the second time the language has needed that
+  shape: `const g = f;` over an overload set is the first, and for the same
+  reason. A literal written where a value is wanted is still a value, and
+  still monomorphic.
+- **The value restriction is `const` plus no annotation.** `var f = fn ...`
+  is one storage location holding one function value; `const f: fn(i64) i64 =
+  fn ...` says which one. Both name a single type, so neither generalises. The
+  dead `Expr::is_syntactic_value`, which claimed sema did this and had no
+  callers, is gone -- the rule now lives where it is used.
+- **A variable a constraint still owns is not quantified.** `solve_constraints`
+  runs once per binding group, which is why `fn add(a, b) { return a + b; }` is
+  `fn(i64, i64) i64` and not generic: `Numeric` defaults it before anything is
+  quantified. A literal generalised at its own binding closes its level first,
+  so quantifying such a variable would give the same body two different types
+  depending on which of the two ways it was written. `const add = fn (a, b)
+  { return a + b; };` is `i64` for exactly the reason the declaration is.
+- **Captures are snapshotted at the definition.** Each use builds its own
+  closure object, so a captured `var` assigned in between would otherwise
+  change what the closure sees. The definition emits one hidden local per
+  capture -- bracketed, as the `for` desugaring's are -- and every
+  instantiation shares them, which is sound because a capture's type belongs
+  to the enclosing frame and so is never one of the quantified variables.
+- **Monomorphisation composes rather than replaces.** A closure body refers to
+  the enclosing function's variables *and* to its own, so `callee_subst` starts
+  from the caller's substitution and adds the literal's quantified variables.
+  That also keeps the cache key right for free: the key is the whole map, so
+  one literal used at two types inside one enclosing instantiation gets two
+  copies, and one used at one type inside two enclosing instantiations still
+  gets two. **The code generator did not change at all** -- each specialisation
+  is an ordinary `FuncId` with a closure layout of its own, and a call through
+  a definition is the indirect call it always was.
 - **The growable array is a library type, not a language one.** `List[T]` is
   an ordinary generic struct in an ordinary `.ws` file; nothing in the lexer,
   the parser, inference or the code generator knows it exists. That it could
@@ -249,6 +291,14 @@ in-group calls, once the group has generalised. See item 5.
 
 - **No array covariance**, deliberately: `[]Sub` is not a `[]Base`, because a
   write through the second would break the first.
+- **A generic `fn` literal cannot be recursive.** `const f = fn (x) { return
+  f(x); };` cannot see `f`, because the name is bound by the statement it is
+  the initialiser of. A declaration is the way to write a recursive generic
+  function, and it works.
+- **A definition builds its closure at each use.** A call through one is an
+  indirect call on a freshly materialised closure, so it allocates an
+  environment object per use rather than per binding. Cheap, and the price of
+  needing no new calling convention -- but it is a cost, not a nothing.
 - **`for` does not iterate a list.** `for` desugars to a `while` over an
   array, so a list is walked as `for (list.to_array(xs))` and pays for a copy.
   Teaching `for` about `List` would put a standard-library struct inside the
@@ -475,8 +525,6 @@ These are deliberate limitations, each with a clear fix:
   the top level; anything computed is rejected with a message saying so.
   Supporting the general case needs global storage plus a startup initialiser —
   and the collector would need those globals as roots.
-- **`fn` literals are monomorphic.** Top-level functions generalise, but a local
-  `const f = fn (x) { return x; };` does not, so it cannot be used at two types.
 - **Field access needs a known type.** Structs are nominal with no row
   polymorphism, so `fn getx(p) { return p.x; }` cannot be inferred and asks for
   an annotation instead.

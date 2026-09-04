@@ -1,8 +1,9 @@
-// Explicit generic parameters, on functions and on structs.
+// Explicit generic parameters, on functions, on structs, and on `fn`
+// literals.
 //
-// Both are monomorphised: a generic function is compiled once per type it is
-// used at, and a generic struct is laid out once per instantiation -- which it
-// has to be, because a `?T` field is two slots or three depending on `T`.
+// All three are monomorphised: a generic function is compiled once per type it
+// is used at, and a generic struct is laid out once per instantiation -- which
+// it has to be, because a `?T` field is two slots or three depending on `T`.
 
 const str = @import("std/str");
 
@@ -39,5 +40,26 @@ fn main() i64 {
 
     print_int(count([]i64{ 1, 2, 3 }, 0));
     print(str.from_int(count([]str{ "a", "b", "c" }, 0)));
+
+    // A `const` bound to a `fn` literal is a *definition*, not a value, so it
+    // generalises exactly as a declaration does. It has to be: a closure value
+    // is one code pointer, and these two uses need two.
+    const first = fn [T](a: []T) T { return a[0]; };
+    print_int(first([]i64{ 7, 8 }));
+    print(first([]str{ "seven", "eight" }));
+
+    // Without written parameters it is the same rule, and it may capture --
+    // the captured value is shared by every instantiation, because its type
+    // belongs to this frame rather than to the literal.
+    const tag = "picked ";
+    const pick = fn (a, b, c) { if (c) { print(tag); return a; } return b; };
+    print_int(pick(1, 2, true));
+    print(pick("x", "y", true));
+
+    // What a *constraint* still owns stays monomorphic, exactly as it does for
+    // a declaration: `Numeric` is solved with the binding group, and `add` is
+    // `fn(i64, i64) i64` for the same reason `fn add(a, b)` is.
+    const add = fn (a, b) { return a + b; };
+    print_int(add(2, 3));
     return 0;
 }

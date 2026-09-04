@@ -225,6 +225,21 @@ Things in this version that differ from older tutorials, each of which cost time
   the first starts at offset 1, which keeps 0 meaning `Span::EMPTY`. Widening
   the span would touch every node in the syntax tree to carry a number only the
   renderer reads.
+- **A generic `fn` literal is a definition, not a value.** A closure value is
+  one code pointer and two instantiations need two, so a `const` bound to one
+  binds a name -- `Binding::Definition`, beside `Binding::Overloads` -- and
+  each *use* materialises the closure. Its captures are snapshotted into hidden
+  locals at the binding, because each use builds its own environment and a
+  captured `var` assigned in between would otherwise change what the closure
+  sees. A literal in expression position is still a value and still
+  monomorphic; so is one bound to a `var`, or to an annotated `const`.
+- **A definition does not generalise over a variable a constraint owns.**
+  `solve_constraints` runs once per binding group, so `Numeric` defaults
+  `fn add(a, b) { return a + b; }` to `i64` before anything is quantified. A
+  `fn` literal closes its level at its own binding, *before* that runs, so
+  `generalize_definition` subtracts every variable the pending constraints
+  still mention. Dropping that makes `const add = fn (a, b) { return a + b; };`
+  mean something different from the declaration spelling the same body.
 - **The closure environment is dead after the prologue.** Captures are copied
   into declared locals before the first safepoint and `env` is never read
   again, so it is not a root and need not be. Re-reading it after a call would

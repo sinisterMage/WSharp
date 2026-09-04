@@ -328,6 +328,86 @@ fn assigning_to_a_captured_binding_is_rejected() {
 }
 
 #[test]
+fn a_const_fn_literal_generalises() {
+    // Let-polymorphism: the literal is inferred at a level of its own and
+    // generalised at its binding, so the two uses instantiate it rather than
+    // fighting over one type.
+    let src = r#"
+        fn main() i64 {
+            const id = fn (x) { return x; };
+            print(id("two"));
+            return id(1);
+        }
+    "#;
+    assert_eq!(sig(src, "main"), "fn() i64");
+    let a = analysis(src);
+    let closure = a
+        .program
+        .funcs
+        .iter()
+        .find(|f| f.is_closure)
+        .expect("a closure was created");
+    assert_eq!(
+        closure.scheme.vars.len(),
+        1,
+        "a `const` bound to a `fn` literal is a definition, and generalises"
+    );
+}
+
+#[test]
+fn a_fn_literal_may_name_type_parameters() {
+    let src = r#"
+        fn main() i64 {
+            const first = fn [T](a: []T) T { return a[0]; };
+            print(first([]str{ "a" }));
+            return first([]i64{ 7 });
+        }
+    "#;
+    assert_eq!(sig(src, "main"), "fn() i64");
+}
+
+#[test]
+fn a_var_fn_literal_stays_monomorphic() {
+    // The value restriction: a `var` is one storage location holding one
+    // function value, so it names one type.
+    let src = r#"
+        fn main() i64 {
+            var f = fn (x) { return x; };
+            print(f("two"));
+            return f(1);
+        }
+    "#;
+    assert_error(src, "type mismatch");
+}
+
+#[test]
+fn a_constrained_fn_literal_stays_monomorphic() {
+    // `Numeric` is solved with the rest of the binding group, so quantifying
+    // the variable it owns would give this body a different type from the
+    // identical `fn add(a, b) { return a + b; }`.
+    let src = r#"
+        fn main() i64 {
+            const add = fn (a, b) { return a + b; };
+            print_float(add(1.0, 2.0));
+            return add(1, 2);
+        }
+    "#;
+    assert_error(src, "type mismatch");
+}
+
+#[test]
+fn a_generic_fn_literal_is_not_assignable() {
+    let src = r#"
+        fn main() i64 {
+            const g = fn (x) { return x; };
+            g = fn (y) { return y; };
+            return g(1);
+        }
+    "#;
+    assert_error(src, "which is a generic `fn`");
+}
+
+#[test]
 fn a_named_function_can_be_passed_as_a_value() {
     let src = r#"
         fn twice(f: fn(i64) i64, x: i64) i64 { return f(f(x)); }

@@ -202,19 +202,28 @@ impl Mono<'_> {
     /// The substitution to specialise `callee` under, given the type arguments
     /// recorded at the call site and the caller's own substitution.
     fn callee_subst(&mut self, callee: hir::FuncId, targs: &[Type], caller: &Subst) -> Subst {
-        // A `fn` literal has no type arguments of its own; its body refers to
-        // the enclosing function's variables, so it inherits that substitution.
-        if self.src.funcs[callee as usize].is_closure {
-            return caller.clone();
-        }
         let vars = self.src.funcs[callee as usize].scheme.vars.clone();
-        vars.iter()
-            .zip(targs)
-            .map(|(var, ty)| {
-                let concrete = self.apply(ty, caller);
-                (*var, concrete)
-            })
-            .collect()
+        // A `fn` literal's body refers to the enclosing function's variables as
+        // well as to any of its own, so a closure composes the two rather than
+        // replacing one with the other: the caller's substitution first, then
+        // whatever this use instantiates the literal's own quantified variables
+        // at. A monomorphic literal has none, and inherits the caller's
+        // substitution exactly as it always did.
+        //
+        // Composing is also what keeps the cache key right. It is the whole
+        // map, so one generic literal used at two types inside one enclosing
+        // instantiation gets two keys, and one used at one type inside two
+        // enclosing instantiations still gets two.
+        let mut subst = if self.src.funcs[callee as usize].is_closure {
+            caller.clone()
+        } else {
+            Subst::new()
+        };
+        for (var, ty) in vars.iter().zip(targs) {
+            let concrete = self.apply(ty, caller);
+            subst.insert(*var, concrete);
+        }
+        subst
     }
 
     // ---- traversal ------------------------------------------------------

@@ -39,10 +39,6 @@ impl Item {
 #[derive(Debug, Clone)]
 pub struct FnDecl {
     pub name: Ident,
-    /// Type parameters written as `fn f[T, U](..)`. They go here rather than on
-    /// [`Func`] because a `fn` literal is monomorphic by design: only a
-    /// top-level declaration generalises, so only one can name a type variable.
-    pub generics: Vec<Ident>,
     pub func: Func,
     pub span: Span,
 }
@@ -50,6 +46,11 @@ pub struct FnDecl {
 /// The parts of a function that a `fn` literal shares with a `fn` declaration.
 #[derive(Debug, Clone)]
 pub struct Func {
+    /// Type parameters, written `fn f[T, U](..)` on a declaration and
+    /// `fn [T, U](..)` on a literal. They live here rather than on [`FnDecl`]
+    /// because both forms generalise: a `const` bound to a `fn` literal is a
+    /// definition, and names type parameters exactly as a declaration does.
+    pub generics: Vec<Ident>,
     pub params: Vec<Param>,
     /// `None` when the return type is left to inference.
     pub ret: Option<TypeExpr>,
@@ -359,22 +360,6 @@ impl Expr {
             Expr::Fn(f) => f.span,
             Expr::If(e) => e.span,
         }
-    }
-
-    /// Whether this expression is a syntactic value, in the sense of the value
-    /// restriction: sema only generalises `const` bindings whose initialiser is
-    /// one of these.
-    pub fn is_syntactic_value(&self) -> bool {
-        matches!(
-            self,
-            Expr::Int(..)
-                | Expr::Float(..)
-                | Expr::Bool(..)
-                | Expr::Str(..)
-                | Expr::Null(..)
-                | Expr::Fn(..)
-                | Expr::Ident(..)
-        )
     }
 }
 
