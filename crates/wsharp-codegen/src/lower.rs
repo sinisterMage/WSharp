@@ -139,11 +139,39 @@ pub fn indirect_signature(store: &mut TypeStore, fn_ty: &Type, call_conv: CallCo
 
 pub fn builtin_signature(builtin: &wsharp_runtime::Builtin, call_conv: CallConv) -> Signature {
     let mut sig = Signature::new(call_conv);
+    // The destination comes first when there is one, because that is where the
+    // C ABIs that pass a result indirectly put it, and because a builtin's own
+    // arguments then keep the order they are written in.
+    if returns_by_pointer(builtin.ret) {
+        sig.params.push(AbiParam::new(PTR));
+    }
     for param in builtin.params {
         sig.params.extend(abi_slots(*param));
     }
-    sig.returns.extend(abi_slots(builtin.ret));
+    if !returns_by_pointer(builtin.ret) {
+        sig.returns.extend(abi_slots(builtin.ret));
+    }
     sig
+}
+
+/// Whether a builtin's result crosses the boundary through a pointer the caller
+/// passes rather than in registers.
+///
+/// Anything wider than one word does. On the Rust side such a result is a
+/// two-word `#[repr(C)]` struct, and the C ABIs do not agree about those:
+/// System V returns one in RAX:RDX and AArch64 in X0:X1 -- which two Cranelift
+/// return values happen to match -- while Windows x64 returns any aggregate
+/// wider than a word through a hidden pointer in RCX, shifting every real
+/// argument one register along. Declaring two returns therefore compiled to
+/// something Rust read as `(destination, ...)` on Windows: `io.read_file` wrote
+/// its tag and payload over the string it had been given, which for a literal
+/// is read-only memory, and the process died with no message.
+///
+/// Parameters carry this shape identically on all three, so the destination is
+/// passed explicitly and no ABI is left to infer anything. One rule for every
+/// target beats three that have to be kept in agreement.
+fn returns_by_pointer(ty: BuiltinTy) -> bool {
+    abi_slots(ty).len() > 1
 }
 
 /// The machine values a builtin's parameter or result occupies.
@@ -1224,16 +1252,48 @@ impl Trans<'_, '_> {
             hir::Callee::Builtin(id) => {
                 let clif = self.decls.builtins[*id as usize];
                 let fr = self.module.declare_func_in_func(clif, self.b.func);
+                let builtins = wsharp_runtime::builtins();
+                let ret = builtins[*id as usize].ret;
+
                 let mut values = Vec::new();
+                // A result of more than one word is written into a slot of ours
+                // rather than returned; see `returns_by_pointer`.
+                let destination = returns_by_pointer(ret).then(|| {
+                    let slots = abi_slots(ret);
+                    let slot = self.b.create_sized_stack_slot(ir::StackSlotData::new(
+                        ir::StackSlotKind::ExplicitSlot,
+                        slots.len() as u32 * layout::SLOT_SIZE,
+                        layout::SLOT_SIZE.trailing_zeros() as u8,
+                    ));
+                    values.push(self.b.ins().stack_addr(PTR, slot, 0));
+                    (slot, slots)
+                });
+
                 for arg in args {
                     values.extend(self.expr(arg));
                 }
                 let call = self.b.ins().call(fr, &values);
-                let mut out: Slots = self.b.inst_results(call).iter().copied().collect();
+
+                let mut out: Slots = match &destination {
+                    // The tag occupies a whole word and the payload follows it,
+                    // which is the `#[repr(C)]` layout the runtime writes.
+                    Some((slot, slots)) => slots
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| {
+                            self.b.ins().stack_load(
+                                PTR,
+                                p.value_type,
+                                *slot,
+                                (i as u32 * layout::SLOT_SIZE) as i32,
+                            )
+                        })
+                        .collect(),
+                    None => self.b.inst_results(call).iter().copied().collect(),
+                };
                 // A tagged result arrives with its tag in a whole word; W#
                 // keeps it in a narrower one, so bring it back.
-                let builtins = wsharp_runtime::builtins();
-                if let Some(tag) = tag_type_of(builtins[*id as usize].ret)
+                if let Some(tag) = tag_type_of(ret)
                     && let Some(first) = out.first_mut()
                 {
                     *first = self.b.ins().ireduce(tag, *first);
