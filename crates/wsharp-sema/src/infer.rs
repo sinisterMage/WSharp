@@ -2201,10 +2201,11 @@ impl<'a> Inferencer<'a> {
     /// there.
     fn infer_place(&mut self, target: &'a ast::Expr) -> Option<(hir::Place, Type)> {
         match target {
-            ast::Expr::Ident(name) if matches!(
-                self.lookup_binding(name.as_str()),
-                Some(Binding::Definition { .. })
-            ) =>
+            ast::Expr::Ident(name)
+                if matches!(
+                    self.lookup_binding(name.as_str()),
+                    Some(Binding::Definition { .. })
+                ) =>
             {
                 self.error(
                     name.span,
