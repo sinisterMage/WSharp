@@ -299,8 +299,9 @@ fn only_the_status_types_a_program_mentions_are_created() {
     // Naming one pulls in its ancestors, because the lattice needs them, but
     // nothing else.
     let (some, _) = mono(
-        "fn f(s: Status4xx) i64 { return 1; }
-         fn main() i64 { return f(NotFound404); }",
+        "const http = @import(\"std/http\");
+         fn f(s: http.Status4xx) i64 { return 1; }
+         fn main() i64 { return f(http.NotFound404); }",
     );
     let mut names: Vec<&str> = some.structs.iter().map(|s| s.name.as_str()).collect();
     names.sort();
@@ -332,7 +333,21 @@ fn structs_strings_and_errors_survive() {
     let (program, _) = mono(src);
     assert_eq!(program.structs.len(), 1);
     assert_eq!(program.strings, vec!["hello".to_string()]);
-    assert_eq!(program.errors, vec!["Negative".to_string()]);
+    // The standard library's errors are interned first, so that a builtin can
+    // return one by index long before the program catching it has been read.
+    assert_eq!(
+        program.errors.last(),
+        Some(&"Negative".to_string()),
+        "the program's own error comes after the library's"
+    );
+    assert!(
+        program.errors.starts_with(
+            &wsharp_runtime::builtins::builtin_errors()
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        )
+    );
     // The struct's field offsets sit past the object header.
     let point = program.strukt(0);
     assert_eq!(point.fields[0].offset, wsharp_runtime::HEADER_SIZE);
@@ -456,4 +471,78 @@ fn type_arguments_are_consumed() {
         );
     }
     let _ = Type::i64();
+}
+
+#[test]
+fn a_generic_struct_is_laid_out_per_instantiation() {
+    // The whole reason offsets cannot be computed once: `first` is one slot in
+    // `Pair[i64, i64]` and two in `Pair[?i64, i64]`, which moves `second`.
+    let src = r#"
+        const Pair = struct[A, B] { first: A, second: B };
+        fn main() i64 {
+            const a = Pair{ .first = 1, .second = 2 };
+            const b: Pair[?i64, i64] = Pair{ .first = 3, .second = 4 };
+            return a.second + b.second;
+        }
+    "#;
+    let (program, mut store) = mono(src);
+    // The declaration survives as a template; its offsets are unresolved,
+    // because they depend on what it is used at.
+    let template = program
+        .structs
+        .iter()
+        .find(|s| s.name == "Pair")
+        .expect("the declaration is in the table");
+    assert!(!template.params.is_empty());
+    assert_eq!(template.size, 0, "a template has no size of its own");
+
+    // Both instantiations are reachable, and their second fields differ.
+    let mut used: Vec<String> = Vec::new();
+    for func in &program.funcs {
+        for local in &func.locals {
+            let ty = local.ty.clone();
+            let shown = store.show(&ty);
+            if shown.starts_with("Pair[") && !used.contains(&shown) {
+                used.push(shown);
+            }
+        }
+    }
+    used.sort();
+    assert_eq!(used, vec!["Pair[?i64, i64]", "Pair[i64, i64]"]);
+}
+
+#[test]
+fn a_recursive_generic_function_specialises_once_per_type() {
+    let src = r#"
+        fn pick(x, again: bool) { if (again) { return pick(x, false); } return x; }
+        fn main() i64 {
+            print_bool(pick(true, true));
+            return pick(1, true);
+        }
+    "#;
+    let (program, mut store) = mono(src);
+    let mut rendered: Vec<String> = copies_of(&program, "pick")
+        .iter()
+        .map(|&i| {
+            let ty = program.func(i).scheme.ty.clone();
+            store.show(&ty)
+        })
+        .collect();
+    rendered.sort();
+    assert_eq!(
+        rendered,
+        vec!["fn(bool, bool) bool", "fn(i64, bool) i64"],
+        "an in-group call must carry the group's own variables"
+    );
+}
+
+#[test]
+fn an_unused_library_module_is_dropped() {
+    // The parts of the standard library written in W# are compiled with the
+    // program, so they have to fall out as dead code like anything else.
+    let (program, _) = mono("fn main() i64 { return 0; }");
+    assert!(
+        copies_of(&program, "concat").is_empty(),
+        "nothing called it, so nothing should be emitted"
+    );
 }

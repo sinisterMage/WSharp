@@ -21,6 +21,7 @@ pub enum TokenKind {
     Error,
     False,
     Fn,
+    For,
     If,
     Null,
     Or,
@@ -37,6 +38,8 @@ pub enum TokenKind {
     RParen,
     LBrace,
     RBrace,
+    LBracket,
+    RBracket,
 
     // Punctuation.
     Comma,
@@ -46,6 +49,7 @@ pub enum TokenKind {
     DotQuestion,
     Pipe,
     Question,
+    At,
 
     // Operators.
     Plus,
@@ -95,6 +99,7 @@ impl TokenKind {
             TokenKind::Error => "error",
             TokenKind::False => "false",
             TokenKind::Fn => "fn",
+            TokenKind::For => "for",
             TokenKind::If => "if",
             TokenKind::Null => "null",
             TokenKind::Or => "or",
@@ -109,6 +114,8 @@ impl TokenKind {
             TokenKind::RParen => ")",
             TokenKind::LBrace => "{",
             TokenKind::RBrace => "}",
+            TokenKind::LBracket => "[",
+            TokenKind::RBracket => "]",
             TokenKind::Comma => ",",
             TokenKind::Semi => ";",
             TokenKind::Colon => ":",
@@ -116,6 +123,7 @@ impl TokenKind {
             TokenKind::DotQuestion => ".?",
             TokenKind::Pipe => "|",
             TokenKind::Question => "?",
+            TokenKind::At => "@",
             TokenKind::Plus => "+",
             TokenKind::Minus => "-",
             TokenKind::Star => "*",
@@ -153,6 +161,7 @@ pub fn keyword(word: &str) -> Option<TokenKind> {
         "error" => TokenKind::Error,
         "false" => TokenKind::False,
         "fn" => TokenKind::Fn,
+        "for" => TokenKind::For,
         "if" => TokenKind::If,
         "null" => TokenKind::Null,
         "or" => TokenKind::Or,

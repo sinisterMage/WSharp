@@ -855,10 +855,12 @@ fn incomparable_overloads_with_disjoint_types_are_not_ambiguous() {
 #[test]
 fn a_status_type_is_a_value_as_well_as_a_type() {
     // Zero-field structs get a singleton, so the type name is usable directly.
+    // The lattice lives in `std/http`, so it has to be imported first.
     assert_eq!(
         sig(
-            "fn kind(s: Status4xx) i64 { return 4; }
-             fn main() i64 { return kind(NotFound404); }",
+            "const http = @import(\"std/http\");
+             fn kind(s: http.Status4xx) i64 { return 4; }
+             fn main() i64 { return kind(http.NotFound404); }",
             "kind"
         ),
         "fn(Status4xx) i64"
@@ -977,4 +979,227 @@ fn the_sample_program_typechecks() {
     assert_eq!(sig(src, "lookup"), "fn(i64) ?i64");
     assert_eq!(sig(src, "risky"), "fn(i64) !i64");
     assert!(a.program.entry.is_some());
+}
+
+// ---- arrays -------------------------------------------------------------
+
+#[test]
+fn array_types_and_indexing() {
+    assert_eq!(
+        sig("fn head(a: []i64) i64 { return a[0]; }", "head"),
+        "fn([]i64) i64"
+    );
+    // The element type comes from the literal's written type, not its
+    // elements, so an empty one still has it.
+    assert_eq!(
+        sig("fn empty() []str { return []str{}; }", "empty"),
+        "fn() []str"
+    );
+    assert_eq!(
+        sig(
+            "fn nest() [][]i64 { return [][]i64{ []i64{ 1 } }; }",
+            "nest"
+        ),
+        "fn() [][]i64"
+    );
+    // Indexing is generic over the element type when the annotation says so.
+    // Without one it is not inferred, for the same reason a field access is
+    // not: the group is solved before any caller could say what `a` was.
+    assert_eq!(
+        sig("fn head[T](a: []T) T { return a[0]; }", "head"),
+        "fn([]T) T"
+    );
+}
+
+#[test]
+fn indexing_something_that_is_not_an_array_is_reported() {
+    assert_error(
+        "fn f() i64 { const n = 1; return n[0]; }",
+        "cannot be indexed",
+    );
+    // With nothing to say what is being indexed, the question is deferred and
+    // then asked -- there is no sensible default the way `i64` is for a
+    // numeric operand.
+    assert_error(
+        "fn f(a) { return a[0]; } fn main() i64 { return 0; }",
+        "cannot tell what is being indexed",
+    );
+    assert_error("fn f(a: []i64) i64 { return a[\"x\"]; }", "type mismatch");
+}
+
+#[test]
+fn a_for_loop_binds_the_element_type() {
+    let src = r#"
+        fn total(xs: []i64) i64 {
+            var sum = 0;
+            for (xs) |x, i| { sum = sum + x + i; }
+            return sum;
+        }
+    "#;
+    assert_eq!(sig(src, "total"), "fn([]i64) i64");
+    assert_error(
+        "fn f() void { for (5) |x| { print_int(x); } }",
+        "cannot be indexed",
+    );
+}
+
+// ---- explicit generics --------------------------------------------------
+
+#[test]
+fn type_parameters_may_be_named() {
+    assert_eq!(sig("fn id[T](x: T) T { return x; }", "id"), "fn(T) T");
+    assert_eq!(
+        sig("fn first[A, B](a: A, b: B) A { return a; }", "first"),
+        "fn(T, U) T"
+    );
+    assert_eq!(
+        sig("fn head[T](a: []T) T { return a[0]; }", "head"),
+        "fn([]T) T"
+    );
+}
+
+#[test]
+fn a_type_parameter_may_not_hide_a_type() {
+    assert_error(
+        "fn f[i64](x: i64) i64 { return x; }",
+        "`i64` is a primitive type",
+    );
+    assert_error(
+        "const P = struct { x: i64 }; fn f[P](x: P) P { return x; }",
+        "`P` is already a type",
+    );
+    assert_error(
+        "fn f[Number](x: Number) Number { return x; }",
+        "abstract type",
+    );
+    assert_error("fn f[T, T](x: T) T { return x; }", "declared twice");
+}
+
+#[test]
+fn a_recursive_generic_function_resolves() {
+    // The call to `pick` inside itself records no type arguments while the
+    // group is being inferred; they are filled in once it generalises.
+    let src = r#"
+        fn pick(x, again: bool) { if (again) { return pick(x, false); } return x; }
+    "#;
+    assert_eq!(sig(src, "pick"), "fn(T, bool) T");
+}
+
+// ---- generic structs ----------------------------------------------------
+
+#[test]
+fn generic_structs_carry_their_arguments() {
+    let src = r#"
+        const Box = struct[T] { value: T };
+        fn unwrap[T](b: Box[T]) T { return b.value; }
+        fn make() Box[i64] { return Box{ .value = 1 }; }
+    "#;
+    assert_eq!(sig(src, "unwrap"), "fn(Box[T]) T");
+    assert_eq!(sig(src, "make"), "fn() Box[i64]");
+}
+
+#[test]
+fn instantiations_are_related_only_to_themselves() {
+    // Struct subtyping ignores arguments only for the non-generic case; a
+    // `Box[i64]` is not a `Box[str]`.
+    assert_error(
+        "const Box = struct[T] { value: T };
+         fn f(b: Box[str]) str { return b.value; }
+         fn main() i64 { const x: Box[str] = Box{ .value = 1 }; return 0; }",
+        "type mismatch",
+    );
+}
+
+#[test]
+fn a_generic_struct_stands_outside_the_lattice() {
+    // Rejected by the parser, which is where the two halves are both in hand.
+    let (_, diags) = parse("const Base = struct { }; const Sub = struct[T] : Base { v: T };");
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.message.contains("cannot have a supertype")),
+        "{:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+
+    assert_error(
+        "const Box = struct[T] { value: T }; fn f(b: Box) i64 { return 0; }",
+        "takes 1 type argument",
+    );
+    assert_error("const Empty = struct[T] { };", "at least one field");
+}
+
+// ---- modules ------------------------------------------------------------
+
+#[test]
+fn the_status_lattice_lives_behind_a_module() {
+    // Unqualified, the status types are not in scope at all -- which is what
+    // the module system was for.
+    assert_error(
+        "fn f(s: Status4xx) i64 { return 4; }",
+        "unknown type `Status4xx`",
+    );
+    assert_eq!(
+        sig(
+            "const http = @import(\"std/http\");
+             fn f(s: http.Status4xx) i64 { return 4; }",
+            "f"
+        ),
+        "fn(Status4xx) i64"
+    );
+}
+
+#[test]
+fn an_import_is_a_module_rather_than_a_value() {
+    assert_error(
+        "const http = @import(\"std/http\");
+         fn main() i64 { print_int(http); return 0; }",
+        "is a module, not a value",
+    );
+    assert_error(
+        "const nope = @import(\"std/nope\");",
+        "cannot find module `std/nope`",
+    );
+    assert_error(
+        "fn main() i64 { const http = @import(\"std/http\"); return 0; }",
+        "only allowed at the top level",
+    );
+}
+
+#[test]
+fn a_local_shadows_an_imported_module() {
+    // Adding an import must not break code that already used the name.
+    assert_eq!(
+        sig(
+            "const http = @import(\"std/http\");
+             fn f() i64 { const http = 5; return http; }",
+            "f"
+        ),
+        "fn() i64"
+    );
+}
+
+// ---- the standard library ------------------------------------------------
+
+#[test]
+fn strings_can_be_compared() {
+    assert_eq!(
+        sig("fn same(a: str, b: str) bool { return a == b; }", "same"),
+        "fn(str, str) bool"
+    );
+    assert_error(
+        "const P = struct { x: i64 }; fn f(a: P, b: P) bool { return a == b; }",
+        "cannot be compared",
+    );
+}
+
+#[test]
+fn a_generic_builtin_is_instantiated_per_use() {
+    // `std/array.len` reads the count out of the header whatever the elements
+    // are, so one machine implementation serves both of these.
+    let src = r#"
+        const array = @import("std/array");
+        fn f() i64 { return array.len([]i64{ 1 }) + array.len([]str{ "a" }); }
+    "#;
+    assert_eq!(sig(src, "f"), "fn() i64");
 }

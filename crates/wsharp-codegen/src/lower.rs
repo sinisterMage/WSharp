@@ -15,12 +15,14 @@ use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, Variable};
 use cranelift_jit::JITModule;
 use cranelift_module::{DataId, FuncId, Module};
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
+use std::collections::HashMap;
 use wsharp_runtime::builtins::{
     BuiltinTy, PANIC_DIVIDE_BY_ZERO, PANIC_DIVIDE_OVERFLOW, PANIC_NO_METHOD, PANIC_UNWRAP_NULL,
 };
 use wsharp_runtime::header::{
-    FLAG_LOGGED, FLAG_SHIFT, META_OFFSET, TYPE_ID_INVALID, TYPE_ID_MASK, align_up,
+    AUX_OFFSET, FLAG_LOGGED, FLAG_SHIFT, HEADER_SIZE, META_OFFSET, TYPE_ID_INVALID, TYPE_ID_MASK,
+    align_up,
 };
 use wsharp_sema::hir;
 use wsharp_sema::layout;
@@ -28,8 +30,16 @@ use wsharp_sema::ty::{StructId, TyCon, Type, TypeStore};
 use wsharp_syntax::ast::{BinOp, UnOp};
 
 use crate::repr::{
-    self, ERROR_OK, ERROR_TAG, OPTION_NULL, OPTION_SOME, PTR, SlotTypes, Slots, error_tag_value,
+    self, ERROR_OK, ERROR_TAG, OPTION_NULL, OPTION_SOME, OPTION_TAG, PTR, SlotTypes, Slots,
+    error_tag_value,
 };
+
+/// Where a struct value's fields sit in memory, for one instantiation of it.
+struct StructShape {
+    type_id: u32,
+    size: u32,
+    fields: Vec<(u32, Type)>,
+}
 
 /// A closure object is a header, then the code pointer, then the captures.
 pub const CLOSURE_CODE_OFFSET: u32 = wsharp_runtime::HEADER_SIZE;
@@ -53,6 +63,14 @@ pub struct Decls {
     pub closure_type_ids: Vec<u32>,
     pub alloc: FuncId,
     pub panic: FuncId,
+    /// The out-of-bounds panic, which reports the index and the length.
+    pub panic_index: FuncId,
+    /// Runtime type id per array type and per generic-struct instantiation,
+    /// keyed by the type as rendered by `TypeStore::show`. Neither kind can be
+    /// numbered with the ordinary structs: an array's layout carries its
+    /// element stride, and an instantiation's is not known until
+    /// monomorphisation has picked its arguments.
+    pub instance_type_ids: HashMap<String, u32>,
     /// The write barrier's slow path.
     pub log_object: FuncId,
     /// The loop safepoint's slow path.
@@ -122,25 +140,41 @@ pub fn indirect_signature(store: &mut TypeStore, fn_ty: &Type, call_conv: CallCo
 pub fn builtin_signature(builtin: &wsharp_runtime::Builtin, call_conv: CallConv) -> Signature {
     let mut sig = Signature::new(call_conv);
     for param in builtin.params {
-        if let Some(p) = abi_of(*param) {
-            sig.params.push(p);
-        }
+        sig.params.extend(abi_slots(*param));
     }
-    if let Some(r) = abi_of(builtin.ret) {
-        sig.returns.push(r);
-    }
+    sig.returns.extend(abi_slots(builtin.ret));
     sig
 }
 
-fn abi_of(ty: BuiltinTy) -> Option<AbiParam> {
-    Some(match ty {
-        BuiltinTy::I64 => AbiParam::new(types::I64),
-        BuiltinTy::F64 => AbiParam::new(types::F64),
+/// The machine values a builtin's parameter or result occupies.
+///
+/// Several for a tagged type: `!str` is a tag and a pointer, matching the two
+/// words a `#[repr(C)]` pair is returned in. The tag is widened to a full word
+/// here and narrowed at the call, because the C ABI has no half-register.
+fn abi_slots(ty: BuiltinTy) -> SmallVec<[AbiParam; 2]> {
+    match ty {
+        BuiltinTy::Void => SmallVec::new(),
+        BuiltinTy::I64 | BuiltinTy::Var(_) => smallvec![AbiParam::new(types::I64)],
+        BuiltinTy::F64 => smallvec![AbiParam::new(types::F64)],
         // C promotes narrow integer arguments, so say so explicitly.
-        BuiltinTy::Bool => AbiParam::new(types::I8).uext(),
-        BuiltinTy::Str => AbiParam::new(PTR),
-        BuiltinTy::Void => return None,
-    })
+        BuiltinTy::Bool => smallvec![AbiParam::new(types::I8).uext()],
+        BuiltinTy::Str | BuiltinTy::Array(_) => smallvec![AbiParam::new(PTR)],
+        BuiltinTy::Optional(inner) | BuiltinTy::ErrUnion(inner) => {
+            let mut out: SmallVec<[AbiParam; 2]> = smallvec![AbiParam::new(types::I64)];
+            out.extend(abi_slots(*inner));
+            out
+        }
+    }
+}
+
+/// Whether a builtin's result is a tagged value whose tag crosses the boundary
+/// as a full word and has to be narrowed to the tag type W# uses.
+fn tag_type_of(ty: BuiltinTy) -> Option<ir::Type> {
+    match ty {
+        BuiltinTy::Optional(_) => Some(OPTION_TAG),
+        BuiltinTy::ErrUnion(_) => Some(ERROR_TAG),
+        _ => None,
+    }
 }
 
 struct LoopCtx {
@@ -369,15 +403,33 @@ impl Trans<'_, '_> {
     /// barrier would then lose those references entirely, and the objects they
     /// point at would be freed while still in use.
     fn emit_store_field(&mut self, obj: ir::Value, offset: u32, ty: &Type, values: &[ir::Value]) {
+        self.store_slots(obj, obj, offset, ty, values);
+    }
+
+    /// The single place generated code writes a value into a heap object, and
+    /// so the single place the collector's write barrier lives.
+    ///
+    /// `owner` is the object the barrier logs and `base` is the address written
+    /// to. They are the same for a field. For an array element they are not:
+    /// the address is inside the object, and logging *it* would set the flag on
+    /// whatever bytes happen to sit at that offset.
+    fn store_slots(
+        &mut self,
+        owner: ir::Value,
+        base: ir::Value,
+        offset: u32,
+        ty: &Type,
+        values: &[ir::Value],
+    ) {
         // Only a store that can create a heap-to-heap reference needs logging;
         // overwriting an `i64` field changes no one's reference count.
         if !repr::pointer_slots(self.store, ty).is_empty() {
-            self.emit_log_barrier(obj);
+            self.emit_log_barrier(owner);
         }
         let flags = MemFlagsData::trusted();
         for (i, value) in values.iter().enumerate() {
             let off = (offset + i as u32 * layout::SLOT_SIZE) as i32;
-            self.b.ins().store(flags, *value, obj, off);
+            self.b.ins().store(flags, *value, base, off);
         }
     }
 
@@ -458,15 +510,23 @@ impl Trans<'_, '_> {
         self.switch(done);
     }
 
-    /// Call the runtime allocator. Every heap object in the language is born
-    /// here, which is what makes the collector a drop-in replacement later.
+    /// Call the runtime allocator for an object of a size known here. Every
+    /// heap object in the language is born through one of these two, which is
+    /// what makes the collector a drop-in replacement later.
     fn alloc(&mut self, type_id: u32, size: u32) -> ir::Value {
+        let size = self.b.ins().iconst(types::I64, align_up(size) as i64);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        self.alloc_raw(type_id, size, zero)
+    }
+
+    /// The allocator with a computed size and element count, for an object
+    /// whose length is not known until it runs: an array.
+    fn alloc_raw(&mut self, type_id: u32, size: ir::Value, aux: ir::Value) -> ir::Value {
         let func = self
             .module
             .declare_func_in_func(self.decls.alloc, self.b.func);
         let id = self.b.ins().iconst(types::I32, type_id as i64);
-        let size = self.b.ins().iconst(types::I64, align_up(size) as i64);
-        let call = self.b.ins().call(func, &[id, size]);
+        let call = self.b.ins().call(func, &[id, size, aux]);
         self.b.inst_results(call)[0]
     }
 
@@ -580,9 +640,20 @@ impl Trans<'_, '_> {
                         obj, strukt, index, ..
                     } => {
                         let ptr = self.expr(obj)[0];
-                        let field = &self.program.strukt(*strukt).fields[*index as usize];
-                        let (offset, ty) = (field.offset, field.ty.clone());
+                        let obj_ty = obj.ty.clone();
+                        let shape = self.struct_shape(&obj_ty, *strukt);
+                        let (offset, ty) = shape.fields[*index as usize].clone();
                         self.emit_store_field(ptr, offset, &ty, &values);
+                    }
+                    hir::Place::Index { arr, index } => {
+                        let array = self.expr(arr)[0];
+                        let i = self.expr(index)[0];
+                        let elem_ty = self.element_type(&arr.ty);
+                        let stride = layout::size_of(self.store, &elem_ty);
+                        let addr = self.elem_addr(array, i, stride);
+                        // The barrier logs the array, not the element's
+                        // address: the flag lives in the object's header.
+                        self.store_slots(array, addr, 0, &elem_ty, &values);
                     }
                 }
             }
@@ -789,6 +860,21 @@ impl Trans<'_, '_> {
             hir::ExprKind::Binary { op, lhs, rhs } => {
                 let l = self.expr(lhs)[0];
                 let r = self.expr(rhs)[0];
+                // `==` on strings compares contents, which is a call rather
+                // than an instruction. Emitted here rather than turned into a
+                // library call by inference, because nothing in inference
+                // synthesises a call and this is the only place that would.
+                if matches!(op, BinOp::Eq | BinOp::Ne)
+                    && matches!(self.store.resolve(&lhs.ty), Type::Con(TyCon::Str, _))
+                {
+                    let equal = self.call_str_eq(l, r);
+                    let result = if *op == BinOp::Ne {
+                        self.b.ins().bxor_imm_u(equal, 1)
+                    } else {
+                        equal
+                    };
+                    return SmallVec::from_slice(&[result]);
+                }
                 let is_float = self.b.func.dfg.value_type(l) == types::F64;
                 SmallVec::from_slice(&[self.binary(*op, l, r, is_float)])
             }
@@ -804,14 +890,41 @@ impl Trans<'_, '_> {
 
             hir::ExprKind::Call { callee, args } => self.call(&expr.ty, callee, args),
 
-            hir::ExprKind::StructNew { strukt, fields } => self.struct_new(*strukt, fields),
+            hir::ExprKind::StructNew { strukt, fields } => {
+                let ty = expr.ty.clone();
+                self.struct_new(&ty, *strukt, fields)
+            }
+
+            hir::ExprKind::ArrayNew { elems } => {
+                let ty = expr.ty.clone();
+                self.array_new(&ty, elems)
+            }
+
+            hir::ExprKind::ArrayLen { arr } => {
+                let array = self.expr(arr)[0];
+                let len = self
+                    .b
+                    .ins()
+                    .load(types::I64, MemFlagsData::trusted(), array, AUX_OFFSET);
+                SmallVec::from_slice(&[len])
+            }
+
+            hir::ExprKind::Index { arr, index } => {
+                let array = self.expr(arr)[0];
+                let i = self.expr(index)[0];
+                let elem_ty = self.element_type(&arr.ty);
+                let stride = layout::size_of(self.store, &elem_ty);
+                let addr = self.elem_addr(array, i, stride);
+                self.load_at(addr, 0, &elem_ty)
+            }
 
             hir::ExprKind::Field {
                 obj, strukt, index, ..
             } => {
                 let ptr = self.expr(obj)[0];
-                let field = &self.program.strukt(*strukt).fields[*index as usize];
-                let (offset, ty) = (field.offset, field.ty.clone());
+                let obj_ty = obj.ty.clone();
+                let shape = self.struct_shape(&obj_ty, *strukt);
+                let (offset, ty) = shape.fields[*index as usize].clone();
                 self.load_at(ptr, offset, &ty)
             }
 
@@ -1092,6 +1205,22 @@ impl Trans<'_, '_> {
                 self.b.inst_results(call).iter().copied().collect()
             }
 
+            // The array constructor is lowered here rather than called: the
+            // element type is what gives the stride and the type id to stamp,
+            // and only this call site knows it.
+            hir::Callee::Builtin(id)
+                if {
+                    let builtins = wsharp_runtime::builtins();
+                    let b = &builtins[*id as usize];
+                    b.module == wsharp_runtime::builtins::ARRAY_MODULE
+                        && b.name == wsharp_runtime::builtins::ARRAY_NEW
+                } =>
+            {
+                let ty = ty.clone();
+                let len = self.expr(&args[0])[0];
+                self.array_alloc(&ty, len)
+            }
+
             hir::Callee::Builtin(id) => {
                 let clif = self.decls.builtins[*id as usize];
                 let fr = self.module.declare_func_in_func(clif, self.b.func);
@@ -1100,7 +1229,16 @@ impl Trans<'_, '_> {
                     values.extend(self.expr(arg));
                 }
                 let call = self.b.ins().call(fr, &values);
-                self.b.inst_results(call).iter().copied().collect()
+                let mut out: Slots = self.b.inst_results(call).iter().copied().collect();
+                // A tagged result arrives with its tag in a whole word; W#
+                // keeps it in a narrower one, so bring it back.
+                let builtins = wsharp_runtime::builtins();
+                if let Some(tag) = tag_type_of(builtins[*id as usize].ret)
+                    && let Some(first) = out.first_mut()
+                {
+                    *first = self.b.ins().ireduce(tag, *first);
+                }
+                out
             }
 
             hir::Callee::Indirect(target) => {
@@ -1240,24 +1378,178 @@ impl Trans<'_, '_> {
         self.jump_to(done, &block_args);
     }
 
-    fn struct_new(&mut self, strukt: StructId, fields: &[hir::Expr]) -> Slots {
+    fn struct_new(&mut self, ty: &Type, strukt: StructId, fields: &[hir::Expr]) -> Slots {
         // Evaluate the field values first, so nothing can allocate while a
         // partly initialised object is live.
         let values: Vec<Slots> = fields.iter().map(|f| self.expr(f)).collect();
 
-        let def = self.program.strukt(strukt);
-        let (type_id, size) = (def.type_id, def.size);
-        let layouts: Vec<(u32, Type)> = def
-            .fields
-            .iter()
-            .map(|f| (f.offset, f.ty.clone()))
-            .collect();
-
-        let ptr = self.alloc(type_id, size);
-        for ((offset, ty), value) in layouts.iter().zip(&values) {
+        let shape = self.struct_shape(ty, strukt);
+        let ptr = self.alloc(shape.type_id, shape.size);
+        for ((offset, ty), value) in shape.fields.iter().zip(&values) {
             self.emit_store_field(ptr, *offset, ty, value);
         }
         SmallVec::from_slice(&[ptr])
+    }
+
+    /// Where a struct value's fields sit, and what type id its instances carry.
+    ///
+    /// A non-generic struct has all of this from inference. A generic one
+    /// cannot: `Box[?i64]` and `Box[i64]` put their second field in different
+    /// places, because the width of a `?T` field depends on `T`. So the
+    /// offsets are recomputed here, where monomorphisation has made every type
+    /// concrete, through the same `layout::place` inference used.
+    fn struct_shape(&mut self, ty: &Type, strukt: StructId) -> StructShape {
+        let def = self.program.strukt(strukt);
+        if def.params.is_empty() {
+            return StructShape {
+                type_id: def.type_id,
+                size: def.size,
+                fields: def
+                    .fields
+                    .iter()
+                    .map(|f| (f.offset, f.ty.clone()))
+                    .collect(),
+            };
+        }
+        let field_types = crate::instance_field_types(self.store, def, ty);
+        let (offsets, end) = layout::place(self.store, &field_types, HEADER_SIZE);
+        StructShape {
+            type_id: self.instance_type_id(ty),
+            size: align_up(end),
+            fields: offsets.into_iter().zip(field_types).collect(),
+        }
+    }
+
+    /// The runtime type id of an array type or a generic struct instantiation.
+    fn instance_type_id(&mut self, ty: &Type) -> u32 {
+        let key = self.store.show(ty);
+        *self
+            .decls
+            .instance_type_ids
+            .get(&key)
+            .unwrap_or_else(|| panic!("no type id registered for `{key}`"))
+    }
+
+    // -----------------------------------------------------------------------
+    // Arrays
+    // -----------------------------------------------------------------------
+
+    /// The element type of `[]T`.
+    fn element_type(&mut self, array_ty: &Type) -> Type {
+        match self.store.resolve(array_ty) {
+            Type::Con(TyCon::Array, args) => args[0].clone(),
+            other => unreachable!("`{}` is not an array", self.store.show(&other)),
+        }
+    }
+
+    /// `[]T{ a, b, c }`: allocate, then fill.
+    ///
+    /// The length is written by `ws_alloc` itself, before the safepoint inside
+    /// it -- an object claiming to be a bare header would be stepped through by
+    /// a heap walk that ran there.
+    fn array_new(&mut self, array_ty: &Type, elems: &[hir::Expr]) -> Slots {
+        // Evaluate the elements first, so nothing can allocate while a partly
+        // initialised object is live. This is what `struct_new` does, and for
+        // the same reason.
+        let values: Vec<Slots> = elems.iter().map(|e| self.expr(e)).collect();
+
+        let elem_ty = self.element_type(array_ty);
+        let stride = layout::size_of(self.store, &elem_ty);
+        let type_id = self.instance_type_id(array_ty);
+        let count = elems.len() as u32;
+
+        let size = self
+            .b
+            .ins()
+            .iconst(types::I64, align_up(HEADER_SIZE + count * stride) as i64);
+        let aux = self.b.ins().iconst(types::I64, count as i64);
+        let ptr = self.alloc_raw(type_id, size, aux);
+
+        for (i, value) in values.iter().enumerate() {
+            let offset = HEADER_SIZE + i as u32 * stride;
+            // An initialising store takes the barrier too: `ws_alloc` is a
+            // call, hence a safepoint, and a collection there clears the
+            // logged bit before these run.
+            self.store_slots(ptr, ptr, offset, &elem_ty, value);
+        }
+        SmallVec::from_slice(&[ptr])
+    }
+
+    /// Whether two strings hold the same bytes.
+    fn call_str_eq(&mut self, a: ir::Value, b: ir::Value) -> ir::Value {
+        let builtins = wsharp_runtime::builtins();
+        let id = builtins
+            .iter()
+            .position(|x| x.module == wsharp_runtime::builtins::STR_MODULE && x.name == "eq")
+            .expect("`std/str.eq` is in the builtin table");
+        let clif = self.decls.builtins[id];
+        let fr = self.module.declare_func_in_func(clif, self.b.func);
+        let call = self.b.ins().call(fr, &[a, b]);
+        self.b.inst_results(call)[0]
+    }
+
+    /// An array of `len` elements, zeroed.
+    ///
+    /// Only the standard library reaches this, through `std/array.new`: the
+    /// elements read as null until they are written, which is a hole in the
+    /// type system that the library closes before returning. The collector is
+    /// untroubled either way -- a null is not a reference -- and this is the
+    /// same zeroed state every fresh object starts in.
+    fn array_alloc(&mut self, array_ty: &Type, len: ir::Value) -> Slots {
+        let elem_ty = self.element_type(array_ty);
+        let stride = layout::size_of(self.store, &elem_ty);
+        let type_id = self.instance_type_id(array_ty);
+
+        let bytes = self.b.ins().imul_imm_s(len, stride as i64);
+        let bytes = self.b.ins().iadd_imm_s(bytes, HEADER_SIZE as i64);
+        // `align_up` as emitted code, because the size is not known here.
+        let bytes = self
+            .b
+            .ins()
+            .iadd_imm_s(bytes, wsharp_runtime::header::ALIGN as i64 - 1);
+        let size = self
+            .b
+            .ins()
+            .band_imm_u(bytes, !(wsharp_runtime::header::ALIGN as i64 - 1));
+        let ptr = self.alloc_raw(type_id, size, len);
+        SmallVec::from_slice(&[ptr])
+    }
+
+    /// The address of `arr[index]`, having checked that there is one.
+    fn elem_addr(&mut self, arr: ir::Value, index: ir::Value, stride: u32) -> ir::Value {
+        self.check_bounds(arr, index);
+        let offset = self.b.ins().imul_imm_s(index, stride as i64);
+        let offset = self.b.ins().iadd_imm_s(offset, HEADER_SIZE as i64);
+        self.b.ins().iadd(arr, offset)
+    }
+
+    /// Panic unless `index` is a valid index into `arr`.
+    ///
+    /// One *unsigned* compare against the length, which rejects a negative
+    /// index in the same instruction: as a `u64`, `-1` is enormous.
+    fn check_bounds(&mut self, arr: ir::Value, index: ir::Value) {
+        let len = self
+            .b
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), arr, AUX_OFFSET);
+        let ok = self
+            .b
+            .ins()
+            .icmp(ir::condcodes::IntCC::UnsignedLessThan, index, len);
+        let in_bounds = self.b.create_block();
+        let out_of_bounds = self.b.create_block();
+        self.brif(ok, in_bounds, NO_ARGS, out_of_bounds, NO_ARGS);
+
+        self.switch(out_of_bounds);
+        let func = self
+            .module
+            .declare_func_in_func(self.decls.panic_index, self.b.func);
+        self.b.ins().call(func, &[index, len]);
+        // `ws_panic_index` never returns; the jump is only here to terminate
+        // the block, as the other panic sites do.
+        self.jump_to(in_bounds, NO_ARGS);
+
+        self.switch(in_bounds);
     }
 
     fn closure(&mut self, func: hir::FuncId, captures: &[hir::Expr]) -> Slots {

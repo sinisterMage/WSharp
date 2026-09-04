@@ -10,6 +10,7 @@
 pub mod lower;
 pub mod repr;
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use cranelift_codegen::ir;
@@ -23,7 +24,7 @@ use wsharp_runtime::header::{FLAG_IMMORTAL, TYPE_ID_FIRST_USER, TYPE_ID_STR, ali
 use wsharp_runtime::stackwalk::{FunctionCode, SafePoint};
 use wsharp_sema::hir;
 use wsharp_sema::layout;
-use wsharp_sema::ty::TypeStore;
+use wsharp_sema::ty::{TyCon, Type, TypeStore};
 
 pub use lower::Options;
 
@@ -117,7 +118,7 @@ pub fn compile(
     }
     let builtins = wsharp_runtime::builtins();
     for builtin in &builtins {
-        jit_builder.symbol(builtin.name, builtin.ptr);
+        jit_builder.symbol(builtin.symbol(), builtin.ptr);
     }
 
     let mut module = JITModule::new(jit_builder);
@@ -125,6 +126,10 @@ pub fn compile(
 
     register_layouts(program, store);
     let closure_type_ids = register_closure_layouts(program, store);
+    // Arrays and generic instantiations continue past the closures, which
+    // continue past the structs.
+    let array_base = TYPE_ID_FIRST_USER + program.structs.len() as u32 + program.funcs.len() as u32;
+    let instance_type_ids = register_instance_layouts(program, store, array_base);
     // Freeze the registry now that every type is in it: from here the collector
     // reads layouts with no lock, which is what makes tracing affordable.
     wsharp_runtime::publish();
@@ -136,6 +141,7 @@ pub fn compile(
         &builtins,
         call_conv,
         closure_type_ids,
+        instance_type_ids,
     )?;
 
     let mut clif = String::new();
@@ -241,6 +247,11 @@ fn register_stack_maps(
 /// instances without knowing anything about W# types.
 fn register_layouts(program: &hir::Program, store: &mut TypeStore) {
     for def in &program.structs {
+        // A generic struct has no instances of its own; each instantiation is
+        // registered separately, with the offsets its arguments imply.
+        if !def.params.is_empty() {
+            continue;
+        }
         let mut ptr_offsets = Vec::new();
         for field in &def.fields {
             let ty = field.ty.clone();
@@ -248,12 +259,246 @@ fn register_layouts(program: &hir::Program, store: &mut TypeStore) {
         }
         wsharp_runtime::register_type(
             def.type_id,
-            TypeLayout {
-                name: def.name.clone(),
-                size: def.size,
-                ptr_offsets,
-            },
+            TypeLayout::fixed(def.name.clone(), def.size, ptr_offsets),
         );
+    }
+}
+
+/// The field types of one instantiation of a generic struct, with its
+/// arguments substituted for the parameters the declaration wrote.
+///
+/// The identity for a non-generic struct, which is every struct until one is
+/// declared `struct[T]`.
+pub(crate) fn instance_field_types(
+    store: &mut TypeStore,
+    def: &hir::StructDef,
+    ty: &Type,
+) -> Vec<Type> {
+    let args = match store.resolve(ty) {
+        Type::Con(TyCon::Struct(_), args) => args,
+        _ => Vec::new(),
+    };
+    if def.params.len() != args.len() {
+        return def.fields.iter().map(|f| f.ty.clone()).collect();
+    }
+    let subst: HashMap<_, _> = def.params.iter().copied().zip(args).collect();
+    def.fields
+        .iter()
+        .map(|f| store.subst_vars(&f.ty, &subst))
+        .collect()
+}
+
+/// Give every array type and every generic-struct instantiation in the program
+/// a runtime type id and a layout, so the collector can trace one.
+///
+/// Neither can be numbered with the ordinary structs. An array needs one id per
+/// `[]T` rather than one for all arrays, because the layout is what carries the
+/// element stride and where a reference sits inside an element -- `[]i64` and
+/// `[]?str` are traced quite differently. A generic struct's instantiations are
+/// not known until monomorphisation has picked their arguments, which is after
+/// the lattice has been numbered; they take ids from above it, which is sound
+/// because a generic struct stands outside the lattice and so is never the
+/// subject of a range test.
+fn register_instance_layouts(
+    program: &hir::Program,
+    store: &mut TypeStore,
+    base: u32,
+) -> HashMap<String, u32> {
+    let mut ids = HashMap::new();
+    for ty in collect_instance_types(program, store) {
+        let key = store.show(&ty);
+        if ids.contains_key(&key) {
+            continue;
+        }
+        let type_id = base + ids.len() as u32;
+        let layout = match store.resolve(&ty) {
+            Type::Con(TyCon::Array, args) => {
+                let (stride, elem_ptr_offsets) = layout::elem_layout(store, &args[0]);
+                TypeLayout::elements(key.clone(), stride, elem_ptr_offsets)
+            }
+            Type::Con(TyCon::Struct(id), _) => {
+                let def = program.strukt(id).clone();
+                let field_types = instance_field_types(store, &def, &ty);
+                let (offsets, end) =
+                    layout::place(store, &field_types, wsharp_runtime::HEADER_SIZE);
+                let mut ptr_offsets = Vec::new();
+                for (offset, field_ty) in offsets.iter().zip(&field_types) {
+                    layout::ptr_offsets(store, field_ty, *offset, &mut ptr_offsets);
+                }
+                TypeLayout::fixed(key.clone(), align_up(end), ptr_offsets)
+            }
+            other => unreachable!("`{}` is not an instance type", store.show(&other)),
+        };
+        wsharp_runtime::register_type(type_id, layout);
+        ids.insert(key, type_id);
+    }
+    ids
+}
+
+/// Every array type and generic-struct instantiation mentioned anywhere in the
+/// program, in a deterministic order so the ids do not depend on hashing.
+///
+/// Expression types are visited as well as declarations: monomorphisation
+/// makes every intermediate type concrete, and `f(g())[0]` mentions an array
+/// type that no local and no signature does.
+fn collect_instance_types(program: &hir::Program, store: &mut TypeStore) -> Vec<Type> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |store: &mut TypeStore, ty: &Type, out: &mut Vec<Type>| {
+        collect_instances_in(store, ty, out, &mut seen)
+    };
+    for def in &program.structs {
+        for field in &def.fields {
+            let ty = field.ty.clone();
+            push(store, &ty, &mut out);
+        }
+    }
+    for func in &program.funcs {
+        let ret = func.ret.clone();
+        push(store, &ret, &mut out);
+        for local in &func.locals {
+            let ty = local.ty.clone();
+            push(store, &ty, &mut out);
+        }
+        let mut types = Vec::new();
+        types_in_block(&func.body, &mut types);
+        for ty in types {
+            push(store, &ty, &mut out);
+        }
+    }
+    out
+}
+
+/// Add every array type and generic-struct instantiation inside `ty`,
+/// innermost first, so `[][]i64` registers `[]i64` as well as itself.
+fn collect_instances_in(
+    store: &mut TypeStore,
+    ty: &Type,
+    out: &mut Vec<Type>,
+    seen: &mut HashSet<String>,
+) {
+    let resolved = store.resolve(ty);
+    let Type::Con(con, args) = resolved.clone() else {
+        return;
+    };
+    for arg in &args {
+        collect_instances_in(store, arg, out, seen);
+    }
+    let is_instance = match con {
+        TyCon::Array => true,
+        // A struct with arguments is an instantiation of a generic one.
+        TyCon::Struct(_) => !args.is_empty(),
+        _ => false,
+    };
+    if is_instance && seen.insert(store.show(&resolved)) {
+        out.push(resolved);
+    }
+}
+
+fn types_in_block(block: &hir::Block, out: &mut Vec<Type>) {
+    for stmt in &block.stmts {
+        types_in_stmt(stmt, out);
+    }
+}
+
+fn types_in_stmt(stmt: &hir::Stmt, out: &mut Vec<Type>) {
+    match stmt {
+        hir::Stmt::Let { init, .. } => types_in_expr(init, out),
+        hir::Stmt::Assign { place, value } => {
+            match place {
+                hir::Place::Field { obj, .. } => types_in_expr(obj, out),
+                hir::Place::Index { arr, index } => {
+                    types_in_expr(arr, out);
+                    types_in_expr(index, out);
+                }
+                hir::Place::Local(_) => {}
+            }
+            types_in_expr(value, out);
+        }
+        hir::Stmt::Expr(e) | hir::Stmt::Return(Some(e)) => types_in_expr(e, out),
+        hir::Stmt::Return(None) | hir::Stmt::Break | hir::Stmt::Continue => {}
+        hir::Stmt::If {
+            cond, then, els, ..
+        } => {
+            types_in_expr(cond, out);
+            types_in_block(then, out);
+            if let Some(els) = els {
+                types_in_block(els, out);
+            }
+        }
+        hir::Stmt::While {
+            cond, cont, body, ..
+        } => {
+            types_in_expr(cond, out);
+            if let Some(cont) = cont {
+                types_in_stmt(cont, out);
+            }
+            types_in_block(body, out);
+        }
+        hir::Stmt::Block(b) => types_in_block(b, out),
+    }
+}
+
+fn types_in_expr(expr: &hir::Expr, out: &mut Vec<Type>) {
+    out.push(expr.ty.clone());
+    match &expr.kind {
+        hir::ExprKind::Unary { expr, .. }
+        | hir::ExprKind::Some(expr)
+        | hir::ExprKind::Ok(expr)
+        | hir::ExprKind::Try(expr)
+        | hir::ExprKind::Unwrap(expr)
+        | hir::ExprKind::Field { obj: expr, .. } => types_in_expr(expr, out),
+        hir::ExprKind::Binary { lhs, rhs, .. } | hir::ExprKind::Logical { lhs, rhs, .. } => {
+            types_in_expr(lhs, out);
+            types_in_expr(rhs, out);
+        }
+        hir::ExprKind::Orelse { expr, alt } | hir::ExprKind::Catch { expr, alt, .. } => {
+            types_in_expr(expr, out);
+            types_in_expr(alt, out);
+        }
+        hir::ExprKind::Call { callee, args } => {
+            if let hir::Callee::Indirect(e) = callee {
+                types_in_expr(e, out);
+            }
+            for arg in args {
+                types_in_expr(arg, out);
+            }
+        }
+        hir::ExprKind::StructNew { fields, .. } => {
+            for f in fields {
+                types_in_expr(f, out);
+            }
+        }
+        hir::ExprKind::ArrayNew { elems } => {
+            for e in elems {
+                types_in_expr(e, out);
+            }
+        }
+        hir::ExprKind::Index { arr, index } => {
+            types_in_expr(arr, out);
+            types_in_expr(index, out);
+        }
+        hir::ExprKind::ArrayLen { arr } => types_in_expr(arr, out),
+        hir::ExprKind::If {
+            cond, then, els, ..
+        } => {
+            types_in_expr(cond, out);
+            types_in_expr(then, out);
+            types_in_expr(els, out);
+        }
+        hir::ExprKind::Closure { captures, .. } => {
+            for c in captures {
+                types_in_expr(c, out);
+            }
+        }
+        hir::ExprKind::Int(_)
+        | hir::ExprKind::Float(_)
+        | hir::ExprKind::Bool(_)
+        | hir::ExprKind::Str(_)
+        | hir::ExprKind::Null
+        | hir::ExprKind::Local(_)
+        | hir::ExprKind::Singleton(_)
+        | hir::ExprKind::Err(_) => {}
     }
 }
 
@@ -278,11 +523,7 @@ fn register_closure_layouts(program: &hir::Program, store: &mut TypeStore) -> Ve
         let what = if func.is_closure { "closure" } else { "fn" };
         wsharp_runtime::register_type(
             type_id,
-            TypeLayout {
-                name: format!("{what} {}", func.name),
-                size,
-                ptr_offsets,
-            },
+            TypeLayout::fixed(format!("{what} {}", func.name), size, ptr_offsets),
         );
         ids.push(type_id);
     }
@@ -296,6 +537,7 @@ fn declare_all(
     builtins: &[wsharp_runtime::Builtin],
     call_conv: CallConv,
     closure_type_ids: Vec<u32>,
+    instance_type_ids: HashMap<String, u32>,
 ) -> Result<lower::Decls, CodegenError> {
     // Monomorphisation produces several functions with the same source name, so
     // the linkage name carries the index too.
@@ -313,7 +555,7 @@ fn declare_all(
     for builtin in builtins {
         let sig = lower::builtin_signature(builtin, call_conv);
         let id = module
-            .declare_function(builtin.name, Linkage::Import, &sig)
+            .declare_function(&builtin.symbol(), Linkage::Import, &sig)
             .map_err(|e| err(&format!("could not declare builtin `{}`", builtin.name), e))?;
         builtin_ids.push(id);
     }
@@ -322,6 +564,8 @@ fn declare_all(
     alloc_sig
         .params
         .push(ir::AbiParam::new(ir::types::I32).uext());
+    alloc_sig.params.push(ir::AbiParam::new(ir::types::I64));
+    // The element count, written into `aux` before the allocator's safepoint.
     alloc_sig.params.push(ir::AbiParam::new(ir::types::I64));
     alloc_sig.returns.push(ir::AbiParam::new(repr::PTR));
     let alloc = module
@@ -333,6 +577,19 @@ fn declare_all(
     let panic = module
         .declare_function("ws_panic", Linkage::Import, &panic_sig)
         .map_err(|e| err("could not declare `ws_panic`", e))?;
+
+    // The out-of-bounds panic takes the index and the length, so that the
+    // message can name them.
+    let mut panic_index_sig = ir::Signature::new(call_conv);
+    panic_index_sig
+        .params
+        .push(ir::AbiParam::new(ir::types::I64));
+    panic_index_sig
+        .params
+        .push(ir::AbiParam::new(ir::types::I64));
+    let panic_index = module
+        .declare_function("ws_panic_index", Linkage::Import, &panic_index_sig)
+        .map_err(|e| err("could not declare `ws_panic_index`", e))?;
 
     // The write barrier's slow path, called only the first time an object is
     // modified in a collection cycle.
@@ -371,8 +628,10 @@ fn declare_all(
         strings,
         singletons,
         closure_type_ids,
+        instance_type_ids,
         alloc,
         panic,
+        panic_index,
         log_object,
         gc_poll,
         resolve,

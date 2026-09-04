@@ -59,7 +59,13 @@ impl Printer {
                     .iter()
                     .map(|f| format!(" ({} {})", f.name, ty(&f.ty)))
                     .collect();
-                self.line(&format!("(struct {}{}{}", s.name, parent, fields));
+                self.line(&format!(
+                    "(struct {}{}{}{}",
+                    s.name,
+                    generics(&s.generics),
+                    parent,
+                    fields
+                ));
                 self.push_close();
             }
             Item::Const(c) => {
@@ -71,7 +77,12 @@ impl Printer {
                 self.push_close();
             }
             Item::Fn(f) => {
-                self.line(&format!("(fn {} {}", f.name, sig(&f.func)));
+                self.line(&format!(
+                    "(fn {}{} {}",
+                    f.name,
+                    generics(&f.generics),
+                    sig(&f.func)
+                ));
                 self.indent += 1;
                 self.stmts(&f.func.body);
                 self.indent -= 1;
@@ -151,6 +162,16 @@ impl Printer {
                 self.nested(&w.body);
                 self.push_close();
             }
+
+            Stmt::For(f) => {
+                let cap = match &f.index {
+                    Some(index) => format!(" |{} {}|", f.value, index),
+                    None => format!(" |{}|", f.value),
+                };
+                self.line(&format!("(for {}{}", expr(&f.iter), cap));
+                self.nested(&f.body);
+                self.push_close();
+            }
         }
     }
 
@@ -185,6 +206,15 @@ impl Printer {
     }
 }
 
+/// ` [T U]` for a declaration's type parameters, or nothing when it has none.
+fn generics(names: &[crate::span::Ident]) -> String {
+    if names.is_empty() {
+        return String::new();
+    }
+    let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+    format!(" [{}]", names.join(" "))
+}
+
 fn sig(f: &Func) -> String {
     let params: Vec<String> = f
         .params
@@ -205,6 +235,17 @@ fn sig(f: &Func) -> String {
 fn ty(t: &TypeExpr) -> String {
     match t {
         TypeExpr::Named(id) => id.to_string(),
+        TypeExpr::Array { elem, .. } => format!("[]{}", ty(elem)),
+        TypeExpr::Path { segments, args, .. } => {
+            let path: Vec<String> = segments.iter().map(|s| s.to_string()).collect();
+            let path = path.join(".");
+            if args.is_empty() {
+                path
+            } else {
+                let args: Vec<String> = args.iter().map(ty).collect();
+                format!("{path}[{}]", args.join(", "))
+            }
+        }
         TypeExpr::Optional { inner, .. } => format!("?{}", ty(inner)),
         TypeExpr::ErrUnion { inner, .. } => format!("!{}", ty(inner)),
         TypeExpr::Fn { params, ret, .. } => {
@@ -242,12 +283,19 @@ pub fn expr(e: &Expr) -> String {
             format!("({})", parts.join(" "))
         }
         Expr::Field { obj, name, .. } => format!("(. {} {})", expr(obj), name),
-        Expr::StructLit { name, fields, .. } => {
+        Expr::ArrayLit { elem, elems, .. } => {
+            let es: Vec<String> = elems.iter().map(expr).collect();
+            format!("(array {} {})", ty(elem), es.join(" "))
+        }
+        Expr::Index { obj, index, .. } => format!("(index {} {})", expr(obj), expr(index)),
+        Expr::Import { path, .. } => format!("(import {path:?})"),
+        Expr::StructLit { path, fields, .. } => {
             let fs: Vec<String> = fields
                 .iter()
                 .map(|f| format!("({} {})", f.name, expr(&f.value)))
                 .collect();
-            format!("(lit {} {})", name, fs.join(" "))
+            let path: Vec<String> = path.iter().map(|p| p.to_string()).collect();
+            format!("(lit {} {})", path.join("."), fs.join(" "))
         }
         Expr::Fn(f) => format!("(fn {} ...)", sig(f)),
         Expr::If(i) => {

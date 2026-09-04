@@ -294,3 +294,78 @@ fn a_whole_program_parses() {
     );
     assert_eq!(module.items.len(), 5);
 }
+
+// ---- arrays, generics and modules ---------------------------------------
+
+#[test]
+fn array_types_literals_and_indexing() {
+    assert_eq!(
+        body("const a = []i64{ 1, 2 };"),
+        "(const a (array i64 1 2))"
+    );
+    assert_eq!(body("const x = a[0];"), "(const x (index a 0))");
+    // Indexing is postfix, so it chains with calls and fields.
+    assert_eq!(
+        body("const x = f()[0].y;"),
+        "(const x (. (index (call f) 0) y))"
+    );
+    // `a[i] = v` is a place, and so is a compound assignment to one.
+    assert_eq!(body("a[1] = 2;"), "(assign (index a 1) 2)");
+    assert_eq!(body("a[1] += 2;"), "(assign+ (index a 1) 2)");
+    // `[]T` nests, and a return type may be one: type syntax never starts
+    // with `{`, so the body is still unambiguous.
+    let dump = ast("fn f(a: [][]str) []i64 { return a2; }");
+    assert!(dump.contains("(a [][]str)"), "{dump}");
+    assert!(dump.contains("(ret []i64)"), "{dump}");
+}
+
+#[test]
+fn for_loops_bind_a_value_and_an_index() {
+    assert_eq!(
+        body("for (xs) |x| { print(x); }"),
+        "(for xs |x|\n  (block\n    (call print x)))"
+    );
+    assert_eq!(
+        body("for (xs) |x, i| { print(i); }"),
+        "(for xs |x i|\n  (block\n    (call print i)))"
+    );
+}
+
+#[test]
+fn type_parameters_are_declared_in_brackets() {
+    let dump = ast("fn first[T, U](a: T, b: U) T { return a; }");
+    assert!(dump.contains("(fn first [T U]"), "{dump}");
+
+    let dump = ast("const Box = struct[T] { value: T };");
+    assert!(dump.contains("(struct Box [T] (value T))"), "{dump}");
+
+    // In a type, arguments follow the name; in an expression they do not, so
+    // `Box[i64]` cannot be confused with indexing `Box`.
+    let dump = ast("fn f(b: Box[i64]) void { }");
+    assert!(dump.contains("(b Box[i64])"), "{dump}");
+}
+
+#[test]
+fn imports_and_qualified_names() {
+    let dump = ast("const http = @import(\"std/http\");");
+    assert!(
+        dump.contains("(const http (import \"std/http\"))"),
+        "{dump}"
+    );
+
+    // A path in type position, and a struct literal reached through a module.
+    let dump = ast("fn f(s: http.Status4xx) void { const p = util.Point{ .x = 1 }; }");
+    assert!(dump.contains("(s http.Status4xx)"), "{dump}");
+    assert!(dump.contains("(lit util.Point (x 1))"), "{dump}");
+}
+
+#[test]
+fn a_type_parameter_list_cannot_be_empty() {
+    assert!(
+        errors("fn f[]() void { }")
+            .iter()
+            .any(|e| e.contains("type parameter list cannot be empty")),
+        "{:?}",
+        errors("fn f[]() void { }")
+    );
+}

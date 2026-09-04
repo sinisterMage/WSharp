@@ -18,7 +18,6 @@
 
 use crate::ast::*;
 use crate::diag::Diagnostic;
-use crate::lexer::lex;
 use crate::span::{Ident, Span};
 use crate::token::{Token, TokenKind};
 
@@ -26,7 +25,15 @@ use crate::token::{Token, TokenKind};
 /// simply omits the parts that could not be parsed), so later passes can still
 /// run and report more.
 pub fn parse(src: &str) -> (Module, Vec<Diagnostic>) {
-    let (tokens, mut diags) = lex(src);
+    parse_at(src, 0)
+}
+
+/// Parse one file of a program, with every span offset by `base`.
+///
+/// The parser itself needs no change: it only ever copies spans out of the
+/// tokens the lexer produced, which already carry the offset.
+pub fn parse_at(src: &str, base: u32) -> (Module, Vec<Diagnostic>) {
+    let (tokens, mut diags) = crate::lexer::lex_at(src, base);
     let mut parser = Parser {
         tokens,
         pos: 0,
@@ -272,9 +279,47 @@ impl Parser {
         let start = self.span();
         self.expect(TokenKind::Fn)?;
         let name = self.ident()?;
+        let generics = self.generic_params()?;
         let func = self.func_rest(start)?;
         let span = start.to(func.span);
-        Some(FnDecl { name, func, span })
+        Some(FnDecl {
+            name,
+            generics,
+            func,
+            span,
+        })
+    }
+
+    /// `[T, U]` after a declaration's name, naming its type parameters.
+    ///
+    /// Unambiguous wherever it appears: a declaration is always followed by
+    /// something fixed -- `(` for a function, `{` for a struct body -- so a `[`
+    /// here can only start a type parameter list. Indexing is an *expression*,
+    /// and no expression is expected at either position.
+    fn generic_params(&mut self) -> Option<Vec<Ident>> {
+        if !self.at(&TokenKind::LBracket) {
+            return Some(Vec::new());
+        }
+        self.scoped(|p| {
+            p.enter("type parameter list")?;
+            p.expect(TokenKind::LBracket)?;
+            let mut names = Vec::new();
+            while !p.at(&TokenKind::RBracket) && !p.at_eof() {
+                names.push(p.ident()?);
+                if !p.eat(TokenKind::Comma) {
+                    break;
+                }
+            }
+            p.expect(TokenKind::RBracket)?;
+            if names.is_empty() {
+                p.error_with_help(
+                    p.prev_span(),
+                    "a type parameter list cannot be empty",
+                    "write `[T]`, or drop the brackets entirely",
+                );
+            }
+            Some(names)
+        })
     }
 
     /// The `(params) RetType { body }` tail shared by `fn` declarations and
@@ -337,6 +382,7 @@ impl Parser {
                 );
             }
             self.expect(TokenKind::Struct)?;
+            let generics = self.generic_params()?;
             // `struct : Parent { ... }` declares a subtype. The colon is
             // unambiguous here: the annotation slot before `=` was already
             // consumed above, and a struct body always starts with `{`.
@@ -345,11 +391,23 @@ impl Parser {
             } else {
                 None
             };
+            // Type ids are a preorder walk of the lattice, fixed before
+            // monomorphisation, and a generic struct's instantiations are not
+            // known until after it -- so a generic struct stands outside the
+            // lattice entirely.
+            if let (false, Some(parent)) = (generics.is_empty(), &parent) {
+                self.error_with_help(
+                    parent.span,
+                    "a generic struct cannot have a supertype",
+                    "give the subtype concrete fields, or drop the type parameters",
+                );
+            }
             let fields = self.struct_body()?;
             self.expect(TokenKind::Semi)?;
             let span = start.to(self.prev_span());
             return Some(Item::Struct(StructDecl {
                 name,
+                generics,
                 parent,
                 fields,
                 span,
@@ -402,6 +460,17 @@ impl Parser {
     fn type_expr_inner(&mut self) -> Option<TypeExpr> {
         let start = self.span();
         match self.peek() {
+            // `[]T`. The empty brackets are Zig's: a slice has no length in
+            // its type, and the object carries it instead.
+            TokenKind::LBracket => {
+                self.bump();
+                self.expect(TokenKind::RBracket)?;
+                let elem = self.type_expr()?;
+                Some(TypeExpr::Array {
+                    elem: Box::new(elem),
+                    span: start.to(self.prev_span()),
+                })
+            }
             TokenKind::Question => {
                 self.bump();
                 let inner = self.type_expr()?;
@@ -436,7 +505,33 @@ impl Parser {
                     ret: Box::new(ret),
                 })
             }
-            TokenKind::Ident(_) => Some(TypeExpr::Named(self.ident()?)),
+            TokenKind::Ident(_) => {
+                let mut segments = vec![self.ident()?];
+                // `http.Status4xx` -- a type reached through a module.
+                while self.eat(TokenKind::Dot) {
+                    segments.push(self.ident()?);
+                }
+                // `Box[i64]`. Unambiguous: indexing is an expression, and no
+                // expression can appear where a type is expected.
+                let mut args = Vec::new();
+                if self.eat(TokenKind::LBracket) {
+                    while !self.at(&TokenKind::RBracket) && !self.at_eof() {
+                        args.push(self.type_expr()?);
+                        if !self.eat(TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(TokenKind::RBracket)?;
+                }
+                if segments.len() == 1 && args.is_empty() {
+                    return Some(TypeExpr::Named(segments.pop().expect("one segment")));
+                }
+                Some(TypeExpr::Path {
+                    span: segments[0].span.to(self.prev_span()),
+                    segments,
+                    args,
+                })
+            }
             other => {
                 let found = other.describe();
                 self.error(start, format!("expected a type, found {found}"));
@@ -523,6 +618,7 @@ impl Parser {
             }
             TokenKind::If => self.if_stmt_or_expr(),
             TokenKind::While => self.while_stmt().map(Stmt::While),
+            TokenKind::For => self.for_stmt().map(Stmt::For),
             TokenKind::LBrace => self.block().map(Stmt::Block),
             _ => self.expr_or_assign_stmt(),
         }
@@ -545,7 +641,10 @@ impl Parser {
         };
         self.bump();
 
-        if !matches!(target, Expr::Ident(_) | Expr::Field { .. }) {
+        if !matches!(
+            target,
+            Expr::Ident(_) | Expr::Field { .. } | Expr::Index { .. }
+        ) {
             self.error(target.span(), "cannot assign to this expression")
         }
         let value = self.expr()?;
@@ -658,6 +757,44 @@ impl Parser {
     }
 
     /// An optional `|name|` payload capture.
+    /// `for (xs) |x| { }`, or `for (xs) |x, i| { }` to bind the index too.
+    ///
+    /// The capture is required: a `for` with nothing bound would be a `while`
+    /// with extra steps.
+    fn for_stmt(&mut self) -> Option<ForStmt> {
+        let start = self.span();
+        self.expect(TokenKind::For)?;
+        self.expect(TokenKind::LParen)?;
+        let iter = self.expr()?;
+        self.expect(TokenKind::RParen)?;
+
+        let cap_start = self.span();
+        if !self.eat(TokenKind::Pipe) {
+            self.error_with_help(
+                cap_start,
+                "expected `|` after the value being iterated",
+                "a `for` binds each element, as in `for (xs) |x| { .. }`",
+            );
+            return None;
+        }
+        let value = self.ident()?;
+        let index = if self.eat(TokenKind::Comma) {
+            Some(self.ident()?)
+        } else {
+            None
+        };
+        self.expect(TokenKind::Pipe)?;
+
+        let body = self.block()?;
+        Some(ForStmt {
+            iter,
+            value,
+            index,
+            body,
+            span: start.to(self.prev_span()),
+        })
+    }
+
     fn opt_capture(&mut self) -> Option<Option<Ident>> {
         if !self.eat(TokenKind::Pipe) {
             return Some(None);
@@ -903,10 +1040,32 @@ impl Parser {
                         p.enter("expression")?;
                         p.bump();
                         let name = p.ident()?;
+                        // `util.Point{ .x = 1 }` -- a struct named through a
+                        // module. Unambiguous for the same reason a bare name
+                        // is: nothing that takes a block puts a path before
+                        // its `{`.
+                        if p.at(&TokenKind::LBrace)
+                            && let Some(mut path) = path_of(&expr)
+                        {
+                            path.push(name);
+                            return p.struct_lit(path);
+                        }
                         let span = expr.span().to(name.span);
                         expr = Expr::Field {
                             obj: Box::new(expr),
                             name,
+                            span,
+                        };
+                    }
+                    TokenKind::LBracket => {
+                        p.enter("expression")?;
+                        p.bump();
+                        let index = p.expr()?;
+                        p.expect(TokenKind::RBracket)?;
+                        let span = expr.span().to(p.prev_span());
+                        expr = Expr::Index {
+                            obj: Box::new(expr),
+                            index: Box::new(index),
                             span,
                         };
                     }
@@ -928,6 +1087,11 @@ impl Parser {
     fn primary_expr(&mut self) -> Option<Expr> {
         let span = self.span();
         match self.peek().clone() {
+            // `[]i64{ 1, 2, 3 }`. Unambiguous with the postfix `a[i]`, which
+            // only ever follows an expression, and with `Point{ .x = 1 }`,
+            // whose `{` follows a bare identifier.
+            TokenKind::LBracket => self.array_lit(span),
+            TokenKind::At => self.builtin_form(span),
             TokenKind::Int(v) => {
                 self.bump();
                 Some(Expr::Int(v, span))
@@ -987,7 +1151,7 @@ impl Parser {
                 // takes a block (`if`, `while`, `fn`) puts a `)` or a type
                 // before its `{`, never a bare identifier.
                 if self.at(&TokenKind::LBrace) {
-                    return self.struct_lit(ident);
+                    return self.struct_lit(vec![ident]);
                 }
                 Some(Expr::Ident(ident))
             }
@@ -1022,7 +1186,71 @@ impl Parser {
         })))
     }
 
-    fn struct_lit(&mut self, name: Ident) -> Option<Expr> {
+    /// `@import("std/http")`.
+    ///
+    /// `@name(..)` is Zig's spelling for a form the compiler handles rather
+    /// than a function it could call. `import` is the only one so far, and it
+    /// has to be one: its argument names a file to read, which is a question
+    /// asked long before anything runs.
+    fn builtin_form(&mut self, start: Span) -> Option<Expr> {
+        self.expect(TokenKind::At)?;
+        let name = self.ident()?;
+        if name.as_str() != "import" {
+            self.error_with_help(
+                name.span,
+                format!("unknown builtin `@{name}`"),
+                "the only one is `@import(\"path\")`",
+            );
+            return None;
+        }
+        self.expect(TokenKind::LParen)?;
+        let path_span = self.span();
+        let TokenKind::Str(path) = self.peek().clone() else {
+            let found = self.peek().describe();
+            self.error_with_help(
+                path_span,
+                format!("expected a module path, found {found}"),
+                "`@import` takes a string, as in `@import(\"std/http\")`",
+            );
+            return None;
+        };
+        self.bump();
+        self.expect(TokenKind::RParen)?;
+        Some(Expr::Import {
+            path,
+            span: start.to(self.prev_span()),
+        })
+    }
+
+    /// `[]T{ a, b }` -- the element type, then the elements.
+    ///
+    /// The type is written rather than inferred from the elements so that an
+    /// empty literal still has one: `[]i64{}` is a value, and nothing else in
+    /// the expression would say what it holds.
+    fn array_lit(&mut self, start: Span) -> Option<Expr> {
+        self.scoped(|p| {
+            p.enter("expression")?;
+            let TypeExpr::Array { elem, .. } = p.type_expr_inner()? else {
+                unreachable!("the caller saw `[`")
+            };
+            p.expect(TokenKind::LBrace)?;
+            let mut elems = Vec::new();
+            while !p.at(&TokenKind::RBrace) && !p.at_eof() {
+                elems.push(p.expr()?);
+                if !p.eat(TokenKind::Comma) {
+                    break;
+                }
+            }
+            p.expect(TokenKind::RBrace)?;
+            Some(Expr::ArrayLit {
+                elem: *elem,
+                elems,
+                span: start.to(p.prev_span()),
+            })
+        })
+    }
+
+    fn struct_lit(&mut self, path: Vec<Ident>) -> Option<Expr> {
         self.expect(TokenKind::LBrace)?;
         let mut fields = Vec::new();
         while !self.at(&TokenKind::RBrace) && !self.at_eof() {
@@ -1041,8 +1269,21 @@ impl Parser {
             }
         }
         self.expect(TokenKind::RBrace)?;
-        let span = name.span.to(self.prev_span());
-        Some(Expr::StructLit { name, fields, span })
+        let span = path[0].span.to(self.prev_span());
+        Some(Expr::StructLit { path, fields, span })
+    }
+}
+
+/// The identifiers making up a dotted path, if that is all the expression is.
+fn path_of(expr: &Expr) -> Option<Vec<Ident>> {
+    match expr {
+        Expr::Ident(name) => Some(vec![name.clone()]),
+        Expr::Field { obj, name, .. } => {
+            let mut path = path_of(obj)?;
+            path.push(name.clone());
+            Some(path)
+        }
+        _ => None,
     }
 }
 
@@ -1063,7 +1304,7 @@ mod tests {
     use super::*;
 
     fn parser_for(src: &str) -> Parser {
-        let (tokens, _) = lex(src);
+        let (tokens, _) = crate::lexer::lex(src);
         Parser {
             tokens,
             pos: 0,
@@ -1159,6 +1400,14 @@ mod tests {
             (
                 format!("fn f(x: {}i64) void {{ }}", "?".repeat(1000)),
                 "type is nested too deeply",
+            ),
+            (
+                format!("fn f(x: {}i64) void {{ }}", "[]".repeat(1000)),
+                "type is nested too deeply",
+            ),
+            (
+                format!("fn main() i64 {{ return x{}; }}", "[0]".repeat(1000)),
+                "expression is nested too deeply",
             ),
             (
                 format!("fn main() void {}{}", "{".repeat(1000), "}".repeat(1000)),

@@ -43,6 +43,12 @@ impl Program {
 #[derive(Debug, Clone)]
 pub struct StructDef {
     pub name: String,
+    /// The variables this struct's type parameters stand for, empty unless it
+    /// was declared `struct[T] { .. }`. A generic struct's field offsets and
+    /// size depend on what it is instantiated at -- a `?T` field is two slots
+    /// or three -- so they are left [`UNRESOLVED`] here and computed per
+    /// instantiation by the code generator, where every type is concrete.
+    pub params: Vec<crate::ty::TypeVarId>,
     /// The declared supertype, if any.
     pub parent: Option<StructId>,
     /// Every field, **inherited ones first**: a subtype's layout begins with a
@@ -159,6 +165,11 @@ pub enum Place {
         index: u32,
         name: Box<str>,
     },
+    /// `a[i] = v`. Bounds-checked when it runs, like a read.
+    Index {
+        arr: Expr,
+        index: Expr,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +206,22 @@ pub enum ExprKind {
     Call {
         callee: Callee,
         args: Vec<Expr>,
+    },
+    /// Allocate an array holding these elements. The element type is
+    /// [`Expr::ty`]'s argument, which is what an empty literal still has.
+    ArrayNew {
+        elems: Vec<Expr>,
+    },
+    /// `a[i]`. Panics if `i` is not below the array's length.
+    Index {
+        arr: Box<Expr>,
+        index: Box<Expr>,
+    },
+    /// How many elements an array holds -- one load of the header's `aux`
+    /// word. A node rather than a builtin call because `for` desugars into a
+    /// loop that needs it before any library exists.
+    ArrayLen {
+        arr: Box<Expr>,
     },
     /// Allocate a struct instance; `fields` are in declaration order.
     StructNew {

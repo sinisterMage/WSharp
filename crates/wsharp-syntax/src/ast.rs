@@ -39,6 +39,10 @@ impl Item {
 #[derive(Debug, Clone)]
 pub struct FnDecl {
     pub name: Ident,
+    /// Type parameters written as `fn f[T, U](..)`. They go here rather than on
+    /// [`Func`] because a `fn` literal is monomorphic by design: only a
+    /// top-level declaration generalises, so only one can name a type variable.
+    pub generics: Vec<Ident>,
     pub func: Func,
     pub span: Span,
 }
@@ -64,6 +68,9 @@ pub struct Param {
 #[derive(Debug, Clone)]
 pub struct StructDecl {
     pub name: Ident,
+    /// Type parameters written as `struct[T] { .. }`. A generic struct is
+    /// outside the dispatch lattice -- see `parent`.
+    pub generics: Vec<Ident>,
     /// The supertype written as `struct : Parent { ... }`, if any. Unresolved
     /// here; sema turns it into a `StructId` and builds the dispatch lattice.
     pub parent: Option<Ident>,
@@ -91,6 +98,16 @@ pub struct ConstDecl {
 pub enum TypeExpr {
     /// `i64`, `bool`, `Point`, ...
     Named(Ident),
+    /// `[]T`
+    Array { elem: Box<TypeExpr>, span: Span },
+    /// A type named through a module, at type arguments, or both:
+    /// `http.Status4xx`, `Box[i64]`, `coll.Map[str, i64]`. A bare name with
+    /// neither is [`TypeExpr::Named`].
+    Path {
+        segments: Vec<Ident>,
+        args: Vec<TypeExpr>,
+        span: Span,
+    },
     /// `?T`
     Optional { inner: Box<TypeExpr>, span: Span },
     /// `!T`
@@ -107,7 +124,9 @@ impl TypeExpr {
     pub fn span(&self) -> Span {
         match self {
             TypeExpr::Named(id) => id.span,
-            TypeExpr::Optional { span, .. }
+            TypeExpr::Path { span, .. }
+            | TypeExpr::Array { span, .. }
+            | TypeExpr::Optional { span, .. }
             | TypeExpr::ErrUnion { span, .. }
             | TypeExpr::Fn { span, .. } => *span,
         }
@@ -128,6 +147,7 @@ pub enum Stmt {
     Return { value: Option<Expr>, span: Span },
     If(IfStmt),
     While(WhileStmt),
+    For(ForStmt),
     Block(Block),
     Break(Span),
     Continue(Span),
@@ -142,6 +162,7 @@ impl Stmt {
             Stmt::Return { span, .. } => *span,
             Stmt::If(s) => s.span,
             Stmt::While(s) => s.span,
+            Stmt::For(s) => s.span,
             Stmt::Block(b) => b.span,
             Stmt::Break(span) | Stmt::Continue(span) => *span,
         }
@@ -198,6 +219,17 @@ pub struct WhileStmt {
 
 /// `if (cond) a else b` in expression position. Unlike the statement form the
 /// `else` is mandatory, because the expression must always produce a value.
+/// `for (xs) |x| { }`, or `for (xs) |x, i| { }` to bind the index too.
+#[derive(Debug, Clone)]
+pub struct ForStmt {
+    pub iter: Expr,
+    pub value: Ident,
+    /// The index, when the capture names two things.
+    pub index: Option<Ident>,
+    pub body: Block,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub struct IfExpr {
     pub cond: Expr,
@@ -248,8 +280,23 @@ pub enum Expr {
         name: Ident,
         span: Span,
     },
+    /// `[]i64{ 1, 2, 3 }` -- the element type is written, so an empty literal
+    /// still has one.
+    ArrayLit {
+        elem: TypeExpr,
+        elems: Vec<Expr>,
+        span: Span,
+    },
+    /// `a[i]`
+    Index {
+        obj: Box<Expr>,
+        index: Box<Expr>,
+        span: Span,
+    },
     StructLit {
-        name: Ident,
+        /// The type's name, possibly reached through a module:
+        /// `Point{ .. }` or `util.Point{ .. }`.
+        path: Vec<Ident>,
         fields: Vec<FieldInit>,
         span: Span,
     },
@@ -274,6 +321,12 @@ pub enum Expr {
         alt: Box<Expr>,
         span: Span,
     },
+    /// `@import("std/http")` -- names a module. Only legal as the value of a
+    /// top-level `const`, which is what binds the name it is reached by.
+    Import {
+        path: Box<str>,
+        span: Span,
+    },
     /// `e.?` -- unwrap an optional, trapping on null.
     Unwrap {
         expr: Box<Expr>,
@@ -295,6 +348,9 @@ impl Expr {
             | Expr::Binary { span, .. }
             | Expr::Call { span, .. }
             | Expr::Field { span, .. }
+            | Expr::ArrayLit { span, .. }
+            | Expr::Index { span, .. }
+            | Expr::Import { span, .. }
             | Expr::StructLit { span, .. }
             | Expr::Try { span, .. }
             | Expr::Catch { span, .. }

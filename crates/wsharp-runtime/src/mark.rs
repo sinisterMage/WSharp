@@ -552,17 +552,19 @@ unsafe fn mark_all(work: &mut Vec<*mut u8>, remembered: &mut Vec<*mut *mut u8>) 
         let Some(info) = types::info(unsafe { type_id_of(obj) }) else {
             continue;
         };
-        for &offset in info.ptr_offsets {
-            let slot = unsafe { obj.add(offset as usize) } as *mut *mut u8;
-            let field = unsafe { (*(slot as *const AtomicPtr<u8>)).load(Ordering::Acquire) };
-            if !unsafe { is_collectable(field) } {
-                continue;
-            }
-            if heap::is_evacuating(field) {
-                remembered.push(slot);
-            }
-            work.push(field);
-        }
+        unsafe {
+            types::for_each_ptr_offset(obj, info, |offset| {
+                let slot = obj.add(offset as usize) as *mut *mut u8;
+                let field = (*(slot as *const AtomicPtr<u8>)).load(Ordering::Acquire);
+                if !is_collectable(field) {
+                    return;
+                }
+                if heap::is_evacuating(field) {
+                    remembered.push(slot);
+                }
+                work.push(field);
+            })
+        };
     }
     true
 }

@@ -64,6 +64,21 @@ Things in this version that differ from older tutorials, each of which cost time
   counts and pointer offsets. Inference uses it to place struct fields, code
   generation to shape registers. They must agree; a test in
   `wsharp-codegen/src/repr.rs` checks that they do.
+- **A builtin may read and write bytes; anything that moves a *reference* from
+  one object into another is written in W#.** This is why `std/array` and
+  `std/str.split` are `.ws` files compiled with the program rather than rows in
+  the builtin table. Generated code goes through the write barrier, the load
+  barrier and the stack maps by construction; a Rust function has none of the
+  three, and its arguments live in locals no stack map describes. `array.concat`
+  was written in Rust first, and `--gc-stress` caught it: the memcpy'd
+  references had never been through the load barrier, so they named objects in
+  blocks about to be released.
+- **A builtin that allocates is a safepoint.** The pause sites are no longer
+  only the ones listed below: `ws_alloc` inside `str.concat` can run a whole
+  collection. Such a builtin must copy what it needs into plain bytes *before*
+  allocating and never hold a raw pointer across the allocator — which is what
+  every function in `strings.rs` does, and why none of them touches a
+  reference.
 - **All allocation goes through `ws_alloc`, all field writes through
   `emit_store_field`, and every expression's result through `Trans::expr`.**
   These are the collector's three choke points: where objects are born, where
@@ -102,6 +117,18 @@ Things in this version that differ from older tutorials, each of which cost time
 - **A fresh object's fields read as null.** A hole is zeroed when an allocator
   takes it (`open_hole`), never assumed clean. The barrier's slow path and the
   marker both read fields of objects whose initialising stores have not run yet.
+- **`types::for_each_ptr_offset` is the single definition of where an object's
+  references are.** Six places need it -- the write barrier, the counting
+  collector, the marker, the evacuation fix-up, the stress verifier and the
+  birth-time "has references?" test -- and a seventh that grew its own loop
+  would be a reference the collector cannot see. It covers the fixed
+  `ptr_offsets` *and* an array's elements, which a fixed list cannot describe:
+  the count belongs to the object, so the type carries a stride and the offsets
+  within one element instead.
+- **`ws_alloc` writes the element count itself.** It has to: `on_allocation`
+  inside it is a safepoint that can run a whole collection, and until `aux`
+  holds the count an array claims to be a bare header, so a heap walk would
+  step into the middle of it.
 - **The object-start bitmap is what makes the heap walkable.** Objects are not
   laid end to end -- a refilled hole puts new ones among the corpses of old
   ones, and an allocation buffer leaves an unused tail -- so a walk that
@@ -128,11 +155,13 @@ Things in this version that differ from older tutorials, each of which cost time
   large object deallocated underneath it.
 - **All three pauses run on the mutator thread**, inside a runtime call at a
   safepoint, because only the mutator can walk its own stack. The collector
-  thread never touches the stack. The pause sites are exactly `ws_gc_poll`,
-  `on_allocation`, the `gc_trace*` builtins and exit — never a builtin such as
-  `print`, which holds its argument in a Rust local no stack map describes.
-  `on_allocation` is safe because the object in flight is in the open block,
-  which is never an evacuation candidate, and on no list, so nothing judges it.
+  thread never touches the stack. The pause sites are `ws_gc_poll`,
+  `on_allocation`, the `gc_trace*` builtins and exit — and so, transitively,
+  any builtin that allocates, since `ws_alloc` is where `on_allocation` lives.
+  Never one that does not: `print` holds its argument in a Rust local no stack
+  map describes, and pausing there would leave it stale. `on_allocation` is
+  safe because the object in flight is in the open block, which is never an
+  evacuation candidate, and on no list, so nothing judges it.
 - **A forwarded header is an address, not flags.** Anything that reads a flag,
   a count, a size or a type id from an object in a block being emptied must
   test forwarding first -- `evacuate::forward`, `heap::evacuate_block` and
@@ -166,6 +195,23 @@ Things in this version that differ from older tutorials, each of which cost time
   marker takes only the buffers lock (to drain `satb`) and answers its heap
   questions from the lock-free directory; the sweeper takes only the heap lock,
   per block; the phase is an atomic so safepoint checks take no lock at all.
+- **A generic struct stands outside the dispatch lattice.** Type ids are a
+  preorder walk of it, fixed before monomorphisation, and a generic struct's
+  instantiations are not known until after. So `struct[T] : Base` is rejected,
+  and an instantiation takes an id from a block above the lattice, where it can
+  disturb no range test. Its field offsets are computed by code generation
+  rather than inference, because a `?T` field is two slots or three depending
+  on what `T` is.
+- **A module's names are stored qualified in one flat table.** An unqualified
+  lookup tries the current module and then the prelude, and what a module
+  cannot see is simply what it has no key for. A local binding shadows an
+  imported module, so adding an import cannot break code that already used the
+  name.
+- **`Span` is two `u32`s with no file in it.** Files are laid end to end in one
+  offset space and a span's file is the range it falls in (`diag::SourceMap`);
+  the first starts at offset 1, which keeps 0 meaning `Span::EMPTY`. Widening
+  the span would touch every node in the syntax tree to carry a number only the
+  renderer reads.
 - **The closure environment is dead after the prologue.** Captures are copied
   into declared locals before the first safepoint and `env` is never read
   again, so it is not a root and need not be. Re-reading it after a call would
@@ -188,6 +234,7 @@ nix-shell --run "cargo test --workspace"
   // expect: 55          one line of expected stdout, in order
   // exit: 3             expected exit status (default 0)
   // error: <substring>  must fail to compile, saying this
+  // panic: <substring>  must die with a W# panic saying this
   ```
 
   The harness (`crates/wsharp-cli/tests/cases.rs`) runs the built binary as a
@@ -195,6 +242,10 @@ nix-shell --run "cargo test --workspace"
   user would.
 - Parser tests compare against the s-expression dump (`wsharp_syntax::dump`),
   which makes precedence bugs obvious.
+- **Fixtures a case imports live in `tests/cases/modules/`.** The harness runs
+  every `.ws` directly in `tests/cases`, and a file with no `main` is not a
+  case; `read_dir` does not recurse, so a subdirectory is where an imported
+  module goes.
 - **The whole case suite runs a second time under `--gc-stress`**, which
   collects at every allocation and checks every root the stack maps describe.
   This is the collector's main defence, because rooting is spread over every

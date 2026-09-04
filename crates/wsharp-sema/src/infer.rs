@@ -45,8 +45,35 @@ impl Analysis {
     }
 }
 
+/// One file of a program, or one of the standard library's modules.
+pub struct SourceModule<'a> {
+    /// The module's identity, and the prefix its top-level names are stored
+    /// under. `"main"` for the root, a standard-library path such as
+    /// `"std/http"`, or the file's own location.
+    pub path: String,
+    pub ast: &'a ast::Module,
+    /// For each `@import` specifier this file writes, the module it names.
+    ///
+    /// Resolved by the driver rather than here: two files may reach the same
+    /// module by different relative paths, and which file a path lands on is a
+    /// question about the file system.
+    pub imports: HashMap<String, String>,
+}
+
+/// Analyse a single-file program. The file is the module named `main`.
 pub fn analyze(module: &ast::Module) -> Analysis {
-    let mut inf = Inferencer::new(module);
+    analyze_program(&[SourceModule {
+        path: "main".into(),
+        ast: module,
+        imports: HashMap::new(),
+    }])
+}
+
+/// Analyse a whole program: the root file, and everything it imports.
+///
+/// The root module must come first; it is the one `main` is looked for in.
+pub fn analyze_program(modules: &[SourceModule]) -> Analysis {
+    let mut inf = Inferencer::new(modules);
     inf.collect_structs();
     inf.collect_globals();
     inf.infer_all();
@@ -66,6 +93,9 @@ pub fn analyze(module: &ast::Module) -> Analysis {
 /// What a top-level name refers to.
 #[derive(Debug, Clone)]
 enum GlobalRef {
+    /// A module bound by `@import`. Never a value; naming one bare is an
+    /// error that says so.
+    Module,
     /// One or more functions. More than one is an overload set, resolved by
     /// multiple dispatch at each call site; a set of one is the ordinary case
     /// and takes exactly the path it always did.
@@ -161,6 +191,12 @@ enum Constraint {
         id: AbstractId,
         span: Span,
     },
+    /// `obj` must be an array, whose element type is `elem`.
+    ///
+    /// A constraint rather than a decision on the spot for the same reason
+    /// [`Constraint::HasField`] is: `a[0]` in a function with no annotation
+    /// meets the question before anything can answer it.
+    Indexable { obj: Type, elem: Type, span: Span },
     /// `obj` must be a struct with field `field`, whose type is `result`.
     HasField {
         obj: Type,
@@ -236,7 +272,21 @@ impl Frame {
 }
 
 struct Inferencer<'a> {
-    module: &'a ast::Module,
+    modules: &'a [SourceModule<'a>],
+    /// The module whose items are being collected or inferred. Every
+    /// unqualified name is looked up in this one first.
+    current: usize,
+    /// Per module, the local name each `@import` bound and the module path it
+    /// names.
+    imports: Vec<HashMap<String, String>>,
+    /// Every module path that exists, so a path can be told from a member.
+    module_paths: HashSet<String>,
+    /// Where each struct was declared: which module, and which item in it.
+    /// Two modules may each declare a `Point`, so a name is no longer enough.
+    struct_decl_of: HashMap<StructId, (usize, usize)>,
+    /// The module each function was declared in, so inference can put its
+    /// module back in scope when it reaches the body.
+    fn_modules: Vec<usize>,
     store: TypeStore,
     diags: Vec<Diagnostic>,
 
@@ -245,6 +295,10 @@ struct Inferencer<'a> {
     /// Where each struct's name was written, so a redeclaration can point
     /// back at the first one. Builtin status types have no entry.
     struct_spans: HashMap<String, Span>,
+
+    /// Per generic struct, the variable each of its type parameters stands
+    /// for. Empty for every other struct.
+    struct_type_params: HashMap<StructId, HashMap<String, Type>>,
 
     globals: HashMap<String, GlobalRef>,
     /// Where each global was first declared, for the same reason. Builtins
@@ -268,6 +322,12 @@ struct Inferencer<'a> {
     /// Per function, the parameters annotated with an abstract type: the
     /// variable standing in for each, and which abstract type constrains it.
     fn_member_vars: Vec<Vec<(Type, AbstractId, Span)>>,
+    /// Per function, the type parameters it declares as `fn f[T](..)`.
+    fn_generic_names: Vec<Vec<Ident>>,
+    /// Per function, the variable each declared type parameter stands for.
+    /// Filled in by [`Inferencer::signature_type`], because the variables must
+    /// be created inside the binding group's level to generalise with it.
+    fn_type_params: Vec<HashMap<String, Type>>,
     /// Filled in when the function's group is generalised.
     schemes: Vec<Option<Scheme>>,
     funcs: Vec<Option<hir::FuncDef>>,
@@ -280,17 +340,35 @@ struct Inferencer<'a> {
     frames: Vec<Frame>,
     constraints: Vec<Constraint>,
     loop_depth: usize,
+    /// The type parameters in scope, innermost last. A `fn` literal inside a
+    /// generic function can still name that function's type parameters, so
+    /// this is a stack rather than one entry; a generic struct pushes one
+    /// while its fields are being laid out.
+    type_scopes: Vec<HashMap<String, Type>>,
 }
 
 impl<'a> Inferencer<'a> {
-    fn new(module: &'a ast::Module) -> Inferencer<'a> {
+    fn new(modules: &'a [SourceModule<'a>]) -> Inferencer<'a> {
         Inferencer {
-            module,
+            modules,
+            current: 0,
+            imports: modules.iter().map(|_| HashMap::new()).collect(),
+            // The standard library's modules exist whether or not the driver
+            // handed one over: `std/http` has no source at all, because its
+            // types are materialised from a table on first mention.
+            module_paths: modules
+                .iter()
+                .map(|m| m.path.clone())
+                .chain(wsharp_runtime::builtins::std_module_paths())
+                .collect(),
+            struct_decl_of: HashMap::new(),
+            fn_modules: Vec::new(),
             store: TypeStore::new(),
             diags: Vec::new(),
             structs: Vec::new(),
             struct_ids: HashMap::new(),
             struct_spans: HashMap::new(),
+            struct_type_params: HashMap::new(),
             globals: HashMap::new(),
             global_spans: HashMap::new(),
             consts: Vec::new(),
@@ -302,6 +380,8 @@ impl<'a> Inferencer<'a> {
             fn_types: Vec::new(),
             fn_decl_params: Vec::new(),
             fn_member_vars: Vec::new(),
+            fn_generic_names: Vec::new(),
+            fn_type_params: Vec::new(),
             schemes: Vec::new(),
             funcs: Vec::new(),
             strings: Vec::new(),
@@ -311,7 +391,67 @@ impl<'a> Inferencer<'a> {
             frames: Vec::new(),
             constraints: Vec::new(),
             loop_depth: 0,
+            type_scopes: Vec::new(),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Names, and the module they belong to
+    // -----------------------------------------------------------------------
+
+    /// The key a name declared in module `m` is stored under.
+    ///
+    /// One flat map with qualified keys, rather than a map per module: name
+    /// resolution is one lookup either way, and every pass downstream keeps
+    /// working on a single table. What a module *cannot* see is then simply
+    /// what it does not have the key for.
+    fn key_in(&self, m: usize, name: &str) -> String {
+        format!("{}.{}", self.modules[m].path, name)
+    }
+
+    fn key(&self, name: &str) -> String {
+        self.key_in(self.current, name)
+    }
+
+    /// Resolve an unqualified name: this module's own declarations, then the
+    /// prelude, which is stored unqualified because every module has it.
+    fn global(&self, name: &str) -> Option<&GlobalRef> {
+        self.globals
+            .get(&self.key(name))
+            .or_else(|| self.globals.get(name))
+    }
+
+    fn global_mut(&mut self, name: &str) -> Option<&mut GlobalRef> {
+        let key = self.key(name);
+        if self.globals.contains_key(&key) {
+            return self.globals.get_mut(&key);
+        }
+        self.globals.get_mut(name)
+    }
+
+    fn has_global(&self, name: &str) -> bool {
+        self.global(name).is_some()
+    }
+
+    /// Declare a name in the module being collected.
+    fn declare_global(&mut self, name: &str, global: GlobalRef, span: Span) {
+        let key = self.key(name);
+        self.globals.insert(key.clone(), global);
+        self.global_spans.insert(key, span);
+    }
+
+    /// Where an unqualified name was first declared, for a redeclaration's
+    /// second label.
+    fn global_span(&self, name: &str) -> Option<Span> {
+        self.global_spans
+            .get(&self.key(name))
+            .or_else(|| self.global_spans.get(name))
+            .copied()
+    }
+
+    /// A struct named without qualification, from this module.
+    fn struct_named(&self, name: &str) -> Option<StructId> {
+        self.struct_ids.get(&self.key(name)).copied()
     }
 
     fn error(&mut self, span: Span, message: impl Into<String>) -> &mut Diagnostic {
@@ -322,7 +462,10 @@ impl<'a> Inferencer<'a> {
     fn finish(mut self) -> Analysis {
         let mut signatures = Vec::new();
         for id in 0..self.fn_names.len() {
-            if self.fn_is_closure[id] {
+            // The root module only: `--emit=types` is for reading back what
+            // was inferred about the file in front of you, and the standard
+            // library's own signatures would bury it.
+            if self.fn_is_closure[id] || self.fn_modules[id] != 0 {
                 continue;
             }
             let name = self.fn_names[id].clone();
@@ -342,10 +485,13 @@ impl<'a> Inferencer<'a> {
 
         // An overloaded `main` has no single entry point; `check_entry` has
         // already reported it, so leave `entry` unset rather than picking one.
-        let mut entry = self.globals.get("main").and_then(|g| match g {
-            GlobalRef::Func(ids) if ids.len() == 1 => Some(ids[0]),
-            _ => None,
-        });
+        let mut entry = self
+            .globals
+            .get(&self.key_in(0, "main"))
+            .and_then(|g| match g {
+                GlobalRef::Func(ids) if ids.len() == 1 => Some(ids[0]),
+                _ => None,
+            });
 
         // `funcs` is indexed by `FuncId`, so entries must never be dropped --
         // that would silently renumber every function. If any body failed to
@@ -421,11 +567,23 @@ impl<'a> Inferencer<'a> {
     /// fine. Fields come last, and in *lattice* order rather than source order,
     /// because a subtype's layout starts as a copy of its supertype's.
     fn collect_structs(&mut self) {
-        for item in &self.module.items {
+        for m in 0..self.modules.len() {
+            self.current = m;
+            self.collect_module_structs(m);
+        }
+        self.current = 0;
+
+        self.resolve_struct_parents();
+        self.layout_struct_fields();
+    }
+
+    fn collect_module_structs(&mut self, m: usize) {
+        for (index, item) in self.modules[m].ast.items.iter().enumerate() {
             let ast::Item::Struct(decl) = item else {
                 continue;
             };
-            if let Some(&first) = self.struct_spans.get(decl.name.as_str()) {
+            let key = self.key(decl.name.as_str());
+            if let Some(&first) = self.struct_spans.get(&key) {
                 self.error(
                     decl.name.span,
                     format!("`{}` is declared more than once", decl.name),
@@ -438,11 +596,40 @@ impl<'a> Inferencer<'a> {
                 continue;
             }
             let id = self.store.declare_struct(decl.name.as_str());
-            self.struct_ids.insert(decl.name.to_string(), id);
-            self.struct_spans
-                .insert(decl.name.to_string(), decl.name.span);
+            self.struct_ids.insert(key.clone(), id);
+            self.struct_spans.insert(key, decl.name.span);
+            self.struct_decl_of.insert(id, (m, index));
+            self.check_generic_names(&decl.generics);
+            if !decl.generics.is_empty() && decl.fields.is_empty() {
+                self.error(
+                    decl.name.span,
+                    "a generic struct must have at least one field",
+                )
+                .help = Some(
+                    "with no field to mention them, nothing could ever say what its type \
+                     parameters are"
+                        .into(),
+                );
+            }
+            // One variable per parameter, and they are its identity: a field's
+            // type mentions them, and an instantiation substitutes for them.
+            let params: Vec<Type> = decl.generics.iter().map(|_| self.store.fresh()).collect();
+            let bindings: HashMap<String, Type> = decl
+                .generics
+                .iter()
+                .map(|g| g.to_string())
+                .zip(params.iter().cloned())
+                .collect();
+            self.struct_type_params.insert(id, bindings);
             self.structs.push(hir::StructDef {
                 name: decl.name.to_string(),
+                params: params
+                    .iter()
+                    .map(|p| match p {
+                        Type::Var(v) => *v,
+                        _ => unreachable!("just made fresh"),
+                    })
+                    .collect(),
                 parent: None,
                 fields: Vec::new(),
                 // Both are filled in by `number_structs` below.
@@ -454,16 +641,18 @@ impl<'a> Inferencer<'a> {
                 span: decl.span,
             });
         }
+    }
 
-        self.resolve_struct_parents();
-
-        // Lay fields out parents-first, so a subtype can start from a copy of
-        // its supertype's layout. Declaration order will not do: a subtype may
-        // be written above its supertype.
+    /// Lay fields out parents-first, so a subtype can start from a copy of its
+    /// supertype's layout. Declaration order will not do: a subtype may be
+    /// written above its supertype, and in another module entirely.
+    fn layout_struct_fields(&mut self) {
         for id in self.layout_order() {
-            let Some(decl) = self.struct_decl_ast(id) else {
+            let Some((m, decl)) = self.struct_decl_ast(id) else {
                 continue;
             };
+            // Field types are resolved in the module that wrote them.
+            self.current = m;
 
             // A subtype's fields are its supertype's followed by its own, so
             // the two layouts agree on every inherited field. `order` is a
@@ -476,6 +665,15 @@ impl<'a> Inferencer<'a> {
                 None => (Vec::new(), HEADER_SIZE),
             };
             let inherited = fields.len() as u32;
+            let generic = self
+                .struct_type_params
+                .get(&id)
+                .filter(|b| !b.is_empty())
+                .cloned();
+            let is_generic = generic.is_some();
+            if let Some(bindings) = generic {
+                self.type_scopes.push(bindings);
+            }
 
             for field in &decl.fields {
                 if let Some(index) = fields.iter().position(|f| f.name == field.name.as_str()) {
@@ -499,44 +697,68 @@ impl<'a> Inferencer<'a> {
                     continue;
                 }
                 let ty = self.resolve_type_expr(&field.ty);
-                let width = crate::layout::size_of(&mut self.store, &ty);
+                // A generic struct's offsets depend on what it is used at, so
+                // they are left unresolved and recomputed per instantiation.
+                // `UNRESOLVED` rather than zero: a zero offset would quietly
+                // write over the header instead of failing where it is wrong.
+                let width = if is_generic {
+                    0
+                } else {
+                    crate::layout::size_of(&mut self.store, &ty)
+                };
                 fields.push(hir::FieldDef {
                     name: field.name.to_string(),
                     ty,
-                    offset,
+                    offset: if is_generic { UNRESOLVED } else { offset },
                     span: field.span,
                 });
                 offset += width;
             }
+            if is_generic {
+                self.type_scopes.pop();
+            }
             let strukt = &mut self.structs[id as usize];
             strukt.fields = fields;
             strukt.inherited = inherited;
-            strukt.field_end = offset;
-            strukt.size = align_up(offset);
+            strukt.field_end = if is_generic { UNRESOLVED } else { offset };
+            strukt.size = if is_generic { 0 } else { align_up(offset) };
         }
+        self.current = 0;
     }
 
-    /// The AST declaration a `StructId` came from.
-    fn struct_decl_ast(&self, id: StructId) -> Option<&'a ast::StructDecl> {
-        let name = self.structs[id as usize].name.as_str();
-        self.module.items.iter().find_map(|item| match item {
-            ast::Item::Struct(decl) if decl.name.as_str() == name => Some(decl),
+    /// The declaration a `StructId` came from, and the module it is in.
+    ///
+    /// By recorded position rather than by name: two modules may each declare
+    /// a `Point`, and a lazily materialised status type has no declaration at
+    /// all.
+    fn struct_decl_ast(&self, id: StructId) -> Option<(usize, &'a ast::StructDecl)> {
+        let &(m, index) = self.struct_decl_of.get(&id)?;
+        match &self.modules[m].ast.items[index] {
+            ast::Item::Struct(decl) => Some((m, decl)),
             _ => None,
-        })
+        }
     }
 
     /// Resolve each `struct : Parent` link, rejecting unknown parents and
     /// cycles. A cycle is broken as well as reported, because everything
     /// downstream walks the parent chain and would not terminate on one.
     fn resolve_struct_parents(&mut self) {
-        for item in &self.module.items {
+        for m in 0..self.modules.len() {
+            self.current = m;
+            self.resolve_module_struct_parents(m);
+        }
+        self.current = 0;
+        self.break_parent_cycles();
+    }
+
+    fn resolve_module_struct_parents(&mut self, m: usize) {
+        for item in &self.modules[m].ast.items {
             let ast::Item::Struct(decl) = item else {
                 continue;
             };
-            let (Some(parent_name), Some(&id)) = (
-                decl.parent.as_ref(),
-                self.struct_ids.get(decl.name.as_str()),
-            ) else {
+            let (Some(parent_name), Some(id)) =
+                (decl.parent.as_ref(), self.struct_named(decl.name.as_str()))
+            else {
                 continue;
             };
             let Some(parent) = self.lookup_struct(parent_name.as_str()) else {
@@ -555,8 +777,10 @@ impl<'a> Inferencer<'a> {
             self.structs[id as usize].parent = Some(parent);
             self.store.set_struct_parent(id, parent);
         }
+    }
 
-        // Break cycles before anything walks a parent chain.
+    /// Break cycles before anything walks a parent chain.
+    fn break_parent_cycles(&mut self) {
         for id in 0..self.structs.len() as StructId {
             let mut seen = vec![id];
             let mut cur = self.structs[id as usize].parent;
@@ -590,16 +814,32 @@ impl<'a> Inferencer<'a> {
     /// one is never created, so it costs no type id, no registry entry and no
     /// singleton. Ancestors come along because the lattice needs them.
     fn lookup_struct(&mut self, name: &str) -> Option<StructId> {
-        if let Some(&id) = self.struct_ids.get(name) {
+        self.struct_named(name)
+    }
+
+    /// A struct named through a module: `http.NotFound404`.
+    ///
+    /// The HTTP status lattice is a table rather than 27 declarations in every
+    /// program, and a program pays only for the statuses it names: an unnamed
+    /// one is never created, so it costs no type id, no registry entry and no
+    /// singleton. Ancestors come along because the lattice needs them.
+    fn lookup_struct_in(&mut self, module: &str, name: &str) -> Option<StructId> {
+        let key = format!("{module}.{name}");
+        if let Some(&id) = self.struct_ids.get(&key) {
             return Some(id);
+        }
+        if module != HTTP_MODULE {
+            return None;
         }
         let table = wsharp_runtime::builtins::status_types();
         let &(sname, parent) = table.iter().find(|(n, _)| *n == name)?;
 
         let id = self.store.declare_struct(sname);
-        self.struct_ids.insert(sname.to_string(), id);
+        self.struct_ids.insert(key, id);
         self.structs.push(hir::StructDef {
             name: sname.to_string(),
+            // A builtin status type is never generic.
+            params: Vec::new(),
             parent: None,
             fields: Vec::new(),
             type_id: TYPE_ID_FIRST_USER,
@@ -611,13 +851,13 @@ impl<'a> Inferencer<'a> {
         });
         // A status type has no fields, so it is also a value.
         self.globals
-            .insert(sname.to_string(), GlobalRef::Singleton(id));
+            .insert(format!("{HTTP_MODULE}.{sname}"), GlobalRef::Singleton(id));
 
         if let Some(parent) = parent {
             // Recurses at most as deep as the lattice, and the table is
             // ordered parents-first, so this terminates.
             let parent = self
-                .lookup_struct(parent)
+                .lookup_struct_in(HTTP_MODULE, parent)
                 .expect("a status type's supertype is in the same table");
             self.structs[id as usize].parent = Some(parent);
             self.store.set_struct_parent(id, parent);
@@ -692,37 +932,123 @@ impl<'a> Inferencer<'a> {
     }
 
     fn collect_globals(&mut self) {
+        // First, so that their ids are the ones the library's own functions
+        // return. A builtin cannot look an error up by name: it is compiled
+        // long before the program that catches it is read.
+        for name in wsharp_runtime::builtins::builtin_errors() {
+            self.intern_error(name);
+        }
         for (i, builtin) in wsharp_runtime::builtins().iter().enumerate() {
-            self.globals.insert(
-                builtin.name.to_string(),
-                GlobalRef::Builtin(i as hir::BuiltinId),
-            );
+            // A prelude builtin is stored unqualified, which is exactly what
+            // makes every module see it: `global` falls back to a bare key
+            // when the current module has none.
+            let key = if builtin.module == wsharp_runtime::builtins::PRELUDE {
+                builtin.name.to_string()
+            } else {
+                format!("{}.{}", builtin.module, builtin.name)
+            };
+            self.globals
+                .insert(key, GlobalRef::Builtin(i as hir::BuiltinId));
         }
 
         // A struct with no fields is also a value: its single instance, named
-        // by the type. That is what makes `handle(req, NotFound404)` read the
-        // way the lattice is written. Structs with fields are constructed as
-        // usual and get no singleton.
+        // by the type. That is what makes `handle(req, http.NotFound404)` read
+        // the way the lattice is written. Structs with fields are constructed
+        // as usual and get no singleton.
         for id in 0..self.structs.len() as StructId {
-            if self.structs[id as usize].fields.is_empty() {
-                let name = self.structs[id as usize].name.clone();
-                if let Some(&span) = self.struct_spans.get(&name) {
-                    self.global_spans.insert(name.clone(), span);
-                }
-                self.globals.insert(name, GlobalRef::Singleton(id));
+            if !self.structs[id as usize].fields.is_empty() {
+                continue;
             }
+            let Some((m, _)) = self.struct_decl_ast(id) else {
+                // A materialised status type; it got its singleton when it was
+                // created, under the module it belongs to.
+                continue;
+            };
+            let name = self.structs[id as usize].name.clone();
+            let key = self.key_in(m, &name);
+            if let Some(&span) = self.struct_spans.get(&key) {
+                self.global_spans.insert(key.clone(), span);
+            }
+            self.globals.insert(key, GlobalRef::Singleton(id));
         }
 
+        // Imports come first: a module's own declarations may mention one.
+        for m in 0..self.modules.len() {
+            self.current = m;
+            self.collect_imports(m);
+        }
+
+        for m in 0..self.modules.len() {
+            self.current = m;
+            self.collect_module_globals(m);
+        }
+        self.current = 0;
+    }
+
+    /// Bind each `const name = @import("path");` in this module.
+    fn collect_imports(&mut self, m: usize) {
+        for item in &self.modules[m].ast.items {
+            let ast::Item::Const(decl) = item else {
+                continue;
+            };
+            let ast::Expr::Import { path, span } = &decl.value else {
+                continue;
+            };
+            if let Some(annot) = &decl.ty {
+                self.error(
+                    annot.span(),
+                    "an `@import` binding cannot have a type annotation",
+                );
+            }
+            // The driver says what a specifier resolves to; a standard-library
+            // path stands for itself, which is what lets a single-file program
+            // be analysed with no driver at all.
+            let target = match self.modules[m].imports.get(&**path) {
+                // Resolved, but still has to name a module that exists:
+                // `@import("std/nope")` resolves to itself and is nothing.
+                Some(target) if self.module_paths.contains(target) => target.clone(),
+                _ if self.module_paths.contains(&**path) => path.to_string(),
+                _ => {
+                    self.error(*span, format!("cannot find module `{path}`"))
+                        .help = Some(
+                        "a path is either a file next to this one, such as \
+                         `@import(\"./util.ws\")`, or one of the standard library's, \
+                         such as `@import(\"std/http\")`"
+                            .into(),
+                    );
+                    continue;
+                }
+            };
+            if self.imports[m]
+                .insert(decl.name.to_string(), target)
+                .is_some()
+            {
+                self.error(
+                    decl.name.span,
+                    format!("`{}` is declared more than once", decl.name),
+                );
+            }
+            // Also a global, so that using the name on its own is met with
+            // "is a module, not a value" rather than "cannot find".
+            self.declare_global(decl.name.as_str(), GlobalRef::Module, decl.name.span);
+        }
+    }
+
+    fn collect_module_globals(&mut self, m: usize) {
         // A `const` bound to a bare name may be naming a function declared
         // further down, so those wait for the whole file to be declared.
         let mut aliases: Vec<&'a ast::ConstDecl> = Vec::new();
-        for item in &self.module.items {
+        for item in &self.modules[m].ast.items {
             match item {
                 ast::Item::Struct(_) => {}
                 ast::Item::Fn(decl) => {
-                    self.declare_function(&decl.name, &decl.func, decl.span, false);
+                    self.declare_function(&decl.name, &decl.generics, &decl.func, decl.span, false);
                 }
                 ast::Item::Const(decl) => {
+                    // Already bound by `collect_imports`.
+                    if matches!(decl.value, ast::Expr::Import { .. }) {
+                        continue;
+                    }
                     // `const name = fn ...` is just another way to declare a
                     // function, and gets generalised like one.
                     if let ast::Expr::Fn(func) = &decl.value {
@@ -732,7 +1058,9 @@ impl<'a> Inferencer<'a> {
                                 "a `const` bound to a `fn` cannot have a type annotation",
                             );
                         }
-                        self.declare_function(&decl.name, func, decl.span, false);
+                        // A `const` bound to a `fn` literal names no type
+                        // parameters of its own; a literal is monomorphic.
+                        self.declare_function(&decl.name, &[], func, decl.span, false);
                     } else if matches!(decl.value, ast::Expr::Ident(_)) {
                         aliases.push(decl);
                     } else {
@@ -758,11 +1086,11 @@ impl<'a> Inferencer<'a> {
         let ast::Expr::Ident(source) = &decl.value else {
             unreachable!("only `const x = name;` is queued")
         };
-        let Some(GlobalRef::Func(ids)) = self.globals.get(source.as_str()).cloned() else {
+        let Some(GlobalRef::Func(ids)) = self.global(source.as_str()).cloned() else {
             self.declare_const(decl);
             return;
         };
-        if self.globals.contains_key(decl.name.as_str()) {
+        if self.has_global(decl.name.as_str()) {
             self.report_redeclaration(&decl.name);
             return;
         }
@@ -782,14 +1110,38 @@ impl<'a> Inferencer<'a> {
             }
             None => GlobalRef::Func(ids),
         };
-        self.globals.insert(decl.name.to_string(), global);
-        self.global_spans
-            .insert(decl.name.to_string(), decl.name.span);
+        self.declare_global(decl.name.as_str(), global, decl.name.span);
+    }
+
+    /// Reject type parameter names that would mean something else.
+    ///
+    /// A type parameter introduces a name into the type namespace, so it can
+    /// hide a primitive or a struct. Silently shadowing either turns a typo
+    /// into a generic function that compiles and then fails to specialise
+    /// somewhere else entirely, which is the wrong place to find out.
+    fn check_generic_names(&mut self, generics: &[Ident]) {
+        for (i, g) in generics.iter().enumerate() {
+            let name = g.as_str();
+            if matches!(name, "i64" | "f64" | "bool" | "void" | "str") {
+                self.error(g.span, format!("`{name}` is a primitive type"))
+                    .help = Some("a type parameter needs a name of its own, such as `T`".into());
+            } else if self.struct_named(name).is_some() {
+                self.error(g.span, format!("`{name}` is already a type"))
+                    .help = Some("a type parameter needs a name of its own, such as `T`".into());
+            } else if lookup_abstract(name).is_some() {
+                self.error(g.span, format!("`{name}` is an abstract type"))
+                    .help = Some("a type parameter needs a name of its own, such as `T`".into());
+            } else if generics[..i].iter().any(|p| p.as_str() == name) {
+                self.error(g.span, format!("type parameter `{name}` is declared twice"))
+                    .help = Some("each type parameter needs a distinct name".into());
+            }
+        }
     }
 
     fn declare_function(
         &mut self,
         name: &Ident,
+        generics: &[Ident],
         func: &'a ast::Func,
         span: Span,
         is_closure: bool,
@@ -800,28 +1152,30 @@ impl<'a> Inferencer<'a> {
             // than colliding with it. Colliding with anything *else* -- a
             // `const`, a builtin, a zero-field struct's singleton -- is still
             // an error, because dispatch only ranges over functions.
-            match self.globals.get(name.as_str()) {
+            match self.global(name.as_str()) {
                 Some(GlobalRef::Func(_)) => {
-                    let Some(GlobalRef::Func(ids)) = self.globals.get_mut(name.as_str()) else {
+                    let Some(GlobalRef::Func(ids)) = self.global_mut(name.as_str()) else {
                         unreachable!("just matched")
                     };
                     ids.push(id);
                 }
                 Some(_) => self.report_redeclaration(name),
                 None => {
-                    self.globals
-                        .insert(name.to_string(), GlobalRef::Func(vec![id]));
-                    self.global_spans.insert(name.to_string(), name.span);
+                    self.declare_global(name.as_str(), GlobalRef::Func(vec![id]), name.span);
                 }
             }
         }
         self.fn_names.push(name.to_string());
+        self.fn_modules.push(self.current);
         self.fn_asts.push(Some(func));
         self.fn_spans.push(span);
         self.fn_is_closure.push(is_closure);
         self.fn_types.push(Type::void());
         self.fn_decl_params.push(Vec::new());
         self.fn_member_vars.push(Vec::new());
+        self.check_generic_names(generics);
+        self.fn_generic_names.push(generics.to_vec());
+        self.fn_type_params.push(HashMap::new());
         self.schemes.push(None);
         self.funcs.push(None);
         id
@@ -860,16 +1214,14 @@ impl<'a> Inferencer<'a> {
             self.expect(&ty, &expected, decl.value.span(), "this constant");
         }
 
-        if self.globals.contains_key(decl.name.as_str()) {
+        if self.has_global(decl.name.as_str()) {
             self.report_redeclaration(&decl.name);
         }
         // `null` is the only literal with a free variable, and generalising it
         // makes `const NOTHING = null;` usable at any optional type.
         let scheme = self.store.generalize(&ty);
-        self.globals
-            .insert(decl.name.to_string(), GlobalRef::Const(self.consts.len()));
-        self.global_spans
-            .insert(decl.name.to_string(), decl.name.span);
+        let global = GlobalRef::Const(self.consts.len());
+        self.declare_global(decl.name.as_str(), global, decl.name.span);
         self.consts.push(ConstDef { scheme, kind });
     }
 
@@ -877,8 +1229,8 @@ impl<'a> Inferencer<'a> {
     /// own message: "declared more than once" would send the reader looking
     /// for a first declaration that is not in the file.
     fn report_redeclaration(&mut self, name: &Ident) {
-        let is_builtin = matches!(self.globals.get(name.as_str()), Some(GlobalRef::Builtin(_)));
-        let first = self.global_spans.get(name.as_str()).copied();
+        let is_builtin = matches!(self.global(name.as_str()), Some(GlobalRef::Builtin(_)));
+        let first = self.global_span(name.as_str());
         let (message, help) = if is_builtin {
             (
                 format!("`{name}` is a builtin and cannot be redeclared"),
@@ -902,24 +1254,71 @@ impl<'a> Inferencer<'a> {
 
     fn resolve_type_expr(&mut self, t: &ast::TypeExpr) -> Type {
         match t {
-            ast::TypeExpr::Named(id) => match id.as_str() {
-                "i64" => Type::i64(),
-                "f64" => Type::f64(),
-                "bool" => Type::bool(),
-                "void" => Type::void(),
-                "str" => Type::str(),
-                name => match self.lookup_struct(name) {
-                    Some(sid) => Type::strukt(sid),
-                    None => {
-                        if !self.reject_abstract(name, id.span) {
-                            self.error(id.span, format!("unknown type `{name}`"));
+            ast::TypeExpr::Named(id) => {
+                // A type parameter in scope wins over everything: it was
+                // checked at its declaration for clashing with a real type.
+                if let Some(ty) = self.lookup_type_param(id.as_str()) {
+                    return ty;
+                }
+                match id.as_str() {
+                    "i64" => Type::i64(),
+                    "f64" => Type::f64(),
+                    "bool" => Type::bool(),
+                    "void" => Type::void(),
+                    "str" => Type::str(),
+                    name => match self.lookup_struct(name) {
+                        Some(sid) if self.structs[sid as usize].params.is_empty() => {
+                            Type::strukt(sid)
                         }
-                        // Recover with a fresh variable so one bad annotation
-                        // does not cascade into every use of the function.
+                        Some(sid) => {
+                            let arity = self.structs[sid as usize].params.len();
+                            self.report_arity(id, arity, 0, id.span);
+                            self.store.fresh()
+                        }
+                        None => {
+                            if !self.reject_abstract(name, id.span) {
+                                self.error(id.span, format!("unknown type `{name}`"));
+                            }
+                            // Recover with a fresh variable so one bad annotation
+                            // does not cascade into every use of the function.
+                            self.store.fresh()
+                        }
+                    },
+                }
+            }
+            ast::TypeExpr::Path {
+                segments,
+                args,
+                span,
+            } => {
+                let args: Vec<Type> = args.iter().map(|a| self.resolve_type_expr(a)).collect();
+                let name = segments.last().expect("a path has a last segment");
+                let found = match self.split_path(segments) {
+                    Some(module) => self.lookup_struct_in(&module, name.as_str()),
+                    // No module prefix, so it is an ordinary name with type
+                    // arguments: `Box[i64]`.
+                    None if segments.len() == 1 => self.lookup_struct(name.as_str()),
+                    None => {
+                        self.report_unknown_module(segments);
+                        return self.store.fresh();
+                    }
+                };
+                match found {
+                    Some(id) => {
+                        let arity = self.structs[id as usize].params.len();
+                        if arity != args.len() {
+                            self.report_arity(name, arity, args.len(), *span);
+                            return self.store.fresh();
+                        }
+                        Type::Con(TyCon::Struct(id), args)
+                    }
+                    None => {
+                        self.error(name.span, format!("unknown type `{name}`"));
                         self.store.fresh()
                     }
-                },
-            },
+                }
+            }
+            ast::TypeExpr::Array { elem, .. } => Type::array(self.resolve_type_expr(elem)),
             ast::TypeExpr::Optional { inner, .. } => Type::optional(self.resolve_type_expr(inner)),
             ast::TypeExpr::ErrUnion { inner, .. } => Type::err_union(self.resolve_type_expr(inner)),
             ast::TypeExpr::Fn { params, ret, .. } => {
@@ -928,6 +1327,75 @@ impl<'a> Inferencer<'a> {
                 Type::func(params, ret)
             }
         }
+    }
+
+    /// The variable a type parameter stands for, searching innermost first.
+    ///
+    /// A `fn` literal nested inside a generic function can name that
+    /// function's type parameters, which is why this walks the whole stack.
+    fn lookup_type_param(&self, name: &str) -> Option<Type> {
+        self.type_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).cloned())
+    }
+
+    /// A field's type as seen through a particular instantiation: `value` in
+    /// `Box[i64]` is `i64`, not the variable the declaration wrote.
+    ///
+    /// The identity substitution for every non-generic struct, which is all of
+    /// them until one is declared `struct[T]`.
+    fn substitute_params(&mut self, id: StructId, args: &[Type], ty: &Type) -> Type {
+        let params = self.structs[id as usize].params.clone();
+        if params.is_empty() || params.len() != args.len() {
+            return ty.clone();
+        }
+        let subst: HashMap<TypeVarId, Type> =
+            params.into_iter().zip(args.iter().cloned()).collect();
+        self.store.subst_vars(ty, &subst)
+    }
+
+    /// Read the leading segments of a path as a module, returning its path.
+    ///
+    /// `http.NotFound404` is the module `std/http` and the name `NotFound404`;
+    /// `std.http.NotFound404` reaches the same place through an import of
+    /// `std`, because a module path is a prefix and each further segment
+    /// extends it. `None` means the first segment names no module at all,
+    /// which for a single-segment path is the ordinary case.
+    fn split_path(&self, segments: &[Ident]) -> Option<String> {
+        let mut path = self.imports[self.current]
+            .get(segments[0].as_str())?
+            .clone();
+        // Every segment but the last may extend the module path; the last one
+        // is the member being named.
+        for segment in &segments[1..segments.len() - 1] {
+            path = format!("{path}/{segment}");
+            if !self.module_paths.contains(&path) {
+                return None;
+            }
+        }
+        Some(path)
+    }
+
+    /// A path whose first segment is not an import, and which is therefore not
+    /// a name this module has.
+    fn report_unknown_module(&mut self, segments: &[Ident]) {
+        let first = &segments[0];
+        self.error(first.span, format!("cannot find module `{first}`"))
+            .help = Some(format!(
+            "bind it first, as in `const {first} = @import(\"std/{first}\");`"
+        ));
+    }
+
+    /// A generic struct named at the wrong number of type arguments.
+    fn report_arity(&mut self, name: &Ident, want: usize, got: usize, span: Span) {
+        let plural = if want == 1 { "" } else { "s" };
+        let example: Vec<String> = (0..want).map(generic_placeholder).collect();
+        self.error(
+            span,
+            format!("`{name}` takes {want} type argument{plural}, but {got} were given"),
+        )
+        .help = Some(format!("write it as `{name}[{}]`", example.join(", ")));
     }
 
     /// Report `name` if it is an abstract type, and say so.
@@ -968,13 +1436,25 @@ impl<'a> Inferencer<'a> {
             };
             let mut names = HashSet::new();
             collect_deps_func(func, &mut names);
+            let module = self.fn_modules[id];
             for name in names {
                 // Every member of an overload set is a dependency: the call
                 // could resolve to any of them, and they must all be
                 // generalised together. A `const` bound to a set depends on the
                 // same functions -- including one pinned by an annotation,
                 // whose member is not known until they have been inferred.
-                let callees = match self.globals.get(&name) {
+                //
+                // A dotted name is a call through a module, whose callee lives
+                // in another one; resolving it here is what puts the two in
+                // dependency order rather than in arbitrary order.
+                let key = match name.split_once('.') {
+                    Some((alias, member)) => match self.imports[module].get(alias) {
+                        Some(path) => format!("{path}.{member}"),
+                        None => continue,
+                    },
+                    None => self.key_in(module, &name),
+                };
+                let callees = match self.globals.get(&key) {
                     Some(GlobalRef::Func(ids)) => ids,
                     Some(GlobalRef::FuncValue(index)) => &self.fn_consts[*index].ids,
                     _ => continue,
@@ -1003,9 +1483,13 @@ impl<'a> Inferencer<'a> {
             self.fn_types[id] = ty;
         }
 
+        // `fn` literals inside these bodies are declared as inference runs,
+        // so anything from here on is part of this group too.
+        let first_nested = self.funcs.len();
         for &id in group {
             self.infer_function(id as hir::FuncId);
         }
+        let nested: Vec<usize> = (first_nested..self.funcs.len()).collect();
 
         self.store.exit_level();
         self.solve_constraints();
@@ -1019,6 +1503,45 @@ impl<'a> Inferencer<'a> {
             }
             self.schemes[id] = Some(scheme);
         }
+
+        self.record_in_group_targs(group, &nested);
+    }
+
+    /// Give every call *within* this group the type arguments it makes.
+    ///
+    /// A call to a function whose group is still being inferred takes the
+    /// monomorphic arm of [`Inferencer::func_type`] and so records no type
+    /// arguments -- which is right while inferring, because the callee is not
+    /// yet generalised, and wrong afterwards: monomorphisation zips the
+    /// callee's quantified variables against an empty list, gets an empty
+    /// substitution, and queues a second copy of the callee with nothing
+    /// substituted into it. That copy still mentions type variables, and
+    /// `cannot tell what type X is being used at` is what the reader sees.
+    ///
+    /// The arguments such a call makes are exactly the callee's own quantified
+    /// variables. Hindley-Milner holds a binding group monomorphic, so a call
+    /// inside it is always at the variables the callee was inferred with, and
+    /// the caller's own substitution then carries them to concrete types. This
+    /// is why polymorphic recursion stays out of reach and ordinary recursion
+    /// works.
+    fn record_in_group_targs(&mut self, group: &[usize], nested: &[usize]) {
+        let members: HashSet<hir::FuncId> = group.iter().map(|id| *id as hir::FuncId).collect();
+        let targs_for: HashMap<hir::FuncId, Vec<Type>> = members
+            .iter()
+            .filter_map(|id| {
+                let scheme = self.schemes[*id as usize].as_ref()?;
+                Some((*id, scheme.vars.iter().map(|v| Type::Var(*v)).collect()))
+            })
+            .collect();
+
+        for id in group.iter().chain(nested) {
+            let Some(def) = &mut self.funcs[*id] else {
+                continue;
+            };
+            let mut body = std::mem::take(&mut def.body);
+            patch_targs_block(&mut body, &targs_for);
+            self.funcs[*id].as_mut().expect("just matched").body = body;
+        }
     }
 
     /// The function's type as written: annotated parts fixed, the rest fresh.
@@ -1026,6 +1549,19 @@ impl<'a> Inferencer<'a> {
     /// Records what the parameters were annotated with, which is not always
     /// what the type says: an abstract annotation becomes a variable here.
     fn signature_type(&mut self, id: hir::FuncId, func: &ast::Func) -> Type {
+        // One fresh variable per declared type parameter, created here rather
+        // than at declaration time because it must belong to this binding
+        // group's level to generalise with the rest of the signature.
+        let bindings: HashMap<String, Type> = self.fn_generic_names[id as usize]
+            .clone()
+            .iter()
+            .map(|g| (g.to_string(), self.store.fresh()))
+            .collect();
+        self.fn_type_params[id as usize] = bindings.clone();
+        self.type_scopes.push(bindings);
+        let enclosing = self.current;
+        self.current = self.fn_modules[id as usize];
+
         let mut decl = Vec::with_capacity(func.params.len());
         let mut params = Vec::with_capacity(func.params.len());
         for p in &func.params {
@@ -1044,6 +1580,8 @@ impl<'a> Inferencer<'a> {
             Some(t) => self.resolve_type_expr(t),
             None => self.store.fresh(),
         };
+        self.type_scopes.pop();
+        self.current = enclosing;
         Type::func(params, ret)
     }
 
@@ -1062,7 +1600,7 @@ impl<'a> Inferencer<'a> {
         let ast::TypeExpr::Named(name) = t else {
             return self.resolve_value_type_expr(t);
         };
-        if self.struct_ids.contains_key(name.as_str()) {
+        if self.struct_named(name.as_str()).is_some() {
             return self.resolve_value_type_expr(t);
         }
         let Some(abstract_id) = lookup_abstract(name.as_str()) else {
@@ -1113,8 +1651,17 @@ impl<'a> Inferencer<'a> {
             frame.params.push(local);
         }
         self.frames.push(frame);
+        self.type_scopes
+            .push(self.fn_type_params[id as usize].clone());
+        // Unqualified names in the body mean what they mean where it was
+        // written, which is not where its binding group happens to start.
+        let enclosing = self.current;
+        self.current = self.fn_modules[id as usize];
 
         let body = self.infer_block(&func.body);
+
+        self.type_scopes.pop();
+        self.current = enclosing;
 
         // A function that can fall off the end must return nothing. This also
         // guarantees code generation can terminate every block.
@@ -1174,7 +1721,18 @@ impl<'a> Inferencer<'a> {
                     return stmt;
                 }
                 let annotated = let_stmt.ty.as_ref().map(|t| self.resolve_type_expr(t));
-                let mut init = self.infer_expr(&let_stmt.init);
+                // A struct literal is told what it is being checked against
+                // before its fields are inferred. Its type arguments otherwise
+                // come only from the field values, and `Pair[?i64, i64]` would
+                // reject `.first = 5` -- the coercion into an optional that
+                // every other annotated binding gets.
+                let mut init = match &annotated {
+                    Some(expected) => {
+                        let expected = expected.clone();
+                        self.infer_expecting(&let_stmt.init, &expected)
+                    }
+                    None => self.infer_expr(&let_stmt.init),
+                };
                 if let Some(expected) = &annotated {
                     init = self.coerce(init, expected, "this initialiser");
                 }
@@ -1246,6 +1804,8 @@ impl<'a> Inferencer<'a> {
                     body,
                 })
             }
+
+            ast::Stmt::For(for_stmt) => self.infer_for_stmt(for_stmt),
 
             ast::Stmt::Block(block) => Some(hir::Stmt::Block(self.infer_block(block))),
 
@@ -1324,6 +1884,143 @@ impl<'a> Inferencer<'a> {
                 ty: want,
                 span,
             },
+        }))
+    }
+
+    /// `for (xs) |x| { .. }` becomes the `while` it stands for.
+    ///
+    /// Desugaring here rather than adding a HIR statement keeps the loop's
+    /// back-edge safepoint, its `break`/`continue` handling and its lowering
+    /// exactly the ones `while` already has. A second loop form in the code
+    /// generator would be a second place for the poll to be forgotten.
+    ///
+    /// The array goes into a hidden local so it is evaluated once --
+    /// `for (build()) |x|` must not rebuild it on every test -- and so that it
+    /// is an ordinary root for the collector, which a temporary would not be.
+    fn infer_for_stmt(&mut self, for_stmt: &'a ast::ForStmt) -> Option<hir::Stmt> {
+        let span = for_stmt.span;
+        let iter = self.infer_expr(&for_stmt.iter);
+        let elem = self.element_of(&iter.ty, for_stmt.iter.span());
+        let arr_ty = iter.ty.clone();
+
+        // The scope holding the hidden locals, so the user's body cannot see
+        // them and a nested `for` gets its own.
+        self.frame().scopes.push(Vec::new());
+        // Bracketed names cannot collide with anything the user can write.
+        let arr_local = self
+            .frame()
+            .add_local("[array]", arr_ty.clone(), false, span);
+        let index_local = self.frame().add_local("[index]", Type::i64(), true, span);
+
+        let int = |v: i64| hir::Expr {
+            kind: hir::ExprKind::Int(v),
+            ty: Type::i64(),
+            span,
+        };
+        let index_ref = || hir::Expr {
+            kind: hir::ExprKind::Local(index_local),
+            ty: Type::i64(),
+            span,
+        };
+        let array_ref = || hir::Expr {
+            kind: hir::ExprKind::Local(arr_local),
+            ty: arr_ty.clone(),
+            span,
+        };
+
+        // `[index] < len([array])`
+        let cond = hir::Expr {
+            kind: hir::ExprKind::Binary {
+                op: BinOp::Lt,
+                lhs: Box::new(index_ref()),
+                rhs: Box::new(hir::Expr {
+                    kind: hir::ExprKind::ArrayLen {
+                        arr: Box::new(array_ref()),
+                    },
+                    ty: Type::i64(),
+                    span,
+                }),
+            },
+            ty: Type::bool(),
+            span,
+        };
+
+        // `[index] += 1`, as the continue expression, so an explicit
+        // `continue` still advances the loop.
+        let step = hir::Stmt::Assign {
+            place: hir::Place::Local(index_local),
+            value: hir::Expr {
+                kind: hir::ExprKind::Binary {
+                    op: BinOp::Add,
+                    lhs: Box::new(index_ref()),
+                    rhs: Box::new(int(1)),
+                },
+                ty: Type::i64(),
+                span,
+            },
+        };
+
+        // The user's bindings, in a scope of their own so the body sees them.
+        self.frame().scopes.push(Vec::new());
+        let value_local = self.frame().add_local(
+            for_stmt.value.as_str(),
+            elem.clone(),
+            false,
+            for_stmt.value.span,
+        );
+        self.frame()
+            .bind_local(for_stmt.value.as_str(), value_local);
+        let mut prologue = vec![hir::Stmt::Let {
+            local: value_local,
+            init: hir::Expr {
+                kind: hir::ExprKind::Index {
+                    arr: Box::new(array_ref()),
+                    index: Box::new(index_ref()),
+                },
+                ty: elem,
+                span,
+            },
+        }];
+        // The index is copied into a binding of its own rather than being the
+        // counter: the counter has to be mutable, and the user's is not.
+        if let Some(name) = &for_stmt.index {
+            let local = self
+                .frame()
+                .add_local(name.as_str(), Type::i64(), false, name.span);
+            self.frame().bind_local(name.as_str(), local);
+            prologue.push(hir::Stmt::Let {
+                local,
+                init: index_ref(),
+            });
+        }
+
+        self.loop_depth += 1;
+        let mut body = self.infer_block(&for_stmt.body);
+        self.loop_depth -= 1;
+        self.frame().scopes.pop();
+
+        prologue.append(&mut body.stmts);
+        let body = hir::Block { stmts: prologue };
+
+        self.frame().scopes.pop();
+
+        Some(hir::Stmt::Block(hir::Block {
+            stmts: vec![
+                hir::Stmt::Let {
+                    local: arr_local,
+                    init: iter,
+                },
+                hir::Stmt::Let {
+                    local: index_local,
+                    init: int(0),
+                },
+                hir::Stmt::While {
+                    cond,
+                    capture: None,
+                    cont: Some(Box::new(step)),
+                    body,
+                },
+            ],
         }))
     }
 
@@ -1432,9 +2129,60 @@ impl<'a> Inferencer<'a> {
                     ty,
                 ))
             }
+            ast::Expr::Index { obj, index, .. } => {
+                // As for a field: a compound assignment evaluates the target
+                // twice, so the base has to be something re-reading is free of.
+                if !is_place_base(obj) {
+                    self.error(obj.span(), "cannot assign through this expression")
+                        .help = Some(
+                        "the left of a `[` in an assignment must be a variable or a field of one"
+                            .into(),
+                    );
+                    return None;
+                }
+                let (arr, index, elem) = self.infer_index(obj, index);
+                Some((hir::Place::Index { arr, index }, elem))
+            }
             other => {
                 self.error(other.span(), "cannot assign to this expression");
                 None
+            }
+        }
+    }
+
+    /// The shared half of `a[i]`, as an expression and as a place: infer both
+    /// sides, require an `i64` index, and produce the element type.
+    fn infer_index(
+        &mut self,
+        obj: &'a ast::Expr,
+        index: &'a ast::Expr,
+    ) -> (hir::Expr, hir::Expr, Type) {
+        let arr = self.infer_expr(obj);
+        let index = self.infer_expr(index);
+        let index = self.coerce(index, &Type::i64(), "this index");
+        let elem = self.element_of(&arr.ty, obj.span());
+        (arr, index, elem)
+    }
+
+    /// The element type of `[]T`, deferred when the array's type is still a
+    /// variable. See [`Constraint::Indexable`].
+    fn element_of(&mut self, arr: &Type, span: Span) -> Type {
+        match self.store.resolve(arr) {
+            Type::Con(TyCon::Array, args) => args[0].clone(),
+            Type::Var(_) => {
+                let elem = self.store.fresh();
+                self.constraints.push(Constraint::Indexable {
+                    obj: arr.clone(),
+                    elem: elem.clone(),
+                    span,
+                });
+                elem
+            }
+            other => {
+                let shown = self.store.show(&other);
+                self.error(span, format!("`{shown}` cannot be indexed"))
+                    .help = Some("only an array `[]T` can be indexed".into());
+                self.store.fresh()
             }
         }
     }
@@ -1504,6 +2252,15 @@ impl<'a> Inferencer<'a> {
             ast::Expr::Call { callee, args, .. } => self.infer_call(callee, args, span),
 
             ast::Expr::Field { obj, name, .. } => {
+                // `http.NotFound404` is a name reached through a module, not a
+                // field of a value called `http`. Modules are checked first,
+                // and only when nothing local shadows the leading name, so
+                // user code always wins.
+                if let Some(path) = self.module_path_of(obj)
+                    && let Some(value) = self.module_member(&path, name)
+                {
+                    return value;
+                }
                 let obj = self.infer_expr(obj);
                 let (strukt, index, ty) = self.field_of(&obj.ty, name);
                 hir::Expr {
@@ -1518,7 +2275,54 @@ impl<'a> Inferencer<'a> {
                 }
             }
 
-            ast::Expr::StructLit { name, fields, .. } => self.infer_struct_lit(name, fields, span),
+            // An `@import` anywhere but a top-level `const` is a mistake with
+            // a specific fix, so say what it is rather than "not a value".
+            ast::Expr::Import { span, .. } => {
+                self.error(*span, "`@import` is only allowed at the top level")
+                    .help = Some(
+                    "bind it once beside the other declarations, as in \
+                     `const http = @import(\"std/http\");`"
+                        .into(),
+                );
+                let ty = self.store.fresh();
+                hir::Expr {
+                    kind: hir::ExprKind::Null,
+                    ty,
+                    span: *span,
+                }
+            }
+
+            ast::Expr::ArrayLit { elem, elems, .. } => {
+                let elem_ty = self.resolve_type_expr(elem);
+                let elems = elems
+                    .iter()
+                    .map(|e| {
+                        let e = self.infer_expecting(e, &elem_ty);
+                        self.coerce(e, &elem_ty, "this element")
+                    })
+                    .collect();
+                hir::Expr {
+                    kind: hir::ExprKind::ArrayNew { elems },
+                    ty: Type::array(elem_ty),
+                    span,
+                }
+            }
+
+            ast::Expr::Index { obj, index, .. } => {
+                let (arr, index, elem) = self.infer_index(obj, index);
+                hir::Expr {
+                    kind: hir::ExprKind::Index {
+                        arr: Box::new(arr),
+                        index: Box::new(index),
+                    },
+                    ty: elem,
+                    span,
+                }
+            }
+
+            ast::Expr::StructLit { path, fields, .. } => {
+                self.infer_struct_lit(path, fields, span, None)
+            }
 
             ast::Expr::Fn(func) => self.infer_closure(func, span),
 
@@ -1652,6 +2456,73 @@ impl<'a> Inferencer<'a> {
         hir::Expr { kind, ty, span }
     }
 
+    /// The module a path expression names, if its leading segment is an
+    /// import that nothing local shadows.
+    fn module_path_of(&self, expr: &ast::Expr) -> Option<String> {
+        let mut segments = Vec::new();
+        let mut cur = expr;
+        loop {
+            match cur {
+                ast::Expr::Field { obj, name, .. } => {
+                    segments.push(name.clone());
+                    cur = obj;
+                }
+                ast::Expr::Ident(name) => {
+                    segments.push(name.clone());
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        segments.reverse();
+        // A local of the same name shadows the import, so that binding a
+        // variable called `http` cannot be broken by an import elsewhere.
+        if self.lookup_binding_exists(segments[0].as_str()) {
+            return None;
+        }
+        let mut path = self.imports[self.current]
+            .get(segments[0].as_str())?
+            .clone();
+        for segment in &segments[1..] {
+            path = format!("{path}/{segment}");
+            if !self.module_paths.contains(&path) {
+                return None;
+            }
+        }
+        Some(path)
+    }
+
+    /// Whether a name is bound locally, without threading a capture through
+    /// the enclosing closures the way looking it up would.
+    fn lookup_binding_exists(&self, name: &str) -> bool {
+        self.frames.iter().any(|f| f.find(name).is_some())
+    }
+
+    /// What a module member names, without turning it into a value.
+    ///
+    /// A call needs this rather than [`Inferencer::module_member`]: a builtin
+    /// is not a value, and an overload set has to be chosen from with the
+    /// arguments in hand.
+    fn module_member_ref(&mut self, obj: &ast::Expr, name: &Ident) -> Option<GlobalRef> {
+        let path = self.module_path_of(obj)?;
+        if path == HTTP_MODULE {
+            self.lookup_struct_in(HTTP_MODULE, name.as_str());
+        }
+        self.globals.get(&format!("{path}.{name}")).cloned()
+    }
+
+    /// A value named through a module: `http.NotFound404`, `math.abs`.
+    fn module_member(&mut self, path: &str, name: &Ident) -> Option<hir::Expr> {
+        // A status type is materialised on first mention, which is what keeps
+        // a program from paying for the 26 it never names.
+        if path == HTTP_MODULE {
+            self.lookup_struct_in(HTTP_MODULE, name.as_str());
+        }
+        let key = format!("{path}.{name}");
+        let global = self.globals.get(&key).cloned()?;
+        Some(self.global_as_value(global, name))
+    }
+
     fn infer_ident(&mut self, name: &Ident) -> hir::Expr {
         let span = name.span;
         if let Some(local) = self.lookup_local(name.as_str()) {
@@ -1669,36 +2540,8 @@ impl<'a> Inferencer<'a> {
         if let Some(ids) = self.overload_set(name.as_str()) {
             return self.func_value(name, &ids);
         }
-        match self.globals.get(name.as_str()).cloned() {
-            // Both are handled by `overload_set` above.
-            Some(GlobalRef::Func(_) | GlobalRef::FuncValue(_)) => {
-                unreachable!("a name meaning functions was resolved above")
-            }
-            Some(GlobalRef::Singleton(id)) => hir::Expr {
-                kind: hir::ExprKind::Singleton(id),
-                ty: Type::strukt(id),
-                span,
-            },
-            Some(GlobalRef::Const(index)) => {
-                let scheme = self.consts[index].scheme.clone();
-                let (ty, _) = self.store.instantiate(&scheme);
-                hir::Expr {
-                    kind: self.consts[index].kind.clone(),
-                    ty,
-                    span,
-                }
-            }
-            Some(GlobalRef::Builtin(id)) => {
-                let owned = name.to_string();
-                self.error(span, format!("builtin `{owned}` cannot be used as a value"))
-                    .help = Some("call it directly, e.g. `print(x)`".into());
-                let ty = self.builtin_type(id);
-                hir::Expr {
-                    kind: hir::ExprKind::Null,
-                    ty,
-                    span,
-                }
-            }
+        match self.global(name.as_str()).cloned() {
+            Some(global) => self.global_as_value(global, name),
             None => {
                 // A status type mentioned for the first time is materialised
                 // here, which is what makes `handle(req, NotFound404)` work
@@ -1716,6 +2559,53 @@ impl<'a> Inferencer<'a> {
                     self.error(span, format!("cannot find `{name}` in this scope"));
                 }
                 let ty = self.store.fresh();
+                hir::Expr {
+                    kind: hir::ExprKind::Null,
+                    ty,
+                    span,
+                }
+            }
+        }
+    }
+
+    /// What a resolved global means as a value.
+    fn global_as_value(&mut self, global: GlobalRef, name: &Ident) -> hir::Expr {
+        let span = name.span;
+        match global {
+            GlobalRef::Func(ids) => self.func_value(name, &ids),
+            GlobalRef::FuncValue(index) => {
+                let ids = self.fn_consts[index].ids.clone();
+                self.func_value(name, &ids)
+            }
+            GlobalRef::Module => {
+                self.error(span, format!("`{name}` is a module, not a value"))
+                    .help = Some("name something inside it, as in `http.NotFound404`".into());
+                let ty = self.store.fresh();
+                hir::Expr {
+                    kind: hir::ExprKind::Null,
+                    ty,
+                    span,
+                }
+            }
+            GlobalRef::Singleton(id) => hir::Expr {
+                kind: hir::ExprKind::Singleton(id),
+                ty: Type::strukt(id),
+                span,
+            },
+            GlobalRef::Const(index) => {
+                let scheme = self.consts[index].scheme.clone();
+                let (ty, _) = self.store.instantiate(&scheme);
+                hir::Expr {
+                    kind: self.consts[index].kind.clone(),
+                    ty,
+                    span,
+                }
+            }
+            GlobalRef::Builtin(id) => {
+                let owned = name.to_string();
+                self.error(span, format!("builtin `{owned}` cannot be used as a value"))
+                    .help = Some("call it directly, e.g. `print(x)`".into());
+                let ty = self.builtin_type(id);
                 hir::Expr {
                     kind: hir::ExprKind::Null,
                     ty,
@@ -1783,7 +2673,7 @@ impl<'a> Inferencer<'a> {
         // A binding in scope shadows the global, pin and all.
         let pinned = match self.lookup_binding(name) {
             Some(_) => None,
-            None => match self.globals.get(name) {
+            None => match self.global(name) {
                 Some(GlobalRef::FuncValue(index)) => Some(*index),
                 _ => None,
             },
@@ -1810,7 +2700,7 @@ impl<'a> Inferencer<'a> {
             Some(Binding::Overloads(ids)) => return Some(ids),
             None => {}
         }
-        match self.globals.get(name) {
+        match self.global(name) {
             Some(GlobalRef::Func(ids)) => Some(ids.clone()),
             Some(GlobalRef::FuncValue(index)) => Some(self.resolve_func_const(*index)),
             _ => None,
@@ -1950,11 +2840,23 @@ impl<'a> Inferencer<'a> {
             .is_some_and(|&id| self.fn_names[id as usize] != name)
     }
 
+    /// The type of a builtin *at this use*.
+    ///
+    /// A generic builtin is instantiated here rather than generalised into a
+    /// scheme: it has one machine implementation, so there is nothing for
+    /// monomorphisation to specialise, and the variables only have to be fresh
+    /// per use for two calls to `len` to be at different element types.
     fn builtin_type(&mut self, id: hir::BuiltinId) -> Type {
         let builtins = wsharp_runtime::builtins();
         let b = &builtins[id as usize];
-        let params = b.params.iter().map(|t| Type::from_builtin(*t)).collect();
-        Type::func(params, Type::from_builtin(b.ret))
+        let mut vars = HashMap::new();
+        let params = b
+            .params
+            .iter()
+            .map(|t| Type::from_builtin_with(*t, &mut self.store, &mut vars))
+            .collect();
+        let ret = Type::from_builtin_with(b.ret, &mut self.store, &mut vars);
+        Type::func(params, ret)
     }
 
     fn infer_binary(&mut self, op: BinOp, lhs: hir::Expr, rhs: hir::Expr, span: Span) -> hir::Expr {
@@ -2019,6 +2921,13 @@ impl<'a> Inferencer<'a> {
         // A `const` alias for a set resolves exactly as the name it aliases.
         let named = match callee {
             ast::Expr::Ident(name) => self.overload_set(name.as_str()).map(|ids| (name, ids)),
+            // `str.concat(a, b)`: a call through a module, which resolves to
+            // the same kinds of callee an unqualified one does.
+            ast::Expr::Field { obj, name, .. } => match self.module_member_ref(obj, name) {
+                Some(GlobalRef::Func(ids)) => Some((name, ids)),
+                Some(GlobalRef::FuncValue(index)) => Some((name, self.resolve_func_const(index))),
+                _ => None,
+            },
             _ => None,
         };
 
@@ -2041,7 +2950,7 @@ impl<'a> Inferencer<'a> {
             }
             None => match callee {
                 ast::Expr::Ident(name) if self.lookup_local(name.as_str()).is_none() => {
-                    match self.globals.get(name.as_str()).cloned() {
+                    match self.global(name.as_str()).cloned() {
                         Some(GlobalRef::Builtin(id)) => {
                             (self.builtin_type(id), hir::Callee::Builtin(id))
                         }
@@ -2050,6 +2959,17 @@ impl<'a> Inferencer<'a> {
                             (e.ty.clone(), hir::Callee::Indirect(Box::new(e)))
                         }
                     }
+                }
+                ast::Expr::Field { obj, name, .. }
+                    if matches!(
+                        self.module_member_ref(obj, name),
+                        Some(GlobalRef::Builtin(_))
+                    ) =>
+                {
+                    let Some(GlobalRef::Builtin(id)) = self.module_member_ref(obj, name) else {
+                        unreachable!("just matched")
+                    };
+                    (self.builtin_type(id), hir::Callee::Builtin(id))
                 }
                 other => {
                     let e = self.infer_expr(other);
@@ -2497,16 +3417,34 @@ impl<'a> Inferencer<'a> {
 
     fn infer_struct_lit(
         &mut self,
-        name: &Ident,
+        path: &[Ident],
         inits: &'a [ast::FieldInit],
         span: Span,
+        expected: Option<Type>,
     ) -> hir::Expr {
-        let Some(id) = self.lookup_struct(name.as_str()) else {
+        let name = path.last().expect("a path has a last segment");
+        let found = match self.split_path(path) {
+            Some(module) => self.lookup_struct_in(&module, name.as_str()),
+            None if path.len() == 1 => self.lookup_struct(name.as_str()),
+            None => {
+                self.report_unknown_module(path);
+                for init in inits {
+                    self.infer_expr(&init.value);
+                }
+                let ty = self.store.fresh();
+                return hir::Expr {
+                    kind: hir::ExprKind::Null,
+                    ty,
+                    span,
+                };
+            }
+        };
+        let Some(id) = found else {
             // A name that exists but is not a type is a different mistake from
             // a name that does not exist, and "unknown" would send the reader
             // hunting for a typo. `find` rather than `lookup_local`: this is
             // only a question, and must not thread a capture through closures.
-            let is_something_else = self.globals.contains_key(name.as_str())
+            let is_something_else = self.has_global(name.as_str())
                 || self.frames.iter().any(|f| f.find(name.as_str()).is_some());
             if is_something_else {
                 self.error(name.span, format!("`{name}` is not a struct"))
@@ -2529,6 +3467,18 @@ impl<'a> Inferencer<'a> {
         };
 
         let decl = self.structs[id as usize].clone();
+        // `Box{ .value = 1 }` rather than `Box[i64]{ .. }`: the arguments come
+        // from the field values, which is the only place they could come from
+        // without `Box[i64]{` colliding with indexing `Box` by `i64`.
+        let args: Vec<Type> = decl.params.iter().map(|_| self.store.fresh()).collect();
+        let ty = Type::Con(TyCon::Struct(id), args.clone());
+        // Bind the arguments from the context when there is one, so each
+        // field is checked against the type it will actually be stored at.
+        // A failure here is not reported: the caller compares the whole types
+        // afterwards and says so once, rather than once per field.
+        if let Some(expected) = expected {
+            let _ = self.store.try_unify(&ty, &expected);
+        }
         let mut values: Vec<Option<hir::Expr>> = vec![None; decl.fields.len()];
         for init in inits {
             let Some(index) = decl.field_index(init.name.as_str()) else {
@@ -2545,8 +3495,9 @@ impl<'a> Inferencer<'a> {
                     format!("field `{}` is set twice", init.name),
                 );
             }
-            let value = self.infer_expr(&init.value);
             let want = decl.fields[index as usize].ty.clone();
+            let want = self.substitute_params(id, &args, &want);
+            let value = self.infer_expecting(&init.value, &want);
             let value = self.coerce(value, &want, "this field");
             values[index as usize] = Some(value);
         }
@@ -2587,8 +3538,25 @@ impl<'a> Inferencer<'a> {
 
         hir::Expr {
             kind: hir::ExprKind::StructNew { strukt: id, fields },
-            ty: Type::strukt(id),
+            ty,
             span,
+        }
+    }
+
+    /// Infer an expression that is already known to be checked against
+    /// `expected`.
+    ///
+    /// This matters only for a struct literal, whose type arguments otherwise
+    /// come from its field values alone: `Pair[?i64, i64]` would then reject
+    /// `.first = 5`, because the field is checked against a variable nothing
+    /// has bound yet rather than against `?i64`. Telling the literal first is
+    /// what gives its fields the coercion every other annotated position gets.
+    fn infer_expecting(&mut self, expr: &'a ast::Expr, expected: &Type) -> hir::Expr {
+        match expr {
+            ast::Expr::StructLit { path, fields, span } => {
+                self.infer_struct_lit(path, fields, *span, Some(expected.clone()))
+            }
+            other => self.infer_expr(other),
         }
     }
 
@@ -2596,7 +3564,7 @@ impl<'a> Inferencer<'a> {
     /// from enclosing frames become captures, copied in by value.
     fn infer_closure(&mut self, func: &'a ast::Func, span: Span) -> hir::Expr {
         let name = Ident::new(format!("closure@{}", span.start), span);
-        let id = self.declare_function(&name, func, span, true);
+        let id = self.declare_function(&name, &[], func, span, true);
         let fn_ty = self.signature_type(id, func);
         self.fn_types[id as usize] = fn_ty.clone();
 
@@ -2758,11 +3726,12 @@ impl<'a> Inferencer<'a> {
     /// deferred; the returned indices are [`UNRESOLVED`] and get patched later.
     fn field_of(&mut self, obj: &Type, field: &Ident) -> (StructId, u32, Type) {
         match self.store.resolve(obj) {
-            Type::Con(TyCon::Struct(id), _) => {
+            Type::Con(TyCon::Struct(id), args) => {
                 let decl = &self.structs[id as usize];
                 match decl.field_index(field.as_str()) {
                     Some(index) => {
                         let ty = decl.fields[index as usize].ty.clone();
+                        let ty = self.substitute_params(id, &args, &ty);
                         (id, index, ty)
                     }
                     None => {
@@ -2878,18 +3847,41 @@ impl<'a> Inferencer<'a> {
                         Type::Var(_) => {
                             let _ = self.store.unify(&ty, &Type::i64());
                         }
-                        Type::Con(TyCon::I64 | TyCon::F64 | TyCon::Bool, _) => {}
+                        // `str` compares by contents rather than by address,
+                        // which takes a call; code generation emits it, so
+                        // nothing here has to know that it is not one
+                        // instruction like the others.
+                        Type::Con(TyCon::I64 | TyCon::F64 | TyCon::Bool | TyCon::Str, _) => {}
                         t => {
                             let shown = self.store.show(&t);
                             self.error(
                                 span,
                                 format!("`{shown}` values cannot be compared with `==`"),
                             )
-                            .help =
-                                Some("only `i64`, `f64` and `bool` can be compared so far".into());
+                            .help = Some(
+                                "only `i64`, `f64`, `bool` and `str` can be compared so far".into(),
+                            );
                         }
                     }
                 }
+                Constraint::Indexable { obj, elem, span } => match self.store.resolve(&obj) {
+                    Type::Con(TyCon::Array, args) => {
+                        let _ = self.store.unify(&elem, &args[0]);
+                    }
+                    // Still a variable, so nothing said what was indexed.
+                    // Unlike `Numeric` there is no sensible default: an
+                    // element type guessed here would be wrong everywhere.
+                    Type::Var(_) => {
+                        self.error(span, "cannot tell what is being indexed").help =
+                            Some("annotate the value being indexed, e.g. `fn f(a: []i64)`".into());
+                    }
+                    other => {
+                        let shown = self.store.show(&other);
+                        self.error(span, format!("`{shown}` cannot be indexed"))
+                            .help = Some("only an array `[]T` can be indexed".into());
+                    }
+                },
+
                 Constraint::HasField {
                     obj,
                     field,
@@ -3040,8 +4032,8 @@ impl<'a> Inferencer<'a> {
                 // An alias for a set is not a set of its own: its members were
                 // already checked under the name they were declared with, and
                 // checking them twice would say everything twice.
-                GlobalRef::Func(ids) if ids.len() > 1 && !self.is_alias(name, ids) => {
-                    Some((name.clone(), ids.clone()))
+                GlobalRef::Func(ids) if ids.len() > 1 && !self.is_alias(bare_name(name), ids) => {
+                    Some((bare_name(name).to_string(), ids.clone()))
                 }
                 _ => None,
             })
@@ -3108,7 +4100,8 @@ impl<'a> Inferencer<'a> {
     }
 
     fn check_entry(&mut self) {
-        let Some(GlobalRef::Func(ids)) = self.globals.get("main").cloned() else {
+        let root_main = self.key_in(0, "main");
+        let Some(GlobalRef::Func(ids)) = self.globals.get(&root_main).cloned() else {
             return;
         };
         if ids.len() > 1 {
@@ -3159,6 +4152,10 @@ fn place_as_expr(place: &hir::Place, ty: &Type, span: Span) -> hir::Expr {
             index: *index,
             name: name.clone(),
         },
+        hir::Place::Index { arr, index } => hir::ExprKind::Index {
+            arr: Box::new(arr.clone()),
+            index: Box::new(index.clone()),
+        },
     };
     hir::Expr {
         kind,
@@ -3185,6 +4182,27 @@ fn is_place_base(expr: &ast::Expr) -> bool {
 /// every path and to guarantee code generation can terminate every basic block.
 fn block_terminates(block: &ast::Block) -> bool {
     block.stmts.iter().any(stmt_terminates)
+}
+
+/// The standard library's module of HTTP status types, which are materialised
+/// from a table on first mention rather than declared.
+pub use wsharp_runtime::builtins::HTTP_MODULE;
+
+/// A stand-in type name for the "takes N type arguments" help line.
+fn generic_placeholder(i: usize) -> String {
+    const LETTERS: [char; 4] = ['T', 'U', 'V', 'W'];
+    match i {
+        0..=3 => LETTERS[i].to_string(),
+        _ => format!("T{}", i - 3),
+    }
+}
+
+/// A global's key without the module it was qualified with.
+///
+/// Keys are `"<module path>.<name>"`, and a name may not contain a `.`, so the
+/// last one separates them however many the path itself has.
+fn bare_name(key: &str) -> &str {
+    key.rsplit('.').next().unwrap_or(key)
 }
 
 fn stmt_terminates(stmt: &ast::Stmt) -> bool {
@@ -3242,6 +4260,10 @@ fn collect_deps_stmt(stmt: &ast::Stmt, out: &mut HashSet<String>) {
                 collect_deps_stmt(cont, out);
             }
         }
+        ast::Stmt::For(s) => {
+            collect_deps_expr(&s.iter, out);
+            collect_deps_block(&s.body, out);
+        }
     }
 }
 
@@ -3260,6 +4282,18 @@ fn collect_deps_expr(expr: &ast::Expr, out: &mut HashSet<String>) {
         ast::Expr::Ident(name) => {
             out.insert(name.to_string());
         }
+        // A module name is not a dependency: it is resolved before any
+        // binding group is formed.
+        ast::Expr::Import { .. } => {}
+        ast::Expr::ArrayLit { elems, .. } => {
+            for e in elems {
+                collect_deps_expr(e, out);
+            }
+        }
+        ast::Expr::Index { obj, index, .. } => {
+            collect_deps_expr(obj, out);
+            collect_deps_expr(index, out);
+        }
         ast::Expr::Int(..)
         | ast::Expr::Float(..)
         | ast::Expr::Bool(..)
@@ -3268,8 +4302,18 @@ fn collect_deps_expr(expr: &ast::Expr, out: &mut HashSet<String>) {
         | ast::Expr::ErrorLit { .. } => {}
         ast::Expr::Unary { expr, .. }
         | ast::Expr::Try { expr, .. }
-        | ast::Expr::Unwrap { expr, .. }
-        | ast::Expr::Field { obj: expr, .. } => collect_deps_expr(expr, out),
+        | ast::Expr::Unwrap { expr, .. } => collect_deps_expr(expr, out),
+        ast::Expr::Field { obj, name, .. } => {
+            // `str.concat(..)` depends on `concat` in whatever `str` names.
+            // Recorded dotted and resolved by the caller, which knows the
+            // module this was written in; a field of a value records the base
+            // name only, and a name that turns out to mean nothing is simply
+            // not an edge.
+            if let ast::Expr::Ident(base) = &**obj {
+                out.insert(format!("{base}.{name}"));
+            }
+            collect_deps_expr(obj, out);
+        }
         ast::Expr::Binary { lhs, rhs, .. } => {
             collect_deps_expr(lhs, out);
             collect_deps_expr(rhs, out);
@@ -3370,6 +4414,136 @@ fn tarjan_scc(n: usize, edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
 // Field index fix-up
 // ---------------------------------------------------------------------------
 
+/// Fill in the type arguments of calls that were made before their callee was
+/// generalised. See [`Inferencer::record_in_group_targs`].
+///
+/// Only an *empty* list is filled: a call recorded outside the group already
+/// carries the arguments its instantiation made.
+fn patch_targs_block(block: &mut hir::Block, targs_for: &HashMap<hir::FuncId, Vec<Type>>) {
+    for stmt in &mut block.stmts {
+        patch_targs_stmt(stmt, targs_for);
+    }
+}
+
+fn patch_targs_stmt(stmt: &mut hir::Stmt, targs_for: &HashMap<hir::FuncId, Vec<Type>>) {
+    match stmt {
+        hir::Stmt::Let { init, .. } => patch_targs_expr(init, targs_for),
+        hir::Stmt::Assign { place, value } => {
+            match place {
+                hir::Place::Field { obj, .. } => patch_targs_expr(obj, targs_for),
+                hir::Place::Index { arr, index } => {
+                    patch_targs_expr(arr, targs_for);
+                    patch_targs_expr(index, targs_for);
+                }
+                hir::Place::Local(_) => {}
+            }
+            patch_targs_expr(value, targs_for);
+        }
+        hir::Stmt::Expr(e) | hir::Stmt::Return(Some(e)) => patch_targs_expr(e, targs_for),
+        hir::Stmt::Return(None) | hir::Stmt::Break | hir::Stmt::Continue => {}
+        hir::Stmt::If {
+            cond, then, els, ..
+        } => {
+            patch_targs_expr(cond, targs_for);
+            patch_targs_block(then, targs_for);
+            if let Some(els) = els {
+                patch_targs_block(els, targs_for);
+            }
+        }
+        hir::Stmt::While {
+            cond, cont, body, ..
+        } => {
+            patch_targs_expr(cond, targs_for);
+            if let Some(cont) = cont {
+                patch_targs_stmt(cont, targs_for);
+            }
+            patch_targs_block(body, targs_for);
+        }
+        hir::Stmt::Block(b) => patch_targs_block(b, targs_for),
+    }
+}
+
+fn patch_targs_expr(expr: &mut hir::Expr, targs_for: &HashMap<hir::FuncId, Vec<Type>>) {
+    let fill = |func: &hir::FuncId, targs: &mut Vec<Type>| {
+        if targs.is_empty()
+            && let Some(vars) = targs_for.get(func)
+        {
+            *targs = vars.clone();
+        }
+    };
+    match &mut expr.kind {
+        hir::ExprKind::Call { callee, args } => {
+            match callee {
+                hir::Callee::Static { func, targs } => fill(func, targs),
+                hir::Callee::Dynamic { cases } => {
+                    for case in cases {
+                        fill(&case.func, &mut case.targs);
+                    }
+                }
+                hir::Callee::Indirect(e) => patch_targs_expr(e, targs_for),
+                hir::Callee::Builtin(_) => {}
+            }
+            for arg in args {
+                patch_targs_expr(arg, targs_for);
+            }
+        }
+        hir::ExprKind::Closure {
+            func,
+            targs,
+            captures,
+        } => {
+            fill(func, targs);
+            for c in captures {
+                patch_targs_expr(c, targs_for);
+            }
+        }
+        hir::ExprKind::Unary { expr, .. }
+        | hir::ExprKind::Some(expr)
+        | hir::ExprKind::Ok(expr)
+        | hir::ExprKind::Try(expr)
+        | hir::ExprKind::Unwrap(expr)
+        | hir::ExprKind::Field { obj: expr, .. } => patch_targs_expr(expr, targs_for),
+        hir::ExprKind::Binary { lhs, rhs, .. } | hir::ExprKind::Logical { lhs, rhs, .. } => {
+            patch_targs_expr(lhs, targs_for);
+            patch_targs_expr(rhs, targs_for);
+        }
+        hir::ExprKind::Orelse { expr, alt } | hir::ExprKind::Catch { expr, alt, .. } => {
+            patch_targs_expr(expr, targs_for);
+            patch_targs_expr(alt, targs_for);
+        }
+        hir::ExprKind::StructNew { fields, .. } => {
+            for f in fields {
+                patch_targs_expr(f, targs_for);
+            }
+        }
+        hir::ExprKind::ArrayNew { elems } => {
+            for e in elems {
+                patch_targs_expr(e, targs_for);
+            }
+        }
+        hir::ExprKind::Index { arr, index } => {
+            patch_targs_expr(arr, targs_for);
+            patch_targs_expr(index, targs_for);
+        }
+        hir::ExprKind::ArrayLen { arr } => patch_targs_expr(arr, targs_for),
+        hir::ExprKind::If {
+            cond, then, els, ..
+        } => {
+            patch_targs_expr(cond, targs_for);
+            patch_targs_expr(then, targs_for);
+            patch_targs_expr(els, targs_for);
+        }
+        hir::ExprKind::Int(_)
+        | hir::ExprKind::Float(_)
+        | hir::ExprKind::Bool(_)
+        | hir::ExprKind::Str(_)
+        | hir::ExprKind::Null
+        | hir::ExprKind::Local(_)
+        | hir::ExprKind::Singleton(_)
+        | hir::ExprKind::Err(_) => {}
+    }
+}
+
 fn fixup_block(block: &mut hir::Block, structs: &[hir::StructDef], store: &mut TypeStore) {
     for stmt in &mut block.stmts {
         fixup_stmt(stmt, structs, store);
@@ -3380,15 +4554,21 @@ fn fixup_stmt(stmt: &mut hir::Stmt, structs: &[hir::StructDef], store: &mut Type
     match stmt {
         hir::Stmt::Let { init, .. } => fixup_expr(init, structs, store),
         hir::Stmt::Assign { place, value } => {
-            if let hir::Place::Field {
-                obj,
-                strukt,
-                index,
-                name,
-            } = place
-            {
-                fixup_expr(obj, structs, store);
-                resolve_field(&obj.ty, name, structs, store, strukt, index);
+            match place {
+                hir::Place::Field {
+                    obj,
+                    strukt,
+                    index,
+                    name,
+                } => {
+                    fixup_expr(obj, structs, store);
+                    resolve_field(&obj.ty, name, structs, store, strukt, index);
+                }
+                hir::Place::Index { arr, index } => {
+                    fixup_expr(arr, structs, store);
+                    fixup_expr(index, structs, store);
+                }
+                hir::Place::Local(_) => {}
             }
             fixup_expr(value, structs, store);
         }
@@ -3465,6 +4645,16 @@ fn fixup_expr(expr: &mut hir::Expr, structs: &[hir::StructDef], store: &mut Type
                 fixup_expr(f, structs, store);
             }
         }
+        hir::ExprKind::ArrayNew { elems } => {
+            for e in elems {
+                fixup_expr(e, structs, store);
+            }
+        }
+        hir::ExprKind::Index { arr, index } => {
+            fixup_expr(arr, structs, store);
+            fixup_expr(index, structs, store);
+        }
+        hir::ExprKind::ArrayLen { arr } => fixup_expr(arr, structs, store),
         hir::ExprKind::If {
             cond, then, els, ..
         } => {

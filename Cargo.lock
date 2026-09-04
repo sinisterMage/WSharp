@@ -657,6 +657,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "wsharp-codegen",
+ "wsharp-runtime",
  "wsharp-sema",
  "wsharp-syntax",
 ]

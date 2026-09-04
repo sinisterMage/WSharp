@@ -78,12 +78,20 @@ impl Diagnostic {
 pub struct SourceFile {
     pub name: String,
     pub text: String,
-    /// Byte offset of the first character of each line.
+    /// Where this file's text begins in the whole program's offset space. A
+    /// [`Span`] is global, so `base` is what turns one back into a position in
+    /// this file. See [`SourceMap`].
+    pub base: u32,
+    /// Byte offset of the first character of each line, relative to `base`.
     line_starts: Vec<u32>,
 }
 
 impl SourceFile {
     pub fn new(name: impl Into<String>, text: impl Into<String>) -> SourceFile {
+        SourceFile::at(name, text, 0)
+    }
+
+    pub fn at(name: impl Into<String>, text: impl Into<String>, base: u32) -> SourceFile {
         let text = text.into();
         let mut line_starts = vec![0u32];
         for (i, b) in text.bytes().enumerate() {
@@ -94,13 +102,21 @@ impl SourceFile {
         SourceFile {
             name: name.into(),
             text,
+            base,
             line_starts,
         }
+    }
+
+    /// The half-open range of global offsets this file covers, the byte just
+    /// past its end included so that a span pointing at end-of-file lands here.
+    fn covers(&self, offset: u32) -> bool {
+        offset >= self.base && offset <= self.base + self.text.len() as u32
     }
 
     /// 1-based line and column for a byte offset. Column counts characters, not
     /// bytes, so multi-byte source still points at the right place.
     pub fn line_col(&self, offset: u32) -> (usize, usize) {
+        let offset = offset.saturating_sub(self.base);
         let line = match self.line_starts.binary_search(&offset) {
             Ok(i) => i,
             Err(i) => i - 1,
@@ -127,6 +143,45 @@ impl SourceFile {
     }
 }
 
+/// Every file that went into one program, laid end to end in a single offset
+/// space.
+///
+/// A [`Span`] stays two `u32`s with no file in it. Widening it would touch
+/// every node in the syntax tree and every diagnostic, to carry a number that
+/// only the renderer ever reads -- so each file is given a base offset instead
+/// and a span's file is found by which range it falls in. The first file starts
+/// at 1, which keeps offset 0 meaning [`Span::EMPTY`]: no source at all.
+#[derive(Default)]
+pub struct SourceMap {
+    files: Vec<SourceFile>,
+}
+
+impl SourceMap {
+    pub fn new() -> SourceMap {
+        SourceMap::default()
+    }
+
+    /// Add a file and return the base its spans must be offset by.
+    pub fn add(&mut self, name: impl Into<String>, text: impl Into<String>) -> u32 {
+        let base = match self.files.last() {
+            Some(last) => last.base + last.text.len() as u32 + 1,
+            None => 1,
+        };
+        self.files.push(SourceFile::at(name, text, base));
+        base
+    }
+
+    pub fn files(&self) -> &[SourceFile] {
+        &self.files
+    }
+
+    /// The file a span points into, or `None` for [`Span::EMPTY`] and anything
+    /// else that names no source.
+    pub fn file(&self, offset: u32) -> Option<&SourceFile> {
+        self.files.iter().find(|f| f.covers(offset))
+    }
+}
+
 /// Render a diagnostic in the style of
 ///
 /// ```text
@@ -138,7 +193,16 @@ impl SourceFile {
 ///    |
 ///    = help: ...
 /// ```
-pub fn render(file: &SourceFile, diag: &Diagnostic) -> String {
+pub fn render(map: &SourceMap, diag: &Diagnostic) -> String {
+    match map.file(diag.primary.span.start) {
+        Some(file) => render_in(file, diag),
+        // A diagnostic should always carry a real span; if one does not, say
+        // what is wrong rather than pointing at an arbitrary file.
+        None => format!("{}: {}\n", diag.severity.label(), diag.message),
+    }
+}
+
+fn render_in(file: &SourceFile, diag: &Diagnostic) -> String {
     let mut out = String::new();
     out.push_str(diag.severity.label());
     out.push_str(": ");
@@ -234,7 +298,7 @@ mod tests {
     fn renders_caret_under_span() {
         let f = SourceFile::new("t.ws", "const x = 1;\nconst y = 2;\n");
         let d = Diagnostic::error(Span::new(19, 20), "bad").label("here");
-        let s = render(&f, &d);
+        let s = render_in(&f, &d);
         assert!(s.starts_with("error: bad\n"), "{s}");
         assert!(s.contains("--> t.ws:2:7"), "{s}");
         assert!(s.contains("2 | const y = 2;"), "{s}");
@@ -247,7 +311,7 @@ mod tests {
         let d = Diagnostic::error(Span::new(19, 20), "`a` is declared more than once")
             .secondary(Span::new(6, 7), "first declared here")
             .help("pick another name");
-        let s = render(&f, &d);
+        let s = render_in(&f, &d);
         let expected = "\
 error: `a` is declared more than once
   --> t.ws:2:7
@@ -267,7 +331,7 @@ error: `a` is declared more than once
     fn multiline_span_underline_stops_at_end_of_line() {
         let f = SourceFile::new("t.ws", "fn a() {\n  return 1;\n}\n");
         let d = Diagnostic::error(Span::new(0, 22), "whole fn");
-        let s = render(&f, &d);
+        let s = render_in(&f, &d);
         // 8 characters on line 1 from column 1, not 22.
         assert!(s.contains("^^^^^^^^\n"), "{s}");
     }

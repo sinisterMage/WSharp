@@ -141,9 +141,11 @@ unsafe fn fix_fields(obj: *mut u8) {
     let Some(info) = types::info(unsafe { type_id_of(obj) }) else {
         return;
     };
-    for &offset in info.ptr_offsets {
-        unsafe { fix_slot(obj.add(offset as usize) as *mut *mut u8) };
-    }
+    unsafe {
+        types::for_each_ptr_offset(obj, info, |offset| {
+            fix_slot(obj.add(offset as usize) as *mut *mut u8)
+        })
+    };
 }
 
 /// Repoint every reference that still points into a block being emptied.
@@ -218,9 +220,11 @@ pub(crate) unsafe fn verify_no_stale_references() {
         let Some(info) = types::info(unsafe { type_id_of(obj) }) else {
             return;
         };
-        for &offset in info.ptr_offsets {
-            check(unsafe { (obj.add(offset as usize) as *const *mut u8).read() });
-        }
+        unsafe {
+            types::for_each_ptr_offset(obj, info, |offset| {
+                check((obj.add(offset as usize) as *const *mut u8).read())
+            })
+        };
     });
     with_buffers(|b| {
         for list in [

@@ -229,8 +229,13 @@ impl Mono<'_> {
         match stmt {
             hir::Stmt::Let { init, .. } => self.rewrite_expr(init, subst),
             hir::Stmt::Assign { place, value } => {
-                if let hir::Place::Field { obj, .. } = place {
-                    self.rewrite_expr(obj, subst);
+                match place {
+                    hir::Place::Field { obj, .. } => self.rewrite_expr(obj, subst),
+                    hir::Place::Index { arr, index } => {
+                        self.rewrite_expr(arr, subst);
+                        self.rewrite_expr(index, subst);
+                    }
+                    hir::Place::Local(_) => {}
                 }
                 self.rewrite_expr(value, subst);
             }
@@ -317,6 +322,16 @@ impl Mono<'_> {
                     self.rewrite_expr(f, subst);
                 }
             }
+            hir::ExprKind::ArrayNew { elems } => {
+                for e in elems {
+                    self.rewrite_expr(e, subst);
+                }
+            }
+            hir::ExprKind::Index { arr, index } => {
+                self.rewrite_expr(arr, subst);
+                self.rewrite_expr(index, subst);
+            }
+            hir::ExprKind::ArrayLen { arr } => self.rewrite_expr(arr, subst),
             hir::ExprKind::If {
                 cond, then, els, ..
             } => {

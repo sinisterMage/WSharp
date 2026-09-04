@@ -18,6 +18,44 @@ pub struct Lexer<'a> {
 /// Tokenize `src`. Always returns a token stream terminated by `Eof`; any
 /// problems are reported in the accompanying diagnostics.
 pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
+    lex_at(src, 0)
+}
+
+/// Lex, offsetting every span by `base` so that it names a position in the
+/// whole program rather than in this file alone.
+///
+/// Shifting afterwards rather than threading `base` through the scanner keeps
+/// every `Span::new` in here about the text in front of it, and leaves exactly
+/// one place where a file's position in the program is applied.
+/// See [`crate::diag::SourceMap`].
+pub fn lex_at(src: &str, base: u32) -> (Vec<Token>, Vec<Diagnostic>) {
+    let (mut tokens, mut diags) = scan(src);
+    if base != 0 {
+        for token in &mut tokens {
+            token.span = shift(token.span, base);
+        }
+        for diag in &mut diags {
+            shift_diagnostic(diag, base);
+        }
+    }
+    (tokens, diags)
+}
+
+pub(crate) fn shift(span: Span, base: u32) -> Span {
+    Span {
+        start: span.start + base,
+        end: span.end + base,
+    }
+}
+
+pub(crate) fn shift_diagnostic(diag: &mut Diagnostic, base: u32) {
+    diag.primary.span = shift(diag.primary.span, base);
+    for label in &mut diag.secondary {
+        label.span = shift(label.span, base);
+    }
+}
+
+fn scan(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
     let mut lexer = Lexer {
         src,
         bytes: src.as_bytes(),
@@ -112,11 +150,14 @@ impl<'a> Lexer<'a> {
                         b')' => TokenKind::RParen,
                         b'{' => TokenKind::LBrace,
                         b'}' => TokenKind::RBrace,
+                        b'[' => TokenKind::LBracket,
+                        b']' => TokenKind::RBracket,
                         b',' => TokenKind::Comma,
                         b';' => TokenKind::Semi,
                         b':' => TokenKind::Colon,
                         b'|' => TokenKind::Pipe,
                         b'?' => TokenKind::Question,
+                        b'@' => TokenKind::At,
                         b'.' => {
                             if self.eat(b'?') {
                                 TokenKind::DotQuestion

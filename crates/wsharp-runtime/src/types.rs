@@ -29,6 +29,50 @@ pub struct TypeLayout {
     /// Byte offsets, from the start of the object, of every field holding a
     /// pointer to another heap object. This is what makes tracing possible.
     pub ptr_offsets: Vec<u32>,
+    /// Bytes between one element and the next, for an object that carries a
+    /// run of them after its header -- a string or an array. Zero for
+    /// everything else.
+    ///
+    /// A fixed `ptr_offsets` list can describe a struct, whose fields are
+    /// known when the layout is registered. It cannot describe "a pointer
+    /// every 8 bytes, `aux` times", because the count belongs to the object
+    /// rather than the type. A stride plus the offsets *within* one element
+    /// says the same thing in a form the type can hold.
+    pub elem_stride: u32,
+    /// Byte offsets within a single element that hold a heap pointer. Empty
+    /// for a string, whose elements are bytes, and for `[]i64`.
+    pub elem_ptr_offsets: Vec<u32>,
+}
+
+impl TypeLayout {
+    /// A layout with a fixed size and a known set of fields: a struct, or a
+    /// closure and its captures.
+    pub fn fixed(name: impl Into<String>, size: u32, ptr_offsets: Vec<u32>) -> TypeLayout {
+        TypeLayout {
+            name: name.into(),
+            size,
+            ptr_offsets,
+            elem_stride: 0,
+            elem_ptr_offsets: Vec::new(),
+        }
+    }
+
+    /// A layout for an object carrying a run of elements after its header,
+    /// with the count in `aux`: a string, or an array.
+    pub fn elements(
+        name: impl Into<String>,
+        elem_stride: u32,
+        elem_ptr_offsets: Vec<u32>,
+    ) -> TypeLayout {
+        TypeLayout {
+            name: name.into(),
+            // Zero says "ask the object": see `has_variable_size`.
+            size: 0,
+            ptr_offsets: Vec::new(),
+            elem_stride,
+            elem_ptr_offsets,
+        }
+    }
 }
 
 /// A published layout: the same information, but borrowed for the process's
@@ -38,12 +82,51 @@ pub struct TypeInfo {
     pub name: &'static str,
     pub size: u32,
     pub ptr_offsets: &'static [u32],
+    pub elem_stride: u32,
+    pub elem_ptr_offsets: &'static [u32],
 }
 
 impl TypeInfo {
     /// Whether instances carry their own size in the `aux` word.
     pub fn has_variable_size(&self) -> bool {
         self.size == 0
+    }
+
+    /// Whether an instance can hold a reference at all.
+    ///
+    /// The barrier and the counting collector use this to decide whether an
+    /// object is worth a snapshot. An array of references answers yes even
+    /// though its `ptr_offsets` is empty, which is exactly the case a fixed
+    /// list gets wrong.
+    pub fn has_references(&self) -> bool {
+        !self.ptr_offsets.is_empty() || !self.elem_ptr_offsets.is_empty()
+    }
+}
+
+/// Visit the byte offset of every slot in `obj` that holds a heap reference:
+/// the fixed fields first, then each element's.
+///
+/// This is the one definition of "where an object's references are". Six
+/// places need it -- the write barrier, the counting collector, the marker,
+/// the evacuation fix-up, the stress verifier, and the birth-time test -- and
+/// a seventh that grew its own loop would be a reference the collector cannot
+/// see, which is not a failure that shows up as a failing test.
+///
+/// # Safety
+/// `obj` must point at a live, un-forwarded object whose type is `info`.
+pub unsafe fn for_each_ptr_offset(obj: *const u8, info: &TypeInfo, mut visit: impl FnMut(u32)) {
+    for &offset in info.ptr_offsets {
+        visit(offset);
+    }
+    if info.elem_stride == 0 || info.elem_ptr_offsets.is_empty() {
+        return;
+    }
+    let count = unsafe { (obj.offset(AUX_OFFSET as isize) as *const u64).read() } as u32;
+    for i in 0..count {
+        let base = HEADER_SIZE + i * info.elem_stride;
+        for &offset in info.elem_ptr_offsets {
+            visit(base + offset);
+        }
     }
 }
 
@@ -80,11 +163,9 @@ pub fn publish() {
     // no outgoing references and no fixed size: the length is in `aux`.
     register_type(
         TYPE_ID_STR,
-        TypeLayout {
-            name: "str".into(),
-            size: 0,
-            ptr_offsets: Vec::new(),
-        },
+        // A string's elements are bytes, so a stride of one makes
+        // `object_size`'s `aux * stride` the byte length it already was.
+        TypeLayout::elements("str", 1, Vec::new()),
     );
 
     let table = with_registry(|r| {
@@ -95,6 +176,8 @@ pub fn publish() {
                 name: Box::leak(layout.name.clone().into_boxed_str()),
                 size: layout.size,
                 ptr_offsets: Box::leak(layout.ptr_offsets.clone().into_boxed_slice()),
+                elem_stride: layout.elem_stride,
+                elem_ptr_offsets: Box::leak(layout.elem_ptr_offsets.clone().into_boxed_slice()),
             });
         }
         table
@@ -127,8 +210,8 @@ pub unsafe fn object_size(ptr: *const u8) -> Option<u32> {
         return Some(info.size);
     }
     // Variable-sized: the element count is in `aux`, right after the header.
-    let aux = unsafe { (ptr.offset(AUX_OFFSET as isize) as *const u64).read() };
-    Some(align_up(HEADER_SIZE + aux as u32))
+    let aux = unsafe { (ptr.offset(AUX_OFFSET as isize) as *const u64).read() } as u32;
+    Some(align_up(HEADER_SIZE + aux * info.elem_stride))
 }
 
 pub fn layout_of(id: TypeId) -> Option<TypeLayout> {
@@ -147,14 +230,7 @@ mod tests {
     #[test]
     fn registered_layouts_can_be_read_back() {
         let id = TYPE_ID_FIRST_USER + 100;
-        register_type(
-            id,
-            TypeLayout {
-                name: "Pair".into(),
-                size: 32,
-                ptr_offsets: vec![16, 24],
-            },
-        );
+        register_type(id, TypeLayout::fixed("Pair", 32, vec![16, 24]));
         let layout = layout_of(id).expect("layout was registered");
         assert_eq!(layout.name, "Pair");
         assert_eq!(layout.size, 32);
@@ -170,14 +246,7 @@ mod tests {
     #[test]
     fn publishing_makes_layouts_readable_without_a_lock() {
         let id = TYPE_ID_FIRST_USER + 200;
-        register_type(
-            id,
-            TypeLayout {
-                name: "Node".into(),
-                size: 24,
-                ptr_offsets: vec![16],
-            },
-        );
+        register_type(id, TypeLayout::fixed("Node", 24, vec![16]));
         publish();
 
         let node = info(id).expect("published");

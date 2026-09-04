@@ -17,6 +17,8 @@
 // parameter, which is what gives it a machine representation: `bigger` is
 // compiled once per pair of types it is used at, and `>` inside it does not
 // decide for the caller.
+const http = @import("std/http");
+
 fn show(x: i64) str { return "an integer"; }
 fn show(x: Number) str { return "a number"; }
 
@@ -27,12 +29,12 @@ fn bigger(a: Number, b: Number) { if (a > b) { return a; } return b; }
 // already known, so its position costs nothing at all -- and the two orderings
 // compose, which is why all four overloads are needed to keep the calls
 // unambiguous.
-fn tag(s: Status, n: Number) str { return "status+number"; }
-fn tag(s: NotFound404, n: Number) str { return "404+number"; }
-fn tag(s: Status, n: i64) str { return "status+int"; }
-fn tag(s: NotFound404, n: i64) str { return "404+int"; }
+fn tag(s: http.Status, n: Number) str { return "status+number"; }
+fn tag(s: http.NotFound404, n: Number) str { return "404+number"; }
+fn tag(s: http.Status, n: i64) str { return "status+int"; }
+fn tag(s: http.NotFound404, n: i64) str { return "404+int"; }
 
-fn route(s: Status) void {
+fn route(s: http.Status) void {
     print(tag(s, 1.5));
     print(tag(s, 7));
 }
@@ -43,7 +45,7 @@ fn main() i64 {
     print_int(bigger(3, 7));
     print_float(bigger(1.5, 0.5));
 
-    route(NotFound404);
-    route(Ok200);
+    route(http.NotFound404);
+    route(http.Ok200);
     return 0;
 }

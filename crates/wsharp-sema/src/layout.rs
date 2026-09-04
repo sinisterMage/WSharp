@@ -33,8 +33,40 @@ pub fn size_of(store: &mut TypeStore, ty: &Type) -> u32 {
 pub fn is_heap_pointer(store: &mut TypeStore, ty: &Type) -> bool {
     matches!(
         store.resolve(ty),
-        Type::Con(TyCon::Str | TyCon::Struct(_) | TyCon::Fn, _)
+        Type::Con(TyCon::Str | TyCon::Struct(_) | TyCon::Fn | TyCon::Array, _)
     )
+}
+
+/// Place a run of values one after another, returning each one's offset and
+/// the offset just past the last.
+///
+/// This is where a struct's fields are put, for both the non-generic case
+/// (inference, which knows them all up front) and an instantiation of a
+/// generic one (code generation, which cannot know them until the arguments
+/// are concrete). Both call this so the two can never disagree.
+pub fn place(store: &mut TypeStore, types: &[Type], start: u32) -> (Vec<u32>, u32) {
+    let mut offsets = Vec::with_capacity(types.len());
+    let mut offset = start;
+    for ty in types {
+        offsets.push(offset);
+        offset += size_of(store, ty);
+    }
+    (offsets, offset)
+}
+
+/// How one element of `[]T` is laid out: its stride in bytes, and the offsets
+/// within it that hold heap pointers.
+///
+/// This is what `TypeLayout.ptr_offsets` cannot say. A fixed list describes a
+/// struct, whose fields are known; an array holds `aux` elements of the same
+/// shape, so the collector needs the shape once and the count from the object.
+/// Elements are laid out exactly as a struct's fields are, which is what lets
+/// both go through [`ptr_offsets`].
+pub fn elem_layout(store: &mut TypeStore, elem: &Type) -> (u32, Vec<u32>) {
+    let stride = size_of(store, elem);
+    let mut offsets = Vec::new();
+    ptr_offsets(store, elem, 0, &mut offsets);
+    (stride, offsets)
 }
 
 /// Collect the byte offsets, relative to `base`, of every slot in a value of

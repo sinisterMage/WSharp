@@ -12,5 +12,6 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 wsharp-codegen.workspace = true
+wsharp-runtime.workspace = true
 wsharp-sema.workspace = true
 wsharp-syntax.workspace = true

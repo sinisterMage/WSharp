@@ -2,8 +2,12 @@
 
 Sessions 1–2 delivered the core language and Hindley-Milner type inference on a
 Cranelift JIT. Sessions 3–4 delivered the garbage collector and multiple
-dispatch. This file records what is done, what is left, and — more usefully —
-where each remaining feature already has a place to plug into.
+dispatch. Session 5 delivered arrays, explicit generics, the standard library
+and the module system — everything the original feature list asked for.
+
+This file records what was built and why it was built that way, the limitations
+that were chosen rather than stumbled into, and — for the items still ahead —
+where each already has a place to plug into.
 
 ---
 
@@ -118,8 +122,8 @@ status types as its standard-library instance.
 
 ### What is left
 
-- **The status types are in the global namespace**, because there is no module
-  system. Item 6.
+Nothing. The status types moved out of the global namespace and into
+`std/http` when item 6 landed, which was the one thing outstanding here.
 
 Scalar dispatch and overload-sets-as-values are done; what they turned into is
 worth recording, because both landed differently from the one-line sketches
@@ -152,73 +156,288 @@ widening would hand a `Base` to a body compiled for `Sub`. `const g = f;`
 binds an alias instead: `g` dispatches exactly as `f` does, and is not a value
 at all. Using an alias as a value is still an error, now one that says so.
 
-### Known limitation, uncovered by the above
+### Known limitation, uncovered by the above — **since fixed**
 
-A **recursive generic function** fails monomorphisation with `cannot tell what
-type X is being used at`. A call within a binding group records no type
-arguments, so a self-call leaves the group's own variables unresolved. This
-predates abstract types -- `fn pick(x, c: bool) { if (c) { return pick(x,
-false); } return x; }` has always failed -- but abstract parameters make
-generic functions easy to write on purpose, so it is much easier to meet now.
-The fix is to record a group's own variables as the type arguments of its
-in-group calls, which is a change to `mono.rs` rather than to inference.
+A **recursive generic function** used to fail monomorphisation with `cannot
+tell what type X is being used at`. A call within a binding group recorded no
+type arguments, so a self-call left the group's own variables unresolved. This
+predated abstract types -- `fn pick(x, c: bool) { if (c) { return pick(x,
+false); } return x; }` had always failed -- but abstract parameters made
+generic functions easy to write on purpose, so it became much easier to meet.
 
----
-
-## 5. Arrays and generics
-
-Most of the type-level work is already done.
-
-**Already exists:**
-
-- `Type::Con(TyCon, Vec<Type>)` is a general constructor-with-arguments
-  representation. `Array(T)` needs no change to the type system.
-- Let-polymorphism, generalisation and instantiation all work today —
-  `fn id(x) { return x; }` infers `fn(T) T`.
-- **Monomorphisation is written and tested** (`wsharp-sema/src/mono.rs`).
-- The object header's `aux` word already holds an element count, and
-  `types::object_size` already reads it: the collector handles variable-sized
-  objects, because strings are ones.
-
-**What is left:**
-
-- `[]T` syntax, and an array object layout (header, length in `aux`, elements
-  inline — the shape string literals already use).
-- Bounds checking, and deciding whether it traps or returns an optional.
-- Explicit generic parameters on declarations, rather than generics only ever
-  being inferred.
-- `for` loops over arrays.
-- Tracing an array's elements: `TypeLayout.ptr_offsets` is a fixed list, which
-  cannot describe "a pointer every 8 bytes for `aux` elements". The registry
-  needs an element-stride notion.
+Fixed in session 5, where the fix predicted here turned out to be the right
+one: inference records a group's own variables as the type arguments of its
+in-group calls, once the group has generalised. See item 5.
 
 ---
 
-## 6. Standard library
+## 5. Arrays and generics — **done**
 
-**Already exists:** `wsharp-runtime/src/builtins.rs` holds a single table of
-`(name, parameter types, return type, function pointer)`. Inference reads it to
-seed the global type environment; code generation reads the *same* table to
-register JIT symbols. Adding a function is a one-line change in one file.
+### What was built
 
-`status_types()` beside it is the same idea for types, and demonstrates the
-pattern scaling: a program pays only for the statuses it names, because they
-are materialised on first mention rather than declared up front.
+- **`[]T`**, a heap object with the length in the header's `aux` word and the
+  elements inline — the shape string literals already had. `[]i64{ 1, 2, 3 }`
+  writes one; the element type is written rather than inferred so that `[]i64{}`
+  is still a value.
+- **Indexing** `a[i]`, as a place as well as a value, so `a[i] += 1` works.
+- **Bounds checks that panic**, reporting the index and the length:
+  `W# panic: index 5 out of bounds (len 3)`, exit 101. One *unsigned* compare
+  against the length, which rejects a negative index in the same instruction.
+- **`for (xs) |x|`**, and `for (xs) |x, i|` to bind the index too.
+- **Explicit type parameters**: `fn first[T](a: []T) T`, and
+  `const Box = struct[T] { value: T };`.
+- **The element-stride notion** the last version of this file asked for.
+  `TypeLayout` gained `elem_stride` and `elem_ptr_offsets` — the offsets within
+  *one* element — and one function, `types::for_each_ptr_offset`, is now the
+  single definition of where an object's references are. The six places that
+  used to walk `ptr_offsets` themselves go through it.
+- **Per-instantiation layout for generic structs.** `Box[?i64]` and `Box[i64]`
+  put their fields in different places, because a `?T` field is two slots or
+  three, so a generic struct's offsets are computed by code generation, where
+  every type is concrete, through the same `layout::place` inference uses.
 
-Currently seeded: `print`, `print_int`, `print_float`, `print_bool`, `assert`,
-`gc_collect`, `gc_trace`, `gc_live_objects`, `gc_live_bytes`, `gc_collections`.
+### Decisions worth recording
 
-**What is left:**
+- **Indexing panics rather than returning `?T`.** The precedent is `.?` on a
+  null optional and division by zero: failures the type system permits but the
+  program must not perform. Returning an optional would make `a[i]` two slots
+  and put an `orelse` in every loop that had already checked the index.
+- **`for` desugars to `while` in inference**, rather than becoming a HIR
+  statement of its own. That keeps one loop form in the code generator, and so
+  one place where the back-edge safepoint can be forgotten. The array goes into
+  a hidden local, which makes it evaluated once and rooted like any other.
+- **A generic struct stands outside the dispatch lattice.** Type ids are a
+  preorder walk of it, fixed before monomorphisation, and a generic struct's
+  instantiations are not known until after. Keeping them out lets an
+  instantiation take an id from a block above the lattice, where no range test
+  can be disturbed. `struct[T] : Base` is rejected with a message saying so.
+- **Type arguments are written in type position only.** `Box[i64]` as a type;
+  `Box{ .value = 1 }` as a literal, with the arguments inferred from the field
+  values. `Box[i64]{ .. }` in expression position would be ambiguous with
+  indexing `Box` by `i64`.
+- **An annotation reaches a literal's fields.** `var c: Pair[?i64, i64] =
+  Pair{ .first = 5, .. }` binds the arguments before the fields are checked, so
+  `5` coerces into `?i64` exactly as it would in any other annotated binding.
+  Without it the fields are checked against variables nothing has bound yet.
+- **The recursive-generic bug is fixed.** A call within a binding group used to
+  record no type arguments, so monomorphisation queued a second, unsubstituted
+  copy of the callee and reported `cannot tell what type X is being used at`.
+  Inference now fills those in with the callee's own quantified variables after
+  the group generalises, which is sound because Hindley-Milner holds a group
+  monomorphic.
 
-- Strings: length, concatenation, comparison, slicing. (`==` on `str` is
-  rejected today precisely because it needs a runtime call.) Concatenation is
-  the first thing that will allocate a *string* on the heap rather than in the
-  data section — the collector already handles that case.
-- Arrays and their operations, once item 5 lands.
-- Math, and file/stdin I/O.
-- **A module system**, so the library is not one flat namespace. This is now
-  the most pressing item: the status lattice adds up to 27 names to the global
-  scope, and any of them can shadow user code.
+### What is left
+
+- **Arrays are fixed-length.** `push` returns a new array, because the length
+  lives in the header and there is no capacity beside it. A growable array
+  wants a second object holding a capacity and a length.
+- **No array covariance**, deliberately: `[]Sub` is not a `[]Base`, because a
+  write through the second would break the first.
+- **`fn` literals are still monomorphic**, so a closure cannot be generic.
+
+---
+
+## 6. Standard library — **done**
+
+### What was built
+
+A module system, and four modules behind it.
+
+| Module | Contents |
+|---|---|
+| `std/str` | `len`, `concat`, `eq`, `substr`, `find`, `split`, `join`, `repeat`, `starts_with`, `from_int`, `from_float` |
+| `std/array` | `len`, `new`, `concat`, `push`, `slice`, `repeat` |
+| `std/math` | `abs`, `min`, `max`, `sign`, `sqrt`, `pow`, `floor`, `ceil`, `round`, `trunc`, `ipow` |
+| `std/io` | `read_file`, `read_line`, `write_file`, `exists` |
+| `std/http` | the 27 status types, moved out of the global namespace |
+
+`==` on `str` works, comparing contents. The prelude — `print`, `assert`, the
+`gc_*` counters — stays global, because every module has it without asking.
+
+### The module system
+
+- `const http = @import("std/http");` binds a module to a name. Only a
+  top-level `const` may hold one, which is what makes the set of files a
+  program needs answerable before anything is type-checked.
+- A path is either a file next to the importing one (`"./util.ws"`) or one of
+  the library's (`"std/http"`). `@import("std")` works too, and `std.http.X`
+  walks into it: a module path is a prefix, and each further segment extends it.
+- Names are stored qualified in one flat table, and an unqualified lookup tries
+  the current module and then the prelude. What a module *cannot* see is simply
+  what it has no key for — so two files may each declare a `helper`.
+- A local binding shadows an imported module, so adding an import cannot break
+  code that already used the name.
+- Import cycles are detected and reported with the chain.
+
+### Decisions worth recording
+
+- **Spans stayed 8 bytes.** A `Span` has no file in it; widening one would
+  touch every node in the syntax tree to carry a number only the renderer
+  reads. Files are laid end to end in a single offset space instead, and a
+  span's file is the range it falls in (`SourceMap`). The first file starts at
+  offset 1, which keeps 0 meaning `Span::EMPTY`.
+- **Half the library is written in W#.** `std/array`, `std/math` and
+  `std/str.split` are `.ws` files compiled with the program, embedded with
+  `include_str!`. The rule that draws the line is worth stating plainly:
+  **a builtin may read and write bytes; anything that moves a *reference* from
+  one object into another is written in W#.**
+
+  This was learned the hard way. `array.concat` was a Rust function that
+  memcpy'd elements between arrays, and `--gc-stress` caught it: the copied
+  references had never been through the load barrier, so they named objects in
+  blocks that were about to be released. Generated code cannot make that
+  mistake — every reference it stores came through the barrier, and the
+  registers holding one are roots — so the fix was to stop writing that code by
+  hand rather than to reproduce three barriers in Rust.
+- **`array.new` is lowered inline** rather than called: only the call site
+  knows the element type, and so the stride and the type id to stamp. It is the
+  one builtin the code generator recognises by name.
+- **A generic builtin is instantiated, not generalised.** `len(a: []T) i64` has
+  one machine implementation, because it reads the count out of the header
+  whatever the elements are; its type variables are made fresh per use, and
+  monomorphisation has nothing to specialise.
+- **`abs` is an overload set, `min` is not.** `min(a: Number, b: Number)`
+  compares two numbers and says nothing about which kind they are, so it is one
+  constrained generic. `abs` compares against a literal zero, and an integer
+  literal is an `i64` — so a single definition would pin `Number` to `i64` at
+  the comparison. Two overloads instead, which is what the language is for.
+- **A fallible builtin returns a `!T` directly.** The tag and the payload cross
+  the boundary as the two words a `#[repr(C)]` pair is returned in. The tag is
+  an index into the program's error table plus one, so the library's error
+  names are interned before any program's — `builtin_errors()` fixes them.
+- **Builtins are keyed by a qualified symbol.** `std/str.len` and
+  `std/array.len` are two functions that source code calls `len`; the symbol
+  table has no notion of a module, so `Builtin::symbol()` supplies one.
+
+### What is left
+
+- **No visibility.** Everything in a module is public; there is no `pub`.
+- **No package management.** An import is a relative path or a library one;
+  there is nothing that fetches anything.
+- **`catch` and `orelse` still take an expression, not a block**, which is felt
+  most in I/O code: `f() catch return false;` cannot be written.
+- **The errors a function can raise are not in its type.** `!T` has a single
+  global error set, so a caller cannot see which errors `read_file` has.
+
+---
+
+## 7. Multithreading — **designed, not built**
+
+The model, settled before anything is written so that the collector and the
+type system are not surprised by it later.
+
+### Workers, each with its own heap
+
+A worker is an OS thread that owns its heap. No object is reachable from two
+workers, and nothing is sent by pointer.
+
+The collector decides this. All three pauses run on the mutator thread because
+only a mutator can walk its own stack, and the stack walker walks exactly one
+stack. Per-worker heaps keep every worker's pauses independent and need no
+rendezvous at all. The alternative — one shared heap — needs every mutator to
+poll and stop before any pause, which turns a 40-microsecond pause into one
+that waits for the slowest thread to reach a safepoint. That is the cost, and
+it is why the shared heap is the rejected design rather than the obvious one.
+
+### Two ways to talk
+
+1. **Typed RPC**, point to point. A worker declares a service — a set of `fn`s
+   — and a caller holds a typed handle checked against the same signatures at
+   compile time. A call returns `!T`, because a worker can die and that is not
+   an exceptional case worth a second mechanism.
+
+2. **A message broker**, many to many, in the shape of Kafka. Named, typed
+   topics; append-only partitioned logs; workers subscribe as consumer groups,
+   each with its own offset; replay from an offset; at-least-once delivery. An
+   in-process broker first — durability is a later concern, and the interface
+   does not change when it arrives.
+
+RPC is for when the caller needs the answer. The broker is for when it does
+not, or when more than one worker wants the same message.
+
+### Where it plugs in
+
+**A subscriber set is an overload set.** `fn handle(m: OrderPlaced)`,
+`fn handle(m: OrderCancelled)`, and the broker picks by the message's runtime
+type id — which is exactly what the dispatcher already does, in one subtract
+and one unsigned compare. A subscriber written for a supertype catches every
+message below it, so a topic's message lattice is the status lattice a second
+time. That the pattern turns up twice, in unrelated features, is the argument
+that it is the right one.
+
+**A `Transferable` constraint**, deferred in the same way and for the same
+reason as `Numeric`: scalars, `str`, arrays and structs of transferable fields
+qualify; closures and function values do not, because they capture an
+environment belonging to another heap. The question cannot be answered where it
+is met — a generic `send[T]` meets it before `T` is known — so it is a
+constraint rather than a check.
+
+**A deep-copy walker**, which can read `TypeLayout.ptr_offsets` and the element
+stride that item 5 added: the collector already knows how to find every
+reference in an object, and copying one to another heap is the same walk.
+
+### What has to change first
+
+- The heap's statics become per-worker. `HEAP`, the buffers, the phase and the
+  type registry are process-wide today; only the registry can stay that way,
+  because it is frozen before any code runs.
+- `builtins.rs` gains `spawn`, the handle types, and the broker's operations —
+  and the broker itself is the first part of the runtime that is not a leaf.
+- The stack walker is already per-thread and needs nothing.
+
+---
+
+## 8. Direct libc calls for I/O and networking — **before v0.5**
+
+`std/io` goes through `std::fs` and `std::io` today, so the platform work is
+Rust's and W# inherits its portability for free. That is the right trade while
+the library is four functions; it stops being the right trade the moment
+networking arrives, and this is the item that has to land before it does.
+
+### Why move
+
+- **Flags and error codes are not reachable.** `std::fs::read` opens a file one
+  way. `O_NONBLOCK`, `O_DIRECT`, `O_CLOEXEC` and the rest are not expressible,
+  and `io_error_tag` currently maps `std::io::ErrorKind` — a portable
+  approximation — where `errno` is the real answer.
+- **Networking needs non-blocking I/O and a readiness API**, which means
+  `epoll` on Linux, `kqueue` on the BSDs and macOS, and IOCP on Windows. None
+  of that is in `std`, so the socket half would end up hand-written regardless;
+  doing the file half the same way keeps one layer rather than two.
+- **A blocking syscall is a hole in the safepoint protocol.** All three
+  collector pauses run on the mutator thread, because only a mutator can walk
+  its own stack — so a thread parked in `read(2)` cannot answer a pause
+  request, and the trace waits for the disk. Today that is a stall in a
+  single-threaded program. With item 7's workers it is one worker's heap
+  blocked on another's slow client, which is exactly the failure a worker model
+  exists to avoid. Non-blocking I/O plus a readiness loop is the fix, and it is
+  the same fix networking wants.
+
+### Decisions worth recording in advance
+
+- **Hand-declared bindings, not the `libc` crate.** `libc` is not in the local
+  registry cache, so adding it would break the offline build that the pinned
+  Cranelift version exists to preserve — the same argument that settled MMTk in
+  item 3. It would also end `wsharp-runtime`'s leaf-crate property: it has zero
+  dependencies today, and that is worth more than a few dozen `extern "C"`
+  declarations are worth avoiding.
+- **Windows is a third arm, not a variation.** It has no libc worth targeting:
+  `CreateFileW`/`ReadFile`, and WSA for sockets. Pretending otherwise behind a
+  `#[cfg(unix)]`/`#[cfg(not(unix))]` split would put the difference in the
+  wrong place. Three arms, named for what they are.
+- **The W# side does not change.** `crates/wsharp-runtime/src/io.rs` is the
+  only file in the tree that touches the outside world, and the builtin table
+  rows, the string object layout and the `!T` tag encoding are all above it.
+  A program that calls `io.read_file` is unaffected, which is what makes this a
+  port rather than a redesign.
+
+### What it costs
+
+Portability becomes ours. `std::fs` currently handles path encoding, retry on
+`EINTR`, short reads and the difference between a file and a pipe; each of
+those becomes a thing to get right, per platform, with a test. That is the
+price of the control, and it is worth paying only because networking cannot be
+had without it.
 
 ---
 
@@ -235,10 +454,10 @@ These are deliberate limitations, each with a clear fix:
 - **Field access needs a known type.** Structs are nominal with no row
   polymorphism, so `fn getx(p) { return p.x; }` cannot be inferred and asks for
   an annotation instead.
-- **`==` is limited to `i64`, `f64` and `bool`.** Strings need a runtime
-  comparison; structs need a decision about identity versus structural
-  equality.
-- **No block expressions.** `catch`/`orelse` take an expression, not a block.
+- **`==` is limited to `i64`, `f64`, `bool` and `str`.** Structs still need a
+  decision about identity versus structural equality.
+- **No block expressions.** `catch`/`orelse` take an expression, not a block,
+  which is felt most in I/O code: `f() catch return false;` cannot be written.
 - **Integer literals are always `i64`.** No `comptime_int` coercion, so `1.0`
   must be written where an `f64` is wanted.
 - **`%` is integer-only.** Cranelift has no float remainder, and a float `%`
@@ -246,3 +465,6 @@ These are deliberate limitations, each with a clear fix:
 - **No sized integer types**, no unsigned types, no bitwise operators.
 - **x86-64 and aarch64 only.** The collector reads the frame pointer with
   inline assembly; other architectures get a `compile_error!`.
+- **No visibility in modules.** Everything a module declares is public.
+- **Fixed-length arrays.** `push` returns a new array; there is no capacity
+  beside the length in the header.

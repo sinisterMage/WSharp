@@ -42,6 +42,9 @@ pub enum TyCon {
     ErrUnion,
     /// The type of an error value, as bound by `catch |e|`.
     Error,
+    /// `[]T`, one argument. A heap object whose header holds the element
+    /// count; the elements follow it inline, as a string's bytes do.
+    Array,
     Struct(StructId),
     /// A name for a set of concrete types, such as `Number`. It classifies
     /// values for dispatch and is never the type of one, so it appears only in
@@ -81,6 +84,11 @@ impl Type {
         Type::Con(TyCon::Fn, params)
     }
 
+    /// `[]T`.
+    pub fn array(elem: Type) -> Type {
+        Type::Con(TyCon::Array, vec![elem])
+    }
+
     pub fn optional(inner: Type) -> Type {
         Type::Con(TyCon::Optional, vec![inner])
     }
@@ -100,9 +108,37 @@ impl Type {
     /// The type a builtin signature's type stands for. The runtime describes
     /// its own tables with a small enum of its own, so that it stays a leaf
     /// crate; this is the single place that translates it.
+    /// A builtin's type, with `Var(n)` resolved through `vars`.
+    ///
+    /// The caller supplies the map so that one use of a generic builtin binds
+    /// each variable once across its whole signature, and the next use gets
+    /// fresh ones -- which is instantiation, done where the store is.
+    pub fn from_builtin_with(
+        t: wsharp_runtime::BuiltinTy,
+        store: &mut TypeStore,
+        vars: &mut std::collections::HashMap<u8, Type>,
+    ) -> Type {
+        use wsharp_runtime::BuiltinTy as B;
+        match t {
+            B::Array(inner) => Type::array(Type::from_builtin_with(*inner, store, vars)),
+            B::Optional(inner) => Type::optional(Type::from_builtin_with(*inner, store, vars)),
+            B::ErrUnion(inner) => Type::err_union(Type::from_builtin_with(*inner, store, vars)),
+            B::Var(n) => vars.entry(n).or_insert_with(|| store.fresh()).clone(),
+            simple => Type::from_builtin(simple),
+        }
+    }
+
+    /// The types a builtin signature can mention without a store: the scalars.
+    ///
+    /// # Panics
+    /// On a constructor that needs one. [`Type::from_builtin_with`] is the
+    /// general form.
     pub fn from_builtin(t: wsharp_runtime::BuiltinTy) -> Type {
         use wsharp_runtime::BuiltinTy as B;
         match t {
+            B::Array(_) | B::Optional(_) | B::ErrUnion(_) | B::Var(_) => {
+                unreachable!("`{t:?}` needs a type store; use `from_builtin_with`")
+            }
             B::I64 => Type::i64(),
             B::F64 => Type::f64(),
             B::Bool => Type::bool(),
@@ -328,13 +364,29 @@ impl TypeStore {
     /// they are the same one.
     pub fn is_sub_ty(&mut self, sub: &Type, sup: &Type) -> bool {
         match (self.resolve(sub), self.resolve(sup)) {
-            (Type::Con(TyCon::Struct(a), _), Type::Con(TyCon::Struct(b), _)) => {
-                self.is_subtype(a, b)
+            // A generic struct stands outside the lattice, so its
+            // instantiations are related only to themselves -- and only when
+            // their arguments agree. `Box[i64]` is not a `Box[str]`.
+            (Type::Con(TyCon::Struct(a), aa), Type::Con(TyCon::Struct(b), ba)) => {
+                self.is_subtype(a, b) && self.args_agree(&aa, &ba)
             }
             (Type::Con(TyCon::Abstract(a), _), Type::Con(TyCon::Abstract(b), _)) => a == b,
             (a, Type::Con(TyCon::Abstract(id), _)) => abstract_members(id).contains(&a),
             (a, b) => a == b,
         }
+    }
+
+    /// Whether two argument lists are the same types.
+    ///
+    /// Deeply resolved, because either side may still hold a variable that has
+    /// since been bound to the other's type.
+    fn args_agree(&mut self, a: &[Type], b: &[Type]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| {
+                let x = self.resolve_deep(x);
+                let y = self.resolve_deep(y);
+                x == y
+            })
     }
 
     pub fn fresh(&mut self) -> Type {
@@ -534,8 +586,18 @@ impl TypeStore {
                 TyCon::Void => "void".into(),
                 TyCon::Str => "str".into(),
                 TyCon::Error => "error".into(),
-                TyCon::Struct(id) => self.struct_name(id).to_string(),
+                TyCon::Struct(id) => {
+                    let name = self.struct_name(id).to_string();
+                    if args.is_empty() {
+                        name
+                    } else {
+                        let args: Vec<String> =
+                            args.iter().map(|a| self.write_ty(a, names)).collect();
+                        format!("{name}[{}]", args.join(", "))
+                    }
+                }
                 TyCon::Abstract(id) => abstract_name(id).to_string(),
+                TyCon::Array => format!("[]{}", self.write_ty(&args[0], names)),
                 TyCon::Optional => format!("?{}", self.write_ty(&args[0], names)),
                 TyCon::ErrUnion => format!("!{}", self.write_ty(&args[0], names)),
                 TyCon::Fn => {

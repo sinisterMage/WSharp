@@ -9,8 +9,10 @@ pub mod evacuate;
 pub mod gc;
 pub mod header;
 pub mod heap;
+pub mod io;
 pub mod mark;
 pub mod stackwalk;
+pub mod strings;
 pub mod types;
 
 pub use builtins::{Builtin, BuiltinTy, builtins, runtime_symbols};

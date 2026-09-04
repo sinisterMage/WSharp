@@ -15,18 +15,20 @@ processes.
 
 ```wsharp
 // The status types come from the standard library; nothing is declared here.
-fn render(r: Request, s: Status)      str { return "HTTP/1.1 500 Internal Server Error"; }
-fn render(r: Request, s: Status2xx)   str { return "HTTP/1.1 200 OK"; }
-fn render(r: Request, s: Status4xx)   str { return "HTTP/1.1 400 Bad Request"; }
-fn render(r: Request, s: NotFound404) str { return "HTTP/1.1 404 Not Found"; }
-fn render(r: Request, s: Teapot418)   str { return "HTTP/1.1 418 I'm a teapot"; }
+const http = @import("std/http");
+
+fn render(r: Request, s: http.Status)      str { return "HTTP/1.1 500 Internal Server Error"; }
+fn render(r: Request, s: http.Status2xx)   str { return "HTTP/1.1 200 OK"; }
+fn render(r: Request, s: http.Status4xx)   str { return "HTTP/1.1 400 Bad Request"; }
+fn render(r: Request, s: http.NotFound404) str { return "HTTP/1.1 404 Not Found"; }
+fn render(r: Request, s: http.Teapot418)   str { return "HTTP/1.1 418 I'm a teapot"; }
 
 // Resolved at compile time: the argument's type is exactly what it says.
-print(render(req, NotFound404));
+print(render(req, http.NotFound404));
 
 // Resolved at run time, from the type id in the object's header, because
 // `s` could be any status by the time this runs.
-fn serve(r: Request, s: Status) void { print(render(r, s)); }
+fn serve(r: Request, s: http.Status) void { print(render(r, s)); }
 ```
 
 Adding a special case means adding a function. Nothing existing is edited, and
@@ -60,13 +62,16 @@ everywhere.** They are checked when written and inferred when not.
 | | |
 |---|---|
 | Bindings | `const x = 1;` immutable, `var y: i64 = 2;` mutable |
-| Types | `i64` `f64` `bool` `void` `str`, `?T` optional, `!T` error union, `fn(A) B` |
+| Types | `i64` `f64` `bool` `void` `str`, `[]T` array, `?T` optional, `!T` error union, `fn(A) B` |
 | Functions | `fn add(a, b) { return a + b; }`, `fn add(a: i64, b: i64) i64 { ... }` |
 | Overloads | several `fn`s may share a name; the call picks the most specific |
 | Abstract types | `Number` stands for `i64` and `f64`, so an overload can claim "any number" while another claims `i64` |
-| Control flow | `if (c) { } else { }`, `while (c) : (i += 1) { }`, `break`, `continue` |
+| Control flow | `if (c) { } else { }`, `while (c) : (i += 1) { }`, `for (xs) \|x\| { }`, `break`, `continue` |
 | Expressions | `if (c) a else b`, `fn (a, b) { ... }` closures |
 | Literals | `42`, `0xff`, `0b1010`, `0o17`, `1_000_000`, `2.5`, `"text"` with `\n \t \r \0 \\ \"` |
+| Arrays | `[]i64{ 1, 2, 3 }`, `a[i]`, `for (a) \|v, i\| { }`; an index out of range panics |
+| Generics | `fn first[T](a: []T) T`, `const Box = struct[T] { value: T };` — inferred when not written |
+| Modules | `const http = @import("std/http");`, then `http.NotFound404` |
 | Structs | `const P = struct { x: i64 };`, `P{ .x = 1 }`, `p.x` |
 | Subtyping | `const Sub = struct : Base { };` — a subtype widens implicitly |
 | Singletons | a struct with no fields is also a value: its sole instance |
@@ -74,10 +79,11 @@ everywhere.** They are checked when written and inferred when not.
 | Errors | `error.Name`, `try f()`, `f() catch 0`, `f() catch \|e\| ...` |
 | Operators | `+ - * /`, `%` (integers only), `== != < <= > >=` (non-chaining), `and or !` |
 
-Two limits worth knowing before they surprise you: `==` works on `i64`, `f64`
-and `bool` only, and `str` has no operations yet beyond being stored and
-printed. Both are standard-library work; see [ROADMAP.md](ROADMAP.md). The
-`e` bound by `catch |e|` is likewise opaque for now.
+`==` compares `str` by contents, so a string built at run time equals a literal.
+
+One limit worth knowing before it surprises you: the `e` bound by `catch |e|`
+is opaque, because `!T` has a single global error set rather than one per
+function. See [ROADMAP.md](ROADMAP.md).
 
 Some things that follow from optional annotations:
 
@@ -242,8 +248,9 @@ wsharp check <file.ws>    # type-check only
 The process exits with the low byte of `main`'s return value, as a C program
 does, so `return 256;` exits 0. A compile error exits 1. A failure the type
 system allows but the program must not perform — `.?` on a null optional, a
-failed `assert`, integer division by zero, `i64::MIN / -1`, a call no overload
-matches — prints `W# panic: <reason>` to stderr and exits with status 101.
+failed `assert`, integer division by zero, `i64::MIN / -1`, an index outside an
+array, a call no overload matches — prints `W# panic: <reason>` to stderr and
+exits with status 101.
 
 `--emit` stops after a stage and prints it, which is the fastest way to see what
 the compiler is thinking:
@@ -275,11 +282,31 @@ Two flags exist for the collector: `--gc-stress` as above, and the
 exit. `WSHARP_GC_TRACE` prints every frame the root walk visits. Both are off
 when unset, empty or `0`.
 
-### Builtins
+### The standard library
 
-There is no standard library yet, only a table of builtins in
-`wsharp-runtime/src/builtins.rs`. Adding one is one row; the type checker and
-the code generator both read the table.
+`@import` binds a module to a name; everything in it is reached through that
+name. A path is either a file next to the importing one or one of the
+library's.
+
+```zig
+const str  = @import("std/str");
+const http = @import("std/http");
+
+fn main() i64 {
+    for (str.split("a,b,c", ",")) |part| { print(part); }
+    return 0;
+}
+```
+
+| Module | |
+|---|---|
+| `std/str` | `len` `concat` `eq` `substr` `find` `split` `join` `repeat` `starts_with` `from_int` `from_float` |
+| `std/array` | `len` `new` `concat` `push` `slice` `repeat` |
+| `std/math` | `abs` `min` `max` `sign` `sqrt` `pow` `floor` `ceil` `round` `trunc` `ipow` |
+| `std/io` | `read_file` `read_line` `write_file` `exists` — the fallible ones return `!str` |
+| `std/http` | the 27 HTTP status types, materialised on first mention |
+
+A **prelude** needs no import, because every module has it:
 
 | | |
 |---|---|
@@ -289,6 +316,14 @@ the code generator both read the table.
 | `gc_trace()` | a whole mark trace, synchronously: cycles are reclaimed when it returns |
 | `gc_trace_start()`, `gc_trace_finish()` | the two halves of a trace, so a program can mutate the heap while the collector thread marks it |
 | `gc_live_objects()`, `gc_live_bytes()`, `gc_collections()`, `gc_traces()` | the collector's counters, for asserting on it |
+
+Half the library is written in W# rather than Rust — `std/array`, `std/math`
+and `str.split` are `.ws` files compiled with your program, monomorphised per
+element type and dropped when nothing calls them. The rule that draws the line
+is worth knowing if you add to it: **a builtin may read and write bytes, and
+anything that moves a *reference* from one object into another is written in
+W#**, where the write barrier, the load barrier and the stack maps all apply by
+construction.
 
 ## How it works
 
@@ -336,11 +371,18 @@ A few decisions worth knowing about:
 - **Every function takes an environment pointer.** Top-level functions ignore it
   and are called with null. That uniformity lets a plain `fn` be passed as a
   value without generating a wrapper.
-- **Standard library entries are one table row.** `builtins.rs` holds
-  `(name, parameters, return type, function pointer)`; inference reads it to
-  seed the global environment and code generation reads the same table to
-  register JIT symbols. The HTTP status lattice is a second such table, and a
-  program pays only for the statuses it names.
+- **Standard library entries are one table row, or one line of W#.**
+  `builtins.rs` holds `(module, name, parameters, return type, function
+  pointer)`; inference reads it to seed each module's environment and code
+  generation reads the same table to register JIT symbols. The HTTP status
+  lattice is a second such table, and a program pays only for the statuses it
+  names. Anything that moves a reference between objects is a `.ws` file
+  instead, compiled with your program so the collector's barriers apply to it.
+- **A module is a prefix on a name.** Names are stored qualified in one flat
+  table, and an unqualified lookup tries the current module and then the
+  prelude; what a module cannot see is what it has no key for. Files are laid
+  end to end in one offset space, so a `Span` stays two `u32`s with no file in
+  it and the renderer works out which file a span fell in.
 
 ## Status
 
@@ -353,8 +395,17 @@ Sessions are numbered by the original feature list:
 - [x] **4.** Multiple dispatch over a subtype lattice, with the HTTP status
       types as its standard-library instance, abstract types for scalars, and
       overload sets as values
-- [ ] **5.** Arrays (generics are done: inferred, checked and monomorphised)
-- [ ] **6.** Standard library and a module system
+- [x] **5.** Arrays, `for` loops, and explicit generic parameters on functions
+      and structs
+- [x] **6.** Standard library — strings, arrays, math and I/O — behind a module
+      system
+- [ ] **7.** Multithreading: workers with their own heaps, talking by typed RPC
+      or through a message broker. Designed in [ROADMAP.md](ROADMAP.md), not
+      built.
+- [ ] **8.** Direct libc calls for I/O, and the networking that needs them.
+      Before v0.5: `std/io` goes through Rust's `std` today, which cannot
+      express non-blocking I/O — and a thread parked in a blocking read cannot
+      answer a collector pause.
 
 What is left, and where it plugs in, is in [ROADMAP.md](ROADMAP.md).
 Conventions and the invariants worth not breaking are in

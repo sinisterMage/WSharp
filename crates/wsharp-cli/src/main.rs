@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use wsharp_syntax::diag::{Diagnostic, Severity, SourceFile, render};
+use wsharp_syntax::diag::{Diagnostic, Severity, SourceMap, render};
+
+mod load;
 
 /// Printed after the option list, since the collector's switches are
 /// environment variables rather than flags: they are read by the runtime,
@@ -92,35 +94,53 @@ fn drive(
     gc_stress: bool,
     run: bool,
 ) -> Result<ExitCode, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let file = SourceFile::new(path.display().to_string(), text);
-
-    // ---- syntax ----
-    let (module, diags) = wsharp_syntax::parse(&file.text);
+    // `--emit=tokens` is about one file, and has to work on one that does not
+    // parse, so it does not go through the loader.
     if emit == Some(Emit::Tokens) {
-        let (tokens, lex_diags) = wsharp_syntax::lexer::lex(&file.text);
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let mut map = SourceMap::new();
+        let base = map.add(path.display().to_string(), text.clone());
+        let (tokens, lex_diags) = wsharp_syntax::lexer::lex_at(&text, base);
         // Tokens first: they are what was asked for, and the lexer recovers
         // from every error, so the stream is complete even when it has some.
         for token in &tokens {
             println!("{:>12?}  {:?}", token.span, token.kind);
         }
-        if report(&file, &lex_diags) {
+        if report(&map, &lex_diags) {
             return Ok(ExitCode::FAILURE);
         }
         return Ok(ExitCode::SUCCESS);
     }
-    if report(&file, &diags) {
+
+    // ---- syntax ----
+    let program = load::load(path)?;
+    let map = &program.map;
+    if report(map, &program.diags) {
         return Ok(ExitCode::FAILURE);
     }
     if emit == Some(Emit::Ast) {
-        print!("{}", wsharp_syntax::dump::dump_module(&module));
+        for module in &program.modules {
+            if program.modules.len() > 1 {
+                println!("; {}", module.path);
+            }
+            print!("{}", wsharp_syntax::dump::dump_module(&module.ast));
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
     // ---- types ----
-    let mut analysis = wsharp_sema::analyze(&module);
-    if report(&file, &analysis.diags) {
+    let modules: Vec<wsharp_sema::SourceModule> = program
+        .modules
+        .iter()
+        .map(|m| wsharp_sema::SourceModule {
+            path: m.path.clone(),
+            ast: &m.ast,
+            imports: m.imports.clone(),
+        })
+        .collect();
+    let mut analysis = wsharp_sema::analyze_program(&modules);
+    if report(map, &analysis.diags) {
         return Ok(ExitCode::FAILURE);
     }
     if emit == Some(Emit::Types) {
@@ -139,7 +159,7 @@ fn drive(
         return Err(format!("{} has no `main` function", path.display()));
     }
     let mono = wsharp_sema::monomorphize(&analysis.program, &mut analysis.store);
-    if report(&file, &mono.diags) {
+    if report(map, &mono.diags) {
         return Ok(ExitCode::FAILURE);
     }
     if emit == Some(Emit::Hir) {
@@ -163,9 +183,9 @@ fn drive(
 }
 
 /// Print diagnostics; returns true if any of them were errors.
-fn report(file: &SourceFile, diags: &[Diagnostic]) -> bool {
+fn report(map: &SourceMap, diags: &[Diagnostic]) -> bool {
     for diag in diags {
-        eprint!("{}", render(file, diag));
+        eprint!("{}", render(map, diag));
     }
     diags.iter().any(|d| d.severity == Severity::Error)
 }

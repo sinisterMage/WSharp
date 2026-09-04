@@ -1066,19 +1066,29 @@ fn with_heap<R>(f: impl FnOnce(&mut Heap) -> R) -> R {
     f(&mut HEAP.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// Allocate a zeroed object of `size` bytes (header included) and stamp its
-/// header with `type_id`.
+/// Allocate a zeroed object of `size` bytes (header included), stamp its
+/// header with `type_id`, and record `aux` as its element count.
 ///
 /// This is the single allocation entry point for generated code. The common
 /// case takes no lock: it is a bump and a few atomic updates in this thread's
 /// own buffer.
 ///
+/// `aux` is what makes a variable-sized object -- a string, an array -- know
+/// how big it is, and it is written *here* rather than by the caller for one
+/// reason: [`crate::gc::on_allocation`] below is a safepoint that can run a
+/// whole collection, and until `aux` holds the count `object_size` reports the
+/// object as a bare header. A heap walk during that collection would then step
+/// into the middle of it. Fixed-size types pass zero.
+///
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `size` must include
 /// [`HEADER_SIZE`] and match the registered layout for `type_id`.
-pub extern "C" fn ws_alloc(type_id: TypeId, size: u64) -> *mut u8 {
+pub extern "C" fn ws_alloc(type_id: TypeId, size: u64, aux: u64) -> *mut u8 {
     let size = align_up((size as u32).max(HEADER_SIZE)) as usize;
     let ptr = allocate(type_id, size);
+    if aux != 0 {
+        unsafe { (ptr.offset(crate::header::AUX_OFFSET as isize) as *mut u64).write(aux) };
+    }
     // The header was published above with a release store, but the zeroed
     // fields were written with plain stores. Generated code will store this
     // pointer into other objects' fields with plain stores too, and a collector
@@ -1246,11 +1256,7 @@ mod tests {
     fn registered(id: TypeId, size: u32) -> TypeId {
         crate::types::register_type(
             id,
-            crate::types::TypeLayout {
-                name: format!("heap test type {id}"),
-                size,
-                ptr_offsets: Vec::new(),
-            },
+            crate::types::TypeLayout::fixed(format!("heap test type {id}"), size, Vec::new()),
         );
         crate::types::publish();
         id
@@ -1258,8 +1264,8 @@ mod tests {
 
     #[test]
     fn allocations_are_aligned_distinct_and_tagged() {
-        let a = ws_alloc(TYPE_ID_FIRST_USER, 24);
-        let b = ws_alloc(TYPE_ID_FIRST_USER + 1, 24);
+        let a = ws_alloc(TYPE_ID_FIRST_USER, 24, 0);
+        let b = ws_alloc(TYPE_ID_FIRST_USER + 1, 24, 0);
         assert!(!a.is_null() && !b.is_null());
         assert_ne!(a, b);
         assert_eq!(a as usize % ALIGN, 0);
@@ -1272,7 +1278,7 @@ mod tests {
 
     #[test]
     fn fields_start_zeroed() {
-        let p = ws_alloc(TYPE_ID_FIRST_USER, 32);
+        let p = ws_alloc(TYPE_ID_FIRST_USER, 32, 0);
         unsafe {
             assert_eq!((p.add(16) as *const u64).read(), 0);
             assert_eq!((p.add(24) as *const u64).read(), 0);
@@ -1286,7 +1292,7 @@ mod tests {
         // object whose fields are all still null must never take the slow
         // path; and a snapshot trace treats everything born after its
         // snapshot as live.
-        let p = ws_alloc(TYPE_ID_FIRST_USER, 32);
+        let p = ws_alloc(TYPE_ID_FIRST_USER, 32, 0);
         unsafe {
             assert!(test_flag(p, FLAG_LOGGED));
             assert!(is_marked(p));
@@ -1296,7 +1302,7 @@ mod tests {
     #[test]
     fn an_object_larger_than_a_block_still_allocates() {
         let big = (BLOCK_BYTES + 4096) as u64;
-        let p = ws_alloc(TYPE_ID_FIRST_USER, big);
+        let p = ws_alloc(TYPE_ID_FIRST_USER, big, 0);
         assert!(!p.is_null());
         assert_eq!(p as usize % ALIGN, 0);
         // Writing the last byte must not fault.
@@ -1310,15 +1316,15 @@ mod tests {
 
     #[test]
     fn a_zero_size_request_still_gets_a_header() {
-        let p = ws_alloc(TYPE_ID_FIRST_USER, 0);
-        let q = ws_alloc(TYPE_ID_FIRST_USER, 0);
+        let p = ws_alloc(TYPE_ID_FIRST_USER, 0, 0);
+        let q = ws_alloc(TYPE_ID_FIRST_USER, 0, 0);
         assert_ne!(p, q);
         assert!((q as usize).abs_diff(p as usize) >= HEADER_SIZE as usize);
     }
 
     #[test]
     fn block_space_objects_are_recognised_and_others_are_not() {
-        let p = ws_alloc(TYPE_ID_FIRST_USER, 32);
+        let p = ws_alloc(TYPE_ID_FIRST_USER, 32, 0);
         assert!(in_heap(p), "a normal object lives in a block");
         assert!(!is_evacuating(p), "nothing is being evacuated");
 
@@ -1344,7 +1350,7 @@ mod tests {
         let count = (BLOCK_BYTES / 64) * 3;
         let mut last = ptr::null_mut();
         for _ in 0..count {
-            last = ws_alloc(TYPE_ID_FIRST_USER, 64);
+            last = ws_alloc(TYPE_ID_FIRST_USER, 64, 0);
             assert!(!last.is_null());
         }
         let after = heap_stats();
@@ -1363,7 +1369,7 @@ mod tests {
         // derive an object's block by masking its address.
         let size = 1024u64;
         for _ in 0..(BLOCK_BYTES / size as usize) * 2 + 3 {
-            let p = ws_alloc(TYPE_ID_FIRST_USER, size) as usize;
+            let p = ws_alloc(TYPE_ID_FIRST_USER, size, 0) as usize;
             let start_block = p >> BLOCK_BITS;
             let end_block = (p + size as usize - 1) >> BLOCK_BITS;
             assert_eq!(start_block, end_block, "object straddled a block");
@@ -1460,8 +1466,8 @@ mod tests {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         // Two allocations from one buffer are adjacent, and the second one
         // took no lock: the buffer had already been handed out.
-        let a = ws_alloc(TYPE_ID_FIRST_USER, 32);
-        let b = ws_alloc(TYPE_ID_FIRST_USER, 32);
+        let a = ws_alloc(TYPE_ID_FIRST_USER, 32, 0);
+        let b = ws_alloc(TYPE_ID_FIRST_USER, 32, 0);
         let adjacent = (b as usize) == (a as usize) + 32;
         assert!(adjacent || (a as usize) >> BLOCK_BITS != (b as usize) >> BLOCK_BITS);
         assert!(TLAB.with(|t| t.limit.get()) > 0, "a buffer is held");

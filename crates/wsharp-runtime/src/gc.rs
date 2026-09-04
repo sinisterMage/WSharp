@@ -117,7 +117,7 @@ pub unsafe extern "C" fn ws_log_object(obj: *mut u8) {
     let Some(info) = types::info(unsafe { type_id_of(obj) }) else {
         return;
     };
-    if info.ptr_offsets.is_empty() {
+    if !info.has_references() {
         return;
     }
     let tracing = mark::tracing();
@@ -128,23 +128,25 @@ pub unsafe extern "C" fn ws_log_object(obj: *mut u8) {
     // where it went means resolving it -- which may move it, which takes the
     // buffers lock to note the copy. The lock does not nest.
     let mut snapshot: SmallSnapshot = SmallSnapshot::new();
-    for &offset in info.ptr_offsets {
-        let field = unsafe { (obj.add(offset as usize) as *const *mut u8).read() };
-        // A string literal or a singleton is a legal field value but not a
-        // counted one: it lives in read-only memory, and decrementing it
-        // would fault.
-        if !unsafe { is_collectable(field) } {
-            continue;
-        }
-        // Record where the object lives now: these lists outlive the blocks
-        // being emptied, and adjusting a count through a stale address would
-        // be a write into released memory.
-        snapshot.push(if moving {
-            unsafe { crate::evacuate::ws_resolve(field) }
-        } else {
-            field
-        });
-    }
+    unsafe {
+        types::for_each_ptr_offset(obj, info, |offset| {
+            let field = (obj.add(offset as usize) as *const *mut u8).read();
+            // A string literal or a singleton is a legal field value but not a
+            // counted one: it lives in read-only memory, and decrementing it
+            // would fault.
+            if !is_collectable(field) {
+                return;
+            }
+            // Record where the object lives now: these lists outlive the blocks
+            // being emptied, and adjusting a count through a stale address would
+            // be a write into released memory.
+            snapshot.push(if moving {
+                crate::evacuate::ws_resolve(field)
+            } else {
+                field
+            });
+        })
+    };
 
     with_buffers(|buffers| {
         for &field in &snapshot {
@@ -439,8 +441,10 @@ pub unsafe fn on_allocation(object: *mut u8) {
     // collection re-reads to turn its fields into increments -- the references
     // a struct literal is about to install would otherwise be counted by no
     // one, and everything it points at would look like garbage.
+    // An array of references answers yes here with an empty `ptr_offsets`,
+    // which is exactly what a fixed list cannot express.
     let has_references =
-        types::info(unsafe { type_id_of(object) }).is_some_and(|i| !i.ptr_offsets.is_empty());
+        types::info(unsafe { type_id_of(object) }).is_some_and(|i| i.has_references());
 
     let due = with_buffers(|b| {
         b.fresh.push(object);
@@ -629,12 +633,14 @@ pub(crate) fn for_each_reference(obj: *mut u8, mut visit: impl FnMut(*mut u8)) {
     let Some(info) = types::info(unsafe { type_id_of(obj) }) else {
         return;
     };
-    for &offset in info.ptr_offsets {
-        let field = unsafe { (obj.add(offset as usize) as *const *mut u8).read() };
-        if unsafe { is_collectable(field) } {
-            visit(field);
-        }
-    }
+    unsafe {
+        types::for_each_ptr_offset(obj, info, |offset| {
+            let field = (obj.add(offset as usize) as *const *mut u8).read();
+            if is_collectable(field) {
+                visit(field);
+            }
+        })
+    };
 }
 
 /// Called from every builtin under stress.
@@ -674,7 +680,7 @@ mod tests {
 
     #[test]
     fn a_heap_object_is_a_legal_root() {
-        let p = ws_alloc(TYPE_ID_FIRST_USER, 32);
+        let p = ws_alloc(TYPE_ID_FIRST_USER, 32, 0);
         assert!(root_is_plausible(p));
     }
 
@@ -683,7 +689,7 @@ mod tests {
         // Every object is 16-byte aligned, so this is a cheap check that needs
         // no dereference -- which matters, because dereferencing rubbish is how
         // a bad root turns into a crash somewhere unrelated.
-        let p = ws_alloc(TYPE_ID_FIRST_USER, 32);
+        let p = ws_alloc(TYPE_ID_FIRST_USER, 32, 0);
         assert!(!root_is_plausible(unsafe { p.add(1) }));
         assert!(!root_is_plausible(0xDEAD_BEEF_usize as *mut u8));
     }
@@ -692,11 +698,7 @@ mod tests {
     fn a_static_object_outside_the_heap_is_a_legal_root() {
         types::register_type(
             TYPE_ID_FIRST_USER + 300,
-            types::TypeLayout {
-                name: "Static".into(),
-                size: 16,
-                ptr_offsets: Vec::new(),
-            },
+            types::TypeLayout::fixed("Static", 16, Vec::new()),
         );
         types::publish();
 
