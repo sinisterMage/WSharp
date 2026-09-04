@@ -1,0 +1,77 @@
+# Does W# build and pass its tests on the macOS and Windows runners?
+#
+# These runners execute on the host, not in a container, so nothing here can
+# lean on the CI image the way `ci.yml` does -- whatever the machine has is
+# what the job gets. The tool probes below are separate steps on purpose: a
+# missing rustc and a missing node are very different problems, and reading
+# which step went red says which it is without opening a log.
+#
+# Each probe is `continue-on-error` so one absent tool does not hide the rest,
+# and every `run:` here is a bare command with no pipes, `&&` or redirection,
+# because the default shell differs between these two machines.
+#
+# Runs when this file changes, or on demand.
+
+name: Smoke
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".forgejo/workflows/smoke.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  macos:
+    name: macos-arm64
+    runs-on: macos-arm64
+    steps:
+      - name: Probe rustc
+        continue-on-error: true
+        run: rustc --version
+      - name: Probe cargo
+        continue-on-error: true
+        run: cargo --version
+      - name: Probe node
+        continue-on-error: true
+        run: node --version
+      - name: Probe git
+        continue-on-error: true
+        run: git --version
+      - name: Probe cc
+        continue-on-error: true
+        run: cc --version
+
+      - uses: actions/checkout@v4
+
+      # The real question: `rust-toolchain.toml` pins 1.95, so this also shows
+      # whether rustup is present to honour it.
+      - name: Test
+        run: cargo test --workspace --locked
+
+  windows:
+    name: windows-amd64
+    runs-on: windows
+    steps:
+      - name: Probe rustc
+        continue-on-error: true
+        run: rustc --version
+      - name: Probe cargo
+        continue-on-error: true
+        run: cargo --version
+      - name: Probe node
+        continue-on-error: true
+        run: node --version
+      - name: Probe git
+        continue-on-error: true
+        run: git --version
+      # No `cc` probe: MSVC links through link.exe, so the build is the only
+      # honest test of whether a linker is reachable.
+
+      - uses: actions/checkout@v4
+
+      - name: Test
+        run: cargo test --workspace --locked
