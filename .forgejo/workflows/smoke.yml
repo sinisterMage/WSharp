@@ -55,6 +55,15 @@ jobs:
   windows:
     name: windows-amd64
     runs-on: windows
+    # Every `run:` step failed with "running scripts is disabled on this
+    # system": the runner writes each one to a .ps1 and PowerShell's execution
+    # policy refuses to load it. cmd has no such policy, and these commands are
+    # bare enough not to care which shell runs them. The alternative is
+    # `Set-ExecutionPolicy RemoteSigned` on the machine, which is the better fix
+    # if a step ever needs a real shell -- packaging a release will.
+    defaults:
+      run:
+        shell: cmd
     steps:
       - name: Probe rustc
         continue-on-error: true
