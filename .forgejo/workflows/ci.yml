@@ -25,13 +25,12 @@ jobs:
   test:
     name: test
     runs-on: docker
-    # Pinned to the toolchain `rust-toolchain.toml` asks for, so rustup has
-    # nothing to download. The bookworm image (not `-slim`, not `-alpine`)
-    # matters: rustc shells out to `cc` to link, and an image without one
-    # reproduces exactly the "linker `cc` not found" failure that CLAUDE.md
-    # warns about -- library crates compile and then tests fail to link.
+    # Built from `.forgejo/ci-image/Dockerfile`, which is where the reasoning
+    # lives. The short of it: Forgejo runs a JavaScript action with `node`
+    # *inside this container*, and the stock Rust image has none, so every job
+    # died at `actions/checkout` with "node: executable file not found".
     container:
-      image: rust:1.95-bookworm
+      image: forgejo-hagc.srv1954822.hstgr.cloud/ofekbickel/wsharp-ci:rust-1.95
     steps:
       - uses: actions/checkout@v4
 
@@ -73,7 +72,7 @@ jobs:
     name: lint
     runs-on: docker
     container:
-      image: rust:1.95-bookworm
+      image: forgejo-hagc.srv1954822.hstgr.cloud/ofekbickel/wsharp-ci:rust-1.95
     steps:
       - uses: actions/checkout@v4
 
