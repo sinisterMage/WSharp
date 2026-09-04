@@ -28,6 +28,14 @@ COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
  && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
+# `actions/forgejo-release`, which the release workflow uploads through, is a
+# shell action that parses the API's answers with jq thirteen times over. It is
+# not in the Rust image, and the failure surfaces as an opaque error from inside
+# the action rather than a missing-command message.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends jq \
+ && rm -rf /var/lib/apt/lists/*
+
 # The official Rust image installs rustup's *minimal* profile, which leaves out
 # both of these -- `cargo fmt` there reports the component is not installed. The
 # `lint` job needs them, and `rust-toolchain.toml` asks for them, so bake them in
@@ -41,4 +49,6 @@ RUN node --version \
  && cargo fmt --version \
  && cargo clippy --version \
  && cc --version | head -1 \
- && git --version
+ && git --version \
+ && jq --version \
+ && curl --version | head -1

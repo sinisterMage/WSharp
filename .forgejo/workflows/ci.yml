@@ -30,7 +30,12 @@ jobs:
     # *inside this container*, and the stock Rust image has none, so every job
     # died at `actions/checkout` with "node: executable file not found".
     container:
-      image: forgejo-hagc.srv1954822.hstgr.cloud/ofekbickel/wsharp-ci:rust-1.95
+    # Pinned by digest, not by tag. The runner pulls only when it has no image
+    # of that name (`forcePull=false`), so a rebuilt `:rust-1.95` would leave it
+    # running the old one for ever -- which is exactly how a job ends up missing
+    # a tool the image was rebuilt to add. A digest it does not have is a digest
+    # it must fetch. `.forgejo/ci-image/push.sh` prints the line to paste here.
+      image: forgejo-hagc.srv1954822.hstgr.cloud/ofekbickel/wsharp-ci@sha256:2f59df0512bbe01d776e35e0a269a27c57805b4dd5026e3ac5d5980ba490187c
     steps:
       - uses: actions/checkout@v4
 
@@ -72,7 +77,12 @@ jobs:
     name: lint
     runs-on: docker
     container:
-      image: forgejo-hagc.srv1954822.hstgr.cloud/ofekbickel/wsharp-ci:rust-1.95
+    # Pinned by digest, not by tag. The runner pulls only when it has no image
+    # of that name (`forcePull=false`), so a rebuilt `:rust-1.95` would leave it
+    # running the old one for ever -- which is exactly how a job ends up missing
+    # a tool the image was rebuilt to add. A digest it does not have is a digest
+    # it must fetch. `.forgejo/ci-image/push.sh` prints the line to paste here.
+      image: forgejo-hagc.srv1954822.hstgr.cloud/ofekbickel/wsharp-ci@sha256:2f59df0512bbe01d776e35e0a269a27c57805b4dd5026e3ac5d5980ba490187c
     steps:
       - uses: actions/checkout@v4
 

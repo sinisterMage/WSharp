@@ -10,9 +10,9 @@
 #
 #     docker login forgejo-hagc.srv1954822.hstgr.cloud -u <user>
 #
-# Bump TAG when the Rust version in `rust-toolchain.toml` moves, and change the
-# workflow to match in the same commit, so a job never runs on a toolchain the
-# repository is not asking for.
+# Bump TAG when the Rust version in `rust-toolchain.toml` moves, so a job never
+# runs on a toolchain the repository is not asking for. Either way the workflows
+# need the new digest this prints; see the note beside it.
 set -eu
 
 REGISTRY=${REGISTRY:-forgejo-hagc.srv1954822.hstgr.cloud}
@@ -28,4 +28,13 @@ docker build --provenance=false -t "$IMAGE:$TAG" -t "$IMAGE:latest" .
 docker push "$IMAGE:$TAG"
 docker push "$IMAGE:latest"
 
+# The workflows pin the digest rather than the tag, because the runner only
+# pulls an image it does not already have by that name -- a moved tag would
+# leave it on the old one indefinitely. Paste this into the `image:` line of
+# every workflow in the same commit that changes the Dockerfile.
+DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$TAG" | cut -d@ -f2)
+echo
 echo "published $IMAGE:$TAG"
+echo "pin this in .forgejo/workflows/*.yml:"
+echo
+echo "      image: $IMAGE@$DIGEST"

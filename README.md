@@ -1,5 +1,7 @@
 # W# (WSharp)
 
+[![CI](https://forgejo-hagc.srv1954822.hstgr.cloud/ofekbickel/WSharp/actions/workflows/ci.yml/badge.svg)](https://forgejo-hagc.srv1954822.hstgr.cloud/ofekbickel/WSharp/actions?workflow=ci.yml)
+
 **A Julia alternative for the programs Julia isn't for.**
 
 Julia's central idea is right: multiple dispatch is a better way to organise a
