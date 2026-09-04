@@ -202,6 +202,19 @@ Things in this version that differ from older tutorials, each of which cost time
   disturb no range test. Its field offsets are computed by code generation
   rather than inference, because a `?T` field is two slots or three depending
   on what `T` is.
+- **A container written in W# bounds-checks itself.** `std/list` indexes its
+  backing array, whose header length is the *capacity*, so `a[i]`'s own check
+  would let a read of a spare slot through. `get`, `set`, `pop`, `insert` and
+  `remove` compare against `count` first and call the prelude's `panic_index`,
+  which is the same entry point generated code calls and gives the same
+  message. A new list operation that indexes `items` and forgets this hands
+  back a spare slot -- a zero, or a null reference -- instead of reporting the
+  mistake.
+- **`std/list` keeps a dead reference in its tail.** `pop` and `remove`
+  decrement the count and leave the vacated slot alone, because
+  `l.items[i] = null` only typechecks when `T` is an optional. The collector
+  walks every element the header claims, so that object stays alive until the
+  slot is reused. This is known and documented, not a bug to fix by nulling.
 - **A module's names are stored qualified in one flat table.** An unqualified
   lookup tries the current module and then the prelude, and what a module
   cannot see is simply what it has no key for. A local binding shadows an

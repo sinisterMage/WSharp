@@ -35,7 +35,8 @@ fn main() i64 {
     print(first([]str{ "a", "b" }));
 
     // Every one of these returns a new array: the length lives in the header,
-    // so there is no capacity to grow into.
+    // so there is no capacity to grow into. `std/list` is the type that has
+    // one -- see examples/list.ws.
     print(show(array.push(xs, 9)));
     print(show(array.slice(xs, 1, 4)));
     print(show(array.concat(xs, []i64{ 9, 2 })));

@@ -105,6 +105,22 @@ pub fn builtins() -> Vec<Builtin> {
             ret: BuiltinTy::Void,
             ptr: ws_assert as *const u8,
         },
+        // The out-of-bounds panic, exposed for the same reason the `gc_*`
+        // counters are: a container written in W# should be able to report a
+        // bad index exactly as `a[i]` does. `std/list` bounds-checks against
+        // its count rather than its backing array's capacity, so the check is
+        // in W# -- and `assert` would only say "assertion failed".
+        //
+        // [`ws_panic_index`] never returns; declaring it `void` is right
+        // because the two have the same ABI, and a caller that writes a
+        // `return` after it is simply writing unreachable code.
+        Builtin {
+            module: PRELUDE,
+            name: "panic_index",
+            params: &[BuiltinTy::I64, BuiltinTy::I64],
+            ret: BuiltinTy::Void,
+            ptr: ws_panic_index as *const u8,
+        },
         // The collector, exposed so that a W# program can assert on it. Being
         // able to say "allocate this much rubbish, collect, check it went" in
         // the language itself is what makes the collector testable end to end
@@ -381,6 +397,8 @@ pub const ARRAY_NEW: &str = "new";
 pub const STR_MODULE: &str = "std/str";
 /// The standard library's array operations.
 pub const ARRAY_MODULE: &str = "std/array";
+/// The standard library's growable array.
+pub const LIST_MODULE: &str = "std/list";
 /// The standard library's arithmetic.
 pub const MATH_MODULE: &str = "std/math";
 /// The standard library's file and standard-input operations.
@@ -420,6 +438,7 @@ pub const HTTP_MODULE: &str = "std/http";
 pub fn std_module_sources() -> &'static [(&'static str, &'static str)] {
     &[
         (ARRAY_MODULE, include_str!("std/array.ws")),
+        (LIST_MODULE, include_str!("std/list.ws")),
         (STR_MODULE, include_str!("std/str.ws")),
         (MATH_MODULE, include_str!("std/math.ws")),
     ]

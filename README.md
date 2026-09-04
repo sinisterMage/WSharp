@@ -70,6 +70,7 @@ everywhere.** They are checked when written and inferred when not.
 | Expressions | `if (c) a else b`, `fn (a, b) { ... }` closures |
 | Literals | `42`, `0xff`, `0b1010`, `0o17`, `1_000_000`, `2.5`, `"text"` with `\n \t \r \0 \\ \"` |
 | Arrays | `[]i64{ 1, 2, 3 }`, `a[i]`, `for (a) \|v, i\| { }`; an index out of range panics |
+| Growable | `std/list` — a backing array plus a count, so `push` is amortised constant time |
 | Generics | `fn first[T](a: []T) T`, `const Box = struct[T] { value: T };` — inferred when not written |
 | Modules | `const http = @import("std/http");`, then `http.NotFound404` |
 | Structs | `const P = struct { x: i64 };`, `P{ .x = 1 }`, `p.x` |
@@ -302,6 +303,7 @@ fn main() i64 {
 |---|---|
 | `std/str` | `len` `concat` `eq` `substr` `find` `split` `join` `repeat` `starts_with` `from_int` `from_float` |
 | `std/array` | `len` `new` `concat` `push` `slice` `repeat` |
+| `std/list` | `List[T]`, a growable array: `new` `with_capacity` `from` `len` `capacity` `get` `set` `push` `pop` `insert` `remove` `extend` `clear` `to_array` |
 | `std/math` | `abs` `min` `max` `sign` `sqrt` `pow` `floor` `ceil` `round` `trunc` `ipow` |
 | `std/io` | `read_file` `read_line` `write_file` `exists` — the fallible ones return `!str` |
 | `std/http` | the 27 HTTP status types, materialised on first mention |
@@ -312,14 +314,15 @@ A **prelude** needs no import, because every module has it:
 |---|---|
 | `print(s: str)`, `print_int(i64)`, `print_float(f64)`, `print_bool(bool)` | write a line to stdout |
 | `assert(c: bool)` | panic if `c` is false |
+| `panic_index(i: i64, len: i64)` | the out-of-bounds panic, so a container written in W# reports a bad index exactly as `a[i]` does |
 | `gc_collect()` | one reference-counting collection |
 | `gc_trace()` | a whole mark trace, synchronously: cycles are reclaimed when it returns |
 | `gc_trace_start()`, `gc_trace_finish()` | the two halves of a trace, so a program can mutate the heap while the collector thread marks it |
 | `gc_live_objects()`, `gc_live_bytes()`, `gc_collections()`, `gc_traces()` | the collector's counters, for asserting on it |
 
-Half the library is written in W# rather than Rust — `std/array`, `std/math`
-and `str.split` are `.ws` files compiled with your program, monomorphised per
-element type and dropped when nothing calls them. The rule that draws the line
+Half the library is written in W# rather than Rust — `std/array`, `std/list`,
+`std/math` and `str.split` are `.ws` files compiled with your program,
+monomorphised per element type and dropped when nothing calls them. The rule that draws the line
 is worth knowing if you add to it: **a builtin may read and write bytes, and
 anything that moves a *reference* from one object into another is written in
 W#**, where the write barrier, the load barrier and the stack maps all apply by

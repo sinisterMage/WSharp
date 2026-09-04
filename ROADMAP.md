@@ -195,6 +195,12 @@ in-group calls, once the group has generalised. See item 5.
   put their fields in different places, because a `?T` field is two slots or
   three, so a generic struct's offsets are computed by code generation, where
   every type is concrete, through the same `layout::place` inference uses.
+- **A growable array**, `std/list`. The last version of this file said one
+  "wants a second object holding a capacity and a length", and that is exactly
+  what `List[T] = struct[T] { items: []T, count: i64 }` is: the backing
+  array's header length is the capacity, and `count` is how much of it is in
+  use. Pushing writes into the spare tail and doubles when it is full, so a
+  run of pushes is amortised constant time.
 
 ### Decisions worth recording
 
@@ -225,15 +231,34 @@ in-group calls, once the group has generalised. See item 5.
   Inference now fills those in with the callee's own quantified variables after
   the group generalises, which is sound because Hindley-Milner holds a group
   monomorphic.
+- **The growable array is a library type, not a language one.** `List[T]` is
+  an ordinary generic struct in an ordinary `.ws` file; nothing in the lexer,
+  the parser, inference or the code generator knows it exists. That it could
+  be written at all is the argument that item 5's generic structs and
+  header-counted arrays were the right primitives — and it is why the whole
+  module is 178 lines with no Rust beside it.
+- **A list bounds-checks against its count, not its capacity.** Indexing the
+  backing array directly would happily hand back a spare slot, so the check is
+  in W#. That needed a way to fail as well as generated code does: the prelude
+  gained `panic_index`, which is the same entry point `a[i]` calls and gives
+  the same `index 5 out of bounds (len 3)`. Exposed for the reason the `gc_*`
+  counters are — a library written in W# should be held to the standard the
+  code generator is.
 
 ### What is left
 
-- **Arrays are fixed-length.** `push` returns a new array, because the length
-  lives in the header and there is no capacity beside it. A growable array
-  wants a second object holding a capacity and a length.
 - **No array covariance**, deliberately: `[]Sub` is not a `[]Base`, because a
   write through the second would break the first.
-- **`fn` literals are still monomorphic**, so a closure cannot be generic.
+- **`for` does not iterate a list.** `for` desugars to a `while` over an
+  array, so a list is walked as `for (list.to_array(xs))` and pays for a copy.
+  Teaching `for` about `List` would put a standard-library struct inside the
+  type checker; an iterator protocol is the honest fix, and it is not item 5's.
+- **`pop` and `remove` leave the vacated tail slot holding its old
+  reference.** The collector walks every element the header claims, so that
+  object stays alive until the slot is overwritten, the list grows or the list
+  dies. It cannot simply be nulled: `l.items[i] = null` only typechecks when
+  `T` is itself an optional. At most one extra object per pop, and `clear`
+  drops the backing array outright.
 
 ---
 
@@ -247,6 +272,7 @@ A module system, and four modules behind it.
 |---|---|
 | `std/str` | `len`, `concat`, `eq`, `substr`, `find`, `split`, `join`, `repeat`, `starts_with`, `from_int`, `from_float` |
 | `std/array` | `len`, `new`, `concat`, `push`, `slice`, `repeat` |
+| `std/list` | `List[T]` and `new`, `with_capacity`, `from`, `len`, `capacity`, `get`, `set`, `push`, `pop`, `insert`, `remove`, `extend`, `clear`, `to_array` |
 | `std/math` | `abs`, `min`, `max`, `sign`, `sqrt`, `pow`, `floor`, `ceil`, `round`, `trunc`, `ipow` |
 | `std/io` | `read_file`, `read_line`, `write_file`, `exists` |
 | `std/http` | the 27 status types, moved out of the global namespace |
@@ -276,8 +302,8 @@ A module system, and four modules behind it.
   reads. Files are laid end to end in a single offset space instead, and a
   span's file is the range it falls in (`SourceMap`). The first file starts at
   offset 1, which keeps 0 meaning `Span::EMPTY`.
-- **Half the library is written in W#.** `std/array`, `std/math` and
-  `std/str.split` are `.ws` files compiled with the program, embedded with
+- **Half the library is written in W#.** `std/array`, `std/list`, `std/math`
+  and `std/str.split` are `.ws` files compiled with the program, embedded with
   `include_str!`. The rule that draws the line is worth stating plainly:
   **a builtin may read and write bytes; anything that moves a *reference* from
   one object into another is written in W#.**
@@ -466,5 +492,3 @@ These are deliberate limitations, each with a clear fix:
 - **x86-64 and aarch64 only.** The collector reads the frame pointer with
   inline assembly; other architectures get a `compile_error!`.
 - **No visibility in modules.** Everything a module declares is public.
-- **Fixed-length arrays.** `push` returns a new array; there is no capacity
-  beside the length in the header.
