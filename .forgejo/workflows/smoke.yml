@@ -87,22 +87,50 @@ jobs:
       - name: Build
         run: cargo build --workspace --locked
 
-      # The most direct question there is: does one generated program run?
-      # `continue-on-error` so the suite below still gets its turn, and a
-      # timeout because a crashing process on Windows can sit at an error
-      # dialog for ever instead of exiting.
-      - name: Run one example directly
-        continue-on-error: true
-        timeout-minutes: 3
-        run: cargo run --locked --bin wsharp -- run examples/fib.ws
-
-      # `every_case_*` are the two that hung: each runs the compiler over every
-      # file in tests/cases and waits on it with no timeout of its own. Skipped
-      # until the crash below is understood, so this job ends.
+      # A bisect, cheapest question first. `library.ws` prints a known sequence
+      # -- greeting, length, comparison, substring, field count, join, then the
+      # arithmetic and the dispatched statuses -- so the last line it manages
+      # names the operation that killed it, with no debugger involved.
       #
-      # `--nocapture` is the point of the exercise: cargo prints a failing
-      # test's output only after the whole binary finishes, so cancelling a run
-      # that hangs takes the one error message worth having with it.
+      # Each step ends in `echo exit=%ERRORLEVEL%`, which both records the exit
+      # status and keeps the step green, so one crash does not hide the rest.
+      # A Windows access violation exits without printing anything at all,
+      # which is why the previous run reported a failure with empty stderr.
+
+      - name: Integers only, no allocation
+        run: |
+          cargo run --locked --bin wsharp -- run examples/fib.ws
+          echo exit=%ERRORLEVEL%
+
+      - name: String literals, still no allocation
+        run: |
+          cargo run --locked --bin wsharp -- run tests/cases/strings.ws
+          echo exit=%ERRORLEVEL%
+
+      - name: Allocating and collecting
+        run: |
+          cargo run --locked --bin wsharp -- run tests/cases/gc_string_concat.ws
+          echo exit=%ERRORLEVEL%
+
+      # The root walk is the part with the most reason to be platform-specific:
+      # it follows the frame-pointer chain by hand. `WSHARP_GC_TRACE` prints
+      # every frame it visits, so if it dies walking, the last frame printed is
+      # where the chain stopped making sense.
+      - name: The root walk, traced
+        env:
+          WSHARP_GC_TRACE: "1"
+          WSHARP_GC_STATS: "1"
+        run: |
+          cargo run --locked --bin wsharp -- run tests/cases/gc_roots.ws
+          echo exit=%ERRORLEVEL%
+
+      - name: The example that failed
+        env:
+          WSHARP_GC_STATS: "1"
+        run: |
+          cargo run --locked --bin wsharp -- run examples/library.ws
+          echo exit=%ERRORLEVEL%
+
       - name: Test, minus the cases that hang
         timeout-minutes: 15
         run: cargo test --workspace --locked -- --nocapture --test-threads=1 --skip every_case_
