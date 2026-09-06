@@ -11,6 +11,7 @@ pub mod header;
 pub mod heap;
 pub mod io;
 pub mod mark;
+pub mod rpc;
 pub mod stackwalk;
 pub mod strings;
 pub mod transfer;

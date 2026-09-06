@@ -391,6 +391,12 @@ pub fn expr(e: &Expr) -> String {
         }
         Expr::Index { obj, index, .. } => format!("(index {} {})", expr(obj), expr(index)),
         Expr::Import { path, .. } => format!("(import {path:?})"),
+        Expr::Spawn { module, args, .. } => {
+            let args: Vec<String> = args.iter().map(expr).collect();
+            let args = args.iter().map(|a| format!(" {a}")).collect::<String>();
+            format!("(spawn {}{})", expr(module), args)
+        }
+        Expr::Join { worker, .. } => format!("(join {})", expr(worker)),
         Expr::Block { stmts, value, .. } => {
             let mut parts: Vec<String> = stmts.iter().map(stmt_inline).collect();
             if let Some(v) = value {

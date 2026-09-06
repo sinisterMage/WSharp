@@ -218,7 +218,9 @@ fn walk(expr: &hir::Expr, program: &hir::Program, store: &mut TypeStore, out: &m
                     out.push(format!("{}: {}", def.name, store.show(&ty)));
                 }
             }
-            hir::Callee::Builtin(_) | hir::Callee::Indirect(_) => {}
+            // A call into a worker names no function here: the callee is
+            // chosen by the worker's own service table.
+            hir::Callee::Builtin(_) | hir::Callee::Indirect(_) | hir::Callee::Rpc { .. } => {}
         }
         for a in args {
             walk(a, program, store, out);

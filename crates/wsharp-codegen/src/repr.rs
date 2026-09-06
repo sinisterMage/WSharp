@@ -46,6 +46,10 @@ pub fn slot_types(store: &mut TypeStore, ty: &Type) -> SlotTypes {
         Type::Con(TyCon::Bool, _) => smallvec![types::I8],
         Type::Con(TyCon::Error, _) => smallvec![ERROR_TAG],
         Type::Con(TyCon::Str | TyCon::Struct(_) | TyCon::Fn | TyCon::Array, _) => smallvec![PTR],
+        // A handle is an index into the runtime's list of workers, not a
+        // pointer: another worker's objects are not this one's to hold, which
+        // is also why the collector never sees one.
+        Type::Con(TyCon::Worker(_), _) => smallvec![types::I64],
         Type::Con(TyCon::Optional, args) => {
             let mut out: SlotTypes = smallvec![OPTION_TAG];
             out.extend(slot_types(store, &args[0]));

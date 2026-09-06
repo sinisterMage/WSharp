@@ -11,7 +11,7 @@
 //! and after this pass no type in the program contains a variable -- which is
 //! precisely the invariant the code generator needs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use wsharp_syntax::{Diagnostic, Span};
 
@@ -51,6 +51,8 @@ pub fn monomorphize(program: &hir::Program, store: &mut TypeStore) -> MonoResult
         pending: Vec::new(),
         diags: Vec::new(),
         current: None,
+        services: program.services.clone(),
+        spawned: HashSet::new(),
     };
 
     let new_entry = mono.specialize(entry, Subst::new());
@@ -71,6 +73,7 @@ pub fn monomorphize(program: &hir::Program, store: &mut TypeStore) -> MonoResult
             strings: program.strings.clone(),
             errors: program.errors.clone(),
             entry: Some(new_entry),
+            services: mono.services,
         },
         diags: mono.diags,
     }
@@ -83,6 +86,7 @@ fn clone_program(p: &hir::Program) -> hir::Program {
         strings: p.strings.clone(),
         errors: p.errors.clone(),
         entry: p.entry,
+        services: p.services.clone(),
     }
 }
 
@@ -96,6 +100,11 @@ struct Mono<'a> {
     /// The function being specialised: its name, where to point a diagnostic,
     /// and whether one has already been reported for it.
     current: Option<(String, Span, bool)>,
+    /// The service table, with each entry's functions renumbered as they are
+    /// specialised. A service's methods are reachable only through this table,
+    /// so `@spawn` is the edge that keeps them alive.
+    services: Vec<hir::ServiceDef>,
+    spawned: HashSet<hir::ServiceId>,
 }
 
 impl Mono<'_> {
@@ -216,6 +225,32 @@ impl Mono<'_> {
         }
     }
 
+    /// Emit a service's `init` and every one of its methods, once.
+    ///
+    /// None of them is generic -- a worker calls a method through one machine
+    /// implementation -- so the substitution is empty and the only work is
+    /// renumbering the table to point at the copies.
+    fn specialize_service(&mut self, service: hir::ServiceId) {
+        if !self.spawned.insert(service) {
+            return;
+        }
+        let def = self.services[service as usize].clone();
+        let init = self.specialize(def.init, Subst::new());
+        let methods = def
+            .methods
+            .iter()
+            .map(|m| hir::ServiceMethod {
+                name: m.name.clone(),
+                func: self.specialize(m.func, Subst::new()),
+            })
+            .collect();
+        self.services[service as usize] = hir::ServiceDef {
+            name: def.name,
+            init,
+            methods,
+        };
+    }
+
     /// The substitution to specialise `callee` under, given the type arguments
     /// recorded at the call site and the caller's own substitution.
     fn callee_subst(&mut self, callee: hir::FuncId, targs: &[Type], caller: &Subst) -> Subst {
@@ -293,6 +328,15 @@ impl Mono<'_> {
     fn rewrite_expr(&mut self, expr: &mut hir::Expr, subst: &Subst) {
         expr.ty = self.apply(&expr.ty, subst);
         match &mut expr.kind {
+            // Spawning is what makes a service's functions reachable at all --
+            // nothing calls them, the runtime does.
+            hir::ExprKind::Spawn { service, args } => {
+                self.specialize_service(*service);
+                for arg in args {
+                    self.rewrite_expr(arg, subst);
+                }
+            }
+            hir::ExprKind::Join(worker) => self.rewrite_expr(worker, subst),
             hir::ExprKind::Block { stmts, value } => {
                 for stmt in stmts {
                     self.rewrite_stmt(stmt, subst);
@@ -303,6 +347,9 @@ impl Mono<'_> {
             }
             hir::ExprKind::Call { callee, args } => {
                 match callee {
+                    // The callee is chosen at run time by the worker's own
+                    // dispatch table, which `specialize_service` rewrote.
+                    hir::Callee::Rpc { worker, .. } => self.rewrite_expr(worker, subst),
                     hir::Callee::Static { func, targs } => {
                         let inner = self.callee_subst(*func, targs, subst);
                         *func = self.specialize(*func, inner);

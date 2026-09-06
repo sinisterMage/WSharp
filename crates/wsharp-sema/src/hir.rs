@@ -9,6 +9,7 @@ use wsharp_runtime::TypeId;
 use wsharp_syntax::Span;
 use wsharp_syntax::ast::{BinOp, UnOp};
 
+pub use crate::ty::ServiceId;
 use crate::ty::{Scheme, StructId, Type};
 
 pub type FuncId = u32;
@@ -28,6 +29,10 @@ pub struct Program {
     pub errors: Vec<String>,
     /// `main`, if the program has one.
     pub entry: Option<FuncId>,
+    /// The services a program spawns, indexed by `ServiceId`. A service is an
+    /// ordinary module: no new declaration form, because W# has no mutable
+    /// globals and the state had to be explicit anyway.
+    pub services: Vec<ServiceDef>,
 }
 
 impl Program {
@@ -117,6 +122,25 @@ pub struct FuncDef {
     /// recursion was allowed here.
     pub self_local: Option<LocalId>,
     pub span: Span,
+}
+
+/// One module, used as a worker's service.
+///
+/// `init` makes the state; a method is any function in the module whose first
+/// parameter is that state. Nothing here is generic: the runtime calls a
+/// method through a fixed trampoline, which one machine implementation has to
+/// satisfy.
+#[derive(Debug, Clone)]
+pub struct ServiceDef {
+    pub name: String,
+    pub init: FuncId,
+    pub methods: Vec<ServiceMethod>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceMethod {
+    pub name: String,
+    pub func: FuncId,
 }
 
 #[derive(Debug, Clone)]
@@ -278,6 +302,10 @@ pub enum ExprKind {
         stmts: Vec<Stmt>,
         value: Option<Box<Expr>>,
     },
+    /// `@spawn(m, args..)` -- start a worker, run `m.init(args..)` on it.
+    Spawn { service: ServiceId, args: Vec<Expr> },
+    /// `@join(w)`.
+    Join(Box<Expr>),
     Orelse {
         expr: Box<Expr>,
         alt: Box<Expr>,
@@ -310,6 +338,15 @@ pub enum Callee {
     Builtin(BuiltinId),
     /// A call through a closure value.
     Indirect(Box<Expr>),
+    /// `w.f(..)` -- a call into another worker's service. The arguments are
+    /// copied there and the result copied back, so it can fail: the type is
+    /// `!R` whatever the method returns.
+    Rpc {
+        worker: Box<Expr>,
+        service: ServiceId,
+        /// Index into the service's `methods`.
+        method: u32,
+    },
     /// Multiple dispatch. `cases` are in specificity order, most specific
     /// first, so the first one whose runtime types match is the winner --
     /// which is exactly Julia's rule, decided at compile time and then simply

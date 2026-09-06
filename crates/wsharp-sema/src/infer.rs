@@ -26,7 +26,7 @@ use wsharp_syntax::diag::Label;
 use wsharp_syntax::span::{Ident, Span};
 
 use crate::hir::{self, UNRESOLVED};
-use crate::ty::{
+use crate::ty::{ServiceId, 
     AbstractId, Scheme, StructId, TyCon, Type, TypeStore, TypeVarId, UnifyError, abstract_members,
     abstract_name, lookup_abstract,
 };
@@ -288,6 +288,10 @@ enum Binding {
 /// has state the subject does not: `iter` makes it, `next` advances it.
 const PROTOCOL_NAMES: &[&str] = &["iter", "next"];
 
+/// Marks a dependency on *every* function of a spawned module. No W# name can
+/// contain an `@`, so this cannot collide with one.
+const SPAWN_DEP: &str = "@spawn:";
+
 /// One function being inferred. A stack of these models nesting: a `fn` literal
 /// pushes a frame, and a name resolved past a frame boundary becomes a capture.
 struct Frame {
@@ -413,6 +417,11 @@ struct Inferencer<'a> {
     /// declares is always visible to itself, which is why one flat set is
     /// enough: a qualified lookup only ever crosses a module boundary, since a
     /// module that imported itself would be a cycle.
+    /// The services this program spawns, and the module each came from. Built
+    /// on demand: a module is a service because something spawned it, and a
+    /// program pays for no service it does not start.
+    services: Vec<hir::ServiceDef>,
+    service_of: HashMap<usize, Option<ServiceId>>,
     private: HashSet<String>,
     /// Spans a privacy error has already been reported at. One qualified name
     /// is resolved more than once -- a call asks whether its callee is an
@@ -473,6 +482,8 @@ impl<'a> Inferencer<'a> {
             strings: Vec::new(),
             string_ids: HashMap::new(),
             frames: Vec::new(),
+            services: Vec::new(),
+            service_of: HashMap::new(),
             private: HashSet::new(),
             reported_private: HashSet::new(),
             pending_self: None,
@@ -606,6 +617,7 @@ impl<'a> Inferencer<'a> {
                 strings: self.strings,
                 errors: self.store.error_names().to_vec(),
                 entry,
+                services: self.services,
             },
             store: self.store,
             diags: self.diags,
@@ -1568,6 +1580,20 @@ impl<'a> Inferencer<'a> {
                 // A dotted name is a call through a module, whose callee lives
                 // in another one; resolving it here is what puts the two in
                 // dependency order rather than in arbitrary order.
+                // Every function of a spawned module, because any of them
+                // could be one of its methods.
+                if let Some(alias) = name.strip_prefix(SPAWN_DEP) {
+                    let Some(path) = self.imports[module].get(alias).cloned() else {
+                        continue;
+                    };
+                    let prefix = format!("{path}.");
+                    for (key, global) in &self.globals {
+                        if let (true, GlobalRef::Func(ids)) = (key.starts_with(&prefix), global) {
+                            deps.extend(ids.iter().map(|id| *id as usize));
+                        }
+                    }
+                    continue;
+                }
                 let key = match name.split_once('.') {
                     Some((alias, member)) => match self.imports[module].get(alias) {
                         Some(path) => format!("{path}.{member}"),
@@ -2441,6 +2467,333 @@ impl<'a> Inferencer<'a> {
         Some(hir::Stmt::Block(hir::Block { stmts }))
     }
 
+    // -----------------------------------------------------------------------
+    // Workers
+    // -----------------------------------------------------------------------
+
+    /// The service a module describes, if it describes one.
+    ///
+    /// A service is an ordinary module: `init` makes the state, and a *method*
+    /// is any function in it whose first parameter is that state. No new
+    /// declaration form, because W# has no mutable globals -- a worker's state
+    /// had to be an explicit value passed in and out, and once it is, the set
+    /// of functions that take it is the set of things the worker can be asked
+    /// to do.
+    ///
+    /// Worked out once per module and cached: the answer is a fact about the
+    /// module, and a program that spawns the same one twice gets one service.
+    fn service_of(&mut self, module: usize, written: &str, span: Span) -> Option<ServiceId> {
+        if let Some(cached) = self.service_of.get(&module) {
+            return *cached;
+        }
+        // Inserted before the work, so a service that reaches itself -- a
+        // module spawning its own kind -- asks the question once.
+        self.service_of.insert(module, None);
+        let path = self.modules[module].path.clone();
+
+        let Some(GlobalRef::Func(ids)) = self.globals.get(&format!("{path}.init")).cloned() else {
+            // Named as the program wrote it: the key is an absolute file path,
+            // which says nothing a reader of this line wants to know.
+            self.error(span, format!("`{written}` is not a service")).help = Some(
+                "a service is a module with an `init` that makes its state, and functions \
+                 taking that state as their first parameter"
+                    .into(),
+            );
+            return None;
+        };
+        let [init] = ids[..] else {
+            self.error(span, "a service's `init` cannot be overloaded")
+                .help = Some("a worker runs one `init`, so there must be exactly one".into());
+            return None;
+        };
+        let Some((init_params, state)) = self.func_signature(init) else {
+            return None;
+        };
+        if !matches!(self.store.resolve(&state), Type::Con(TyCon::Struct(_), _)) {
+            let shown = self.store.show(&state);
+            self.error(span, format!("a service's state must be a struct, not `{shown}`"))
+                .help = Some(
+                "the worker holds it for as long as it lives, and holding it is what a \
+                 struct is for"
+                    .into(),
+            );
+            return None;
+        }
+        for ty in &init_params {
+            self.require_transferable(ty, span);
+        }
+
+        // Sorted, so the method numbering a program compiles against is the
+        // same one the runtime dispatches on however the module was written.
+        let prefix = format!("{path}.");
+        let mut named: Vec<(String, hir::FuncId)> = Vec::new();
+        for (key, global) in &self.globals {
+            let (Some(name), GlobalRef::Func(ids)) = (key.strip_prefix(&prefix), global) else {
+                continue;
+            };
+            if name == "init" || ids.len() != 1 {
+                continue;
+            }
+            named.push((name.to_string(), ids[0]));
+        }
+        named.sort();
+
+        let mut methods = Vec::new();
+        for (name, func) in named {
+            let Some((params, ret)) = self.func_signature(func) else {
+                continue;
+            };
+            // What makes a function a method is that it takes the state.
+            let takes_state = params
+                .first()
+                .is_some_and(|p| self.store.try_unify(p, &state));
+            if !takes_state {
+                continue;
+            }
+            let at = self.fn_spans[func as usize];
+            if !self.schemes[func as usize]
+                .as_ref()
+                .is_none_or(|s| s.vars.is_empty())
+            {
+                self.error(at, format!("a service method cannot be generic: `{name}`"))
+                    .help = Some(
+                    "a worker calls it through one machine implementation, which a generic \
+                     function does not have"
+                        .into(),
+                );
+                continue;
+            }
+            if matches!(self.store.resolve(&ret), Type::Con(TyCon::ErrUnion, _)) {
+                self.error(
+                    at,
+                    format!("a service method cannot return an error union: `{name}`"),
+                )
+                .help = Some(
+                    "a call into a worker is already `!T`, because the worker can die -- \
+                     return the value and let that wrap it"
+                        .into(),
+                );
+                continue;
+            }
+            for ty in params.iter().skip(1).chain(std::iter::once(&ret)) {
+                self.require_transferable(ty, at);
+            }
+            methods.push(hir::ServiceMethod { name, func });
+        }
+
+        let id = self.store.declare_service(written);
+        self.services.push(hir::ServiceDef {
+            name: written.to_string(),
+            init,
+            methods,
+        });
+        self.service_of.insert(module, Some(id));
+        Some(id)
+    }
+
+    /// A declared function's parameter types and return type, as inference has
+    /// them so far.
+    fn func_signature(&mut self, id: hir::FuncId) -> Option<(Vec<Type>, Type)> {
+        let (ty, _) = self.func_type(id);
+        let resolved = self.store.resolve_deep(&ty);
+        let (params, ret) = resolved.as_fn()?;
+        Some((params.to_vec(), ret.clone()))
+    }
+
+    fn require_transferable(&mut self, ty: &Type, span: Span) {
+        self.constraints.push(Constraint::Transferable {
+            ty: ty.clone(),
+            span,
+        });
+    }
+
+    fn module_index(&self, path: &str) -> Option<usize> {
+        self.modules.iter().position(|m| m.path == path)
+    }
+
+    /// `@spawn(m, args..)`.
+    fn infer_spawn(
+        &mut self,
+        module: &'a ast::Expr,
+        args: &'a [ast::Expr],
+        span: Span,
+    ) -> hir::Expr {
+        let written = match module {
+            ast::Expr::Ident(name) => name.to_string(),
+            other => self.module_path_of(other).unwrap_or_default(),
+        };
+        let service = self
+            .module_path_of(module)
+            .and_then(|path| self.module_index(&path))
+            .and_then(|m| self.service_of(m, &written, span));
+        let mut hir_args: Vec<hir::Expr> = args.iter().map(|a| self.infer_expr(a)).collect();
+        let Some(service) = service else {
+            if self.module_path_of(module).is_none() {
+                self.error(module.span(), "`@spawn` takes a module")
+                    .help = Some("as in `@spawn(counter, 0)`, where `counter` was imported".into());
+            }
+            let ty = self.store.fresh();
+            return hir::Expr {
+                kind: hir::ExprKind::Null,
+                ty,
+                span,
+            };
+        };
+        let init = self.services[service as usize].init;
+        if let Some((params, _)) = self.func_signature(init) {
+            if params.len() != hir_args.len() {
+                let n = params.len();
+                self.error(
+                    span,
+                    format!(
+                        "this service's `init` takes {n} argument{} but {} {} given",
+                        if n == 1 { "" } else { "s" },
+                        hir_args.len(),
+                        if hir_args.len() == 1 { "was" } else { "were" }
+                    ),
+                );
+            }
+            for (arg, want) in hir_args.iter_mut().zip(&params) {
+                let taken = std::mem::replace(
+                    arg,
+                    hir::Expr {
+                        kind: hir::ExprKind::Null,
+                        ty: Type::void(),
+                        span,
+                    },
+                );
+                *arg = self.coerce(taken, want, "this argument");
+            }
+        }
+        let failed = self.intern_error(wsharp_runtime::builtins::SPAWN_FAILED);
+        let set = self.store.err_set([failed]);
+        hir::Expr {
+            kind: hir::ExprKind::Spawn {
+                service,
+                args: hir_args,
+            },
+            ty: Type::err_union(Type::worker(service), set),
+            span,
+        }
+    }
+
+    /// `@join(w)`.
+    fn infer_join(&mut self, worker: &'a ast::Expr, span: Span) -> hir::Expr {
+        let worker = self.infer_expr(worker);
+        if !matches!(self.store.resolve(&worker.ty), Type::Con(TyCon::Worker(_), _)) {
+            let shown = self.store.show(&worker.ty);
+            self.error(worker.span, format!("`@join` takes a worker, not `{shown}`"));
+        }
+        let died = self.intern_error(wsharp_runtime::builtins::WORKER_DIED);
+        let set = self.store.err_set([died]);
+        hir::Expr {
+            kind: hir::ExprKind::Join(Box::new(worker)),
+            ty: Type::err_union(Type::void(), set),
+            span,
+        }
+    }
+
+    /// `w.f(args)` -- a call into the service a worker is running.
+    ///
+    /// Recognised from the shape rather than from a new syntax: `w` is a local
+    /// holding a handle, which is what tells this apart from `str.concat(a, b)`
+    /// where the object is a module path.
+    fn worker_call_target(&mut self, callee: &ast::Expr) -> Option<(hir::LocalId, ServiceId)> {
+        let ast::Expr::Field { obj, .. } = callee else {
+            return None;
+        };
+        let ast::Expr::Ident(base) = obj.as_ref() else {
+            return None;
+        };
+        let local = self.lookup_local(base.as_str())?;
+        let ty = self.frames.last()?.locals[local as usize].ty.clone();
+        match self.store.resolve(&ty) {
+            Type::Con(TyCon::Worker(id), _) => Some((local, id)),
+            _ => None,
+        }
+    }
+
+    fn infer_rpc_call(
+        &mut self,
+        local: hir::LocalId,
+        service: ServiceId,
+        name: &Ident,
+        args: &'a [ast::Expr],
+        span: Span,
+    ) -> hir::Expr {
+        let def = &self.services[service as usize];
+        let handle = hir::Expr {
+            kind: hir::ExprKind::Local(local),
+            ty: Type::worker(service),
+            span,
+        };
+        let Some(method) = def.methods.iter().position(|m| m.name == name.as_str()) else {
+            let service_name = def.name.clone();
+            let known: Vec<String> = def.methods.iter().map(|m| m.name.clone()).collect();
+            let known = known.join("`, `");
+            self.error(
+                name.span,
+                format!("`{service_name}` has no method `{name}`"),
+            )
+            .help = Some(format!(
+                "a method is a function taking the service's state first; this one has \
+                 `{known}`"
+            ));
+            let ty = self.store.fresh();
+            return hir::Expr {
+                kind: hir::ExprKind::Null,
+                ty,
+                span,
+            };
+        };
+        let func = def.methods[method].func;
+        let mut hir_args: Vec<hir::Expr> = args.iter().map(|a| self.infer_expr(a)).collect();
+        let mut ret = self.store.fresh();
+        if let Some((params, declared)) = self.func_signature(func) {
+            // The state is the worker's, not the caller's, so the arguments
+            // line up against the parameters after it.
+            let wanted = &params[1..];
+            if wanted.len() != hir_args.len() {
+                let n = wanted.len();
+                self.error(
+                    span,
+                    format!(
+                        "`{name}` takes {n} argument{} but {} {} given",
+                        if n == 1 { "" } else { "s" },
+                        hir_args.len(),
+                        if hir_args.len() == 1 { "was" } else { "were" }
+                    ),
+                );
+            }
+            for (arg, want) in hir_args.iter_mut().zip(wanted) {
+                let taken = std::mem::replace(
+                    arg,
+                    hir::Expr {
+                        kind: hir::ExprKind::Null,
+                        ty: Type::void(),
+                        span,
+                    },
+                );
+                *arg = self.coerce(taken, want, "this argument");
+            }
+            ret = declared;
+        }
+        let died = self.intern_error(wsharp_runtime::builtins::WORKER_DIED);
+        let set = self.store.err_set([died]);
+        hir::Expr {
+            kind: hir::ExprKind::Call {
+                callee: hir::Callee::Rpc {
+                    worker: Box::new(handle),
+                    service,
+                    method: method as u32,
+                },
+                args: hir_args,
+            },
+            ty: Type::err_union(ret, set),
+            span,
+        }
+    }
+
     /// The overload set of `name` in the module that declares `strukt`.
     fn protocol_fn(
         &mut self,
@@ -2702,6 +3055,8 @@ impl<'a> Inferencer<'a> {
         let span = expr.span();
         match expr {
             ast::Expr::Block { stmts, value, .. } => self.infer_value_block(stmts, value, span),
+            ast::Expr::Spawn { module, args, .. } => self.infer_spawn(module, args, span),
+            ast::Expr::Join { worker, .. } => self.infer_join(worker, span),
             ast::Expr::Int(v, _) => self.lit(hir::ExprKind::Int(*v), Type::i64(), span),
             ast::Expr::Float(v, _) => self.lit(hir::ExprKind::Float(*v), Type::f64(), span),
             ast::Expr::Bool(v, _) => self.lit(hir::ExprKind::Bool(*v), Type::bool(), span),
@@ -3536,6 +3891,15 @@ impl<'a> Inferencer<'a> {
         args: &'a [ast::Expr],
         span: Span,
     ) -> hir::Expr {
+        // `w.f(a)` -- a call into another worker. Checked before anything else
+        // a `Field` callee could mean, because the object is a *value* holding
+        // a handle rather than a module path.
+        if let ast::Expr::Field { name, .. } = callee
+            && let Some((local, service)) = self.worker_call_target(callee)
+        {
+            return self.infer_rpc_call(local, service, name, args, span);
+        }
+
         // A `const` alias for a set resolves exactly as the name it aliases.
         let named = match callee {
             ast::Expr::Ident(name) => self.overload_set(name.as_str()).map(|ids| (name, ids)),
@@ -4682,6 +5046,9 @@ impl<'a> Inferencer<'a> {
                 // whatever it captured; copying the code pointer alone would
                 // hand another worker an address into a closure it does not
                 // have.
+                // A handle is an index, not a pointer, so it travels -- which
+                // is what lets one worker hand another a way to reach a third.
+                TyCon::Worker(_) => None,
                 TyCon::Fn => Some(resolved.clone()),
                 // The error set rides as a second argument and is not a value.
                 TyCon::Optional | TyCon::ErrUnion | TyCon::Array => {
@@ -5327,6 +5694,19 @@ fn collect_deps_if(s: &ast::IfStmt, out: &mut HashSet<String>) {
 
 fn collect_deps_expr(expr: &ast::Expr, out: &mut HashSet<String>) {
     match expr {
+        // Spawning a module makes every function in it reachable, and which
+        // ones are its methods is not knowable before inference. Marked rather
+        // than named, because no W# name can contain an `@`.
+        ast::Expr::Spawn { module, args, .. } => {
+            if let ast::Expr::Ident(alias) = module.as_ref() {
+                out.insert(format!("{SPAWN_DEP}{alias}"));
+            }
+            collect_deps_expr(module, out);
+            for arg in args {
+                collect_deps_expr(arg, out);
+            }
+        }
+        ast::Expr::Join { worker, .. } => collect_deps_expr(worker, out),
         ast::Expr::Block { stmts, value, .. } => {
             for stmt in stmts {
                 collect_deps_stmt(stmt, out);
@@ -5536,8 +5916,17 @@ fn patch_targs_expr(expr: &mut hir::Expr, targs_for: &HashMap<hir::FuncId, Vec<T
                 patch_targs_expr(v, targs_for);
             }
         }
+        // A service's functions are never generic, so there is nothing here to
+        // patch -- but the arguments to them are ordinary expressions.
+        hir::ExprKind::Spawn { args, .. } => {
+            for arg in args {
+                patch_targs_expr(arg, targs_for);
+            }
+        }
+        hir::ExprKind::Join(worker) => patch_targs_expr(worker, targs_for),
         hir::ExprKind::Call { callee, args } => {
             match callee {
+                hir::Callee::Rpc { worker, .. } => patch_targs_expr(worker, targs_for),
                 hir::Callee::Static { func, targs } => fill(func, targs),
                 hir::Callee::Dynamic { cases } => {
                     for case in cases {
@@ -5672,6 +6061,12 @@ fn fixup_expr(expr: &mut hir::Expr, structs: &[hir::StructDef], store: &mut Type
                 fixup_expr(v, structs, store);
             }
         }
+        hir::ExprKind::Spawn { args, .. } => {
+            for arg in args {
+                fixup_expr(arg, structs, store);
+            }
+        }
+        hir::ExprKind::Join(worker) => fixup_expr(worker, structs, store),
         hir::ExprKind::Field {
             obj,
             strukt,

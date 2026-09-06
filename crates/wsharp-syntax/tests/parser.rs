@@ -56,6 +56,25 @@ fn function_with_and_without_annotations() {
 }
 
 #[test]
+fn spawn_and_join_are_builtin_forms() {
+    assert_eq!(
+        body("const w = @spawn(counter, 1, \"x\");"),
+        "(const w (spawn counter 1 \"x\"))"
+    );
+    assert_eq!(body("const w = @spawn(counter);"), "(const w (spawn counter))");
+    assert_eq!(body("const n = @join(w);"), "(const n (join w))");
+}
+
+#[test]
+fn an_unknown_builtin_form_is_reported() {
+    let errs = errors("fn main() void { const x = @nope(1); }");
+    assert!(
+        errs.iter().any(|e| e.contains("unknown builtin `@nope`")),
+        "unexpected errors: {errs:?}"
+    );
+}
+
+#[test]
 fn catch_and_orelse_take_a_block() {
     assert_eq!(
         body("const x = f() catch { g(); 0 };"),

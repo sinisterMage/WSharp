@@ -71,6 +71,9 @@ impl Jit {
             entry(0);
             0
         };
+        // Every worker still parked on its queue would keep the process alive,
+        // and one in the middle of a trace would be left half way through it.
+        wsharp_runtime::rpc::stop_all();
         // A trace may still be in flight; settle it so the report is stable.
         wsharp_runtime::gc::quiesce();
         wsharp_runtime::gc::report_if_asked();
@@ -174,11 +177,25 @@ pub fn compile(
         module.clear_context(&mut ctx);
     }
 
+    // One trampoline per service function, emitted after the functions they
+    // call so that every `FuncId` they need is declared.
+    let services = define_trampolines(
+        &mut module,
+        program,
+        store,
+        &decls,
+        call_conv,
+        &mut ctx,
+        &mut fb_ctx,
+        &mut harvested,
+    )?;
+
     module
         .finalize_definitions()
         .map_err(|e| err("could not finalize the module", e))?;
 
     register_stack_maps(&module, harvested);
+    register_services(&module, program, services);
 
     let entry_func = program.func(entry);
     let entry_returns_value = !lower::returns_nothing(store, &entry_func.ret);
@@ -190,6 +207,127 @@ pub fn compile(
         entry_returns_value,
         clif,
     })
+}
+
+/// A trampoline, pending the address it will finally live at.
+struct Trampoline {
+    clif_id: cranelift_module::FuncId,
+    /// Which service, and which of its methods -- `None` for its `init`.
+    service: usize,
+    method: Option<usize>,
+    name: String,
+    args: Vec<wsharp_runtime::rpc::SlotKind>,
+    ret: Vec<wsharp_runtime::rpc::SlotKind>,
+}
+
+/// Emit the unpacking stub each service function is called through.
+///
+/// A worker is handed its arguments as bytes and has to turn them back into a
+/// call. Doing that in Rust would mean moving references into a call with none
+/// of the write barrier, the load barrier or the stack maps -- the mistake
+/// `array.concat` taught -- so it is done in generated code, where all three
+/// apply by construction.
+#[allow(clippy::too_many_arguments)]
+fn define_trampolines(
+    module: &mut JITModule,
+    program: &hir::Program,
+    store: &mut TypeStore,
+    decls: &lower::Decls,
+    call_conv: cranelift_codegen::isa::CallConv,
+    ctx: &mut cranelift_codegen::Context,
+    fb_ctx: &mut FunctionBuilderContext,
+    harvested: &mut Vec<(cranelift_module::FuncId, HarvestedCode)>,
+) -> Result<Vec<Trampoline>, CodegenError> {
+    let mut out = Vec::new();
+    for (sid, service) in program.services.iter().enumerate() {
+        let mut wanted: Vec<(Option<usize>, String, hir::FuncId, bool)> = vec![(
+            None,
+            format!("service{sid}$init"),
+            service.init,
+            false,
+        )];
+        for (m, method) in service.methods.iter().enumerate() {
+            wanted.push((
+                Some(m),
+                format!("service{sid}$m{m}"),
+                method.func,
+                true,
+            ));
+        }
+
+        for (method, name, target_id, takes_state) in wanted {
+            let target = program.func(target_id);
+            let sig = lower::trampoline_signature(call_conv, takes_state);
+            let clif_id = module
+                .declare_function(&name, Linkage::Local, &sig)
+                .map_err(|e| err(&format!("could not declare `{name}`"), e))?;
+
+            ctx.func.signature = sig;
+            ctx.func.name = ir::UserFuncName::user(0, clif_id.as_u32());
+            {
+                let builder = FunctionBuilder::new(&mut ctx.func, fb_ctx);
+                lower::trampoline(builder, module, store, decls, target, target_id, takes_state);
+            }
+            module
+                .define_function(clif_id, ctx)
+                .map_err(|e| err(&format!("could not compile `{name}`"), e))?;
+            harvested.push((clif_id, harvest_stack_maps(ctx)));
+            module.clear_context(ctx);
+
+            // The state is the worker's own and never crosses, so a method's
+            // wire arguments start after it.
+            let skip = usize::from(takes_state);
+            let mut args = Vec::new();
+            for param in target.params.iter().skip(skip) {
+                let ty = target.locals[*param as usize].ty.clone();
+                args.extend(lower::slot_kinds(store, &ty));
+            }
+            let ret = lower::slot_kinds(store, &target.ret.clone());
+            out.push(Trampoline {
+                clif_id,
+                service: sid,
+                method,
+                name: match method {
+                    None => "init".to_string(),
+                    Some(m) => service.methods[m].name.clone(),
+                },
+                args,
+                ret,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Hand the runtime the finished addresses, so a worker can call into a
+/// service it was only ever given the number of.
+fn register_services(module: &JITModule, program: &hir::Program, found: Vec<Trampoline>) {
+    use wsharp_runtime::rpc::{MethodCode, ServiceCode};
+    let mut services: Vec<Vec<Trampoline>> = program.services.iter().map(|_| Vec::new()).collect();
+    for t in found {
+        services[t.service].push(t);
+    }
+    let mut out: Vec<&'static ServiceCode> = Vec::new();
+    for (sid, mut entries) in services.into_iter().enumerate() {
+        entries.sort_by_key(|t| t.method.map_or(0, |m| m + 1));
+        let init = entries.remove(0);
+        let methods: Vec<MethodCode> = entries
+            .into_iter()
+            .map(|t| MethodCode {
+                name: Box::leak(t.name.into_boxed_str()),
+                call: module.get_finalized_function(t.clif_id),
+                args: Box::leak(t.args.into_boxed_slice()),
+                ret: Box::leak(t.ret.into_boxed_slice()),
+            })
+            .collect();
+        out.push(Box::leak(Box::new(ServiceCode {
+            name: Box::leak(program.services[sid].name.clone().into_boxed_str()),
+            init: module.get_finalized_function(init.clif_id),
+            init_args: Box::leak(init.args.into_boxed_slice()),
+            methods: Box::leak(methods.into_boxed_slice()),
+        })));
+    }
+    wsharp_runtime::rpc::register_services(out);
 }
 
 /// A function's code length and its safepoints, pending a base address.
@@ -450,6 +588,12 @@ fn types_in_expr(expr: &hir::Expr, out: &mut Vec<Type>) {
                 types_in_expr(v, out);
             }
         }
+        hir::ExprKind::Spawn { args, .. } => {
+            for arg in args {
+                types_in_expr(arg, out);
+            }
+        }
+        hir::ExprKind::Join(worker) => types_in_expr(worker, out),
         hir::ExprKind::Unary { expr, .. }
         | hir::ExprKind::Some(expr)
         | hir::ExprKind::Ok(expr)
@@ -465,8 +609,11 @@ fn types_in_expr(expr: &hir::Expr, out: &mut Vec<Type>) {
             types_in_expr(alt, out);
         }
         hir::ExprKind::Call { callee, args } => {
-            if let hir::Callee::Indirect(e) = callee {
-                types_in_expr(e, out);
+            match callee {
+                hir::Callee::Indirect(e) | hir::Callee::Rpc { worker: e, .. } => {
+                    types_in_expr(e, out)
+                }
+                _ => {}
             }
             for arg in args {
                 types_in_expr(arg, out);
@@ -627,6 +774,35 @@ fn declare_all(
         )
         .map_err(|e| err("could not declare `ws_gc_poll`", e))?;
 
+    // Starting a worker, calling into one, and waiting for one. Each takes
+    // its arguments as a buffer of machine words, because only the call site
+    // knows what shape they are and only generated code may build one.
+    let mut spawn_sig = ir::Signature::new(call_conv);
+    spawn_sig.params.push(ir::AbiParam::new(ir::types::I32).uext());
+    spawn_sig.params.push(ir::AbiParam::new(repr::PTR));
+    spawn_sig.returns.push(ir::AbiParam::new(ir::types::I64));
+    let spawn = module
+        .declare_function("ws_spawn", Linkage::Import, &spawn_sig)
+        .map_err(|e| err("could not declare `ws_spawn`", e))?;
+
+    let mut rpc_sig = ir::Signature::new(call_conv);
+    rpc_sig.params.push(ir::AbiParam::new(ir::types::I64));
+    rpc_sig.params.push(ir::AbiParam::new(ir::types::I32).uext());
+    rpc_sig.params.push(ir::AbiParam::new(ir::types::I32).uext());
+    rpc_sig.params.push(ir::AbiParam::new(repr::PTR));
+    rpc_sig.params.push(ir::AbiParam::new(repr::PTR));
+    rpc_sig.returns.push(ir::AbiParam::new(ir::types::I64));
+    let rpc_call = module
+        .declare_function("ws_rpc_call", Linkage::Import, &rpc_sig)
+        .map_err(|e| err("could not declare `ws_rpc_call`", e))?;
+
+    let mut join_sig = ir::Signature::new(call_conv);
+    join_sig.params.push(ir::AbiParam::new(ir::types::I64));
+    join_sig.returns.push(ir::AbiParam::new(ir::types::I64));
+    let join = module
+        .declare_function("ws_join", Linkage::Import, &join_sig)
+        .map_err(|e| err("could not declare `ws_join`", e))?;
+
     let strings = define_strings(module, program)?;
     let singletons = define_singletons(module, program)?;
 
@@ -643,6 +819,9 @@ fn declare_all(
         log_object,
         gc_poll,
         resolve,
+        spawn,
+        rpc_call,
+        join,
     })
 }
 

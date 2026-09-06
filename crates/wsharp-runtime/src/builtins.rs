@@ -443,8 +443,26 @@ pub const IO_MODULE: &str = "std/io";
 /// catch it has been read. The type checker therefore interns these first, so
 /// the ids below are what they are in every program.
 pub fn builtin_errors() -> &'static [&'static str] {
-    &["NotFound", "PermissionDenied", "IoFailed", "EndOfFile"]
+    &[
+        "NotFound",
+        "PermissionDenied",
+        "IoFailed",
+        "EndOfFile",
+        // A worker can die, and that is not an exceptional case worth a second
+        // mechanism -- so an RPC returns `!T` and this is what it raises.
+        "WorkerDied",
+        "SpawnFailed",
+    ]
 }
+
+/// The error a call into a worker that has gone raises.
+pub const ERROR_WORKER_DIED: i64 = 5;
+/// The error `@spawn` raises when a thread could not be started.
+pub const ERROR_SPAWN_FAILED: i64 = 6;
+/// The names, for the type checker to intern -- it needs them by name, and
+/// they must be the same two the constants above number.
+pub const WORKER_DIED: &str = "WorkerDied";
+pub const SPAWN_FAILED: &str = "SpawnFailed";
 
 /// The tags for [`builtin_errors`]: an index plus one, because zero is success.
 pub const ERROR_NOT_FOUND: i64 = 1;
@@ -533,6 +551,9 @@ pub fn runtime_symbols() -> Vec<(&'static str, *const u8)> {
         ("ws_log_object", crate::gc::ws_log_object as *const u8),
         ("ws_gc_poll", crate::gc::ws_gc_poll as *const u8),
         ("ws_resolve", crate::evacuate::ws_resolve as *const u8),
+        ("ws_spawn", crate::rpc::ws_spawn as *const u8),
+        ("ws_rpc_call", crate::rpc::ws_rpc_call as *const u8),
+        ("ws_join", crate::rpc::ws_join as *const u8),
     ]
 }
 

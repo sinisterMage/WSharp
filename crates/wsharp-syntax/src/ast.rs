@@ -352,6 +352,15 @@ pub enum Expr {
         value: Option<Box<Expr>>,
         span: Span,
     },
+    /// `@spawn(m, args..)` -- start a worker running module `m`'s service,
+    /// with `m.init(args..)` as its first act.
+    Spawn {
+        module: Box<Expr>,
+        args: Vec<Expr>,
+        span: Span,
+    },
+    /// `@join(w)` -- wait for a worker to finish and shut it down.
+    Join { worker: Box<Expr>, span: Span },
     Import {
         path: Box<str>,
         span: Span,
@@ -380,6 +389,8 @@ impl Expr {
             | Expr::ArrayLit { span, .. }
             | Expr::Index { span, .. }
             | Expr::Block { span, .. }
+            | Expr::Spawn { span, .. }
+            | Expr::Join { span, .. }
             | Expr::Import { span, .. }
             | Expr::StructLit { span, .. }
             | Expr::Try { span, .. }

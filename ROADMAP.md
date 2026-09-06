@@ -485,7 +485,7 @@ A module system, and four modules behind it.
 
 ---
 
-## 7. Multithreading — **per-worker heaps built; the rest designed**
+## 7. Multithreading — **workers and RPC built; the broker designed**
 
 The model, settled before anything is written so that the collector and the
 type system are not surprised by it later.
@@ -590,11 +590,56 @@ counters are exposed: a mechanism the language depends on should be assertable
 from W#, including under `--gc-stress`, where every allocation `decode` makes
 is a whole collection.
 
+**Workers, and typed RPC.** `@spawn(m, args..)` starts an OS thread running
+module `m`'s service and hands back a handle; `w.f(a, b)` calls into it;
+`@join(w)` waits for it and shuts it down. A handle is an `i64` -- an index,
+not a pointer, because another worker's objects are not this one's to hold, and
+so the collector never sees one.
+
+**A service is an ordinary module**, which is the decision the rest follows
+from. `init` makes the state and a *method* is any function taking that state
+as its first parameter. No new declaration form was needed, because W# has no
+mutable globals: a worker's state had to be an explicit value passed in and out
+anyway, and once it is, the set of functions that take it is exactly the set of
+things the worker can be asked to do. `@spawn` and `@join` are new arms of the
+form `@import` already was -- a thing the compiler handles rather than a
+function it could call, because the first argument names a *module* and no
+parameter could have a type that accepts one.
+
+Marshalling meets generated code exactly twice, and both times through a buffer
+of machine words: the call site writes its arguments into one and reads its
+result from another, and a **trampoline** -- one generated function per method
+-- reads the arguments back out and calls the real function. Both are generated
+code on purpose. A reference moving from a buffer into a call goes through the
+write barrier, the load barrier and the stack maps by construction there, and a
+hand-written Rust caller would have none of the three -- the mistake
+`array.concat` taught. What is left for the runtime is bytes, which is what it
+may touch.
+
+Two things fell out of the queue rather than the types. A worker's state is
+pinned on the runtime root list for as long as the worker lives, because
+nothing on its stack holds it between calls. And a call and a shutdown share
+one lock: a call that got in before the worker stopped is answered by the drain
+on the way out, and one that arrives after sees the worker gone under the same
+lock and is told so -- without that, a call to a worker that had been joined
+waits for a reply nobody is left to send.
+
+### What is left
+
+- **A handle must be in a variable to be called through.** `w.f(a)` is
+  recognised from the shape -- an object that is a local holding a handle,
+  rather than a module path -- so a handle in a struct field or straight out of
+  a call cannot be called through yet.
+- **A service method cannot be generic and cannot return `!T`.** The first
+  because a worker calls it through one machine implementation; the second
+  because the call is already `!T`, and `!!T` is not what anyone wants.
+- **A call blocks the caller.** RPC is for when the caller needs the answer;
+  when it does not, the broker below is the shape.
+
 ### What has to change next
 
-- `builtins.rs` gains `spawn`, the handle types, and the broker's operations —
-  and the broker itself is the first part of the runtime that is not a leaf.
-- The stack walker is already per-thread and needs nothing.
+- The message broker: named typed topics, append-only partitioned logs,
+  consumer groups with their own offsets, replay, at-least-once delivery.
 
 ---
 

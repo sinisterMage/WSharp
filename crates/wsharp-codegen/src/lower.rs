@@ -77,6 +77,12 @@ pub struct Decls {
     pub gc_poll: FuncId,
     /// The load barrier's slow path.
     pub resolve: FuncId,
+    /// Start a worker: `ws_spawn(service, argv) -> handle`.
+    pub spawn: FuncId,
+    /// Call into one: `ws_rpc_call(worker, service, method, argv, out) -> tag`.
+    pub rpc_call: FuncId,
+    /// `ws_join(worker) -> tag`.
+    pub join: FuncId,
 }
 
 /// The heap layout of the closure object for a `fn` literal: its total size,
@@ -241,6 +247,96 @@ pub fn translate(
     // Finalising is what releases the shared `FunctionBuilderContext` for the
     // next function; without it the next `FunctionBuilder::new` asserts.
     trans.b.finalize(frontend_config);
+}
+
+/// One generated function that unpacks a buffer of machine words and calls a
+/// service's `init` or one of its methods.
+///
+/// Generated rather than hand-written in Rust, and that is the whole reason it
+/// exists: a reference this moves from a buffer into a call goes through the
+/// stack maps and the barriers by construction, which a Rust caller would have
+/// to reproduce and could not be trusted to. What is left for the runtime is
+/// bytes, which is what it may touch.
+///
+/// `takes_state` says whether the first parameter comes as its own argument --
+/// a method's does, because the worker holds the state and the caller never
+/// sees it -- rather than out of the buffer.
+pub fn trampoline(
+    mut b: FunctionBuilder<'_>,
+    module: &mut JITModule,
+    store: &mut TypeStore,
+    decls: &Decls,
+    target: &hir::FuncDef,
+    target_id: hir::FuncId,
+    takes_state: bool,
+) {
+    let frontend_config = module.target_config();
+    let entry = b.create_block();
+    b.append_block_params_for_function_params(entry);
+    b.switch_to_block(entry);
+    let params: Vec<ir::Value> = b.block_params(entry).to_vec();
+    let (state, argv, out) = if takes_state {
+        (Some(params[0]), params[1], params[2])
+    } else {
+        (None, params[0], params[1])
+    };
+
+    let flags = MemFlagsData::trusted();
+    // Top-level functions ignore the environment pointer; a service's are.
+    let mut call_args = vec![b.ins().iconst(PTR, 0)];
+    if let Some(state) = state {
+        call_args.push(state);
+    }
+    let mut at = 0i32;
+    for (i, param) in target.params.iter().enumerate() {
+        if i == 0 && takes_state {
+            continue;
+        }
+        let ty = target.locals[*param as usize].ty.clone();
+        for slot in repr::slot_types(store, &ty) {
+            call_args.push(b.ins().load(slot, flags, argv, at * layout::SLOT_SIZE as i32));
+            at += 1;
+        }
+    }
+
+    let fr = module.declare_func_in_func(decls.funcs[target_id as usize], b.func);
+    let call = b.ins().call(fr, &call_args);
+    let results: Vec<ir::Value> = b.inst_results(call).to_vec();
+    for (i, value) in results.iter().enumerate() {
+        b.ins()
+            .store(flags, *value, out, i as i32 * layout::SLOT_SIZE as i32);
+    }
+    b.ins().return_(&[]);
+    b.seal_all_blocks();
+    b.finalize(frontend_config);
+}
+
+/// The signature a trampoline has, seen from Rust.
+pub fn trampoline_signature(call_conv: CallConv, takes_state: bool) -> Signature {
+    let mut sig = Signature::new(call_conv);
+    if takes_state {
+        sig.params.push(AbiParam::new(PTR));
+    }
+    // argv, out
+    sig.params.push(AbiParam::new(PTR));
+    sig.params.push(AbiParam::new(PTR));
+    sig
+}
+
+/// Which of a value's machine words hold references, for the runtime to copy
+/// rather than move.
+pub fn slot_kinds(store: &mut TypeStore, ty: &Type) -> Vec<wsharp_runtime::rpc::SlotKind> {
+    use wsharp_runtime::rpc::SlotKind;
+    let pointers = repr::pointer_slots(store, ty);
+    (0..repr::slot_types(store, ty).len())
+        .map(|i| {
+            if pointers.contains(&i) {
+                SlotKind::Ref
+            } else {
+                SlotKind::Scalar
+            }
+        })
+        .collect()
 }
 
 struct Trans<'a, 'f> {
@@ -828,6 +924,8 @@ impl Trans<'_, '_> {
     fn expr_inner(&mut self, expr: &hir::Expr) -> Slots {
         match &expr.kind {
             hir::ExprKind::Block { stmts, value } => self.value_block(&expr.ty, stmts, value),
+            hir::ExprKind::Spawn { service, args } => self.spawn(&expr.ty, *service, args),
+            hir::ExprKind::Join(worker) => self.join(worker),
             hir::ExprKind::Int(v) => SmallVec::from_slice(&[self.b.ins().iconst(types::I64, *v)]),
             hir::ExprKind::Float(v) => SmallVec::from_slice(&[self.b.ins().f64const(*v)]),
             hir::ExprKind::Bool(v) => {
@@ -1178,6 +1276,129 @@ impl Trans<'_, '_> {
         self.b.block_params(merge).iter().copied().collect()
     }
 
+    /// A buffer of machine words, one per slot, and its address.
+    ///
+    /// How arguments and results cross to the runtime: only the call site knows
+    /// what shape they are, and only generated code may build one, because a
+    /// reference in it has to be a reference this heap agrees about.
+    fn word_buffer(&mut self, words: usize) -> (ir::StackSlot, ir::Value) {
+        let slot = self.b.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            (words.max(1) as u32) * layout::SLOT_SIZE,
+            layout::SLOT_SIZE.trailing_zeros() as u8,
+        ));
+        let addr = self.b.ins().stack_addr(PTR, slot, 0);
+        (slot, addr)
+    }
+
+    /// Lower each argument and lay its slots out one machine word apart.
+    fn write_args(&mut self, slot: ir::StackSlot, args: &[hir::Expr]) -> usize {
+        let mut at = 0i32;
+        for arg in args {
+            let values = self.expr(arg);
+            for value in values {
+                self.b
+                    .ins()
+                    .stack_store(PTR, value, slot, at * layout::SLOT_SIZE as i32);
+                at += 1;
+            }
+        }
+        at as usize
+    }
+
+    /// Read a value's slots back out of a word buffer.
+    fn read_slots(&mut self, slot: ir::StackSlot, ty: &Type) -> Slots {
+        let tys = self.slots_of(ty);
+        tys.iter()
+            .enumerate()
+            .map(|(i, t)| {
+                self.b
+                    .ins()
+                    .stack_load(PTR, *t, slot, i as i32 * layout::SLOT_SIZE as i32)
+            })
+            .collect()
+    }
+
+    /// `@spawn(m, args..)` -- `!worker`, because starting a thread can fail.
+    fn spawn(&mut self, ty: &Type, service: hir::ServiceId, args: &[hir::Expr]) -> Slots {
+        let words: usize = args
+            .iter()
+            .map(|a| self.slots_of(&a.ty.clone()).len())
+            .sum();
+        let (slot, argv) = self.word_buffer(words);
+        self.write_args(slot, args);
+
+        let fr = self.module.declare_func_in_func(self.decls.spawn, self.b.func);
+        let id = self.b.ins().iconst(types::I32, service as i64);
+        let call = self.b.ins().call(fr, &[id, argv]);
+        let handle = self.b.inst_results(call)[0];
+
+        // A negative handle is the only failure a spawn has: either the thread
+        // started or it did not.
+        let failed = self
+            .b
+            .ins()
+            .icmp_imm_s(ir::condcodes::IntCC::SignedLessThan, handle, 0);
+        let tag_ty = repr::ERROR_TAG;
+        let failed_tag = self
+            .b
+            .ins()
+            .iconst(tag_ty, wsharp_runtime::rpc::SPAWN_FAILED_TAG);
+        let ok_tag = self.b.ins().iconst(tag_ty, repr::ERROR_OK);
+        let tag = self.b.ins().select(failed, failed_tag, ok_tag);
+        let _ = ty;
+        SmallVec::from_slice(&[tag, handle])
+    }
+
+    /// `@join(w)` -- `!void`, which is one tag and no payload.
+    fn join(&mut self, worker: &hir::Expr) -> Slots {
+        let handle = self.expr(worker)[0];
+        let fr = self.module.declare_func_in_func(self.decls.join, self.b.func);
+        let call = self.b.ins().call(fr, &[handle]);
+        let wide = self.b.inst_results(call)[0];
+        let tag = self.b.ins().ireduce(repr::ERROR_TAG, wide);
+        SmallVec::from_slice(&[tag])
+    }
+
+    /// `w.f(args)` -- the arguments out through a word buffer, the result back
+    /// through another, and a tag saying whether the worker was still there.
+    fn rpc_call(
+        &mut self,
+        ty: &Type,
+        worker: &hir::Expr,
+        service: hir::ServiceId,
+        method: u32,
+        args: &[hir::Expr],
+    ) -> Slots {
+        // The payload of the `!R` this produces is what the method returns.
+        let payload = match self.store.resolve(ty) {
+            Type::Con(TyCon::ErrUnion, args) => args[0].clone(),
+            other => other,
+        };
+        let handle = self.expr(worker)[0];
+        let words: usize = args
+            .iter()
+            .map(|a| self.slots_of(&a.ty.clone()).len())
+            .sum();
+        let (arg_slot, argv) = self.word_buffer(words);
+        self.write_args(arg_slot, args);
+        let out_words = self.slots_of(&payload).len();
+        let (out_slot, out) = self.word_buffer(out_words);
+
+        let fr = self
+            .module
+            .declare_func_in_func(self.decls.rpc_call, self.b.func);
+        let sid = self.b.ins().iconst(types::I32, service as i64);
+        let mid = self.b.ins().iconst(types::I32, method as i64);
+        let call = self.b.ins().call(fr, &[handle, sid, mid, argv, out]);
+        let wide = self.b.inst_results(call)[0];
+        let tag = self.b.ins().ireduce(repr::ERROR_TAG, wide);
+
+        let mut slots: Slots = SmallVec::from_slice(&[tag]);
+        slots.extend(self.read_slots(out_slot, &payload));
+        slots
+    }
+
     /// The block form of a `catch` or an `orelse`.
     ///
     /// With no trailing value the block left by returning, breaking or
@@ -1267,6 +1488,11 @@ impl Trans<'_, '_> {
 
     fn call(&mut self, ty: &Type, callee: &hir::Callee, args: &[hir::Expr]) -> Slots {
         match callee {
+            hir::Callee::Rpc {
+                worker,
+                service,
+                method,
+            } => self.rpc_call(ty, worker, *service, *method, args),
             hir::Callee::Static { func, .. } => {
                 let fr = self.func_ref(*func);
                 // Top-level functions ignore the environment pointer.

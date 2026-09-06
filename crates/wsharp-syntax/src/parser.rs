@@ -1369,13 +1369,19 @@ impl Parser {
     fn builtin_form(&mut self, start: Span) -> Option<Expr> {
         self.expect(TokenKind::At)?;
         let name = self.ident()?;
-        if name.as_str() != "import" {
-            self.error_with_help(
-                name.span,
-                format!("unknown builtin `@{name}`"),
-                "the only one is `@import(\"path\")`",
-            );
-            return None;
+        match name.as_str() {
+            "import" => {}
+            "spawn" => return self.spawn_form(start),
+            "join" => return self.join_form(start),
+            other => {
+                self.error_with_help(
+                    name.span,
+                    format!("unknown builtin `@{other}`"),
+                    "there are three: `@import(\"path\")`, `@spawn(module, ..)` and \
+                     `@join(worker)`",
+                );
+                return None;
+            }
         }
         self.expect(TokenKind::LParen)?;
         let path_span = self.span();
@@ -1393,6 +1399,46 @@ impl Parser {
         Some(Expr::Import {
             path,
             span: start.to(self.prev_span()),
+        })
+    }
+
+    /// `@spawn(m, args..)` -- start a worker running module `m`'s service.
+    ///
+    /// A form the compiler handles rather than a function it could call, for
+    /// the reason `@import` is one: its first argument names a *module*, and
+    /// there is no type a parameter could have that would accept one.
+    fn spawn_form(&mut self, start: Span) -> Option<Expr> {
+        self.scoped(|p| {
+            p.enter("expression")?;
+            p.expect(TokenKind::LParen)?;
+            let module = p.expr()?;
+            let mut args = Vec::new();
+            while p.eat(TokenKind::Comma) {
+                if p.at(&TokenKind::RParen) {
+                    break;
+                }
+                args.push(p.expr()?);
+            }
+            p.expect(TokenKind::RParen)?;
+            Some(Expr::Spawn {
+                module: Box::new(module),
+                args,
+                span: start.to(p.prev_span()),
+            })
+        })
+    }
+
+    /// `@join(w)` -- wait for a worker to finish and shut it down.
+    fn join_form(&mut self, start: Span) -> Option<Expr> {
+        self.scoped(|p| {
+            p.enter("expression")?;
+            p.expect(TokenKind::LParen)?;
+            let worker = p.expr()?;
+            p.expect(TokenKind::RParen)?;
+            Some(Expr::Join {
+                worker: Box::new(worker),
+                span: start.to(p.prev_span()),
+            })
         })
     }
 

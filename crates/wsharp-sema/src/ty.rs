@@ -15,6 +15,8 @@ pub type TypeVarId = u32;
 pub type StructId = u32;
 /// Index into [`TypeStore`]'s table of interned error sets.
 pub type ErrSetId = u32;
+/// Index into `hir::Program.services`.
+pub type ServiceId = u32;
 /// Index into [`TypeStore`]'s table of error names, and what a `!T`'s runtime
 /// tag is (plus one, so that zero can mean success).
 pub type ErrorId = u32;
@@ -55,6 +57,11 @@ pub enum TyCon {
     /// The type of an error value, as bound by `catch |e|`. One argument: the
     /// set it can be drawn from.
     Error,
+    /// A handle to a worker running a service: the set of `fn`s one module
+    /// exports, checked at compile time against the same signatures the module
+    /// declares. One `i64` at run time -- an index, not a pointer, because a
+    /// worker's objects are not this worker's to hold.
+    Worker(ServiceId),
     /// A set of error names, interned. Appears only as the second argument of
     /// [`TyCon::ErrUnion`] and the argument of [`TyCon::Error`], so nothing
     /// that walks a value's shape ever meets one.
@@ -114,6 +121,10 @@ impl Type {
     /// `!T` over a named set of errors.
     pub fn err_union(inner: Type, set: Type) -> Type {
         Type::Con(TyCon::ErrUnion, vec![inner, set])
+    }
+
+    pub fn worker(id: ServiceId) -> Type {
+        Type::Con(TyCon::Worker(id), Vec::new())
     }
 
     pub fn strukt(id: StructId) -> Type {
@@ -283,6 +294,8 @@ pub struct TypeStore {
     /// the empty set instead of being reported. Instantiation carries the mark
     /// across, or a generic function's set would lose it at every call.
     err_set_vars: HashSet<TypeVarId>,
+    /// Names for `TyCon::Worker` ids, so a handle's type can be printed.
+    service_names: Vec<String>,
 }
 
 impl Default for TypeStore {
@@ -346,6 +359,21 @@ impl TypeStore {
         self.err_set_vars.contains(&v)
     }
 
+    /// The name of a service, for printing a handle's type. Registered
+    /// alongside the struct names and for the same reason: a type has to be
+    /// printable, and the store is where printing happens.
+    pub fn declare_service(&mut self, name: &str) -> ServiceId {
+        self.service_names.push(name.to_string());
+        (self.service_names.len() - 1) as ServiceId
+    }
+
+    pub fn service_name(&self, id: ServiceId) -> &str {
+        self.service_names
+            .get(id as usize)
+            .map(String::as_str)
+            .unwrap_or("?")
+    }
+
     pub fn err_set_members(&self, id: ErrSetId) -> &[ErrorId] {
         self.err_sets.get(id as usize).map_or(&[], Vec::as_slice)
     }
@@ -380,6 +408,7 @@ impl TypeStore {
             err_sets: Vec::new(),
             err_set_ids: HashMap::new(),
             err_set_vars: HashSet::new(),
+            service_names: Vec::new(),
         }
     }
 
@@ -744,6 +773,7 @@ impl TypeStore {
                 TyCon::Void => "void".into(),
                 TyCon::Str => "str".into(),
                 TyCon::Error => "error".into(),
+                TyCon::Worker(id) => format!("worker[{}]", self.service_name(id)),
                 // Never printed on its own: a set is only ever an argument of
                 // the two constructors above, which render it themselves.
                 TyCon::ErrorSet(id) => self.set_text(id),
