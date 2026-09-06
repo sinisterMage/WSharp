@@ -162,6 +162,23 @@ Things in this version that differ from older tutorials, each of which cost time
   means adding it to all four of `gc::collect`'s root set, the evacuation
   pause's root pass, `evacuate::fix_references` and `--gc-stress`'s verifier;
   this list is the first thing that had to.
+- **A worker's service is called through generated trampolines, and its
+  arguments cross as machine words.** The call site writes a buffer and reads
+  another; one generated function per method reads the arguments back out and
+  calls the real one. Both halves are generated code for the reason
+  `array.concat` had to be: a reference moving from a buffer into a call goes
+  through the write barrier, the load barrier and the stack maps by
+  construction there, and a hand-written Rust caller would have none of the
+  three. The runtime is left with bytes, which is what it may touch. A worker's
+  state is pinned on the runtime root list for its whole life, because nothing
+  on its stack holds it between calls.
+- **A broker message must be an object, not merely transferable.** An object
+  carries its type id in its header, and that id is both what lets the copy be
+  made without knowing the type and what makes the decoded value dispatchable
+  on the other side -- which is how a subscriber set is an overload set and
+  needs no broker-side machinery at all. `BuiltinTy::Message` says so, and the
+  demand travels from the builtin through `std/broker`'s generic wrappers to
+  each use exactly as an abstract type's does.
 - **A value crosses to another worker as bytes, never as a pointer.**
   `transfer::encode` flattens the graph reachable from an object into plain
   memory with each reference replaced by an index, and `transfer::decode`

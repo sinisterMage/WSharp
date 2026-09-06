@@ -8,7 +8,17 @@
 // to be an explicit value passed in and out, and once it is, the functions
 // that take it are exactly the things the worker can be asked to do.
 const counter = @import("./modules/counter.ws");
+const broker = @import("std/broker");
 const str = @import("std/str");
+
+const Event = struct { at: i64 };
+const Finished = struct : Event { count: i64 };
+const Failed = struct : Event { why: str };
+
+// The subscriber set. Nothing in the broker knows these exist.
+fn report(e: Event) void { print("something happened"); }
+fn report(e: Finished) void { print(str.concat("finished with ", str.from_int(e.count))); }
+fn report(e: Failed) void { print(str.concat("failed: ", e.why)); }
 
 fn main() i64 {
     // Each of these is a thread with a heap of its own. Nothing either of them
@@ -31,6 +41,19 @@ fn main() i64 {
             str.from_int(total),
         ));
     }
+
+    // The broker is the other half: RPC is for when the caller needs the
+    // answer, and this is for when it does not, or when more than one worker
+    // wants the same message. A subscriber set is an overload set, and
+    // choosing between its members is the dispatcher -- one subtract and one
+    // unsigned compare on the type id the message carried with it.
+    var audit: broker.Topic[Event] = broker.topic("audit", 2);
+    broker.publish(audit, "orders", Finished{ .at = 1, .count = 5 });
+    broker.publish(audit, "errors", Failed{ .at = 2, .why = "nothing to do" });
+
+    var reader: broker.Consumer[Event] = broker.subscribe(audit, "report");
+    while (broker.next(reader)) |e| { report(e); }
+    broker.commit(reader);
 
     @join(orders) catch return 2;
     @join(errors) catch return 2;

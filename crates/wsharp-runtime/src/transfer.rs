@@ -33,6 +33,7 @@ use crate::worker::Pinned;
 /// The body only: the header is rebuilt by the receiving allocator, because a
 /// header is about the heap the object is in -- its mark parity, its reference
 /// count, its flags -- and none of that travels.
+#[derive(Clone)]
 struct Object {
     type_id: TypeId,
     /// The element count of a string or an array; zero for anything else.
@@ -43,6 +44,10 @@ struct Object {
 }
 
 /// A graph of objects, flattened.
+///
+/// Cloneable, because a broker hands the same message to every consumer group
+/// that wants it and each decodes its own copy into its own heap.
+#[derive(Clone)]
 pub struct Wire {
     objects: Vec<Object>,
 }

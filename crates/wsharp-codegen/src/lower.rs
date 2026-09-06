@@ -191,6 +191,8 @@ fn abi_slots(ty: BuiltinTy) -> SmallVec<[AbiParam; 2]> {
         BuiltinTy::I64 | BuiltinTy::Var(_) | BuiltinTy::Transferable(_) => {
             smallvec![AbiParam::new(types::I64)]
         }
+        // A message is an object, so it crosses as the pointer it is.
+        BuiltinTy::Message(_) => smallvec![AbiParam::new(PTR)],
         BuiltinTy::F64 => smallvec![AbiParam::new(types::F64)],
         // C promotes narrow integer arguments, so say so explicitly.
         BuiltinTy::Bool => smallvec![AbiParam::new(types::I8).uext()],

@@ -346,6 +346,7 @@ A module system, and four modules behind it.
 | `std/math` | `abs`, `min`, `max`, `sign`, `sqrt`, `pow`, `floor`, `ceil`, `round`, `trunc`, `ipow` |
 | `std/io` | `read_file`, `read_line`, `write_file`, `exists` |
 | `std/http` | the 27 status types, moved out of the global namespace |
+| `std/broker` | `Topic[M]`, `Consumer[M]` and `topic`, `publish`, `subscribe`, `next`, `commit`, `seek`, `len` |
 
 `==` on `str` works, comparing contents. The prelude — `print`, `assert`, the
 `gc_*` counters — stays global, because every module has it without asking.
@@ -485,7 +486,7 @@ A module system, and four modules behind it.
 
 ---
 
-## 7. Multithreading — **workers and RPC built; the broker designed**
+## 7. Multithreading — **done**
 
 The model, settled before anything is written so that the collector and the
 type system are not surprised by it later.
@@ -624,8 +625,41 @@ on the way out, and one that arrives after sees the worker gone under the same
 lock and is told so -- without that, a call to a worker that had been joined
 waits for a reply nobody is left to send.
 
+**The broker.** Named topics, append-only partitioned logs, consumer groups
+with their own offsets, replay, at-least-once delivery -- Kafka's shape,
+because that shape is what makes two useful things possible at once: a
+consumer that has fallen behind can catch up, and a consumer that has died can
+be replaced by one that starts where its group had got to. A message sits in
+the log as *bytes*, so it belongs to no heap while it waits and each consumer
+decodes its own copy into its own.
+
+The handles are numbers, because a topic belongs to the process rather than to
+any one worker's heap; what makes them typed is `std/broker.ws`, where
+`Topic[M]` and `Consumer[M]` carry the message type. The always-null `sample:
+?M` field is what makes `M` a parameter of the struct rather than a name
+nothing mentions, and so what makes the compiler check that a publisher and a
+consumer agree about it.
+
+**Choosing a subscriber needed no broker-side machinery at all.** `next`
+returns the topic's message type and the program writes
+`fn handle(m: OrderPlaced)` beside `fn handle(m: OrderCancelled)`; the existing
+dispatcher picks by the type id the copy carried with it, in one subtract and
+one unsigned compare. That the same pattern turns up here and in the status
+lattice, in unrelated features, is the argument that it was the right one --
+and it is why a message must be an *object* rather than merely transferable: a
+scalar carries no header, so there would be nothing to dispatch on and nothing
+to copy it by. `BuiltinTy::Message` says so, and the demand travels from the
+builtin through `std/broker`'s generic wrappers to each use, the way an
+abstract type's does.
+
 ### What is left
 
+- **Durability.** The log is kept rather than written down, so a topic lives
+  as long as the process. The interface does not change when that changes:
+  nothing above the log would know.
+- **One broker, in one process.** Named topics are what let two workers that
+  have never met agree on one, and the same naming is what a networked broker
+  would use -- but item 8's non-blocking I/O has to land first.
 - **A handle must be in a variable to be called through.** `w.f(a)` is
   recognised from the shape -- an object that is a local holding a handle,
   rather than a module path -- so a handle in a struct field or straight out of
@@ -635,11 +669,6 @@ waits for a reply nobody is left to send.
   because the call is already `!T`, and `!!T` is not what anyone wants.
 - **A call blocks the caller.** RPC is for when the caller needs the answer;
   when it does not, the broker below is the shape.
-
-### What has to change next
-
-- The message broker: named typed topics, append-only partitioned logs,
-  consumer groups with their own offsets, replay, at-least-once delivery.
 
 ---
 

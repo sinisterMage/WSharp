@@ -219,7 +219,16 @@ enum Constraint {
     /// walk -- scalars, `str`, arrays and structs whose fields all qualify, and
     /// never a function, which captures an environment belonging to another
     /// heap.
-    Transferable { ty: Type, span: Span },
+    Transferable {
+        ty: Type,
+        /// Whether it must also be a heap *object* -- a struct, a string or an
+        /// array -- rather than merely copyable. A broker's message must be:
+        /// an object carries its type id in its header, and that id is both
+        /// what lets the copy be made without knowing the type and what makes
+        /// the value dispatchable on the other side.
+        object: bool,
+        span: Span,
+    },
     /// `sub` must be a subset of `sup`.
     ///
     /// What `try` needs: propagating a callee's errors is only sound if this
@@ -398,6 +407,15 @@ struct Inferencer<'a> {
     /// Per function, the parameters annotated with an abstract type: the
     /// variable standing in for each, and which abstract type constrains it.
     fn_member_vars: Vec<Vec<(Type, AbstractId, Span)>>,
+    /// Per function, the variables its body needs to be transferable -- and
+    /// whether each must also be a heap object. Recorded for the reason the
+    /// abstract-type ones are: the question cannot be answered where it is
+    /// met, because a generic `publish[M]` meets it before `M` is known, so it
+    /// travels to every use with the type that use instantiates it at.
+    fn_transferable_vars: Vec<Vec<(Type, bool, Span)>>,
+    /// The function whose body is being inferred, so a constraint met in it
+    /// can be recorded against it.
+    current_fn: Option<hir::FuncId>,
     /// Per function, the type parameters it declares as `fn f[T](..)`.
     fn_generic_names: Vec<Vec<Ident>>,
     /// Per function, the variable each declared type parameter stands for.
@@ -475,6 +493,8 @@ impl<'a> Inferencer<'a> {
             fn_types: Vec::new(),
             fn_decl_params: Vec::new(),
             fn_member_vars: Vec::new(),
+            fn_transferable_vars: Vec::new(),
+            current_fn: None,
             fn_generic_names: Vec::new(),
             fn_type_params: Vec::new(),
             schemes: Vec::new(),
@@ -666,6 +686,14 @@ impl<'a> Inferencer<'a> {
     /// fine. Fields come last, and in *lattice* order rather than source order,
     /// because a subtype's layout starts as a copy of its supertype's.
     fn collect_structs(&mut self) {
+        // Imports come first, and before the structs rather than beside the
+        // rest of the globals: a struct *field* may be written
+        // `broker.Consumer[Job]`, and resolving that needs to know what
+        // `broker` is long before any body is inferred.
+        for m in 0..self.modules.len() {
+            self.current = m;
+            self.collect_imports(m);
+        }
         for m in 0..self.modules.len() {
             self.current = m;
             self.collect_module_structs(m);
@@ -1087,12 +1115,6 @@ impl<'a> Inferencer<'a> {
             self.globals.insert(key, GlobalRef::Singleton(id));
         }
 
-        // Imports come first: a module's own declarations may mention one.
-        for m in 0..self.modules.len() {
-            self.current = m;
-            self.collect_imports(m);
-        }
-
         for m in 0..self.modules.len() {
             self.current = m;
             self.collect_module_globals(m);
@@ -1286,6 +1308,7 @@ impl<'a> Inferencer<'a> {
         self.fn_types.push(Type::void());
         self.fn_decl_params.push(Vec::new());
         self.fn_member_vars.push(Vec::new());
+        self.fn_transferable_vars.push(Vec::new());
         self.check_generic_names(generics);
         self.fn_generic_names.push(generics.to_vec());
         self.fn_type_params.push(HashMap::new());
@@ -1832,7 +1855,9 @@ impl<'a> Inferencer<'a> {
         let enclosing = self.current;
         self.current = self.fn_modules[id as usize];
 
+        let enclosing_fn = self.current_fn.replace(id);
         let body = self.infer_block(&func.body);
+        self.current_fn = enclosing_fn;
 
         self.type_scopes.pop();
         self.current = enclosing;
@@ -2603,6 +2628,7 @@ impl<'a> Inferencer<'a> {
     fn require_transferable(&mut self, ty: &Type, span: Span) {
         self.constraints.push(Constraint::Transferable {
             ty: ty.clone(),
+            object: false,
             span,
         });
     }
@@ -3576,6 +3602,22 @@ impl<'a> Inferencer<'a> {
             // variable the signature recorded a constraint on.
             return;
         };
+        for (var, object, at) in self.fn_transferable_vars[id as usize].clone() {
+            let Type::Var(v) = self.store.resolve(&var) else {
+                // The body pinned it, and the constraint recorded there has
+                // already checked it.
+                continue;
+            };
+            if let Some(pos) = scheme.vars.iter().position(|q| *q == v)
+                && let Some(targ) = targs.get(pos)
+            {
+                self.constraints.push(Constraint::Transferable {
+                    ty: targ.clone(),
+                    object,
+                    span: if span == Span::EMPTY { at } else { span },
+                });
+            }
+        }
         for (var, abstract_id, _) in self.fn_member_vars[id as usize].clone() {
             let Type::Var(v) = self.store.resolve(&var) else {
                 // The body pinned it to a concrete type, which the constraint
@@ -3793,7 +3835,7 @@ impl<'a> Inferencer<'a> {
         // A signature may say that one of its variables has to be copyable to
         // another worker's heap. The runtime's own small type enum cannot ask
         // that question, so it names the variable and this records it.
-        let mut wants: Vec<u8> = Vec::new();
+        let mut wants: Vec<(u8, bool)> = Vec::new();
         for t in b.params.iter().chain(std::iter::once(&b.ret)) {
             collect_transferable(*t, &mut wants);
         }
@@ -3801,12 +3843,21 @@ impl<'a> Inferencer<'a> {
         // signature that takes and returns the same `[]T` names it twice.
         wants.sort_unstable();
         wants.dedup();
-        for n in wants {
+        for (n, object) in wants {
             if let Some(ty) = vars.get(&n) {
                 self.constraints.push(Constraint::Transferable {
                     ty: ty.clone(),
+                    object,
                     span,
                 });
+                // And on the function this was met in, so that every use of
+                // *it* carries the same demand to whatever it instantiates it
+                // at. Without this a generic wrapper over such a builtin --
+                // which is exactly what `std/broker` is -- would swallow the
+                // constraint.
+                if let Some(func) = self.current_fn {
+                    self.fn_transferable_vars[func as usize].push((ty.clone(), object, span));
+                }
             }
         }
         Type::func(params, ret)
@@ -5111,7 +5162,20 @@ impl<'a> Inferencer<'a> {
 
         for constraint in constraints {
             match constraint {
-                Constraint::Transferable { ty, span } => {
+                Constraint::Transferable { ty, object, span } => {
+                    if object
+                        && let resolved = self.store.resolve(&ty)
+                        && !matches!(resolved, Type::Var(_))
+                        && !crate::layout::is_heap_pointer(&mut self.store, &resolved)
+                    {
+                        let shown = self.store.show(&resolved);
+                        self.error(span, format!("a message cannot be `{shown}`"))
+                            .help = Some(
+                            "a message is copied by reading its header, so it has to have one \
+                             -- a struct, a string or an array"
+                                .into(),
+                        );
+                    }
                     // Still a variable means a parameter of the scheme about to
                     // be generalised -- the constrained generic the signature
                     // asks for -- and monomorphisation reports one nothing ever
@@ -5574,10 +5638,11 @@ fn is_place_base(expr: &ast::Expr) -> bool {
 /// through instead of returning or jumping. Used both to require a `return` on
 /// every path and to guarantee code generation can terminate every basic block.
 /// The variables a builtin signature marks as needing to be transferable.
-fn collect_transferable(t: wsharp_runtime::BuiltinTy, out: &mut Vec<u8>) {
+fn collect_transferable(t: wsharp_runtime::BuiltinTy, out: &mut Vec<(u8, bool)>) {
     use wsharp_runtime::BuiltinTy as B;
     match t {
-        B::Transferable(n) => out.push(n),
+        B::Transferable(n) => out.push((n, false)),
+        B::Message(n) => out.push((n, true)),
         B::Array(inner) | B::Optional(inner) | B::ErrUnion(inner, _) => {
             collect_transferable(*inner, out)
         }

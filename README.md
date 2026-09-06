@@ -78,6 +78,7 @@ everywhere.** They are checked when written and inferred when not.
 | Generics | `fn first[T](a: []T) T`, `const Box = struct[T] { value: T };`, `fn [T](x: T) T` — inferred when not written |
 | Modules | `const http = @import("std/http");`, then `http.NotFound404`; `pub` is what another module may name |
 | Workers | `@spawn(counter, 0)` starts a thread with a heap of its own, `w.add(5)` calls into it, `@join(w)` waits for it |
+| Messages | `std/broker` — named topics, partitioned logs, consumer groups with their own offsets, and replay |
 | Structs | `const P = struct { x: i64 };`, `P{ .x = 1 }`, `p.x` |
 | Subtyping | `const Sub = struct : Base { };` — a subtype widens implicitly |
 | Singletons | a struct with no fields is also a value: its sole instance |
@@ -322,6 +323,7 @@ fn main() i64 {
 | `std/math` | `abs` `min` `max` `sign` `sqrt` `pow` `floor` `ceil` `round` `trunc` `ipow` |
 | `std/io` | `read_file` `read_line` `write_file` `exists` — the fallible ones name their errors, e.g. `!{NotFound, PermissionDenied, IoFailed}str` |
 | `std/http` | the 27 HTTP status types, materialised on first mention |
+| `std/broker` | `Topic[M]` `Consumer[M]` and `topic` `publish` `subscribe` `next` `commit` `seek` `len` |
 
 A **prelude** needs no import, because every module has it:
 
@@ -420,9 +422,8 @@ Sessions are numbered by the original feature list:
       parameters on functions, structs and `fn` literals
 - [x] **6.** Standard library — strings, arrays, math and I/O — behind a module
       system
-- [ ] **7.** Multithreading: workers with their own heaps, talking by typed RPC
-      or through a message broker. Designed in [ROADMAP.md](ROADMAP.md), not
-      built.
+- [x] **7.** Multithreading — workers with their own heaps, talking by typed
+      RPC or through a Kafka-shaped message broker
 - [ ] **8.** Direct libc calls for I/O, and the networking that needs them.
       Before v0.5: `std/io` goes through Rust's `std` today, which cannot
       express non-blocking I/O — and a thread parked in a blocking read cannot

@@ -35,6 +35,14 @@ pub enum BuiltinTy {
     /// `Transferable` constraint on it, which is a question about a type that
     /// the runtime's small enum cannot ask for itself.
     Transferable(u8),
+    /// A type variable that must be a transferable *heap object* -- a struct,
+    /// a string or an array -- rather than merely transferable.
+    ///
+    /// What a broker's message must be. An object carries its type id in its
+    /// header, and that id is both what lets the copy be made without knowing
+    /// the type and what makes the decoded value dispatchable on the other
+    /// side. A scalar carries nothing.
+    Message(u8),
     /// A type variable, numbered within one signature: every `Var(0)` in a row
     /// is the same type, and each *use* of the builtin gets its own.
     ///
@@ -80,6 +88,9 @@ impl Builtin {
 
 /// `[]T`, where `T` must be copyable to another worker's heap.
 const TRANSFERABLE_ARRAY: BuiltinTy = BuiltinTy::Array(&BuiltinTy::Transferable(0));
+
+/// The message type a topic carries.
+const MESSAGE: BuiltinTy = BuiltinTy::Message(0);
 
 /// Every builtin visible to W# source.
 pub fn builtins() -> Vec<Builtin> {
@@ -357,6 +368,59 @@ fn library() -> Vec<Builtin> {
             ret: TRANSFERABLE_ARRAY,
             ptr: crate::transfer::ws_transfer_roundtrip as *const u8,
         },
+        // The broker. Handles are numbers rather than objects: a topic and a
+        // consumer belong to the process, not to any one worker's heap, and a
+        // number is what can be held from either side. `std/broker.ws` wraps
+        // them in `Topic[M]` and `Consumer[M]`, which is what makes them typed.
+        Builtin {
+            module: BROKER_MODULE,
+            name: "raw_topic",
+            params: &[BuiltinTy::Str, BuiltinTy::I64],
+            ret: BuiltinTy::I64,
+            ptr: crate::broker::ws_broker_topic as *const u8,
+        },
+        Builtin {
+            module: BROKER_MODULE,
+            name: "raw_publish",
+            params: &[BuiltinTy::I64, BuiltinTy::Str, MESSAGE],
+            ret: BuiltinTy::I64,
+            ptr: crate::broker::ws_broker_publish as *const u8,
+        },
+        Builtin {
+            module: BROKER_MODULE,
+            name: "raw_subscribe",
+            params: &[BuiltinTy::I64, BuiltinTy::Str],
+            ret: BuiltinTy::I64,
+            ptr: crate::broker::ws_broker_subscribe as *const u8,
+        },
+        Builtin {
+            module: BROKER_MODULE,
+            name: "raw_poll",
+            params: &[BuiltinTy::I64],
+            ret: BuiltinTy::Optional(&MESSAGE),
+            ptr: crate::broker::ws_broker_poll as *const u8,
+        },
+        Builtin {
+            module: BROKER_MODULE,
+            name: "raw_commit",
+            params: &[BuiltinTy::I64],
+            ret: BuiltinTy::Void,
+            ptr: crate::broker::ws_broker_commit as *const u8,
+        },
+        Builtin {
+            module: BROKER_MODULE,
+            name: "raw_seek",
+            params: &[BuiltinTy::I64, BuiltinTy::I64, BuiltinTy::I64],
+            ret: BuiltinTy::Void,
+            ptr: crate::broker::ws_broker_seek as *const u8,
+        },
+        Builtin {
+            module: BROKER_MODULE,
+            name: "raw_len",
+            params: &[BuiltinTy::I64],
+            ret: BuiltinTy::I64,
+            ptr: crate::broker::ws_broker_len as *const u8,
+        },
         Builtin {
             module: ARRAY_MODULE,
             name: "new",
@@ -476,6 +540,8 @@ pub const ERROR_END_OF_FILE: i64 = 4;
 /// than declared, so the module has no other content and no entry in
 /// [`builtins`]; it still has to be a path an `@import` can name.
 pub const HTTP_MODULE: &str = "std/http";
+/// The broker's module: named topics, partitioned logs, consumer groups.
+pub const BROKER_MODULE: &str = "std/broker";
 
 /// The parts of the standard library written in W# rather than Rust.
 ///
@@ -491,6 +557,7 @@ pub fn std_module_sources() -> &'static [(&'static str, &'static str)] {
         (LIST_MODULE, include_str!("std/list.ws")),
         (STR_MODULE, include_str!("std/str.ws")),
         (MATH_MODULE, include_str!("std/math.ws")),
+        (BROKER_MODULE, include_str!("std/broker.ws")),
     ]
 }
 
