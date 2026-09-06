@@ -29,6 +29,7 @@
 // expect: aes-256-gcm over x25519 agreed
 // expect: aes-128-gcm over p-256 agreed, after a retry
 // expect: chacha20-poly1305 over p-256 agreed, after a retry
+// expect: aes-256-gcm over p-384 agreed, after a retry
 // expect: the client heard the server
 // expect: the server heard the client
 // expect: a record larger than one fragment survived
@@ -48,13 +49,14 @@ fn main() i64 {
     const key = x509.parse_spki(hex(SPKI)) catch return 1;
 
     // Every combination that changes what the code does. The group is chosen
-    // by the *server*, so asking for P-256 makes the client retry: it offered
-    // a share for x25519 alone, which is what a first flight does.
+    // by the *server*, so asking for either NIST curve makes the client retry:
+    // it offered a share for x25519 alone, which is what a first flight does.
     pair("aes-128-gcm over x25519 agreed", key, 0x1301, 0);
     pair("chacha20-poly1305 over x25519 agreed", key, 0x1303, 0);
     pair("aes-256-gcm over x25519 agreed", key, 0x1302, 0);
     pair("aes-128-gcm over p-256 agreed, after a retry", key, 0x1301, 0x0017);
     pair("chacha20-poly1305 over p-256 agreed, after a retry", key, 0x1303, 0x0017);
+    pair("aes-256-gcm over p-384 agreed, after a retry", key, 0x1302, 0x0018);
 
     // One connection, used.
     const cl = tls.client(tls.pinned_config("localhost", key)) catch return 2;

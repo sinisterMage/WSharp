@@ -32,7 +32,7 @@ const hash = @import("std/hash");
 const cipher = @import("std/cipher");
 const crypto = @import("std/crypto");
 const curve = @import("std/curve25519");
-const p256 = @import("std/p256");
+const nistec = @import("std/nistec");
 const x509 = @import("std/x509");
 const net = @import("std/net");
 const list = @import("std/list");
@@ -76,6 +76,7 @@ pub const TLS_CHACHA20_POLY1305_SHA256 = 0x1303;
 
 pub const GROUP_X25519 = 0x001d;
 pub const GROUP_SECP256R1 = 0x0017;
+pub const GROUP_SECP384R1 = 0x0018;
 
 /// Alert descriptions, for the ones this sends.
 const AL_CLOSE_NOTIFY = 0;
@@ -465,13 +466,14 @@ fn make_share(c: Conn, group: i64) !void {
         c.share = curve.x25519_base(c.secret);
         return;
     }
-    if (group == GROUP_SECP256R1) {
+    if (group == GROUP_SECP256R1 or group == GROUP_SECP384R1) {
+        const curve = nist_curve(group);
         // A scalar out of range is possible and is simply retried; the chance
         // is about one in 2^32 and a loop is the standard answer.
         var tries = 0;
         while (tries < 8) : (tries += 1) {
-            const s = try crypto.random(32);
-            const pub_point = p256.derive(s) catch continue;
+            const s = try crypto.random(curve.size);
+            const pub_point = nistec.derive(curve, s) catch continue;
             c.secret = s;
             c.share = pub_point;
             return;
@@ -481,13 +483,19 @@ fn make_share(c: Conn, group: i64) !void {
     return error.NoSharedGroup;
 }
 
+fn nist_curve(group: i64) nistec.Curve {
+    if (group == GROUP_SECP384R1) { return nistec.p384(); }
+    return nistec.p256();
+}
+
 fn shared_secret(c: Conn, peer: []u8) ![]u8 {
     if (c.group == GROUP_X25519) {
         if (array.len(peer) != 32) { return error.IllegalParameter; }
         return curve.x25519(c.secret, peer) catch return error.IllegalParameter;
     }
-    if (c.group == GROUP_SECP256R1) {
-        return p256.ecdh(c.secret, peer) catch return error.IllegalParameter;
+    if (c.group == GROUP_SECP256R1 or c.group == GROUP_SECP384R1) {
+        return nistec.ecdh(nist_curve(c.group), c.secret, peer)
+            catch return error.IllegalParameter;
     }
     return error.NoSharedGroup;
 }
@@ -567,6 +575,7 @@ fn ext_open(b: bytes.Buf, typ: i64) i64 {
 const SCHEMES = []i64{
     0x0807,   // ed25519
     0x0403,   // ecdsa_secp256r1_sha256
+    0x0503,   // ecdsa_secp384r1_sha384
     0x0804,   // rsa_pss_rsae_sha256
     0x0805,   // rsa_pss_rsae_sha384
     0x0806,   // rsa_pss_rsae_sha512
@@ -576,7 +585,7 @@ const SCHEMES = []i64{
 };
 
 /// The groups offered, in preference order.
-const GROUPS = []i64{ 0x001d, 0x0017 };
+const GROUPS = []i64{ 0x001d, 0x0017, 0x0018 };
 
 fn build_client_hello(c: Conn) []u8 {
     const b = bytes.buf(512);
@@ -1277,7 +1286,7 @@ fn emit_ccs(c: Conn) void {
 }
 
 fn we_do_group(g: i64) bool {
-    return g == GROUP_X25519 or g == GROUP_SECP256R1;
+    return g == GROUP_X25519 or g == GROUP_SECP256R1 or g == GROUP_SECP384R1;
 }
 
 fn server_message(c: Conn, typ: i64, msg: []u8) !void {
@@ -1417,13 +1426,7 @@ fn server_client_hello(c: Conn, msg: []u8, body: []u8) !void {
     }
 
     bytes.put_all(c.tr, msg);
-    c.group = ks_group;
-    if (ks_group == GROUP_X25519) {
-        c.secret = try crypto.random(32);
-        c.share = curve.x25519_base(c.secret);
-    } else {
-        try make_share(c, ks_group);
-    }
+    try make_share(c, ks_group);
     c.random = try crypto.random(32);
     emit_handshake(c, HS_SERVER_HELLO, build_hello(c, sid, ks_group, false));
     emit_ccs(c);

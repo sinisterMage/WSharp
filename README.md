@@ -82,8 +82,8 @@ everywhere.** They are checked when written and inferred when not.
 | Messages | `std/broker` — named topics, partitioned logs, consumer groups with their own offsets, and replay |
 | Bytes | `std/bytes` — `[]u8` as a buffer, the bridge to and from `str`, word accessors and hex |
 | Crypto | `std/hash` — SHA-2, HMAC, HKDF; `std/cipher` — ChaCha20-Poly1305 and AES-GCM; `std/crypto` — the system's generator |
-| Key agreement | `std/curve25519` — X25519; `std/p256` — ECDH on NIST P-256, with the key-share validation RFC 8446 requires |
-| Signatures | `std/rsa` — PKCS#1 v1.5 and PSS verification; `std/curve25519` — Ed25519, signing and verification; `std/p256` — ECDSA verification |
+| Key agreement | `std/curve25519` — X25519; `std/nistec` — ECDH on NIST P-256 and P-384, with the key-share validation RFC 8446 requires |
+| Signatures | `std/rsa` — PKCS#1 v1.5 and PSS verification; `std/curve25519` — Ed25519, signing and verification; `std/nistec` — ECDSA verification on P-256 and P-384 |
 | TLS | `std/tls` — TLS 1.3, client and server; `std/x509` — certificates and chains, so `http.get("https://…")` works |
 | Structs | `const P = struct { x: i64 };`, `P{ .x = 1 }`, `p.x` |
 | Subtyping | `const Sub = struct : Base { };` — a subtype widens implicitly |
@@ -293,10 +293,11 @@ network-dependent one would make CI depend on the weather. Save it and run it:
 nix-shell --run "cargo run -p wsharp-cli -- run /tmp/fetch.ws"
 ```
 
-The one thing to know before trying an arbitrary host: **there is no P-384**,
-so a chain that goes through a `secp384r1` intermediate cannot be verified.
-That covers a good deal of the modern web — `example.com` is one — and it is
-the first thing listed under what is left in [ROADMAP.md](ROADMAP.md).
+`example.com`, `github.com`, `nixos.org`, `www.cloudflare.com` and
+`crates.io` all work, which between them cover RSA, P-256 and P-384 chains.
+What does not is a chain through a P-521 key — there is one such root in a
+typical store, and it is the last line under what is left in
+[ROADMAP.md](ROADMAP.md).
 
 ## The compiler
 
@@ -396,7 +397,7 @@ serving many connections from one worker, not for keeping the collector alive.
 | `std/time` | `now` — seconds since the Unix epoch |
 | `std/bignum` | fixed-width unsigned limbs and Montgomery arithmetic: `from_be` `to_be` `cmp` `add` `sub` `mont` `mont_mul` `mont_add` `mont_sub` `to_mont` `from_mont` `modexp`. A limb is 32 bits, which is what makes a 64x64 → 128 product unnecessary |
 | `std/curve25519` | `x25519` `x25519_base` — and the small-order check on the *output*, which is the one a list of bad encodings misses |
-| `std/p256` | `derive` `ecdh` `valid` — ECDH on secp256r1, with a Montgomery ladder over Jacobian points |
+| `std/nistec` | `p256` `p384` `derive` `ecdh` `valid` `ecdsa_verify` — the NIST prime curves, one implementation over `std/bignum` |
 | `std/rsa` | `public_key` `verify_pkcs1` `verify_pss` — verification only, since TLS 1.3 does no RSA key exchange. The encoded message is built and compared, never parsed |
 | `std/der` | a strict DER reader: `read_value`, `read_seq`, `read_uint`, `read_oid`, `read_bitstring`, `read_time` (item 10) |
 | `std/x509` | `SigKey` and its three subtypes, `parse_spki`, `verify_signature`; certificates, `matches_host`, `verify_chain`, `pem_certificates`, `system_roots` (item 10) |

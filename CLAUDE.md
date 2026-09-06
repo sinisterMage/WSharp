@@ -178,7 +178,7 @@ extra `sin_len` byte out of this code entirely.
   A back-edge safepoint costs nothing here by contrast — `ws_gc_poll` does not
   collect under stress, only `on_allocation` does.
 - **A limb is 32 bits, because there is no 64x64 -> 128 product.** `std/bignum`,
-  `std/p256` and anything else doing multi-precision arithmetic hold 32-bit
+  `std/nistec` and anything else doing multi-precision arithmetic hold 32-bit
   values and accumulate in a `u64`, which is what makes `t + a*b + carry` fit:
   `(2^32-1)^2 + 2*(2^32-1)` is exactly `2^64 - 1`. Widening a limb to 64 bits
   needs `bits.mulhi`, which does not exist. `std/curve25519` is the same rule
@@ -491,6 +491,14 @@ extra `sin_len` byte out of this code entirely.
   two would have to write the same two-dozen-name set out twice. An optional
   field and an `if` keep every error intact. The lattice is right when the
   members agree about failure and wrong when they do not.
+- **One curve implementation, two curves.** `std/nistec` carries the limb
+  count, the coordinate size and the scalar width in its `Curve`, so P-256 and
+  P-384 are the same code over different tables. That is only possible because
+  the arithmetic is `std/bignum`'s generic Montgomery multiplication rather
+  than a fast reduction written for one prime -- the trade stage two made, and
+  what made P-384 a table of constants when thirty-five root certificates
+  turned out to need it. A third curve is the same again; P-521 is not, because
+  its 521 bits are not a whole number of 32-bit limbs.
 - **A trust store is a bag; a chain is a structure.** A certificate in the
   store this library cannot read is dropped and the rest are used; one *in a
   chain* is a refusal. Answering both the same way either makes a machine with

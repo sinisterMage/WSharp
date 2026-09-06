@@ -24,7 +24,7 @@ const bytes = @import("std/bytes");
 const der = @import("std/der");
 const hash = @import("std/hash");
 const rsa = @import("std/rsa");
-const p256 = @import("std/p256");
+const nistec = @import("std/nistec");
 const ed = @import("std/curve25519");
 const list = @import("std/list");
 const text = @import("std/str");
@@ -45,6 +45,10 @@ pub const RSA_PKCS1_SHA256 = 0x0401;
 pub const RSA_PKCS1_SHA384 = 0x0501;
 pub const RSA_PKCS1_SHA512 = 0x0601;
 pub const ECDSA_SECP256R1_SHA256 = 0x0403;
+pub const ECDSA_SECP384R1_SHA384 = 0x0503;
+/// Named so that a certificate signed `ecdsa-with-SHA512` by a P-256 or P-384
+/// key can be verified. There is no P-521 curve here, so this never names one.
+pub const ECDSA_SECP521R1_SHA512 = 0x0603;
 pub const RSA_PSS_RSAE_SHA256 = 0x0804;
 pub const RSA_PSS_RSAE_SHA384 = 0x0805;
 pub const RSA_PSS_RSAE_SHA512 = 0x0806;
@@ -63,11 +67,11 @@ pub fn scheme_hash(scheme: i64) ?hash.Hash {
         return hash.sha256_hash();
     }
     if (scheme == RSA_PKCS1_SHA384 or scheme == RSA_PSS_RSAE_SHA384
-        or scheme == RSA_PSS_PSS_SHA384) {
+        or scheme == RSA_PSS_PSS_SHA384 or scheme == ECDSA_SECP384R1_SHA384) {
         return hash.sha384_hash();
     }
     if (scheme == RSA_PKCS1_SHA512 or scheme == RSA_PSS_RSAE_SHA512
-        or scheme == RSA_PSS_PSS_SHA512) {
+        or scheme == RSA_PSS_PSS_SHA512 or scheme == ECDSA_SECP521R1_SHA512) {
         return hash.sha512_hash();
     }
     // Ed25519 hashes internally and names no hash of its own.
@@ -86,6 +90,19 @@ fn is_pkcs1(scheme: i64) bool {
         or scheme == RSA_PKCS1_SHA512;
 }
 
+/// Whether a scheme is ECDSA over *some* curve.
+///
+/// The curve is the key's, not the scheme's, and that is not a shortcut: in
+/// X.509 the algorithm identifier names only the hash -- `ecdsa-with-SHA384`
+/// says nothing about which curve signed -- so a P-256 key signing with
+/// SHA-384 is an ordinary and legal certificate. TLS's `SignatureScheme`
+/// registry conflates the two, and a peer that names the wrong one simply
+/// fails to verify, which is the same answer a stricter check would give.
+fn is_ecdsa(scheme: i64) bool {
+    return scheme == ECDSA_SECP256R1_SHA256 or scheme == ECDSA_SECP384R1_SHA384
+        or scheme == ECDSA_SECP521R1_SHA512;
+}
+
 // ---------------------------------------------------------------------------
 // Keys
 // ---------------------------------------------------------------------------
@@ -95,8 +112,12 @@ fn is_pkcs1(scheme: i64) bool {
 pub const SigKey = struct { };
 
 pub const RsaKey = struct : SigKey { k: rsa.PublicKey };
-/// An uncompressed point, 65 bytes, as `std/p256` wants it.
+/// An uncompressed point, as `std/nistec` wants it: 65 bytes on P-256 and 97
+/// on P-384. Two types rather than one carrying a curve, so that the
+/// dispatcher goes on doing the work -- a third curve is a struct and a
+/// function, not an edit to a chain.
 pub const EcdsaP256Key = struct : SigKey { point: []u8 };
+pub const EcdsaP384Key = struct : SigKey { point: []u8 };
 pub const Ed25519Key = struct : SigKey { pk: []u8 };
 
 // The algorithm identifiers a SubjectPublicKeyInfo can carry, as the contents
@@ -104,6 +125,7 @@ pub const Ed25519Key = struct : SigKey { pk: []u8 };
 const OID_RSA = []u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
 const OID_EC = []u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 };
 const OID_P256 = []u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
+const OID_P384 = []u8{ 0x2b, 0x81, 0x04, 0x00, 0x22 };
 const OID_ED25519 = []u8{ 0x2b, 0x65, 0x70 };
 
 /// The public key a DER SubjectPublicKeyInfo carries.
@@ -138,15 +160,24 @@ pub fn parse_spki(spki: []u8) !SigKey {
         return key;
     }
     if (bytes.equal(oid, OID_EC)) {
-        const curve = try der.read_oid(alg);
+        const named = try der.read_oid(alg);
         try der.expect_end(alg);
-        // P-256 is the only curve here, because it is the only one with point
-        // arithmetic behind it.
-        if (!bytes.equal(curve, OID_P256)) { return error.BadKey; }
-        if (array.len(bits) != 65 or bits[0] != 4) { return error.BadKey; }
-        if (!p256.valid(bits)) { return error.BadKey; }
-        const key: SigKey = EcdsaP256Key{ .point = bits };
-        return key;
+        // P-256 and P-384 are the curves with point arithmetic behind them.
+        // P-521 is not, and a key on it is refused here rather than accepted
+        // and then unable to verify anything.
+        if (bytes.equal(named, OID_P256)) {
+            if (array.len(bits) != 65 or bits[0] != 4) { return error.BadKey; }
+            if (!nistec.valid(nistec.p256(), bits)) { return error.BadKey; }
+            const key: SigKey = EcdsaP256Key{ .point = bits };
+            return key;
+        }
+        if (bytes.equal(named, OID_P384)) {
+            if (array.len(bits) != 97 or bits[0] != 4) { return error.BadKey; }
+            if (!nistec.valid(nistec.p384(), bits)) { return error.BadKey; }
+            const key: SigKey = EcdsaP384Key{ .point = bits };
+            return key;
+        }
+        return error.BadKey;
     }
     if (bytes.equal(oid, OID_RSA)) {
         // RFC 3279: the parameters must be present and NULL.
@@ -197,8 +228,15 @@ pub fn verify_signature(k: RsaKey, scheme: i64, content: []u8, sig: []u8) bool {
 }
 
 pub fn verify_signature(k: EcdsaP256Key, scheme: i64, content: []u8, sig: []u8) bool {
-    if (scheme != ECDSA_SECP256R1_SHA256) { return false; }
-    return p256.ecdsa_verify(k.point, hash.sha256(content), sig);
+    if (!is_ecdsa(scheme)) { return false; }
+    const h = scheme_hash(scheme) orelse return false;
+    return nistec.ecdsa_verify(nistec.p256(), k.point, h.digest(content), sig);
+}
+
+pub fn verify_signature(k: EcdsaP384Key, scheme: i64, content: []u8, sig: []u8) bool {
+    if (!is_ecdsa(scheme)) { return false; }
+    const h = scheme_hash(scheme) orelse return false;
+    return nistec.ecdsa_verify(nistec.p384(), k.point, h.digest(content), sig);
 }
 
 pub fn verify_signature(k: Ed25519Key, scheme: i64, content: []u8, sig: []u8) bool {
@@ -229,6 +267,8 @@ const OID_SHA256_RSA = []u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0
 const OID_SHA384_RSA = []u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c };
 const OID_SHA512_RSA = []u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d };
 const OID_ECDSA_SHA256 = []u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02 };
+const OID_ECDSA_SHA384 = []u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03 };
+const OID_ECDSA_SHA512 = []u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04 };
 
 /// The extensions this reads. Anything else marked critical is a refusal.
 const OID_BASIC_CONSTRAINTS = []u8{ 0x55, 0x1d, 0x13 };
@@ -275,6 +315,8 @@ fn scheme_of_oid(oid: []u8) i64 {
     if (bytes.equal(oid, OID_SHA384_RSA)) { return RSA_PKCS1_SHA384; }
     if (bytes.equal(oid, OID_SHA512_RSA)) { return RSA_PKCS1_SHA512; }
     if (bytes.equal(oid, OID_ECDSA_SHA256)) { return ECDSA_SECP256R1_SHA256; }
+    if (bytes.equal(oid, OID_ECDSA_SHA384)) { return ECDSA_SECP384R1_SHA384; }
+    if (bytes.equal(oid, OID_ECDSA_SHA512)) { return ECDSA_SECP521R1_SHA512; }
     if (bytes.equal(oid, OID_ED25519)) { return ED25519; }
     return 0;
 }

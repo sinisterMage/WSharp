@@ -30,7 +30,7 @@
 // expect: a truncated signature refused
 // expect: a SET where a SEQUENCE belongs refused
 // expect: a public key off the curve refused
-const p256 = @import("std/p256");
+const nistec = @import("std/nistec");
 const hash = @import("std/hash");
 const bytes = @import("std/bytes");
 
@@ -65,7 +65,7 @@ fn main() i64 {
 
     // Without this line every other line below passes with a verifier that
     // refuses everything.
-    if (p256.ecdsa_verify(pk, digest, hex(SIG))) {
+    if (nistec.ecdsa_verify(p256(), pk, digest, hex(SIG))) {
         print("the published signature is accepted");
     }
 
@@ -88,8 +88,11 @@ fn main() i64 {
 }
 
 fn refuse(pk: []u8, digest: []u8, sig: str, note: str) void {
-    if (!p256.ecdsa_verify(pk, digest, hex(sig))) { print(note); }
+    if (!nistec.ecdsa_verify(p256(), pk, digest, hex(sig))) { print(note); }
     return;
 }
 
 fn hex(s: str) []u8 { return bytes.from_hex(s) catch bytes.new(0); }
+
+/// The curve, named so the helpers below need no extra parameter.
+fn p256() nistec.Curve { return nistec.p256(); }

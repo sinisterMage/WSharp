@@ -842,8 +842,8 @@ pub const TIME_MODULE: &str = "std/time";
 pub const BIGNUM_MODULE: &str = "std/bignum";
 /// X25519, on Curve25519.
 pub const CURVE25519_MODULE: &str = "std/curve25519";
-/// ECDH on NIST P-256.
-pub const P256_MODULE: &str = "std/p256";
+/// The NIST prime curves: ECDH and ECDSA on P-256 and P-384.
+pub const NISTEC_MODULE: &str = "std/nistec";
 /// RSA signature verification: PKCS#1 v1.5 and PSS.
 pub const RSA_MODULE: &str = "std/rsa";
 /// Distinguished Encoding Rules, which X.509 is written in.
@@ -974,7 +974,7 @@ pub fn std_module_sources() -> &'static [(&'static str, &'static str)] {
         (CIPHER_MODULE, include_str!("std/cipher.ws")),
         (BIGNUM_MODULE, include_str!("std/bignum.ws")),
         (CURVE25519_MODULE, include_str!("std/curve25519.ws")),
-        (P256_MODULE, include_str!("std/p256.ws")),
+        (NISTEC_MODULE, include_str!("std/nistec.ws")),
         (RSA_MODULE, include_str!("std/rsa.ws")),
         (DER_MODULE, include_str!("std/der.ws")),
         (X509_MODULE, include_str!("std/x509.ws")),

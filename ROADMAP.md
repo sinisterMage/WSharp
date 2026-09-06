@@ -372,7 +372,7 @@ A module system, and four modules behind it.
 | `std/time` | `now` — seconds since the Unix epoch (item 10) |
 | `std/bignum` | fixed-width limbs and Montgomery arithmetic: `from_be`, `to_be`, `cmp`, `add`, `sub`, `mont`, `mont_mul`, `mont_add`, `mont_sub`, `to_mont`, `from_mont`, `modexp` (item 10) |
 | `std/curve25519` | `x25519`, `x25519_base` (item 10) |
-| `std/p256` | `derive`, `ecdh`, `valid` (item 10) |
+| `std/nistec` | the NIST prime curves: `p256`, `p384`, `derive`, `ecdh`, `valid`, `ecdsa_verify` (item 10) |
 | `std/rsa` | `public_key`, `verify_pkcs1`, `verify_pss` (item 10) |
 
 `==` on `str` works, comparing contents. The prelude — `print`, `assert`, the
@@ -1123,11 +1123,11 @@ or moving the bignum across the boundary anyway.
 | `modexp`, square and multiply, for a public exponent | same |
 | X25519, on TweetNaCl's sixteen-limb field, with the ladder of RFC 7748 section 5 | `std/curve25519.ws` |
 | The small-order check, on the output rather than on the input | same |
-| P-256: Jacobian points, `dbl-2001-b` and `add-2007-bl`, and a Montgomery ladder over them | `std/p256.ws` |
+| P-256: Jacobian points, `dbl-2001-b` and `add-2007-bl`, and a Montgomery ladder over them | `std/nistec.ws` |
 | Key-share validation: length, form, both coordinates below p, and on the curve | same |
 | RSA PKCS#1 v1.5 and PSS verification, generic over the hash by value | `std/rsa.ws` |
 | MGF1, and the three DigestInfo prefixes as `const` tables | same |
-| Published vectors for the curves, and vectors built twice for RSA | `tests/cases/{bignum_ops,curve25519_*,p256_*,rsa_*}.ws` |
+| Published vectors for the curves, and vectors built twice for RSA | `tests/cases/{bignum_ops,curve25519_*,p256_*,p384_*,rsa_*}.ws` |
 
 #### Decisions worth recording
 
@@ -1227,7 +1227,7 @@ recorded bytes is a client whose *own* bytes nothing has ever read.
 | Piece | Where |
 |---|---|
 | Ed25519, signing and verification, on the field `std/curve25519` already had | `std/curve25519.ws` |
-| ECDSA verification on P-256, with arithmetic modulo the group order | `std/p256.ws` |
+| ECDSA verification, with arithmetic modulo the group order | `std/nistec.ws` |
 | Shamir's trick, so a verification is one ladder rather than two | same |
 | A strict DER reader: definite lengths, minimal encodings, no trailing data | `std/der.ws` |
 | Public keys as a dispatch lattice, and `SubjectPublicKeyInfo` | `std/x509.ws` |
@@ -1363,16 +1363,17 @@ which is a certificate parser, a chain, and somewhere to get the anchors from.
   applies to them. The scheme becomes zero instead, `verify_signature` refuses
   it, and a chain that actually needs the signature still fails. That change
   took the local store from 79 usable roots to 83.
-- **What is left out is 36 of them, and the reason is P-384.** Thirty-five of
-  this machine's 119 root certificates have `secp384r1` keys and one has
-  `secp521r1`, and `std/p256` is the only curve with point arithmetic behind
-  it. That is the single biggest limitation of this item: `https://` reaches
-  `www.google.com`, whose chain is a P-256 leaf under three RSA certificates,
-  and does not reach `example.com`, whose chain goes through two P-384
-  intermediates. It is also the cheapest thing left to fix -- the formulas are
-  the same, `a` is -3 on both curves, and the arithmetic is `std/bignum`'s
-  Montgomery multiplication at twelve limbs instead of eight, which is exactly
-  the payoff of not having written a Solinas reduction for P-256.
+- **What was left out was 36 of them, and the reason was P-384** -- until it
+  was written. Thirty-five of this machine's 119 root certificates have
+  `secp384r1` keys, and until `std/nistec` carried a second curve none of them
+  could be used and no chain through a P-384 intermediate could be verified,
+  which is most of the modern web. Fixing it is stage two's decision paying
+  off: because P-256 was written against `std/bignum`'s generic Montgomery
+  multiplication rather than a Solinas reduction for one prime, the second
+  curve is five tables and a limb count. Eighty-three usable roots became a
+  hundred and eighteen. The one still refused has a P-521 key, whose 521 bits
+  are not a whole number of 32-bit limbs -- the one place the shape of this
+  bignum shows through.
 - **A store is a bag, a chain is a structure.** A certificate in the store that
   this library cannot read is dropped and the rest are used; a certificate *in
   a chain* that it cannot read is a refusal. Those are different questions --
@@ -1409,6 +1410,46 @@ which is a certificate parser, a chain, and somewhere to get the anchors from.
   item. It is not a correctness fix: `modexp` costs one modular multiplication
   per exponent bit, so a certificate carrying a 2048-bit exponent is a peer
   deciding how much work this machine does.
+
+### Stage five, second pass: the second curve
+
+Stage five shipped with one limitation big enough to be worth its own section,
+and this is it closed. Thirty-five of a typical machine's 119 root
+certificates have P-384 keys; none of them could be used, and a chain through
+a P-384 intermediate -- which is most of the modern web -- could not be
+verified at all.
+
+`std/p256` became `std/nistec`, and the module now carries three numbers in its
+`Curve`: how many 32-bit limbs a field element takes, how many bytes a
+coordinate is, and how many bits a scalar has. Everything below that is the
+same code. Both curves are short Weierstrass with `a = -3`, so every formula
+was already shared; what was hard-coded was the size.
+
+- **This is the receipt for stage two's decision.** That stage chose
+  `std/bignum`'s generic Montgomery multiplication over a Solinas reduction
+  written for P-256's prime, and recorded the trade: "a page that exists only
+  to be faster, in a file where being wrong is a security problem". Had the
+  fast page been written, P-384 would have needed a second one -- different
+  prime, different shifts, separately wrong. Instead it needed five byte tables
+  and a limb count.
+- **A key is two types, not one carrying a curve.** `EcdsaP256Key` and
+  `EcdsaP384Key` are both subtypes of `SigKey`, so the dispatcher goes on doing
+  the work and a third curve is a struct and a function rather than an edit to
+  a chain. That is the same argument the whole `SigKey` lattice is.
+- **In X.509 the algorithm identifier names only the hash.**
+  `ecdsa-with-SHA384` says nothing about which curve signed, so a P-256 key
+  signing with SHA-384 is an ordinary certificate and the curve has to come
+  from the key. TLS's `SignatureScheme` conflates the two; a peer that names
+  the wrong one simply fails to verify, which is the answer a stricter check
+  would give anyway.
+- **P-521 is still refused, and it is the one curve a third table would not
+  buy.** 521 bits is not a whole number of 32-bit limbs, so the top limb is
+  nine bits wide and `std/bignum`'s "a number's length *is* its width"
+  invariant would need a mask everywhere it is read.
+
+Eighty-three usable roots became a hundred and eighteen, and `example.com` --
+whose chain goes through two P-384 intermediates and which was the worked
+example of the limitation -- now answers.
 
 ### What being wrong costs here, and how that is paid
 
@@ -1482,19 +1523,17 @@ rejection is the historical failure.
 
 ### What is left
 
-`https://` works. `http.get("https://www.google.com/")` returns a 200 with
-90 KB of HTML, over a TLS 1.3 connection whose certificate chain was checked
-against this machine's own trust store. What is left is a list of things that
-were left on purpose, and one that was not:
+`https://` works. `example.com`, `github.com`, `nixos.org`,
+`www.cloudflare.com`, `www.google.com` and `crates.io` all answer, which
+between them cover RSA, P-256 and P-384 chains and both AES suites. What is
+left is a list of things that were left on purpose:
 
-- **No P-384, and it is the limitation that matters.** Thirty-six of this
-  machine's 119 root certificates have keys this library cannot use, and a
-  large share of the modern web chains through a P-384 intermediate --
-  `example.com` does. It is also the cheapest thing on this list to fix,
-  because `std/p256` was written against `std/bignum`'s generic Montgomery
-  multiplication rather than a fast reduction for one prime: the formulas are
-  the same, `a` is -3 on both curves, and what changes is a table of constants
-  and a limb count. Anyone picking this up should start here.
+- **No P-521.** One root certificate in a typical store has such a key, and a
+  chain through one cannot be verified. It is the one curve a third table would
+  not buy: 521 bits is not a whole number of 32-bit limbs, so the top limb is
+  nine bits wide and `std/bignum`'s "the length *is* the width" invariant no
+  longer holds without a mask everywhere it is read. P-256 and P-384 between
+  them cover a hundred and eighteen of a hundred and nineteen.
 - **Nothing checks revocation.** No OCSP, no CRL, no stapling. A certificate
   that was issued and then withdrawn is still accepted until it expires, which
   is a real hole and a large piece of work -- OCSP is another protocol and

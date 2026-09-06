@@ -24,7 +24,7 @@
 // expect: sha-384 over "test" verifies
 // expect: sha-512 over "test" verifies
 // expect: nothing kept
-const p256 = @import("std/p256");
+const nistec = @import("std/nistec");
 const hash = @import("std/hash");
 const bytes = @import("std/bytes");
 
@@ -40,28 +40,30 @@ const SIG_384_TEST = "304602210083910e8b48bb0c74244ebdf7f07a1c5413d61472bd941ef3
 const SIG_512_TEST = "30440220461d93f31b6540894788fd206c07cfa0cc35f46fa3c91816fff1040ad1581a04022039af9f15de0db8d97e72719c74820d304ce5226e32dedae67519e840d1194e55";
 
 fn main() i64 {
+    const p256 = nistec.p256();
+
     // The key the signatures belong to, derived rather than transcribed.
-    const pk = p256.derive(hex(X)) catch return 1;
+    const pk = nistec.derive(p256, hex(X)) catch return 1;
     print(bytes.to_hex(pk));
 
     const sample = bytes.of("sample");
     const test = bytes.of("test");
-    if (p256.ecdsa_verify(pk, hash.sha256(sample), hex(SIG_256_SAMPLE))) {
+    if (nistec.ecdsa_verify(p256, pk, hash.sha256(sample), hex(SIG_256_SAMPLE))) {
         print("sha-256 over \"sample\" verifies");
     }
-    if (p256.ecdsa_verify(pk, hash.sha384(sample), hex(SIG_384_SAMPLE))) {
+    if (nistec.ecdsa_verify(p256, pk, hash.sha384(sample), hex(SIG_384_SAMPLE))) {
         print("sha-384 over \"sample\" verifies");
     }
-    if (p256.ecdsa_verify(pk, hash.sha512(sample), hex(SIG_512_SAMPLE))) {
+    if (nistec.ecdsa_verify(p256, pk, hash.sha512(sample), hex(SIG_512_SAMPLE))) {
         print("sha-512 over \"sample\" verifies");
     }
-    if (p256.ecdsa_verify(pk, hash.sha256(test), hex(SIG_256_TEST))) {
+    if (nistec.ecdsa_verify(p256, pk, hash.sha256(test), hex(SIG_256_TEST))) {
         print("sha-256 over \"test\" verifies");
     }
-    if (p256.ecdsa_verify(pk, hash.sha384(test), hex(SIG_384_TEST))) {
+    if (nistec.ecdsa_verify(p256, pk, hash.sha384(test), hex(SIG_384_TEST))) {
         print("sha-384 over \"test\" verifies");
     }
-    if (p256.ecdsa_verify(pk, hash.sha512(test), hex(SIG_512_TEST))) {
+    if (nistec.ecdsa_verify(p256, pk, hash.sha512(test), hex(SIG_512_TEST))) {
         print("sha-512 over \"test\" verifies");
     }
 
@@ -72,7 +74,7 @@ fn main() i64 {
     const before = gc_live_objects();
     var i = 0;
     while (i < 3) : (i += 1) {
-        if (!p256.ecdsa_verify(pk, digest, sig)) { print("unreachable"); }
+        if (!nistec.ecdsa_verify(p256, pk, digest, sig)) { print("unreachable"); }
     }
     gc_collect();
     gc_trace();

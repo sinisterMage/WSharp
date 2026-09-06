@@ -22,7 +22,7 @@
 // expect: a scalar at the order refused
 // expect: a scalar above the order refused
 // expect: a real exchange is not refused
-const p256 = @import("std/p256");
+const nistec = @import("std/nistec");
 const bytes = @import("std/bytes");
 const array = @import("std/array");
 const text = @import("std/str");
@@ -35,7 +35,7 @@ const ZERO = "0000000000000000000000000000000000000000000000000000000000000000";
 
 fn main() i64 {
     const key = hex(KEY);
-    const good = p256.derive(key) catch return 1;
+    const good = nistec.derive(p256(), key) catch return 1;
 
     // A point one bit off the curve. This is the attack, and everything else
     // in this file is a way of getting to it through a shortcut.
@@ -59,14 +59,14 @@ fn main() i64 {
                "a scalar above the order refused");
 
     // The other half of every claim above: the good key still works.
-    const secret = p256.ecdh(key, good) catch return 2;
+    const secret = nistec.ecdh(p256(), key, good) catch return 2;
     if (array.len(secret) == 32) { print("a real exchange is not refused"); }
     return 0;
 }
 
 fn bad_point(peer: []u8, note: str) void {
-    if (p256.valid(peer)) { return; }
-    const out = p256.ecdh(hex(KEY), peer) catch |e| {
+    if (nistec.valid(p256(), peer)) { return; }
+    const out = nistec.ecdh(p256(), hex(KEY), peer) catch |e| {
         if (e == error.BadPoint) { print(note); }
         bytes.new(0)
     };
@@ -74,7 +74,7 @@ fn bad_point(peer: []u8, note: str) void {
 }
 
 fn bad_scalar(secret: []u8, note: str) void {
-    const out = p256.derive(secret) catch |e| {
+    const out = nistec.derive(p256(), secret) catch |e| {
         if (e == error.BadScalar) { print(note); }
         bytes.new(0)
     };
@@ -99,3 +99,6 @@ fn point(x: str, y: str) []u8 {
 }
 
 fn hex(s: str) []u8 { return bytes.from_hex(s) catch bytes.new(0); }
+
+/// The curve, named so the helpers below need no extra parameter.
+fn p256() nistec.Curve { return nistec.p256(); }

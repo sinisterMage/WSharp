@@ -1,13 +1,20 @@
-// ECDH on NIST P-256 -- secp256r1, the group TLS 1.3 calls `secp256r1` and
-// the one a server that will not do X25519 will do instead.
+// The NIST prime curves: P-256 and P-384, and everything above them.
 //
-// The field is `std/bignum`'s Montgomery arithmetic at eight limbs, not a
-// hand-written reduction for this prime. P-256's modulus is a Solinas prime
-// and the fast way to reduce modulo it is a page of shifted additions with
-// signed corrections, which is a page of security-critical code that exists
-// only to be quicker -- and this is not quick enough anywhere for that to buy
-// anything. One Montgomery multiplication, shared with RSA, is worth more than
-// the difference.
+// One module and one implementation, because the two curves differ in exactly
+// three numbers -- how many limbs a field element takes, how many bytes a
+// coordinate is, and how many bits a scalar has -- and in the tables those
+// numbers describe. Both are short Weierstrass curves with `a = -3`, so every
+// formula below is the same formula; writing them twice is how two copies come
+// to disagree, and one of the two would be the copy nobody reads.
+//
+// **That this was possible is stage two's decision paying off.** P-256's
+// modulus is a Solinas prime and the quick way to reduce modulo it is a page
+// of shifted additions with signed corrections -- a page that would have been
+// written for P-256 and would have had to be written again, differently, for
+// P-384. Sharing `std/bignum`'s Montgomery multiplication instead means the
+// second curve is a table of constants and a limb count. P-384 arrived because
+// thirty-five of this machine's root certificates have keys on it and none of
+// them could be used; it cost no new arithmetic at all.
 //
 // **Constant time is a construction, not a guarantee**, exactly as in
 // `std/cipher` and `std/curve25519`: no index below is computed from a secret,
@@ -16,58 +23,104 @@
 //
 // **Nothing allocates below `scalar_mul`.** Every field and point routine
 // writes into storage the caller owns, and one `Work` is built per operation,
-// because the ladder runs 256 times and the case suite runs a second time
-// collecting at every allocation.
+// because the ladder runs once per scalar bit and the case suite runs a second
+// time collecting at every allocation.
 const array = @import("std/array");
 const bytes = @import("std/bytes");
 const bignum = @import("std/bignum");
 const der = @import("std/der");
 
 // ---------------------------------------------------------------------------
-// The curve
+// The curves
 // ---------------------------------------------------------------------------
 //
 // y^2 = x^3 - 3x + b over F_p, with the base point G and the group order n.
-// All five are `const` byte tables, so naming one costs an address.
+// Five `const` byte tables per curve, so naming one costs an address, and the
+// byte length of the first is what tells the code below which curve it is on.
 
 /// p = 2^256 - 2^224 + 2^192 + 2^96 - 1.
-const P = []u8{
+const P256_P = []u8{
     0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 };
 /// The curve's b. Its a is -3, which is why the doubling below is the short one.
-const B = []u8{
+const P256_B = []u8{
     0x5a, 0xc6, 0x35, 0xd8, 0xaa, 0x3a, 0x93, 0xe7,
     0xb3, 0xeb, 0xbd, 0x55, 0x76, 0x98, 0x86, 0xbc,
     0x65, 0x1d, 0x06, 0xb0, 0xcc, 0x53, 0xb0, 0xf6,
     0x3b, 0xce, 0x3c, 0x3e, 0x27, 0xd2, 0x60, 0x4b,
 };
-const GX = []u8{
+const P256_GX = []u8{
     0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47,
     0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4, 0x40, 0xf2,
     0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0,
     0xf4, 0xa1, 0x39, 0x45, 0xd8, 0x98, 0xc2, 0x96,
 };
-const GY = []u8{
+const P256_GY = []u8{
     0x4f, 0xe3, 0x42, 0xe2, 0xfe, 0x1a, 0x7f, 0x9b,
     0x8e, 0xe7, 0xeb, 0x4a, 0x7c, 0x0f, 0x9e, 0x16,
     0x2b, 0xce, 0x33, 0x57, 0x6b, 0x31, 0x5e, 0xce,
     0xcb, 0xb6, 0x40, 0x68, 0x37, 0xbf, 0x51, 0xf5,
 };
 /// The order of G. A private scalar must be in 1..n-1.
-const N = []u8{
+const P256_N = []u8{
     0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84,
     0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
 };
 
-/// How many limbs a field element takes: 256 bits at 32 bits each.
-const LIMBS = 8;
+/// p = 2^384 - 2^128 - 2^96 + 2^32 - 1.
+///
+/// Checked rather than transcribed: the base point below satisfies the curve
+/// equation over this modulus, and `n` times it is the point at infinity.
+const P384_P = []u8{
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+};
+const P384_B = []u8{
+    0xb3, 0x31, 0x2f, 0xa7, 0xe2, 0x3e, 0xe7, 0xe4,
+    0x98, 0x8e, 0x05, 0x6b, 0xe3, 0xf8, 0x2d, 0x19,
+    0x18, 0x1d, 0x9c, 0x6e, 0xfe, 0x81, 0x41, 0x12,
+    0x03, 0x14, 0x08, 0x8f, 0x50, 0x13, 0x87, 0x5a,
+    0xc6, 0x56, 0x39, 0x8d, 0x8a, 0x2e, 0xd1, 0x9d,
+    0x2a, 0x85, 0xc8, 0xed, 0xd3, 0xec, 0x2a, 0xef,
+};
+const P384_GX = []u8{
+    0xaa, 0x87, 0xca, 0x22, 0xbe, 0x8b, 0x05, 0x37,
+    0x8e, 0xb1, 0xc7, 0x1e, 0xf3, 0x20, 0xad, 0x74,
+    0x6e, 0x1d, 0x3b, 0x62, 0x8b, 0xa7, 0x9b, 0x98,
+    0x59, 0xf7, 0x41, 0xe0, 0x82, 0x54, 0x2a, 0x38,
+    0x55, 0x02, 0xf2, 0x5d, 0xbf, 0x55, 0x29, 0x6c,
+    0x3a, 0x54, 0x5e, 0x38, 0x72, 0x76, 0x0a, 0xb7,
+};
+const P384_GY = []u8{
+    0x36, 0x17, 0xde, 0x4a, 0x96, 0x26, 0x2c, 0x6f,
+    0x5d, 0x9e, 0x98, 0xbf, 0x92, 0x92, 0xdc, 0x29,
+    0xf8, 0xf4, 0x1d, 0xbd, 0x28, 0x9a, 0x14, 0x7c,
+    0xe9, 0xda, 0x31, 0x13, 0xb5, 0xf0, 0xb8, 0xc0,
+    0x0a, 0x60, 0xb1, 0xce, 0x1d, 0x7e, 0x81, 0x9d,
+    0x7a, 0x43, 0x1d, 0x7c, 0x90, 0xea, 0x0e, 0x5f,
+};
+const P384_N = []u8{
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xc7, 0x63, 0x4d, 0x81, 0xf4, 0x37, 0x2d, 0xdf,
+    0x58, 0x1a, 0x0d, 0xb2, 0x48, 0xb0, 0xa7, 0x7a,
+    0xec, 0xec, 0x19, 0x6a, 0xcc, 0xc5, 0x29, 0x73,
+};
 
-/// The curve's constants, in the form the arithmetic wants them.
+/// A curve's constants, in the form the arithmetic wants them.
+///
+/// The last three fields are the whole of what distinguishes P-256 from P-384
+/// below this line. Everything else is the same code.
 pub const Curve = struct {
     /// Arithmetic modulo p.
     fp: bignum.Mont,
@@ -80,25 +133,47 @@ pub const Curve = struct {
     gy: []u32,
     /// p - 2, the exponent an inversion is.
     pm2: []u32,
+    /// p and n as big-endian bytes, for the range checks a key and a signature
+    /// go through before any arithmetic touches them.
+    pb: []u8,
+    nb: []u8,
+    /// How many 32-bit limbs a field element takes, how many bytes a
+    /// coordinate is, and how many bits a scalar has.
+    limbs: i64,
+    size: i64,
+    bits: i64,
 };
 
-/// The curve, built once. Costs one Montgomery setup and a handful of arrays.
-pub fn curve() Curve {
-    const fp = bignum.mont(bignum.from_be(P, 0, 32, LIMBS));
-    const one = bignum.new(LIMBS);
+/// A curve from its five tables. The size of the modulus says the rest.
+fn build(pb: []u8, bb: []u8, gxb: []u8, gyb: []u8, nb: []u8) Curve {
+    const size = array.len(pb);
+    const limbs = size / 4;
+    const fp = bignum.mont(bignum.from_be(pb, 0, size, limbs));
+    const one = bignum.new(limbs);
     bignum.mont_one(fp, one);
-    const b = bignum.new(LIMBS);
-    const gx = bignum.new(LIMBS);
-    const gy = bignum.new(LIMBS);
-    bignum.to_mont(fp, b, bignum.from_be(B, 0, 32, LIMBS));
-    bignum.to_mont(fp, gx, bignum.from_be(GX, 0, 32, LIMBS));
-    bignum.to_mont(fp, gy, bignum.from_be(GY, 0, 32, LIMBS));
-    const two = bignum.new(LIMBS);
+    const b = bignum.new(limbs);
+    const gx = bignum.new(limbs);
+    const gy = bignum.new(limbs);
+    bignum.to_mont(fp, b, bignum.from_be(bb, 0, size, limbs));
+    bignum.to_mont(fp, gx, bignum.from_be(gxb, 0, size, limbs));
+    bignum.to_mont(fp, gy, bignum.from_be(gyb, 0, size, limbs));
+    const two = bignum.new(limbs);
     two[0] = 2;
-    const pm2 = bignum.new(LIMBS);
-    bignum.sub(pm2, bignum.from_be(P, 0, 32, LIMBS), two);
-    return Curve{ .fp = fp, .one = one, .b = b, .gx = gx, .gy = gy, .pm2 = pm2 };
+    const pm2 = bignum.new(limbs);
+    bignum.sub(pm2, bignum.from_be(pb, 0, size, limbs), two);
+    // Both curves have a modulus and an order of exactly `8 * size` bits,
+    // which is what makes one number stand for both here.
+    return Curve{
+        .fp = fp, .one = one, .b = b, .gx = gx, .gy = gy, .pm2 = pm2,
+        .pb = pb, .nb = nb, .limbs = limbs, .size = size, .bits = size * 8,
+    };
 }
+
+/// Built once per operation. Costs one Montgomery setup and a handful of
+/// arrays, which is why a caller doing several should keep the answer.
+pub fn p256() Curve { return build(P256_P, P256_B, P256_GX, P256_GY, P256_N); }
+
+pub fn p384() Curve { return build(P384_P, P384_B, P384_GX, P384_GY, P384_N); }
 
 // ---------------------------------------------------------------------------
 // Points
@@ -110,8 +185,9 @@ pub fn curve() Curve {
 
 pub const Point = struct { x: []u32, y: []u32, z: []u32 };
 
-fn point() Point {
-    return Point{ .x = bignum.new(LIMBS), .y = bignum.new(LIMBS), .z = bignum.new(LIMBS) };
+fn point(c: Curve) Point {
+    return Point{ .x = bignum.new(c.limbs), .y = bignum.new(c.limbs),
+                  .z = bignum.new(c.limbs) };
 }
 
 fn pt_copy(r: Point, p: Point) void {
@@ -135,15 +211,16 @@ const Work = struct {
     ia: []u32, ib: []u32,
 };
 
-fn work() Work {
+fn work(c: Curve) Work {
+    const n = c.limbs;
     return Work{
-        .r0 = point(), .r1 = point(), .t = point(),
-        .a = bignum.new(LIMBS), .b = bignum.new(LIMBS), .c = bignum.new(LIMBS),
-        .d = bignum.new(LIMBS), .e = bignum.new(LIMBS), .f = bignum.new(LIMBS),
-        .g = bignum.new(LIMBS), .h = bignum.new(LIMBS), .i = bignum.new(LIMBS),
-        .j = bignum.new(LIMBS), .k = bignum.new(LIMBS), .l = bignum.new(LIMBS),
-        .ox = bignum.new(LIMBS), .oy = bignum.new(LIMBS), .oz = bignum.new(LIMBS),
-        .ia = bignum.new(LIMBS), .ib = bignum.new(LIMBS),
+        .r0 = point(c), .r1 = point(c), .t = point(c),
+        .a = bignum.new(n), .b = bignum.new(n), .c = bignum.new(n),
+        .d = bignum.new(n), .e = bignum.new(n), .f = bignum.new(n),
+        .g = bignum.new(n), .h = bignum.new(n), .i = bignum.new(n),
+        .j = bignum.new(n), .k = bignum.new(n), .l = bignum.new(n),
+        .ox = bignum.new(n), .oy = bignum.new(n), .oz = bignum.new(n),
+        .ia = bignum.new(n), .ib = bignum.new(n),
     };
 }
 
@@ -276,7 +353,7 @@ fn fe_inv(c: Curve, out: []u32, a: []u32, w: Work) void {
     const m = c.fp;
     bignum.copy(w.ia, c.one);
     bignum.copy(w.ib, a);
-    var i = 255;
+    var i = c.bits - 1;
     while (i >= 0) {
         bignum.mont_mul(m, w.ia, w.ia, w.ia);
         if (bignum.bit(c.pm2, i) == 1) { bignum.mont_mul(m, w.ia, w.ia, w.ib); }
@@ -297,12 +374,12 @@ fn scalar_mul(c: Curve, r: Point, k: []u8, p: Point, w: Work) void {
     bignum.copy(w.r0.x, c.one);
     bignum.copy(w.r0.y, c.one);
     var i = 0;
-    while (i < LIMBS) : (i += 1) { w.r0.z[i] = 0; }
+    while (i < c.limbs) : (i += 1) { w.r0.z[i] = 0; }
     pt_copy(w.r1, p);
 
-    i = 255;
+    i = c.bits - 1;
     while (i >= 0) {
-        const take = 0 - u32((k[31 - (i / 8)] >> u8(i % 8)) & 1);
+        const take = 0 - u32((k[c.size - 1 - (i / 8)] >> u8(i % 8)) & 1);
         pt_swap(w.r0, w.r1, take, w);
         pt_add(c, w.t, w.r0, w.r1, w);
         pt_double(c, w.r0, w.r0, w);
@@ -331,9 +408,9 @@ fn pt_affine(c: Curve, out: []u8, at: i64, p: Point, w: Work) !void {
     bignum.mont_mul(m, w.d, p.x, w.b);
     bignum.mont_mul(m, w.e, p.y, w.c);
     bignum.from_mont(m, w.f, w.d);
-    bignum.to_be_at(w.f, out, at, 32);
+    bignum.to_be_at(w.f, out, at, c.size);
     bignum.from_mont(m, w.f, w.e);
-    bignum.to_be_at(w.f, out, at + 32, 32);
+    bignum.to_be_at(w.f, out, at + c.size, c.size);
     return;
 }
 
@@ -347,16 +424,16 @@ fn lt_mask(x: u32, y: u32) u32 { return 0 - u32((u64(x) - u64(y)) >> 63); }
 /// All ones when `x` is not zero.
 fn nz_mask(x: u32) u32 { return lt_mask(0, x); }
 
-/// True when the 32 bytes of `a` at `at`, read big-endian, are below `b`.
+/// True when the `n` bytes of `a` at `at`, read big-endian, are below `b`.
 ///
 /// Every byte is examined: the first difference decides, and the rest are
 /// looked at anyway, because where a key stops matching a bound is a fact
 /// about the key.
-fn below(a: []u8, at: i64, b: []u8) bool {
+fn below(a: []u8, at: i64, b: []u8, n: i64) bool {
     var lt: u32 = 0;
     var settled: u32 = 0;
     var i = 0;
-    while (i < 32) : (i += 1) {
+    while (i < n) : (i += 1) {
         const x = u32(a[at + i]);
         const y = u32(b[i]);
         const differ = nz_mask(x ^ y);
@@ -373,16 +450,18 @@ fn below(a: []u8, at: i64, b: []u8) bool {
 /// and that a receiver must verify it: a coordinate at or above p is a second
 /// encoding of a value, and a point off the curve is the invalid-curve attack,
 /// which recovers a private key from a handful of exchanges.
-pub fn valid(p: []u8) bool { return valid_with(curve(), work(), p); }
+pub fn valid(c: Curve, p: []u8) bool { return valid_with(c, work(c), p); }
 
 /// The same check, against a curve and a scratch the caller already has.
 fn valid_with(c: Curve, w: Work, p: []u8) bool {
-    if (array.len(p) != 65) { return false; }
+    if (array.len(p) != 1 + 2 * c.size) { return false; }
     if (p[0] != 4) { return false; }
-    if (!below(p, 1, P) or !below(p, 33, P)) { return false; }
+    if (!below(p, 1, c.pb, c.size) or !below(p, 1 + c.size, c.pb, c.size)) {
+        return false;
+    }
     const m = c.fp;
-    bignum.to_mont(m, w.a, bignum.from_be(p, 1, 32, LIMBS));    // x
-    bignum.to_mont(m, w.b, bignum.from_be(p, 33, 32, LIMBS));   // y
+    bignum.to_mont(m, w.a, bignum.from_be(p, 1, c.size, c.limbs));           // x
+    bignum.to_mont(m, w.b, bignum.from_be(p, 1 + c.size, c.size, c.limbs));  // y
     bignum.mont_sqr(m, w.c, w.b);                               // y^2
     bignum.mont_sqr(m, w.d, w.a);
     bignum.mont_mul(m, w.d, w.d, w.a);                          // x^3
@@ -400,26 +479,25 @@ fn valid_with(c: Curve, w: Work, p: []u8) bool {
 ///
 /// Zero is not one, and neither is anything from n upwards: both would be a
 /// key whose public point is the identity or a repeat of another key's.
-fn private_scalar(secret: []u8) ![]u8 {
-    if (array.len(secret) != 32) { return error.BadScalar; }
-    if (!below(secret, 0, N)) { return error.BadScalar; }
-    const k = bignum.from_be(secret, 0, 32, LIMBS);
+fn private_scalar(c: Curve, secret: []u8) ![]u8 {
+    if (array.len(secret) != c.size) { return error.BadScalar; }
+    if (!below(secret, 0, c.nb, c.size)) { return error.BadScalar; }
+    const k = bignum.from_be(secret, 0, c.size, c.limbs);
     if (bignum.is_zero(k)) { return error.BadScalar; }
     return secret;
 }
 
 /// The public point for `secret`: 65 bytes, `0x04` then X then Y.
-pub fn derive(secret: []u8) ![]u8 {
-    const k = try private_scalar(secret);
-    const c = curve();
-    const w = work();
-    const g = point();
+pub fn derive(c: Curve, secret: []u8) ![]u8 {
+    const k = try private_scalar(c, secret);
+    const w = work(c);
+    const g = point(c);
     bignum.copy(g.x, c.gx);
     bignum.copy(g.y, c.gy);
     bignum.copy(g.z, c.one);
-    const r = point();
+    const r = point(c);
     scalar_mul(c, r, k, g, w);
-    const out = bytes.new(65);
+    const out = bytes.new(1 + 2 * c.size);
     out[0] = 4;
     try pt_affine(c, out, 1, r, w);
     return out;
@@ -431,24 +509,23 @@ pub fn derive(secret: []u8) ![]u8 {
 /// The Y coordinate is thrown away rather than never computed. Deriving both
 /// is what the ladder does anyway, and a key-agreement function that answered
 /// with a point would be one every caller had to remember to cut down.
-pub fn ecdh(secret: []u8, peer: []u8) ![]u8 {
-    const k = try private_scalar(secret);
-    const c = curve();
-    const w = work();
+pub fn ecdh(c: Curve, secret: []u8, peer: []u8) ![]u8 {
+    const k = try private_scalar(c, secret);
+    const w = work(c);
     if (!valid_with(c, w, peer)) { return error.BadPoint; }
-    const q = point();
-    bignum.to_mont(c.fp, q.x, bignum.from_be(peer, 1, 32, LIMBS));
-    bignum.to_mont(c.fp, q.y, bignum.from_be(peer, 33, 32, LIMBS));
+    const q = point(c);
+    bignum.to_mont(c.fp, q.x, bignum.from_be(peer, 1, c.size, c.limbs));
+    bignum.to_mont(c.fp, q.y, bignum.from_be(peer, 1 + c.size, c.size, c.limbs));
     bignum.copy(q.z, c.one);
-    const r = point();
+    const r = point(c);
     scalar_mul(c, r, k, q, w);
     // A cofactor of one and a peer point already checked to be on the curve
     // leave only one way to reach infinity, and that is a scalar that is a
     // multiple of n -- which `private_scalar` has already refused. `pt_affine`
     // says so once more, because it is the place that would otherwise answer.
-    const full = bytes.new(64);
+    const full = bytes.new(2 * c.size);
     try pt_affine(c, full, 0, r, w);
-    return bytes.slice(full, 0, 32);
+    return bytes.slice(full, 0, c.size);
 }
 
 // ---------------------------------------------------------------------------
@@ -478,17 +555,18 @@ const Group = struct {
     one: []u32,
     /// n - 2, the exponent an inversion modulo n is.
     nm2: []u32,
+    bits: i64,
 };
 
-fn group() Group {
-    const m = bignum.mont(bignum.from_be(N, 0, 32, LIMBS));
-    const one = bignum.new(LIMBS);
+fn group(c: Curve) Group {
+    const m = bignum.mont(bignum.from_be(c.nb, 0, c.size, c.limbs));
+    const one = bignum.new(c.limbs);
     bignum.mont_one(m, one);
-    const two = bignum.new(LIMBS);
+    const two = bignum.new(c.limbs);
     two[0] = 2;
-    const nm2 = bignum.new(LIMBS);
-    bignum.sub(nm2, bignum.from_be(N, 0, 32, LIMBS), two);
-    return Group{ .m = m, .one = one, .nm2 = nm2 };
+    const nm2 = bignum.new(c.limbs);
+    bignum.sub(nm2, bignum.from_be(c.nb, 0, c.size, c.limbs), two);
+    return Group{ .m = m, .one = one, .nm2 = nm2, .bits = c.bits };
 }
 
 /// Everything one verification needs, allocated once.
@@ -505,17 +583,18 @@ const Verify = struct {
     t0: Point, t1: Point, t2: Point, t3: Point, acc: Point,
 };
 
-fn verify_work() Verify {
+fn verify_work(c: Curve) Verify {
+    const n = c.limbs;
     return Verify{
-        .w = work(),
-        .z1 = bignum.new(LIMBS), .z2 = bignum.new(LIMBS),
-        .u1 = bignum.new(LIMBS), .u2 = bignum.new(LIMBS),
-        .s1 = bignum.new(LIMBS), .s2 = bignum.new(LIMBS),
-        .m1 = bignum.new(LIMBS), .m2 = bignum.new(LIMBS),
-        .n1 = bignum.new(LIMBS), .n2 = bignum.new(LIMBS), .n3 = bignum.new(LIMBS),
-        .ia = bignum.new(LIMBS), .ib = bignum.new(LIMBS),
-        .t0 = point(), .t1 = point(), .t2 = point(), .t3 = point(),
-        .acc = point(),
+        .w = work(c),
+        .z1 = bignum.new(n), .z2 = bignum.new(n),
+        .u1 = bignum.new(n), .u2 = bignum.new(n),
+        .s1 = bignum.new(n), .s2 = bignum.new(n),
+        .m1 = bignum.new(n), .m2 = bignum.new(n),
+        .n1 = bignum.new(n), .n2 = bignum.new(n), .n3 = bignum.new(n),
+        .ia = bignum.new(n), .ib = bignum.new(n),
+        .t0 = point(c), .t1 = point(c), .t2 = point(c), .t3 = point(c),
+        .acc = point(c),
     };
 }
 
@@ -523,7 +602,7 @@ fn pt_infinity(c: Curve, p: Point) void {
     bignum.copy(p.x, c.one);
     bignum.copy(p.y, c.one);
     var i = 0;
-    while (i < LIMBS) : (i += 1) { p.z[i] = 0; }
+    while (i < c.limbs) : (i += 1) { p.z[i] = 0; }
     return;
 }
 
@@ -567,9 +646,10 @@ fn table_pick(d: i64, v: Verify) Point {
 /// `r = ka * pa + kb * pb`, by walking both scalars at once.
 ///
 /// Shamir's trick: one doubling per bit for the pair rather than one each, and
-/// one addition from a table of the four combinations. That is 256 doublings
-/// and about 192 additions where two separate ladders would be 512 of each --
-/// the optimisation the roadmap left open, taken where it is free.
+/// one addition from a table of the four combinations. That is one doubling
+/// per bit and about three additions per four, where two separate ladders
+/// would be one of each per bit -- the optimisation the roadmap left open,
+/// taken where it is free.
 ///
 /// It is *not* taken on the secret path above, and that is a decision rather
 /// than an omission: a windowed ladder over a secret scalar can reach a step
@@ -583,7 +663,7 @@ fn shamir(c: Curve, r: Point, ka: []u32, pa: Point, kb: []u32, pb: Point, v: Ver
     pt_copy(v.t2, pb);
     pt_add_any(c, v.t3, pa, pb, v);
     pt_infinity(c, r);
-    var i = 255;
+    var i = c.bits - 1;
     while (i >= 0) {
         pt_double(c, r, r, v.w);
         const d = i64(bignum.bit(ka, i)) | (i64(bignum.bit(kb, i)) << 1);
@@ -597,7 +677,7 @@ fn shamir(c: Curve, r: Point, ka: []u32, pa: Point, kb: []u32, pb: Point, v: Ver
 fn sc_inv(g: Group, out: []u32, a: []u32, v: Verify) void {
     bignum.copy(v.ia, g.one);
     bignum.copy(v.ib, a);
-    var i = 255;
+    var i = g.bits - 1;
     while (i >= 0) {
         bignum.mont_sqr(g.m, v.ia, v.ia);
         if (bignum.bit(g.nm2, i) == 1) { bignum.mont_mul(g.m, v.ia, v.ia, v.ib); }
@@ -617,14 +697,14 @@ fn reduce_n(a: []u32, v: Verify) void {
     return;
 }
 
-/// `r` and `s` from a DER `SEQUENCE { INTEGER r, INTEGER s }`, as 64 big-endian
-/// bytes.
+/// `r` and `s` from a DER `SEQUENCE { INTEGER r, INTEGER s }`, as two
+/// coordinate-sized big-endian numbers laid end to end.
 ///
 /// Strict, through `std/der`: a non-minimal integer, a negative one, an
 /// indefinite length or a single trailing byte are all refusals. A signature is
 /// a value a peer chose, and every extra encoding a verifier accepts is a
 /// second name for the same signature.
-fn ecdsa_split(sig: []u8) ![]u8 {
+fn ecdsa_split(c: Curve, sig: []u8) ![]u8 {
     const r = der.reader(sig);
     const seq = try der.read_seq(r);
     try der.expect_end(r);
@@ -633,10 +713,10 @@ fn ecdsa_split(sig: []u8) ![]u8 {
     try der.expect_end(seq);
     const rn = array.len(rb);
     const sn = array.len(sb);
-    if (rn > 32 or sn > 32) { return error.BadSignature; }
-    const out = bytes.new(64);
-    bytes.copy(out, 32 - rn, rb, 0, rn);
-    bytes.copy(out, 64 - sn, sb, 0, sn);
+    if (rn > c.size or sn > c.size) { return error.BadSignature; }
+    const out = bytes.new(2 * c.size);
+    bytes.copy(out, c.size - rn, rb, 0, rn);
+    bytes.copy(out, 2 * c.size - sn, sb, 0, sn);
     return out;
 }
 
@@ -652,34 +732,37 @@ fn ecdsa_split(sig: []u8) ![]u8 {
 /// about this code, and rejecting the high half would refuse signatures that
 /// every other verifier accepts. A protocol that needs a signature to be a
 /// unique name for something needs to say so itself.
-pub fn ecdsa_verify(pubkey: []u8, digest: []u8, sig: []u8) bool {
-    const c = curve();
-    const v = verify_work();
+pub fn ecdsa_verify(c: Curve, pubkey: []u8, digest: []u8, sig: []u8) bool {
+    const v = verify_work(c);
     if (!valid_with(c, v.w, pubkey)) { return false; }
 
-    const rs = ecdsa_split(sig) catch return false;
+    const rs = ecdsa_split(c, sig) catch return false;
     // 0 < r < n and 0 < s < n. A zero either side makes the verification
     // equation degenerate, and a value at or above n is a second encoding.
-    if (!below(rs, 0, N) or !below(rs, 32, N)) { return false; }
-    bignum.copy(v.m2, bignum.from_be(N, 0, 32, LIMBS));
-    const rr = bignum.from_be(rs, 0, 32, LIMBS);
-    const ss = bignum.from_be(rs, 32, 32, LIMBS);
+    if (!below(rs, 0, c.nb, c.size) or !below(rs, c.size, c.nb, c.size)) {
+        return false;
+    }
+    bignum.copy(v.m2, bignum.from_be(c.nb, 0, c.size, c.limbs));
+    const rr = bignum.from_be(rs, 0, c.size, c.limbs);
+    const ss = bignum.from_be(rs, c.size, c.size, c.limbs);
     if (bignum.is_zero(rr) or bignum.is_zero(ss)) { return false; }
 
-    // z is the leftmost 256 bits of the digest -- the whole of a SHA-256 one,
-    // the first half of a SHA-512 one -- taken as a number and reduced.
-    const zb = bytes.new(32);
+    // z is the leftmost `bits` of the digest -- all of a SHA-256 one on P-256,
+    // the first half of a SHA-512 one -- taken as a number and reduced. A
+    // digest shorter than the curve is the whole number, right-aligned, which
+    // is what a SHA-256 signature on P-384 is.
+    const zb = bytes.new(c.size);
     const dn = array.len(digest);
-    if (dn >= 32) {
-        bytes.copy(zb, 0, digest, 0, 32);
+    if (dn >= c.size) {
+        bytes.copy(zb, 0, digest, 0, c.size);
     } else {
-        bytes.copy(zb, 32 - dn, digest, 0, dn);
+        bytes.copy(zb, c.size - dn, digest, 0, dn);
     }
-    const zz = bignum.from_be(zb, 0, 32, LIMBS);
+    const zz = bignum.from_be(zb, 0, c.size, c.limbs);
     reduce_n(zz, v);
 
     // u1 = z/s and u2 = r/s, both modulo n.
-    const g = group();
+    const g = group(c);
     bignum.to_mont(g.m, v.n1, ss);
     sc_inv(g, v.n2, v.n1, v);
     bignum.to_mont(g.m, v.n3, zz);
@@ -690,20 +773,20 @@ pub fn ecdsa_verify(pubkey: []u8, digest: []u8, sig: []u8) bool {
     bignum.from_mont(g.m, v.n3, v.n3);
 
     // R = u1*G + u2*Q, and the signature is good when R's x is r modulo n.
-    const gp = point();
+    const gp = point(c);
     bignum.copy(gp.x, c.gx);
     bignum.copy(gp.y, c.gy);
     bignum.copy(gp.z, c.one);
-    const q = point();
-    bignum.to_mont(c.fp, q.x, bignum.from_be(pubkey, 1, 32, LIMBS));
-    bignum.to_mont(c.fp, q.y, bignum.from_be(pubkey, 33, 32, LIMBS));
+    const q = point(c);
+    bignum.to_mont(c.fp, q.x, bignum.from_be(pubkey, 1, c.size, c.limbs));
+    bignum.to_mont(c.fp, q.y, bignum.from_be(pubkey, 1 + c.size, c.size, c.limbs));
     bignum.copy(q.z, c.one);
     shamir(c, v.acc, v.m1, gp, v.n3, q, v);
     if (bignum.is_zero(v.acc.z)) { return false; }
 
-    const xy = bytes.new(64);
+    const xy = bytes.new(2 * c.size);
     pt_affine(c, xy, 0, v.acc, v.w) catch return false;
-    const xn = bignum.from_be(xy, 0, 32, LIMBS);
+    const xn = bignum.from_be(xy, 0, c.size, c.limbs);
     reduce_n(xn, v);
     return bignum.cmp(xn, rr) == 0;
 }
