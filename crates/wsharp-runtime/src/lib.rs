@@ -13,6 +13,7 @@ pub mod io;
 pub mod mark;
 pub mod stackwalk;
 pub mod strings;
+pub mod transfer;
 pub mod types;
 pub mod worker;
 

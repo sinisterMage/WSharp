@@ -153,6 +153,25 @@ Things in this version that differ from older tutorials, each of which cost time
   dead, because that object may be the only path the snapshot had to something
   live; so the marker never tests `FLAG_DEAD`, and no block is recycled and no
   large object deallocated underneath it.
+- **The runtime has roots of its own, and they are a fourth list.** Generated
+  code's roots are its stack slots and the maps say where they are; a runtime
+  function that *builds* an object graph -- `transfer::decode` is the only one
+  -- holds its half-built pieces in Rust locals instead, which the collector
+  cannot see. Those go on `worker::PINNED`, thread-local beside the stack
+  because only a mutator ever holds one. Adding a place a heap pointer can live
+  means adding it to all four of `gc::collect`'s root set, the evacuation
+  pause's root pass, `evacuate::fix_references` and `--gc-stress`'s verifier;
+  this list is the first thing that had to.
+- **A value crosses to another worker as bytes, never as a pointer.**
+  `transfer::encode` flattens the graph reachable from an object into plain
+  memory with each reference replaced by an index, and `transfer::decode`
+  builds it again in the receiving heap. Allocating into another worker's heap
+  would need its lock, its allocation buffer and its mark parity, and the
+  object would be judged by a collector that never saw it born. `decode` runs
+  in two passes on purpose: the first allocates with every pointer slot left
+  null, because an allocation is a safepoint and a collection between two of
+  them would otherwise read a slot holding an index; the second writes the
+  pointers and allocates nothing, so nothing can move underneath it.
 - **Collector state belongs to a worker, not to the process.** `heap`,
   `buffers`, the phase machine, the mark parity and the statistics all live on
   `worker::Worker`, reached through a thread-local pointer; a collector thread

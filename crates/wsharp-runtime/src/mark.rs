@@ -286,14 +286,16 @@ unsafe fn finish_marking() {
     // what establishes the invariant that barrier maintains: nothing the
     // program holds is in a block that is being emptied.
     gc::set_evacuating(me(), true);
-    unsafe {
-        walk_roots(|slot| {
-            let value = slot.read();
-            if heap::is_evacuating(value) {
-                slot.write(evacuate::evacuate_one(value));
-            }
-        })
+    let mut move_root = |slot: *mut *mut u8| {
+        let value = unsafe { slot.read() };
+        if heap::is_evacuating(value) {
+            unsafe { slot.write(evacuate::evacuate_one(value)) };
+        }
     };
+    unsafe { walk_roots(&mut move_root) };
+    // The runtime's own roots go with the program's: a pinned object left in a
+    // block being emptied would be written through after the block was gone.
+    crate::worker::for_each_pinned_slot(move_root);
 
     {
         let mut s = state();

@@ -167,6 +167,8 @@ unsafe fn fix_fields(obj: *mut u8) {
 ///   marker never scanned, because a new object is born marked), and every
 ///   copy made during the evacuation (whose fields are a snapshot of an
 ///   original's, and so may point at objects that had not moved yet).
+/// * a **runtime root** -- something the runtime is holding while it builds an
+///   object graph, on the list beside the stack that `worker::PINNED` is.
 /// * an entry in one of the **collector's own lists**.
 ///
 /// Under `--gc-stress` the whole heap is walked afterwards and the run aborts
@@ -177,6 +179,7 @@ unsafe fn fix_fields(obj: *mut u8) {
 /// The evacuation pause, after the copying and before the blocks are released.
 pub(crate) unsafe fn fix_references(remembered: &[*mut *mut u8], scan: &[*mut u8]) {
     unsafe { walk_roots(|slot| fix_slot(slot)) };
+    crate::worker::for_each_pinned_slot(|slot| unsafe { fix_slot(slot) });
     for &slot in remembered {
         unsafe { fix_slot(slot) };
     }
@@ -213,6 +216,7 @@ pub(crate) unsafe fn verify_no_stale_references() {
         }
     };
     unsafe { walk_roots(|slot| check(slot.read())) };
+    crate::worker::for_each_pinned_slot(|slot| check(unsafe { slot.read() }));
     heap::for_each_object(true, |obj| {
         if !unsafe { is_marked(obj) } {
             return;

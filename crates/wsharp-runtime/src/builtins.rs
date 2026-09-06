@@ -28,6 +28,13 @@ pub enum BuiltinTy {
     /// the program that catches its errors, so what it can raise is a fact
     /// about the row and nothing else can work it out.
     ErrUnion(&'static BuiltinTy, &'static [&'static str]),
+    /// A type variable that must be copyable to another worker's heap.
+    ///
+    /// Numbered as [`BuiltinTy::Var`] is, and the same variable: the two
+    /// differ only in that this one makes the type checker record a
+    /// `Transferable` constraint on it, which is a question about a type that
+    /// the runtime's small enum cannot ask for itself.
+    Transferable(u8),
     /// A type variable, numbered within one signature: every `Var(0)` in a row
     /// is the same type, and each *use* of the builtin gets its own.
     ///
@@ -70,6 +77,9 @@ impl Builtin {
         }
     }
 }
+
+/// `[]T`, where `T` must be copyable to another worker's heap.
+const TRANSFERABLE_ARRAY: BuiltinTy = BuiltinTy::Array(&BuiltinTy::Transferable(0));
 
 /// Every builtin visible to W# source.
 pub fn builtins() -> Vec<Builtin> {
@@ -331,6 +341,21 @@ fn library() -> Vec<Builtin> {
             params: &[BuiltinTy::Str],
             ret: BuiltinTy::Bool,
             ptr: crate::io::ws_io_exists as *const u8,
+        },
+        // Copy an array out of this worker's heap and build it again, which
+        // is what sending it somewhere does. Exposed for the reason the `gc_*`
+        // counters are: the deep copy is a mechanism the language depends on,
+        // and it should be assertable from W# -- including under
+        // `--gc-stress`, where every allocation it makes is a collection.
+        //
+        // An array rather than a bare `T`, because the implementation is handed
+        // one word and has to know it is a reference.
+        Builtin {
+            module: PRELUDE,
+            name: "gc_transfer",
+            params: &[TRANSFERABLE_ARRAY],
+            ret: TRANSFERABLE_ARRAY,
+            ptr: crate::transfer::ws_transfer_roundtrip as *const u8,
         },
         Builtin {
             module: ARRAY_MODULE,

@@ -210,6 +210,16 @@ enum Constraint {
         widens: bool,
         span: Span,
     },
+    /// Must be a type a value of which can be copied into another worker's
+    /// heap.
+    ///
+    /// A constraint rather than a check on the spot for the reason `Member` is
+    /// one: a generic `send[T]` meets the question before `T` is known. And
+    /// unlike an abstract type it is not a *list* of members but a structural
+    /// walk -- scalars, `str`, arrays and structs whose fields all qualify, and
+    /// never a function, which captures an environment belonging to another
+    /// heap.
+    Transferable { ty: Type, span: Span },
     /// `sub` must be a subset of `sup`.
     ///
     /// What `try` needs: propagating a callee's errors is only sound if this
@@ -237,6 +247,7 @@ impl Constraint {
             Constraint::Numeric { ty, .. }
             | Constraint::Equatable { ty, .. }
             | Constraint::Member { ty, .. } => [ty, ty],
+            Constraint::Transferable { ty, .. } => [ty, ty],
             Constraint::ErrorSetHas { set, .. } => [set, set],
             Constraint::ErrorSubset { sub, sup, .. } => [sub, sup],
             Constraint::Indexable { obj, elem, .. } => [obj, elem],
@@ -3172,7 +3183,7 @@ impl<'a> Inferencer<'a> {
                 let owned = name.to_string();
                 self.error(span, format!("builtin `{owned}` cannot be used as a value"))
                     .help = Some("call it directly, e.g. `print(x)`".into());
-                let ty = self.builtin_type(id);
+                let ty = self.builtin_type(id, span);
                 hir::Expr {
                     kind: hir::ExprKind::Null,
                     ty,
@@ -3414,7 +3425,7 @@ impl<'a> Inferencer<'a> {
     /// scheme: it has one machine implementation, so there is nothing for
     /// monomorphisation to specialise, and the variables only have to be fresh
     /// per use for two calls to `len` to be at different element types.
-    fn builtin_type(&mut self, id: hir::BuiltinId) -> Type {
+    fn builtin_type(&mut self, id: hir::BuiltinId, span: Span) -> Type {
         let builtins = wsharp_runtime::builtins();
         let b = &builtins[id as usize];
         let mut vars = HashMap::new();
@@ -3424,6 +3435,25 @@ impl<'a> Inferencer<'a> {
             .map(|t| Type::from_builtin_with(*t, &mut self.store, &mut vars))
             .collect();
         let ret = Type::from_builtin_with(b.ret, &mut self.store, &mut vars);
+        // A signature may say that one of its variables has to be copyable to
+        // another worker's heap. The runtime's own small type enum cannot ask
+        // that question, so it names the variable and this records it.
+        let mut wants: Vec<u8> = Vec::new();
+        for t in b.params.iter().chain(std::iter::once(&b.ret)) {
+            collect_transferable(*t, &mut wants);
+        }
+        // One variable, one constraint, however many positions name it -- a
+        // signature that takes and returns the same `[]T` names it twice.
+        wants.sort_unstable();
+        wants.dedup();
+        for n in wants {
+            if let Some(ty) = vars.get(&n) {
+                self.constraints.push(Constraint::Transferable {
+                    ty: ty.clone(),
+                    span,
+                });
+            }
+        }
         Type::func(params, ret)
     }
 
@@ -3544,7 +3574,7 @@ impl<'a> Inferencer<'a> {
                 ast::Expr::Ident(name) if self.lookup_binding(name.as_str()).is_none() => {
                     match self.global(name.as_str()).cloned() {
                         Some(GlobalRef::Builtin(id)) => {
-                            (self.builtin_type(id), hir::Callee::Builtin(id))
+                            (self.builtin_type(id, span), hir::Callee::Builtin(id))
                         }
                         _ => {
                             let e = self.infer_expr(callee);
@@ -3561,7 +3591,7 @@ impl<'a> Inferencer<'a> {
                     let Some(GlobalRef::Builtin(id)) = self.module_member_ref(obj, name) else {
                         unreachable!("just matched")
                     };
-                    (self.builtin_type(id), hir::Callee::Builtin(id))
+                    (self.builtin_type(id, span), hir::Callee::Builtin(id))
                 }
                 other => {
                     let e = self.infer_expr(other);
@@ -4316,6 +4346,12 @@ impl<'a> Inferencer<'a> {
         }
         let mut owned = Vec::new();
         for constraint in &self.constraints {
+            // A `Transferable` variable is one the *caller* decides, exactly as
+            // an abstract parameter's is: the solver will never pin it, so
+            // quantifying it changes nothing it could disagree with.
+            if matches!(constraint, Constraint::Transferable { .. }) {
+                continue;
+            }
             for ty in constraint.types() {
                 self.store.collect_vars(ty, &mut owned);
             }
@@ -4618,6 +4654,67 @@ impl<'a> Inferencer<'a> {
         }
     }
 
+    /// The part of `ty` that cannot be copied to another worker, if any.
+    ///
+    /// Structural rather than a table of members, which is why it is not an
+    /// abstract type: what makes a struct transferable is what its fields are,
+    /// and a list could not say that. A variable answers "yes for now" --
+    /// nothing is known about it, and a use that pins it will be checked.
+    fn not_transferable(&mut self, ty: &Type) -> Option<Type> {
+        let mut seen = Vec::new();
+        self.first_untransferable(ty, &mut seen)
+    }
+
+    fn first_untransferable(&mut self, ty: &Type, seen: &mut Vec<StructId>) -> Option<Type> {
+        let resolved = self.store.resolve(ty);
+        match &resolved {
+            Type::Var(_) => None,
+            Type::Con(con, args) => match con {
+                TyCon::I64
+                | TyCon::F64
+                | TyCon::Bool
+                | TyCon::Void
+                | TyCon::Str
+                | TyCon::Error
+                | TyCon::ErrorSet(_) => None,
+                // A code pointer plus an environment object that belongs to the
+                // heap it was made in. Copying the environment would copy
+                // whatever it captured; copying the code pointer alone would
+                // hand another worker an address into a closure it does not
+                // have.
+                TyCon::Fn => Some(resolved.clone()),
+                // The error set rides as a second argument and is not a value.
+                TyCon::Optional | TyCon::ErrUnion | TyCon::Array => {
+                    self.first_untransferable(&args[0].clone(), seen)
+                }
+                TyCon::Abstract(id) => abstract_members(*id)
+                    .into_iter()
+                    .find_map(|m| self.first_untransferable(&m, seen)),
+                TyCon::Struct(id) => {
+                    // A struct may reach itself -- a linked list does -- so a
+                    // second visit answers yes rather than recursing for ever.
+                    if seen.contains(id) {
+                        return None;
+                    }
+                    seen.push(*id);
+                    let fields: Vec<Type> = self.structs[*id as usize]
+                        .fields
+                        .iter()
+                        .map(|f| f.ty.clone())
+                        .collect();
+                    let args = args.clone();
+                    let id = *id;
+                    let found = fields.into_iter().find_map(|f| {
+                        let f = self.substitute_params(id, &args, &f);
+                        self.first_untransferable(&f, seen)
+                    });
+                    seen.pop();
+                    found
+                }
+            },
+        }
+    }
+
     /// `{NotFound, IoFailed}` for a diagnostic.
     fn show_err_set(&mut self, errors: &[hir::ErrorId]) -> String {
         let names: Vec<String> = errors
@@ -4647,6 +4744,30 @@ impl<'a> Inferencer<'a> {
 
         for constraint in constraints {
             match constraint {
+                Constraint::Transferable { ty, span } => {
+                    // Still a variable means a parameter of the scheme about to
+                    // be generalised -- the constrained generic the signature
+                    // asks for -- and monomorphisation reports one nothing ever
+                    // pins.
+                    if let Some(offender) = self.not_transferable(&ty) {
+                        let whole = self.store.show(&ty);
+                        let shown = self.store.show(&offender);
+                        let what = if whole == shown {
+                            format!("`{shown}` cannot be sent to another worker")
+                        } else {
+                            format!(
+                                "`{whole}` cannot be sent to another worker, because \
+                                 `{shown}` cannot"
+                            )
+                        };
+                        self.error(span, what).help = Some(
+                            "a worker has a heap of its own, so a value is copied to reach \
+                             it -- and a function value captures an environment that belongs \
+                             to the heap it was made in"
+                                .into(),
+                        );
+                    }
+                }
                 Constraint::ErrorSetHas {
                     set, errors, span, ..
                 } => {
@@ -5085,6 +5206,18 @@ fn is_place_base(expr: &ast::Expr) -> bool {
 /// Whether control can reach the end of this block, i.e. whether it can fall
 /// through instead of returning or jumping. Used both to require a `return` on
 /// every path and to guarantee code generation can terminate every basic block.
+/// The variables a builtin signature marks as needing to be transferable.
+fn collect_transferable(t: wsharp_runtime::BuiltinTy, out: &mut Vec<u8>) {
+    use wsharp_runtime::BuiltinTy as B;
+    match t {
+        B::Transferable(n) => out.push(n),
+        B::Array(inner) | B::Optional(inner) | B::ErrUnion(inner, _) => {
+            collect_transferable(*inner, out)
+        }
+        _ => {}
+    }
+}
+
 fn block_terminates(block: &ast::Block) -> bool {
     stmts_terminate(&block.stmts)
 }

@@ -146,7 +146,9 @@ impl Type {
                 let set = store.err_set(ids);
                 Type::err_union(Type::from_builtin_with(*inner, store, vars), set)
             }
-            B::Var(n) => vars.entry(n).or_insert_with(|| store.fresh()).clone(),
+            B::Var(n) | B::Transferable(n) => {
+                vars.entry(n).or_insert_with(|| store.fresh()).clone()
+            }
             simple => Type::from_builtin(simple),
         }
     }
@@ -159,7 +161,7 @@ impl Type {
     pub fn from_builtin(t: wsharp_runtime::BuiltinTy) -> Type {
         use wsharp_runtime::BuiltinTy as B;
         match t {
-            B::Array(_) | B::Optional(_) | B::ErrUnion(..) | B::Var(_) => {
+            B::Array(_) | B::Optional(_) | B::ErrUnion(..) | B::Var(_) | B::Transferable(_) => {
                 unreachable!("`{t:?}` needs a type store; use `from_builtin_with`")
             }
             B::I64 => Type::i64(),

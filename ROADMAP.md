@@ -567,6 +567,29 @@ This landed with a single worker and changed nothing observable: the whole
 end-to-end suite passed unaltered, twice, and `WSHARP_GC_STATS` reported the
 same collections, roots, traces and objects moved as before, to the number.
 
+**`Transferable`, and the deep copy.** A sixth `Constraint`, created the way
+`Member` is and deferred for the same reason -- a generic `send[T]` meets the
+question before `T` is known. Unlike an abstract type it is not a list of
+members but a structural walk: scalars, `str`, arrays and structs whose fields
+all qualify, and never a function, which is a code pointer plus an environment
+object belonging to the heap it was made in. A struct that reaches itself
+answers yes on the second visit rather than recursing for ever.
+
+The walk that does the copying needed nothing new: `types::for_each_ptr_offset`
+is already the one definition of where an object's references are, and it
+covers an array's elements as well as a struct's fields. What *was* new is the
+list `decode` needs. It builds a graph in Rust locals, which no stack map
+describes, so every object it makes is pinned on a runtime root list until the
+graph is finished -- and that list is a fourth place a heap pointer can live,
+so it went into `gc::collect`'s root set, the evacuation pause's root pass,
+`evacuate::fix_references` and `--gc-stress`'s verifier, which is the standing
+rule for exactly this.
+
+`gc_transfer` exposes both halves on one worker, for the reason the `gc_*`
+counters are exposed: a mechanism the language depends on should be assertable
+from W#, including under `--gc-stress`, where every allocation `decode` makes
+is a whole collection.
+
 ### What has to change next
 
 - `builtins.rs` gains `spawn`, the handle types, and the broker's operations —

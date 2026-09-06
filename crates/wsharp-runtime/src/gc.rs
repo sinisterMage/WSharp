@@ -537,6 +537,14 @@ pub unsafe fn collect() -> Vec<*mut u8> {
             }
         })
     };
+    // What the runtime is holding, which no stack map describes. See
+    // `worker::PINNED`.
+    crate::worker::for_each_pinned_slot(|slot| {
+        let value = unsafe { slot.read() };
+        if unsafe { is_collectable(value) } {
+            roots.push(value);
+        }
+    });
     worker
         .stats
         .roots_seen

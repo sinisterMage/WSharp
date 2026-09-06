@@ -28,7 +28,7 @@
 //!   worker: correct, because both slow paths are idempotent, and rare,
 //!   because both flags are set only around a pause.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, Once};
@@ -180,6 +180,66 @@ pub(crate) fn for_each_worker(mut f: impl FnMut(&'static Worker)) {
     for worker in list {
         f(worker);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime roots
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Heap references the *runtime* is holding, which no stack map describes.
+    ///
+    /// Generated code's roots are its stack slots, and the maps say where they
+    /// are. A runtime function that builds an object graph -- `transfer::decode`
+    /// is the only one -- holds its half-built pieces in Rust locals instead,
+    /// which the collector cannot see: it would free them between one
+    /// allocation and the next, and move them out from under the pointers
+    /// still to be written.
+    ///
+    /// So they go on a list beside the stack, and that list is a fourth place a
+    /// heap pointer can live. Anything that adds such a place has to be added
+    /// to all four of `gc::collect`'s root set, the evacuation pause's root
+    /// pass, `evacuate::fix_references` and `--gc-stress`'s verifier -- which
+    /// is the standing rule this list is the first user of.
+    ///
+    /// Thread-local rather than on the worker, for the same reason the stack
+    /// is: only the mutator ever holds one, and all three pauses run on the
+    /// mutator.
+    static PINNED: RefCell<Vec<*mut u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Keeps everything pinned above a mark alive, and lets it go again.
+pub(crate) struct Pinned {
+    depth: usize,
+}
+
+impl Pinned {
+    /// Start a region. Every [`Pinned::add`] until this is dropped is a root.
+    pub(crate) fn new() -> Pinned {
+        Pinned {
+            depth: PINNED.with(|p| p.borrow().len()),
+        }
+    }
+
+    pub(crate) fn add(&self, obj: *mut u8) {
+        PINNED.with(|p| p.borrow_mut().push(obj));
+    }
+}
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        PINNED.with(|p| p.borrow_mut().truncate(self.depth));
+    }
+}
+
+/// Visit the *address* of every pinned slot, so a moving collector can rewrite
+/// it in place, exactly as it does a stack slot.
+pub(crate) fn for_each_pinned_slot(mut f: impl FnMut(*mut *mut u8)) {
+    PINNED.with(|p| {
+        for slot in p.borrow_mut().iter_mut() {
+            f(slot as *mut *mut u8);
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
