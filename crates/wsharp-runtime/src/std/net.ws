@@ -56,6 +56,61 @@ pub fn read(s: Socket, max: i64) !str {
     return try raw_read(s.handle, max);
 }
 
+// ---------------------------------------------------------------------------
+// The same three operations, over a buffer the caller owns
+// ---------------------------------------------------------------------------
+//
+// `read`/`write` above hand a fresh `str` over per call, which is the right
+// shape for a protocol made of lines and the wrong one for a protocol made of
+// records: TLS reads up to 16 KiB at a time and works in the buffer it read
+// into. These read *into* a `[]u8` and write *out of* one, so a connection can
+// keep one buffer for its whole life.
+//
+// Read into rather than returning bytes because a builtin may not allocate an
+// array -- `array.new` is lowered inline, since only the call site knows the
+// element type -- and because not allocating is the whole point.
+//
+// An offset outside the buffer panics through the same entry point `a[i]` does,
+// rather than coming back as an error: a stream can be short, but a buffer
+// offset cannot be almost right.
+
+/// At most `max` bytes into `buf` at `at`, answering how many arrived. Zero
+/// means the far end has finished.
+///
+/// `max` is clamped to the room left, so "as much as will fit" is written
+/// `read_into(s, buf, at, array.len(buf))`.
+pub fn read_into(s: Socket, buf: []u8, at: i64, max: i64) !i64 {
+    return try raw_read_into(s.handle, buf, at, max);
+}
+
+/// Write what the socket will take now of `buf[at..at+n]`, and report how much.
+pub fn write_bytes(s: Socket, buf: []u8, at: i64, n: i64) !i64 {
+    return try raw_write_bytes(s.handle, buf, at, n);
+}
+
+/// Write all of `buf[at..at+n]`, however many writes that takes.
+pub fn write_all_bytes(s: Socket, buf: []u8, at: i64, n: i64) !void {
+    var sent = 0;
+    while (sent < n) {
+        const wrote = try raw_write_bytes(s.handle, buf, at + sent, n - sent);
+        if (wrote <= 0) { return error.BrokenPipe; }
+        sent += wrote;
+    }
+    return;
+}
+
+/// Exactly `n` bytes into `buf` at `at`. `error.EndOfFile` if the peer goes
+/// first, which is what makes a record header safe to read in one call.
+pub fn read_exactly_into(s: Socket, buf: []u8, at: i64, n: i64) !void {
+    var got = 0;
+    while (got < n) {
+        const read = try raw_read_into(s.handle, buf, at + got, n - got);
+        if (read == 0) { return error.EndOfFile; }
+        got += read;
+    }
+    return;
+}
+
 /// Write what the socket will take now, and report how much that was.
 pub fn write(s: Socket, bytes: str) !i64 {
     return try raw_write(s.handle, bytes);

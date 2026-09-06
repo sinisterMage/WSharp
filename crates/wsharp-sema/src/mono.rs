@@ -71,6 +71,7 @@ pub fn monomorphize(program: &hir::Program, store: &mut TypeStore) -> MonoResult
             structs: program.structs.clone(),
             funcs,
             strings: program.strings.clone(),
+            arrays: program.arrays.clone(),
             errors: program.errors.clone(),
             entry: Some(new_entry),
             services: mono.services,
@@ -84,6 +85,7 @@ fn clone_program(p: &hir::Program) -> hir::Program {
         structs: p.structs.clone(),
         funcs: p.funcs.clone(),
         strings: p.strings.clone(),
+        arrays: p.arrays.clone(),
         errors: p.errors.clone(),
         entry: p.entry,
         services: p.services.clone(),
@@ -425,6 +427,7 @@ impl Mono<'_> {
             | hir::ExprKind::Float(_)
             | hir::ExprKind::Bool(_)
             | hir::ExprKind::Str(_)
+            | hir::ExprKind::ArrayConst(_)
             | hir::ExprKind::Null
             | hir::ExprKind::Local(_)
             | hir::ExprKind::Singleton(_)

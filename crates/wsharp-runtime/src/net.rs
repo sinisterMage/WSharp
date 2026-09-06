@@ -232,6 +232,89 @@ pub unsafe extern "C" fn ws_net_read(out: *mut crate::io::FallibleStr, socket: i
 /// wants more loops, which it has to anyway: a stream may return short.
 const MAX_READ: i64 = 1 << 20;
 
+/// Read into a buffer the caller owns, and answer how many bytes arrived.
+///
+/// The byte-oriented twin of [`ws_net_read`], and the shape a record layer
+/// wants: one buffer for a whole connection instead of a fresh `str` per read.
+/// It is *read into* rather than *returning bytes* because a builtin may not
+/// allocate an array -- `array.new` is lowered inline, since only the call site
+/// knows the element type -- and because not allocating is the point.
+///
+/// The kernel still reads into a Rust `Vec` first, and that is not laziness:
+/// the receive happens inside a safe region, where this worker is parked and
+/// its collector is free to move objects. A pointer into `buf` taken before
+/// the region would name an object that had moved by the time `recv` wrote
+/// through it. So the copy into `buf` happens after, with nothing in flight.
+///
+/// # Safety
+/// Called from JIT-compiled code across an FFI boundary; `out` must point at
+/// storage laid out as a [`FallibleI64`] and `buf` must be null or a W# `[]u8`.
+pub unsafe extern "C" fn ws_net_read_into(
+    out: *mut FallibleI64,
+    socket: i64,
+    buf: *mut u8,
+    at: i64,
+    max: i64,
+) {
+    unsafe { crate::gc::checkpoint() };
+    let Some(fd) = lookup(socket, Kind::Stream) else {
+        unsafe { out.write(FallibleI64::err(no_such_socket())) };
+        return;
+    };
+    let len = unsafe { crate::bytes::elements(buf) }.len() as i64;
+    // The offset is a mistake if it is outside the buffer; the count is not,
+    // because a stream may return short anyway and "as much as will fit" is
+    // what every caller means.
+    crate::bytes::check_span(at, 0, len);
+    let room = (len - at).min(MAX_READ);
+    let max = max.clamp(0, room) as usize;
+
+    let mut staging = vec![0u8; max];
+    let read = crate::worker::blocking(|| sys::recv(fd, &mut staging));
+    let result = match read {
+        Ok(n) => {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    staging.as_ptr(),
+                    buf.add(crate::header::HEADER_SIZE as usize + at as usize),
+                    n,
+                );
+            }
+            FallibleI64::ok(n as i64)
+        }
+        Err(e) => FallibleI64::err(sys::error_tag(e)),
+    };
+    unsafe { out.write(result) };
+}
+
+/// Write `n` bytes of a buffer to a socket, returning how many were taken.
+///
+/// # Safety
+/// As [`ws_net_read_into`].
+pub unsafe extern "C" fn ws_net_write_bytes(
+    out: *mut FallibleI64,
+    socket: i64,
+    buf: *const u8,
+    at: i64,
+    n: i64,
+) {
+    unsafe { crate::gc::checkpoint() };
+    let Some(fd) = lookup(socket, Kind::Stream) else {
+        unsafe { out.write(FallibleI64::err(no_such_socket())) };
+        return;
+    };
+    let elems = unsafe { crate::bytes::elements(buf) };
+    crate::bytes::check_span(at, n, elems.len() as i64);
+    // Out of the heap before the safe region, for the reason above.
+    let owned = elems[at as usize..(at + n) as usize].to_vec();
+    let sent = crate::worker::blocking(|| sys::send(fd, &owned));
+    let result = match sent {
+        Ok(n) => FallibleI64::ok(n as i64),
+        Err(e) => FallibleI64::err(sys::error_tag(e)),
+    };
+    unsafe { out.write(result) };
+}
+
 /// Write bytes to a socket, returning how many were taken.
 ///
 /// # Safety

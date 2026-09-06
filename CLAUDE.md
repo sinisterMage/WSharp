@@ -151,6 +151,32 @@ extra `sin_len` byte out of this code entirely.
   whole words and sends them to another thread. This was already true of `bool`
   and of every option tag and was simply never exercised; `narrow_worker.ws` is
   the case that would have caught it.
+- **A builtin may write an array it did not allocate, and may not allocate
+  one.** The first half follows from the rule below: a `[]u8` holds no
+  references, so a `memcpy` into one is reading and writing bytes. The second
+  is a fact about the code generator rather than about the collector --
+  `array.new` is lowered inline because only the call site knows the element
+  type, and so the stride and the type id to stamp, and a Rust function has no
+  channel to learn either. So every entry point in `std/bytes` and every
+  byte-oriented socket call is W# allocating and Rust filling. It is also why
+  `net.read_into` reads into a caller's buffer rather than answering with a
+  fresh array, which happens to be the shape a record layer wants anyway.
+- **A library primitive allocates once per call, not once per block.** The
+  whole case suite runs a second time under `--gc-stress`, which collects at
+  *every* allocation, so a temporary inside a hash's or a cipher's block loop
+  turns a test into a timeout. `std/hash`'s message schedule and working words
+  live in the state and are made at `init`; a 64-byte digest and a 64 KiB one
+  both cost six objects, which is checkable with `gc_live_objects()` and worth
+  checking after touching one.
+- **A top-level `const` array is immortal data, and read-only.** It is emitted
+  beside the string literals with `FLAG_IMMORTAL` (`codegen/src/lib.rs` --
+  `define_arrays`), so it needs no roots and no startup initialiser, which is
+  the whole reason it is allowed to be a literal at all: it holds no
+  references. Its elements must therefore be scalars, and inference says so.
+  Writing an element through the `const`'s own name is rejected, because a
+  top-level `const` is shared by every worker and W# has no mutable globals; an
+  alias defeats that check, which is why the data is emitted *writable* -- a
+  read-only page would turn the mistake into a fault with no message.
 - **A builtin may read and write bytes; anything that moves a *reference* from
   one object into another is written in W#.** This is why `std/array`,
   `std/str.split`, `std/net` and `std/http` are `.ws` files compiled with the
@@ -444,6 +470,20 @@ nix-shell --run "cargo test --workspace"
   every `.ws` directly in `tests/cases`, and a file with no `main` is not a
   case; `read_dir` does not recurse, so a subdirectory is where an imported
   module goes.
+- **A cryptographic case is checked against an independent implementation,
+  not against memory.** Every primitive in `std/hash` and `std/cipher` has its
+  published vectors -- FIPS 180-4, RFC 4231, RFC 5869, RFC 8439, FIPS 197, and
+  McGrew and Viega's GCM cases -- and each was confirmed against a second
+  implementation before being written into a header comment. That is not
+  belt-and-braces: a remembered RFC ciphertext turned out to be wrong while the
+  code was right, and the same habit catches the reverse. `node -e` has
+  ChaCha20-Poly1305 and AES-GCM built in, and Python's `hashlib`/`hmac` cover
+  the rest.
+- **An AEAD case tests each way of being wrong separately.** A changed
+  ciphertext, a changed tag, changed additional data that is not itself
+  transmitted, the wrong nonce, the wrong key, and a truncation too short to
+  hold a tag are six different paths, and a single "rejects a bad tag" check
+  covers one of them.
 - **A case that prints a narrow integer converts it.** `print_int` takes an
   `i64`, so a `u8` is written `print_int(i64(x))`; `print_uint` exists for the
   half of `u64`'s range an `i64` cannot hold. Conversions are written and never

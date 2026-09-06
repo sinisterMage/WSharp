@@ -10,6 +10,10 @@ hand on three platform arms, a safe region that lets a thread block without
 stalling its collector, and `std/net` and `std/http` above them. Session 8
 delivered item 9: eight more integer types, the bit operators, and literals
 that take the type they are used at — which is what makes item 10 writable.
+Session 9 began item 10 and delivered its symmetric half: byte buffers, the
+system's generator, SHA-2, HMAC, HKDF, ChaCha20-Poly1305 and AES-GCM, each
+against its published vectors — and, because writing them is what finds the
+holes, the one thing the language turned out to be missing, a `const` table.
 
 This file records what was built and why it was built that way, the limitations
 that were chosen rather than stumbled into, and — for the items still ahead —
@@ -351,7 +355,12 @@ A module system, and four modules behind it.
 | `std/io` | `read_file`, `read_line`, `write_file`, `exists` |
 | `std/http` | the 27 status types, moved out of the global namespace; since item 8, an HTTP/1.1 client and server over `std/net` |
 | `std/broker` | `Topic[M]`, `Consumer[M]` and `topic`, `publish`, `subscribe`, `next`, `commit`, `seek`, `len` |
-| `std/net` | `Socket`, `Listener`, `Poller`, `Event`, `Datagrams`, `Peer`, `Datagram` and `connect`, `listen`, `accept`, `read`, `write`, `write_all`, `read_exactly`, `read_all`, `set_nonblocking`, `poller`, `watch`, `wait`, `udp`, `send_to`, `receive`, `reply`, `close` (item 8) |
+| `std/net` | `Socket`, `Listener`, `Poller`, `Event`, `Datagrams`, `Peer`, `Datagram` and `connect`, `listen`, `accept`, `read`, `write`, `write_all`, `read_exactly`, `read_all`, `set_nonblocking`, `poller`, `watch`, `wait`, `udp`, `send_to`, `receive`, `reply`, `close` (item 8); and since item 10, `read_into`, `write_bytes`, `write_all_bytes`, `read_exactly_into` over a `[]u8` |
+| `std/bytes` | `[]u8` as a buffer and the bridge to `str`: `new`, `of`, `to_str`, `slice`, `concat`, `copy`, `fill`, `xor`, `equal`, the big- and little-endian word accessors, `to_hex`, `from_hex` (item 10) |
+| `std/hash` | SHA-256, SHA-384, SHA-512 one-shot and incremental; `hmac`, `hkdf_extract`, `hkdf_expand` (item 10) |
+| `std/cipher` | ChaCha20, Poly1305, ChaCha20-Poly1305; AES-128/256, GHASH, AES-GCM (item 10) |
+| `std/crypto` | `random` — the system's generator (item 10) |
+| `std/time` | `now` — seconds since the Unix epoch (item 10) |
 
 `==` on `str` works, comparing contents. The prelude — `print`, `assert`, the
 `gc_*` counters — stays global, because every module has it without asking.
@@ -944,23 +953,39 @@ Doing it turned up two things:
   an integer literal was an `i64`, which `comptime_int` has retired; it is now
   that negation is meaningless on an unsigned type. A narrow signed value needs
   a conversion.
-- **An array index is still an `i64`.** Every literal index works, and `i64(i)`
-  covers the rest.
+- **An array index is still an `i64`.** "Every literal index works" is true and
+  is not the case that chafes; writing item 10's ciphers found the one that
+  does, and it is a *byte-valued* index -- `table[b]`. `i64(b)` covers it, and
+  it turned out to be barely met, because a table indexed by a secret byte is
+  the thing constant-time code must not do anyway.
 - **No `u128`, and no `usize`.** The second is deliberate — this language has
   no pointer arithmetic to size, and a type whose overload depends on the
-  target is a type whose overflow does.
+  target is a type whose overflow does. The first was an open question, and
+  item 10 answered it: Poly1305's 130-bit accumulator and GHASH's
+  multiplication in GF(2^128) are the two places a 128-bit type is usually
+  reached for, and both are written without one — five 26-bit limbs in `u64`s
+  for the first, two `u64` halves and 128 shifts for the second. Neither is a
+  workaround; both are the shape a portable implementation has anyway. What is
+  still missing is a 64x64 -> 128 product, and the one place it is genuinely
+  wanted is RSA's `modexp`; `bits.mulhi` is one table row and one arm in
+  `lower.rs` when that day comes.
 - **An overload set distinguished only by integer width needs the conversion
   written at the call.** A literal argument settles to its default before the
   overload is chosen, because which overload is meant is a question about the
   argument's type.
 
 
-## 10. TLS 1.3, written in W# — **next**
+## 10. TLS 1.3, written in W# — **in progress: the symmetric half is done**
 
 Item 8 left `https://` as `error.NotSupported` rather than a connection that
-quietly speaks the wrong protocol. This is what removes it -- and what the
-package manager needs before it can fetch anything from a host it did not
-already trust.
+quietly speaks the wrong protocol. Removing it is what this item is for -- and
+what the package manager needs before it can fetch anything from a host it did
+not already trust.
+
+It is also by a wide margin the largest item in the tree, so it is being built
+in stages, and this section records the first of them rather than pretending
+the whole thing landed at once. **Stage one is the byte plumbing and every
+symmetric primitive TLS 1.3 uses.** The stages after it are listed at the end.
 
 ### Why in W# rather than in the runtime
 
@@ -971,62 +996,142 @@ SHA-256 has a hole in it, and the fastest way to find out where the hole is, is
 to try. The handshake and X.509 have to be W# regardless -- both build object
 graphs, and item 6's rule sends those to `.ws` files.
 
-### What it needs
+**Trying found exactly one hole, and it is now closed.** Every crypto primitive
+in the world is written around a table of constants -- SHA-256's sixty-four
+round words, SHA-512's eighty, AES's round constants, a hex alphabet -- and a
+top-level `const` could only be a literal, so not one of them could be written
+down. Nothing else was missing. That is a better result than the item expected,
+and the fix is described below.
 
-Item 9 landed the arithmetic this needs: 32-bit words that wrap, `& | ^ << >>`,
-and `bits.rotl`. What follows is the rest.
+### What was built
 
-| Piece | Notes |
+| Piece | Where |
 |---|---|
-| Hashes | SHA-256 and SHA-384; HMAC and HKDF on top |
-| Ciphers | AES-128-GCM and AES-256-GCM, ChaCha20-Poly1305 |
-| Key exchange | X25519, and P-256 for a server that will not do better |
-| Signatures | Ed25519 and ECDSA P-256 to speak TLS 1.3; RSA PKCS#1 v1.5 and PSS to *verify certificates*, which is a different and larger problem |
-| Record layer | Framing, sequence numbers, key updates, the 1.2-shaped outer header 1.3 keeps for middleboxes |
-| Handshake | ClientHello through Finished, plus HelloRetryRequest |
-| X.509 | DER parsing, validity and name checking, chain building |
-| Root store | Three platforms, three answers |
+| A top-level `const` array of scalars, emitted as immortal data | `infer.rs` — `const_array`; `codegen/src/lib.rs` — `define_arrays` |
+| `[]u8` as a buffer, and the bridge to and from `str` | `std/bytes.ws`, `bytes.rs` |
+| Byte-oriented sockets: read into a buffer, write out of one | `std/net.ws` — `read_into`, `write_all_bytes`; `net.rs` |
+| The system's CSPRNG, on three arms | `sys/{linux,bsd,windows}.rs` — `random`; `crypto.rs` |
+| The wall clock, likewise | `sys/*` — `wall_clock_secs`; `std/time.now` |
+| SHA-256, SHA-384 and SHA-512, one-shot and incremental | `std/hash.ws` |
+| HMAC and HKDF, written once over a value describing the hash | same |
+| ChaCha20, Poly1305 and ChaCha20-Poly1305 | `std/cipher.ws` |
+| AES-128 and AES-256, GHASH, and AES-GCM | same |
+| Published vectors for every one of them | `tests/cases/{hash_*,cipher_*,bytes_ops,crypto_random}.ws` |
 
-### Decisions worth recording in advance
+### Decisions worth recording
 
-- **Constant time cannot be promised, and saying so is part of the design.**
+- **Constant time is a construction, not a guarantee, and the code says so.**
   W# compiles through Cranelift, which is free to turn a branchless expression
-  into a branch and a conditional move into a jump. There is no `black_box`, no
-  way to pin a secret away from a comparison the optimiser invented. So the
-  implementation should be written constant-time *by construction* -- no
-  secret-dependent indices, no early-exit compares -- and the ROADMAP should
-  say plainly that this is a best effort against a local attacker rather than a
-  guarantee. Anyone who needs the guarantee needs a reviewed C library and an
-  FFI, which is a different item.
-- **TLS 1.3 only.** No 1.2, no fallback, no downgrade dance. A client that
-  cannot talk to a 1.2-only server is a client that fails loudly on a server
-  that should be upgraded, and every hour spent on 1.2 is an hour spent on the
-  version with the worse security story.
-- **RSA is for certificates, not for the handshake.** 1.3 does not do RSA key
-  exchange, but most of the certificate chain on the public internet is still
-  RSA-signed -- so a bignum `modexp` is unavoidable even though nothing in the
-  handshake wants one. An ECDSA-only client would fail against a large share of
-  real hosts, and failing to verify is not an option.
-- **The root store is a fourth arm-shaped problem.** `/etc/ssl/certs` and a
-  handful of distribution-specific paths on Linux, the Keychain on macOS, the
-  system store on Windows -- three implementations behind one question, which
-  is exactly the shape `sys/` already has. Bundling a copy of Mozilla's list
-  instead would make the build reproducible and the trust decisions stale, and
-  staleness in a trust store is the failure mode that matters.
-- **A TLS connection is a `Socket` by another name.** `tls.connect` returns
-  something with `read`, `write` and `close`, so `std/http` takes either and
-  neither knows which -- which is what makes `https://` a one-line change
-  there rather than a second client.
+  into a branch and a select into a jump, and there is no `black_box` to pin a
+  secret away from an optimisation the compiler invented. So the primitives are
+  written constant-time *by construction* -- no secret-dependent indices, no
+  early-exit compares -- and this is stated as a best effort against a local
+  attacker rather than a promise. Anyone who needs the promise needs a reviewed
+  C library behind an FFI, which is a different item.
+- **AES has no S-box table, and GHASH has no multiplication table.** This is
+  the visible cost of the paragraph above. A 256-byte S-box indexed by a byte
+  of the state is indexed by a byte that depends on the key, and which cache
+  line that touches is exactly what a timing attack reads -- so `sbox` inverts
+  in GF(2^8) by exponentiation instead, which is about a hundred times slower
+  and touches the same instructions whatever the input. GHASH is 128 shifts and
+  exclusive-ors for the same reason, and needs no `u128` as a bonus.
+- **A `const` array of scalars is a literal, not a computed global.** The
+  restriction it lifts was never about arrays: it was about needing storage and
+  a startup initialiser, and about the collector needing globals as roots. An
+  immortal array of scalars needs neither -- it is a string literal with a wider
+  element, emitted by the same code path, carrying the same `FLAG_IMMORTAL`, and
+  holding nothing the collector has to trace. Writing an element of one through
+  the `const`'s own name is rejected, because a top-level `const` is shared by
+  every worker and W# has no mutable globals.
+- **A builtin may write an array it did not allocate.** The standing rule is "a
+  builtin may read and write bytes; anything that moves a *reference* is written
+  in W#", and a `[]u8` holds no references, so a `memcpy` into one is on the
+  permitted side of it. What a builtin still may not do is *allocate* an array:
+  `array.new` is lowered inline because only the call site knows the element
+  type, and so the stride and the type id to stamp. Every entry point in
+  `std/bytes` is therefore W# allocating and Rust filling.
+- **The byte-oriented socket API reads into a buffer rather than returning
+  one.** Forced by the rule above, and better than the alternative anyway: the
+  `str` API allocates a fresh object per read, which is right for a protocol
+  made of lines and wrong for one made of 16 KiB records. A connection can now
+  keep one buffer for its whole life. The `str` API is untouched, and `std/http`
+  did not change.
+- **The generator is the system's.** `getrandom` on Linux, `arc4random_buf` on
+  the BSDs, `BCryptGenRandom` on Windows -- a fourth `#[link]`, since neither
+  kernel32 nor ws2_32 has it. A TLS stack is the last place to be clever about
+  entropy: the kernel has it, and it knows things this process cannot, such as
+  that the machine forked or was restored from a snapshot. The call blocks until
+  the pool is initialised, which is correct and is safe here because it is made
+  inside a safe region.
+- **HMAC is written once, over a value.** The three things it needs to know --
+  block size, digest size, and how to hash -- are three fields of a `Hash`
+  struct, the third an ordinary function value. An overload set would have read
+  better and does not work: which overload is meant is a question about a
+  parameter's *type*, and inside a body generic over the algorithm there is no
+  type yet to ask about. This is the same shape, for the same reason, that made
+  `for` ask a type's own module how to walk it.
+- **AES decryption is not written.** GCM is counter mode and encrypts even to
+  decrypt, so the inverse cipher has no caller -- and unreachable code in a
+  security-critical file is exactly the shape a bug hides in.
+- **A digest allocates once, not once per block.** The message schedule and the
+  working words live in the state. This is not tuning: the whole case suite runs
+  a second time under `--gc-stress`, which collects at *every* allocation, so a
+  temporary inside a block loop is the difference between a test and a timeout.
+  It is checkable, and checked -- a 64-byte digest and a 64 KiB one both cost
+  six objects.
 
-### What it costs
+### What it costs, and how that was paid
 
 This is the first thing in the tree where being wrong is a security problem
-rather than a crash. A collector bug shows up as a failing test; a certificate
-chain accepted when it should not have been shows up as nothing at all. The
-mitigation is not cleverness, it is test vectors: RFC 8448's traced handshake,
-Wycheproof for the primitives, and a corpus of certificates that must be
-rejected with the reason each is rejected for. Those go in before the code they
-check, not after.
+rather than a crash. A collector bug shows up as a failing test; a wrong hash
+shows up as nothing at all until something signs with it. The mitigation is not
+cleverness, it is test vectors, and every primitive here has its published ones:
+FIPS 180-4 for SHA-2, RFC 4231 for HMAC, RFC 5869 for HKDF, RFC 8439 for
+ChaCha20 and Poly1305, FIPS 197 for AES, and McGrew and Viega's original cases
+for GCM.
+
+Two habits are worth writing down because both caught something. Vectors were
+**checked against an independent implementation** rather than transcribed from
+memory -- which found that a remembered RFC ciphertext was wrong and the code
+was right, and would equally have found the reverse. And every AEAD has a case
+for each *way* of being wrong: a changed ciphertext, a changed tag, changed
+additional data that is not itself transmitted, the wrong nonce, the wrong key,
+and a truncation that leaves no room for a tag.
+
+### What is left
+
+The stages after this one, in the order they have to happen:
+
+| Stage | Contents |
+|---|---|
+| 2 | X25519, and P-256 for a server that will not do better |
+| 3 | A bignum, and RSA PKCS#1 v1.5 and PSS -- to *verify certificates*, since 1.3 does no RSA key exchange, and most of the public internet's chain is still RSA-signed |
+| 4 | Ed25519 and ECDSA P-256; the record layer; ClientHello through Finished, plus HelloRetryRequest |
+| 5 | X.509: DER parsing, validity and name checking, chain building; the root store on three platforms; `https://` |
+
+And the decisions already taken about them:
+
+- **TLS 1.3 only.** No 1.2, no fallback, no downgrade dance. A client that
+  cannot talk to a 1.2-only server fails loudly against a server that should be
+  upgraded, and every hour spent on 1.2 is an hour spent on the version with the
+  worse security story.
+- **The root store is a fourth arm-shaped problem**, and the exploration for
+  this stage narrowed it. Most Linux distributions ship a concatenated PEM
+  bundle, so a list of candidate paths tried with the existing `io.exists` and
+  `io.read_file` covers Linux with no new syscall at all; macOS ships no such
+  file and needs Security.framework, and Windows' store is not a file path, so
+  neither would have been helped by a directory listing. Bundling a copy of
+  Mozilla's list instead would make the build reproducible and the trust
+  decisions stale, and staleness in a trust store is the failure mode that
+  matters.
+- **A TLS connection is a `Socket` by another name**, and `std/http` is already
+  shaped for it: every read and write in that module bottoms out in three calls
+  on `Conn.socket`, so `https://` is a change to `Conn` and `parse_url` rather
+  than a second client.
+- **The wall clock has no caller yet.** It went in with this stage because it is
+  one declaration per arm and because X.509 validity checking is the first thing
+  stage five needs; it is exposed as `std/time.now` and tested against a date
+  that has certainly passed.
 
 ---
 
@@ -1156,3 +1261,21 @@ These are deliberate limitations, each with a clear fix:
   and `i64(i)` covers the rest.
 - **x86-64 and aarch64 only.** The collector reads the frame pointer with
   inline assembly; other architectures get a `compile_error!`.
+- **`g[i][j] = v` is rejected**, because the base of a place must be a variable
+  or a field chain -- a compound assignment evaluates its target twice, and
+  restricting the base is what keeps that unobservable. `var row = g[i];
+  row[j] = v;` is the spelling, and it is correct rather than merely accepted,
+  since an array is a reference. Found while writing item 10's AES, where it
+  cost nothing: the state is a flat sixteen-byte buffer, which is how AES is
+  written anyway.
+- **`wsharp check` accepts a program `wsharp run` rejects**, when a generic
+  call's type variable is never pinned. `var b = array.new(32);` with nothing
+  to say what the elements are passes the first and fails the second with
+  `cannot tell what type main is being used at`, because `check` does not
+  monomorphise. The diagnostic is right; which command reports it is not.
+- **A top-level `const` array can be written through an alias.** `K[0] = 1` is
+  rejected, and `var a = K; a[0] = 1;` is not: the second is a local holding
+  the same address, and W# has no way to say that a reference is read-only.
+  The data is emitted writable rather than read-only for that reason, so the
+  mistake is a shared table quietly changing rather than a fault with no
+  message.

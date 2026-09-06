@@ -4,10 +4,13 @@
 // comparing two numbers says nothing about which kind they are: each is a
 // constrained generic, compiled once per type it is used at.
 //
-// `abs` and `sign` cannot be, and the reason is worth knowing: they compare
-// against a literal zero, and an integer literal is an `i64`, so a single
-// definition would pin `Number` to `i64` at the comparison. They are an
-// overload set instead -- which is what the language is for.
+// `abs` and `sign` cannot be, and the reason changed when item 9 landed. It
+// used to be that they compare against a literal zero and an integer literal
+// was an `i64`, so a single definition would pin `Number` to `i64` at the
+// comparison; `comptime_int` retired that. What stands instead is that both
+// negate, and negation is meaningless on an unsigned type -- which `Number`
+// includes. They are an overload set for that reason, and a narrow signed
+// value needs a conversion to use one.
 //
 // The rest are `f64` machine instructions and come from the builtin table.
 

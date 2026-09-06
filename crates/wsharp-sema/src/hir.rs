@@ -15,6 +15,8 @@ use crate::ty::{Scheme, StructId, Type};
 pub type FuncId = u32;
 pub type LocalId = u32;
 pub type StrId = u32;
+/// Index into [`Program::arrays`]; a top-level `const` array of scalars.
+pub type ArrayId = u32;
 pub type BuiltinId = u32;
 /// Index into [`Program::errors`]; the runtime representation of an error value.
 pub type ErrorId = u32;
@@ -25,6 +27,8 @@ pub struct Program {
     pub funcs: Vec<FuncDef>,
     /// String literals, emitted as immortal static data by the code generator.
     pub strings: Vec<String>,
+    /// Top-level `const` arrays, emitted the same way and for the same reason.
+    pub arrays: Vec<ArrayConst>,
     /// Error names in declaration order; an error value is one of these indices.
     pub errors: Vec<String>,
     /// `main`, if the program has one.
@@ -43,6 +47,23 @@ impl Program {
     pub fn strukt(&self, id: StructId) -> &StructDef {
         &self.structs[id as usize]
     }
+}
+
+/// A top-level `const` bound to an array of scalar literals.
+///
+/// Emitted into the data section beside the string literals and immortal for
+/// the same reason: the collector must neither move it nor free it. It holds
+/// no references -- which is the whole of why it needs no roots and no startup
+/// initialiser, and so why it is a literal rather than a computed global.
+#[derive(Debug, Clone)]
+pub struct ArrayConst {
+    /// The array type. Its rendered form is the key the code generator looks
+    /// the runtime type id up by, and its element decides the stride.
+    pub ty: Type,
+    /// One entry per element, already masked into its element's width: an
+    /// integer as `IntTy::mask` leaves it, an `f64` as its bits, a `bool` as 0
+    /// or 1. The code generator writes the low `stride` bytes of each.
+    pub values: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +243,10 @@ pub enum ExprKind {
     Float(f64),
     Bool(bool),
     Str(StrId),
+    /// The address of a top-level `const` array, which lives in the data
+    /// section rather than the heap. No allocation, exactly as [`Self::Str`]
+    /// and [`Self::Singleton`] are none.
+    ArrayConst(ArrayId),
     /// The absent case of an optional.
     Null,
     Local(LocalId),

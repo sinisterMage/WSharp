@@ -251,6 +251,9 @@ fn library() -> Vec<Builtin> {
     // reads the count out of the header either way.
     const ELEM: &BuiltinTy = &BuiltinTy::Var(0);
     const ARRAY_OF_ELEM: BuiltinTy = BuiltinTy::Array(ELEM);
+    /// `[]u8` written out: `std/bytes` is not generic over its element, because
+    /// what it means by a byte is a byte.
+    const BYTES_OF_U8: BuiltinTy = BuiltinTy::Array(&BuiltinTy::U8);
     vec![
         Builtin {
             module: STR_MODULE,
@@ -375,6 +378,60 @@ fn library() -> Vec<Builtin> {
             params: &[ARRAY_OF_ELEM],
             ret: BuiltinTy::I64,
             ptr: crate::strings::ws_array_len as *const u8,
+        },
+        // `std/bytes`. Each of these writes into an object the caller made:
+        // a `[]u8` holds no references, so nothing here can create a stale
+        // one, and `array.new` is lowered inline so the allocation had to be
+        // W#'s anyway. See `crate::bytes`.
+        Builtin {
+            module: BYTES_MODULE,
+            name: "raw_to_str",
+            params: &[BYTES_OF_U8, BuiltinTy::I64, BuiltinTy::I64],
+            ret: BuiltinTy::Str,
+            ptr: crate::bytes::ws_bytes_to_str as *const u8,
+        },
+        Builtin {
+            module: BYTES_MODULE,
+            name: "raw_from_str",
+            params: &[BYTES_OF_U8, BuiltinTy::I64, BuiltinTy::Str],
+            ret: BuiltinTy::Void,
+            ptr: crate::bytes::ws_bytes_from_str as *const u8,
+        },
+        Builtin {
+            module: BYTES_MODULE,
+            name: "copy",
+            params: &[
+                BYTES_OF_U8,
+                BuiltinTy::I64,
+                BYTES_OF_U8,
+                BuiltinTy::I64,
+                BuiltinTy::I64,
+            ],
+            ret: BuiltinTy::Void,
+            ptr: crate::bytes::ws_bytes_copy as *const u8,
+        },
+        Builtin {
+            module: BYTES_MODULE,
+            name: "equal",
+            params: &[BYTES_OF_U8, BYTES_OF_U8],
+            ret: BuiltinTy::Bool,
+            ptr: crate::bytes::ws_bytes_equal as *const u8,
+        },
+        Builtin {
+            module: CRYPTO_MODULE,
+            name: "raw_random",
+            params: &[BuiltinTy::I64],
+            // The same set `std/io` raises, since this is the same kind of
+            // failure: the system was asked for something and said no.
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::Str, &["PermissionDenied", "IoFailed"]),
+            ptr: crate::crypto::ws_crypto_random as *const u8,
+        },
+        Builtin {
+            module: TIME_MODULE,
+            name: "now",
+            params: &[],
+            ret: BuiltinTy::I64,
+            ptr: crate::crypto::ws_time_now as *const u8,
         },
         Builtin {
             module: MATH_MODULE,
@@ -547,6 +604,20 @@ fn library() -> Vec<Builtin> {
             params: &[BuiltinTy::I64, BuiltinTy::I64],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::Str, NET_ERRORS),
             ptr: crate::net::ws_net_read as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_read_into",
+            params: &[BuiltinTy::I64, BYTES_OF_U8, BuiltinTy::I64, BuiltinTy::I64],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            ptr: crate::net::ws_net_read_into as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_write_bytes",
+            params: &[BuiltinTy::I64, BYTES_OF_U8, BuiltinTy::I64, BuiltinTy::I64],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            ptr: crate::net::ws_net_write_bytes as *const u8,
         },
         Builtin {
             module: NET_MODULE,
@@ -748,6 +819,16 @@ pub const LIST_MODULE: &str = "std/list";
 pub const MATH_MODULE: &str = "std/math";
 /// The standard library's file and standard-input operations.
 pub const IO_MODULE: &str = "std/io";
+/// The standard library's byte buffers, and the bridge to `str`.
+pub const BYTES_MODULE: &str = "std/bytes";
+/// The standard library's AEADs: ChaCha20-Poly1305 and AES-GCM.
+pub const CIPHER_MODULE: &str = "std/cipher";
+/// The standard library's hashes: SHA-2, HMAC and HKDF.
+pub const HASH_MODULE: &str = "std/hash";
+/// The system's random bytes.
+pub const CRYPTO_MODULE: &str = "std/crypto";
+/// The wall clock.
+pub const TIME_MODULE: &str = "std/time";
 
 /// The error names the library can raise, in the order their ids are assigned.
 ///
@@ -864,6 +945,10 @@ pub fn std_module_sources() -> &'static [(&'static str, &'static str)] {
         (ARRAY_MODULE, include_str!("std/array.ws")),
         (LIST_MODULE, include_str!("std/list.ws")),
         (STR_MODULE, include_str!("std/str.ws")),
+        (BYTES_MODULE, include_str!("std/bytes.ws")),
+        (CRYPTO_MODULE, include_str!("std/crypto.ws")),
+        (HASH_MODULE, include_str!("std/hash.ws")),
+        (CIPHER_MODULE, include_str!("std/cipher.ws")),
         (MATH_MODULE, include_str!("std/math.ws")),
         (BROKER_MODULE, include_str!("std/broker.ws")),
         (NET_MODULE, include_str!("std/net.ws")),

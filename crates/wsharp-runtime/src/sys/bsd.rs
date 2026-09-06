@@ -27,6 +27,15 @@ mod c {
         pub(super) fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
         #[cfg(test)]
         pub(super) fn unlink(path: *const u8) -> c_int;
+        /// Bytes from the kernel's generator. Void return and no length cap,
+        /// because it cannot fail: it is present on macOS and on every BSD,
+        /// and reseeds itself across a fork. `getentropy` is the alternative
+        /// and is capped at 256 bytes a call, which would mean a loop for no
+        /// benefit.
+        pub(super) fn arc4random_buf(buf: *mut u8, len: usize);
+        /// Seconds since the Unix epoch. `time_t` is 64 bits on every member
+        /// of this family that this collector's inline assembly supports.
+        pub(super) fn time(out: *mut i64) -> i64;
     }
 
     // `errno`'s address, whose spelling is the one thing here that is not
@@ -110,6 +119,19 @@ fn c_path(path: &[u8]) -> Result<Vec<u8>, Errno> {
 
 fn set_cloexec(fd: c_int) {
     unsafe { c::fcntl(fd, F_SETFD, FD_CLOEXEC) };
+}
+
+/// Bytes from the kernel, and how many arrived -- always all of them.
+///
+/// The easy arm. `arc4random_buf` has no failure mode to report and no cap to
+/// loop around; the shared wrapper's loop simply runs once.
+pub(crate) fn random(buf: &mut [u8]) -> Result<usize, Errno> {
+    unsafe { c::arc4random_buf(buf.as_mut_ptr(), buf.len()) };
+    Ok(buf.len())
+}
+
+pub(crate) fn wall_clock_secs() -> i64 {
+    unsafe { c::time(std::ptr::null_mut()) }
 }
 
 pub(crate) fn open_read(path: &[u8]) -> Result<Fd, Errno> {

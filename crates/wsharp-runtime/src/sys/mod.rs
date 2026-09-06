@@ -126,6 +126,45 @@ pub(crate) fn exists(path: &[u8]) -> bool {
     imp::exists(path)
 }
 
+// ---------------------------------------------------------------------------
+// Entropy, and the clock
+// ---------------------------------------------------------------------------
+
+/// Fill `buf` with bytes from the system's cryptographic generator.
+///
+/// The system's, not one of ours. A generator is the one part of a TLS stack
+/// where being clever is purely downside: the kernel has the entropy, it
+/// reseeds across a fork and a VM snapshot, and nothing written here could
+/// know when either happened.
+///
+/// The loop is here rather than in the arms because two of the three can
+/// return short -- `getrandom` caps a call at 32 MiB and gives back what it
+/// has when a signal arrives -- and because `EINTR` is handled once in this
+/// file for everything else too.
+pub(crate) fn random(buf: &mut [u8]) -> Result<(), Errno> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match imp::random(&mut buf[filled..]) {
+            Ok(0) => return Err(io_failed()),
+            Ok(n) => filled += n,
+            Err(e) if e.is_interrupted() => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Seconds since the Unix epoch.
+///
+/// Seconds because the only caller that matters is a certificate's
+/// `notBefore`/`notAfter`, which are written to the second. Wall clock rather
+/// than the monotonic one the collector times its pauses with: this answers
+/// "what is the date", which is a different question from "how long did that
+/// take" and has a different failure mode -- it can go backwards.
+pub(crate) fn wall_clock_secs() -> i64 {
+    imp::wall_clock_secs()
+}
+
 /// Everything left on `fd`.
 pub(crate) fn read_to_end(fd: Fd) -> Result<Vec<u8>, Errno> {
     let mut out = Vec::new();

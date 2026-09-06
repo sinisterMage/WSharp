@@ -9,11 +9,12 @@
 use super::{Errno, Fd};
 
 pub(crate) type c_int = i32;
+pub(crate) type c_uint = u32;
 
 /// The C library, in a module of its own so that the wrappers below can
 /// keep the names the rest of the runtime calls them by.
 mod c {
-    use super::c_int;
+    use super::{c_int, c_uint};
 
     unsafe extern "C" {
         /// Variadic because it is: the third argument exists only when `O_CREAT` is
@@ -28,6 +29,15 @@ mod c {
         pub(super) fn unlink(path: *const u8) -> c_int;
         /// `errno` is a macro in C, and this is what it expands to.
         pub(super) fn __errno_location() -> *mut c_int;
+        /// Bytes from the kernel's generator. glibc has exported this since
+        /// 2.25 and musl since 1.1.20, which is what keeps it a C library
+        /// symbol like everything else here rather than a raw `syscall`.
+        pub(super) fn getrandom(buf: *mut u8, len: usize, flags: c_uint) -> isize;
+        /// Seconds since the Unix epoch, or -1. One field, so there is no
+        /// `struct timespec` to lay out and no 32-bit `time_t` to worry about:
+        /// the return is a `time_t`, and on every target this collector
+        /// supports that is 64 bits wide.
+        pub(super) fn time(out: *mut i64) -> i64;
     }
 }
 
@@ -83,6 +93,23 @@ fn c_path(path: &[u8]) -> Result<Vec<u8>, Errno> {
     out.extend_from_slice(path);
     out.push(0);
     Ok(out)
+}
+
+/// Bytes from the kernel, and how many arrived.
+///
+/// Flags of zero, which means "block until the pool is initialised" -- the
+/// only correct choice for a key. It matters exactly once, in the first
+/// seconds of a boot, and the alternative is a generator that answers before
+/// it has anything to answer with. The blocking is safe here for the reason
+/// every other blocking call in this layer is: the caller makes it inside a
+/// safe region, so this worker's collector can walk its stack while it waits.
+pub(crate) fn random(buf: &mut [u8]) -> Result<usize, Errno> {
+    let n = unsafe { c::getrandom(buf.as_mut_ptr(), buf.len(), 0) };
+    if n < 0 { Err(errno()) } else { Ok(n as usize) }
+}
+
+pub(crate) fn wall_clock_secs() -> i64 {
+    unsafe { c::time(std::ptr::null_mut()) }
 }
 
 pub(crate) fn open_read(path: &[u8]) -> Result<Fd, Errno> {

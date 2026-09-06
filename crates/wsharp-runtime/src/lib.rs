@@ -6,6 +6,8 @@
 
 pub mod broker;
 pub mod builtins;
+pub mod bytes;
+pub mod crypto;
 pub mod evacuate;
 pub mod gc;
 pub mod header;

@@ -55,6 +55,9 @@ pub struct Decls {
     pub builtins: Vec<FuncId>,
     /// Indexed by `hir::StrId`.
     pub strings: Vec<DataId>,
+    /// Indexed by `hir::ArrayId`: a top-level `const` array, in the data
+    /// section beside the strings, so naming one allocates nothing.
+    pub arrays: Vec<DataId>,
     /// Indexed by `StructId`; only zero-field structs have one. Their sole
     /// instance lives in the data section, so naming a status type is free.
     pub singletons: Vec<Option<DataId>>,
@@ -1016,6 +1019,13 @@ impl Trans<'_, '_> {
             }
             hir::ExprKind::Str(id) => {
                 let data = self.decls.strings[*id as usize];
+                let gv = self.module.declare_data_in_func(data, self.b.func);
+                SmallVec::from_slice(&[self.b.ins().symbol_value(PTR, gv)])
+            }
+            hir::ExprKind::ArrayConst(id) => {
+                // Exactly like a string literal, and a singleton: one static
+                // object, referenced by address, allocating nothing.
+                let data = self.decls.arrays[*id as usize];
                 let gv = self.module.declare_data_in_func(data, self.b.func);
                 SmallVec::from_slice(&[self.b.ins().symbol_value(PTR, gv)])
             }

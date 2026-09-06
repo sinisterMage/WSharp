@@ -80,6 +80,8 @@ everywhere.** They are checked when written and inferred when not.
 | Modules | `const http = @import("std/http");`, then `http.NotFound404`; `pub` is what another module may name |
 | Workers | `@spawn(counter, 0)` starts a thread with a heap of its own, `w.add(5)` calls into it, `@join(w)` waits for it |
 | Messages | `std/broker` — named topics, partitioned logs, consumer groups with their own offsets, and replay |
+| Bytes | `std/bytes` — `[]u8` as a buffer, the bridge to and from `str`, word accessors and hex |
+| Crypto | `std/hash` — SHA-2, HMAC, HKDF; `std/cipher` — ChaCha20-Poly1305 and AES-GCM; `std/crypto` — the system's generator |
 | Structs | `const P = struct { x: i64 };`, `P{ .x = 1 }`, `p.x` |
 | Subtyping | `const Sub = struct : Base { };` — a subtype widens implicitly |
 | Singletons | a struct with no fields is also a value: its sole instance |

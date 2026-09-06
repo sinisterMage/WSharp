@@ -55,6 +55,74 @@ unsafe extern "system" {
     fn DeleteFileW(path: *const u16) -> BOOL;
 }
 
+// Bytes from the system's generator. Neither kernel32 nor ws2_32 has it, so
+// this is a third library -- and `BCryptGenRandom` is the documented modern
+// entry point. `RtlGenRandom` is the older alternative and is reached by the
+// ordinal name `SystemFunction036`, which Microsoft has never documented.
+#[link(name = "bcrypt")]
+unsafe extern "system" {
+    fn BCryptGenRandom(algorithm: *mut c_void, buf: *mut u8, len: DWORD, flags: DWORD) -> NTSTATUS;
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetSystemTimeAsFileTime(out: *mut FILETIME);
+}
+
+/// Not a `BOOL` and not an `errno`: zero is success and anything else is a
+/// status code that `GetLastError` knows nothing about.
+type NTSTATUS = i32;
+
+/// 100-nanosecond ticks since 1601-01-01, split in two because the struct is.
+#[repr(C)]
+struct FILETIME {
+    low: DWORD,
+    high: DWORD,
+}
+
+/// Ask for the system-preferred algorithm, which is what lets the handle be
+/// null and saves opening one.
+const BCRYPT_USE_SYSTEM_PREFERRED_RNG: DWORD = 0x0000_0002;
+
+/// 1601-01-01 to 1970-01-01, in the 100-nanosecond ticks a `FILETIME` counts.
+const FILETIME_EPOCH_DELTA: u64 = 116_444_736_000_000_000;
+const FILETIME_TICKS_PER_SECOND: u64 = 10_000_000;
+
+/// Bytes from the system, and how many arrived -- always all of them, since
+/// this either fills the buffer or fails.
+///
+/// A single call is capped at a `DWORD`'s worth, which the shared wrapper's
+/// loop takes care of. The status is not an `errno`, so it cannot go through
+/// `error_tag`: a failure here is reported as plain I/O failure, which is the
+/// truth -- there is nothing a program could do differently for one code
+/// rather than another.
+pub(crate) fn random(buf: &mut [u8]) -> Result<usize, Errno> {
+    let want = buf.len().min(DWORD::MAX as usize);
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            want as DWORD,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status == 0 {
+        Ok(want)
+    } else {
+        Err(Errno(EIO))
+    }
+}
+
+pub(crate) fn wall_clock_secs() -> i64 {
+    let mut ft = FILETIME { low: 0, high: 0 };
+    unsafe { GetSystemTimeAsFileTime(&raw mut ft) };
+    let ticks = (u64::from(ft.high) << 32) | u64::from(ft.low);
+    // Before the Unix epoch the subtraction would wrap, which a clock set to
+    // 1600 could produce. Saturating there gives a date the caller will reject
+    // rather than one far in the future that it will not.
+    ticks.saturating_sub(FILETIME_EPOCH_DELTA) as i64 / FILETIME_TICKS_PER_SECOND as i64
+}
+
 const GENERIC_READ: DWORD = 0x8000_0000;
 const GENERIC_WRITE: DWORD = 0x4000_0000;
 const FILE_SHARE_READ: DWORD = 0x0000_0001;

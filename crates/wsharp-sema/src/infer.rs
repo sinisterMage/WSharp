@@ -510,6 +510,11 @@ struct Inferencer<'a> {
 
     strings: Vec<String>,
     string_ids: HashMap<String, hir::StrId>,
+    /// Top-level `const` arrays, in declaration order. Not interned by value
+    /// the way strings are: two tables that happen to hold the same numbers
+    /// are still two names, and sharing one object between them would make
+    /// them the same object.
+    arrays: Vec<hir::ArrayConst>,
 
     frames: Vec<Frame>,
     /// Qualified keys another module may *not* name. Private is the default, so
@@ -583,6 +588,7 @@ impl<'a> Inferencer<'a> {
             funcs: Vec::new(),
             strings: Vec::new(),
             string_ids: HashMap::new(),
+            arrays: Vec::new(),
             frames: Vec::new(),
             services: Vec::new(),
             service_of: HashMap::new(),
@@ -717,6 +723,7 @@ impl<'a> Inferencer<'a> {
                 structs: self.structs,
                 funcs,
                 strings: self.strings,
+                arrays: self.arrays,
                 errors: self.store.error_names().to_vec(),
                 entry,
                 services: self.services,
@@ -1453,6 +1460,18 @@ impl<'a> Inferencer<'a> {
                     let inner = self.store.fresh();
                     (Type::optional(inner), hir::ExprKind::Null)
                 }
+                // An array of scalar literals is a literal too, and it is
+                // the one whose absence was felt: SHA-256's round constants,
+                // AES's round table, a hex alphabet. It is emitted as one
+                // immortal object in the data section rather than substituted
+                // at each use, so naming it costs an address and mentioning it
+                // inside a loop allocates nothing.
+                ast::Expr::ArrayLit { elem, elems, .. } => {
+                    match self.const_array(elem, elems, decl.value.span()) {
+                        Some(pair) => pair,
+                        None => return,
+                    }
+                }
                 other => {
                     self.error(other.span(), "a top-level `const` must be a literal or a `fn`")
                     .help = Some(
@@ -1478,6 +1497,118 @@ impl<'a> Inferencer<'a> {
         let global = GlobalRef::Const(self.consts.len());
         self.declare_global(decl.name.as_str(), global, decl.name.span);
         self.consts.push(ConstDef { scheme, kind });
+    }
+
+    /// A top-level `const` array of scalar literals, as one immortal object.
+    ///
+    /// Two restrictions, each with a different reason. The elements must be
+    /// **literals** for the reason every top-level `const`'s value must be:
+    /// there is no startup initialiser to run anything in. They must be
+    /// **scalars** because an object in the data section is never traced --
+    /// a reference stored in one would be a reference the collector cannot
+    /// see, and `for_each_ptr_offset` would walk into it during a trace.
+    ///
+    /// What falls out is that this needs no globals, no roots and no barrier:
+    /// it is a string literal with a wider element.
+    fn const_array(
+        &mut self,
+        elem: &ast::TypeExpr,
+        elems: &[ast::Expr],
+        span: Span,
+    ) -> Option<(Type, hir::ExprKind)> {
+        let elem_ty = self.resolve_type_expr(elem);
+        if !matches!(
+            self.store.resolve(&elem_ty),
+            Type::Con(TyCon::Int(_) | TyCon::F64 | TyCon::Bool, _)
+        ) {
+            let shown = self.store.show(&elem_ty);
+            self.error(
+                span,
+                format!("a top-level `const` array may not hold `{shown}`"),
+            )
+            .help = Some(
+                "it lives in the data section, which the collector never traces -- so its \
+                 elements must be numbers or booleans, never anything holding a reference"
+                    .into(),
+            );
+            return None;
+        }
+
+        let mut values = Vec::with_capacity(elems.len());
+        for e in elems {
+            values.push(self.const_scalar(e, &elem_ty)?);
+        }
+
+        let ty = Type::array(elem_ty);
+        let id = self.arrays.len() as hir::ArrayId;
+        self.arrays.push(hir::ArrayConst {
+            ty: ty.clone(),
+            values,
+        });
+        Some((ty, hir::ExprKind::ArrayConst(id)))
+    }
+
+    /// One element of such an array, as the bits the code generator writes.
+    ///
+    /// A minus sign is folded into the literal here for the reason it is
+    /// everywhere else: without it `-128` is the negation of `128`, and the one
+    /// value each signed type has that its positive twin does not would be
+    /// unwritable.
+    fn const_scalar(&mut self, e: &ast::Expr, elem_ty: &Type) -> Option<u64> {
+        let negated = |expr: &ast::Expr| -> Option<i128> {
+            match expr {
+                ast::Expr::Unary {
+                    op: UnOp::Neg,
+                    expr,
+                    ..
+                } => match **expr {
+                    ast::Expr::Int(v, _) => Some(-v),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let int = match e {
+            ast::Expr::Int(v, _) => Some(*v),
+            other => negated(other),
+        };
+        match (self.store.resolve(elem_ty), int) {
+            (Type::Con(TyCon::Int(t), _), Some(v)) => {
+                self.check_literal_fits(t, v, e.span());
+                Some(t.mask(v) as u64)
+            }
+            (Type::Con(TyCon::F64, _), _) => match e {
+                ast::Expr::Float(v, _) => Some(v.to_bits()),
+                _ => {
+                    self.element_must_be_literal(e, elem_ty);
+                    None
+                }
+            },
+            (Type::Con(TyCon::Bool, _), _) => match e {
+                ast::Expr::Bool(v, _) => Some(u64::from(*v)),
+                _ => {
+                    self.element_must_be_literal(e, elem_ty);
+                    None
+                }
+            },
+            _ => {
+                self.element_must_be_literal(e, elem_ty);
+                None
+            }
+        }
+    }
+
+    fn element_must_be_literal(&mut self, e: &ast::Expr, elem_ty: &Type) {
+        let shown = self.store.show(elem_ty);
+        self.error(
+            e.span(),
+            format!("every element of a top-level `const` array must be a `{shown}` literal"),
+        )
+        .help = Some(
+            "there is no startup initialiser to compute one in -- move the computation into a \
+             function"
+                .into(),
+        );
     }
 
     /// `name` collides with a global that already exists. Builtins get their
@@ -3170,6 +3301,23 @@ impl<'a> Inferencer<'a> {
                     );
                     return None;
                 }
+                // A top-level `const` array is one object shared by every
+                // worker in the process. W# has no mutable globals -- the
+                // workers' design rests on it, since a worker's state has to
+                // be an explicit value passed in and out -- so writing an
+                // element of one is rejected rather than raced over.
+                if let Some(name) = self.names_const_array(obj) {
+                    self.error(
+                        obj.span(),
+                        format!("`{name}` is a top-level `const` array, which cannot be written"),
+                    )
+                    .help = Some(
+                        "it lives in the data section and is shared by every worker -- copy it \
+                         first, with `array.slice(..)`, if you need one to change"
+                            .into(),
+                    );
+                    return None;
+                }
                 let (arr, index, elem) = self.infer_index(obj, index);
                 Some((hir::Place::Index { arr, index }, elem))
             }
@@ -3178,6 +3326,25 @@ impl<'a> Inferencer<'a> {
                 None
             }
         }
+    }
+
+    /// The name, if this expression is one naming a top-level `const` array.
+    ///
+    /// A local shadows a global, so the local scope is asked first -- which is
+    /// also what makes `var a = K;` a different thing from `K` itself, and why
+    /// a write through such an alias is not caught here.
+    fn names_const_array(&mut self, obj: &ast::Expr) -> Option<String> {
+        let ast::Expr::Ident(name) = obj else {
+            return None;
+        };
+        if self.lookup_local(name.as_str()).is_some() {
+            return None;
+        }
+        let Some(GlobalRef::Const(index)) = self.global(name.as_str()) else {
+            return None;
+        };
+        matches!(self.consts[*index].kind, hir::ExprKind::ArrayConst(_))
+            .then(|| name.as_str().to_string())
     }
 
     /// The shared half of `a[i]`, as an expression and as a place: infer both
@@ -6479,6 +6646,7 @@ fn patch_targs_expr(expr: &mut hir::Expr, targs_for: &HashMap<hir::FuncId, Vec<T
         | hir::ExprKind::Float(_)
         | hir::ExprKind::Bool(_)
         | hir::ExprKind::Str(_)
+        | hir::ExprKind::ArrayConst(_)
         | hir::ExprKind::Null
         | hir::ExprKind::Local(_)
         | hir::ExprKind::Singleton(_)
@@ -6633,6 +6801,7 @@ fn fixup_expr(expr: &mut hir::Expr, structs: &[hir::StructDef], store: &mut Type
         | hir::ExprKind::Float(_)
         | hir::ExprKind::Bool(_)
         | hir::ExprKind::Str(_)
+        | hir::ExprKind::ArrayConst(_)
         | hir::ExprKind::Null
         | hir::ExprKind::Local(_)
         | hir::ExprKind::Singleton(_)

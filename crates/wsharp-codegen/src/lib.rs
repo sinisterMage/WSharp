@@ -494,6 +494,14 @@ fn collect_instance_types(program: &hir::Program, store: &mut TypeStore) -> Vec<
             push(store, &ty, &mut out);
         }
     }
+    // A top-level `const` array needs its type id even when nothing names it:
+    // `define_arrays` emits one object per declaration, exactly as
+    // `define_strings` emits one per interned literal, and neither asks
+    // whether monomorphisation kept a use.
+    for array in &program.arrays {
+        let ty = array.ty.clone();
+        push(store, &ty, &mut out);
+    }
     for func in &program.funcs {
         let ret = func.ret.clone();
         push(store, &ret, &mut out);
@@ -654,6 +662,7 @@ fn types_in_expr(expr: &hir::Expr, out: &mut Vec<Type>) {
         | hir::ExprKind::Float(_)
         | hir::ExprKind::Bool(_)
         | hir::ExprKind::Str(_)
+        | hir::ExprKind::ArrayConst(_)
         | hir::ExprKind::Null
         | hir::ExprKind::Local(_)
         | hir::ExprKind::Singleton(_)
@@ -814,12 +823,14 @@ fn declare_all(
         .map_err(|e| err("could not declare `ws_join`", e))?;
 
     let strings = define_strings(module, program)?;
+    let arrays = define_arrays(module, program, store, &instance_type_ids)?;
     let singletons = define_singletons(module, program)?;
 
     Ok(lower::Decls {
         funcs,
         builtins: builtin_ids,
         strings,
+        arrays,
         singletons,
         closure_type_ids,
         instance_type_ids,
@@ -872,6 +883,67 @@ fn define_singletons(
             .define_data(id, &desc)
             .map_err(|e| err(&format!("could not define `{}`", def.name), e))?;
         ids.push(Some(id));
+    }
+    Ok(ids)
+}
+
+/// Emit each top-level `const` array as a static object with a W# header.
+///
+/// `define_strings` with a wider element: the same immortal flag, for the same
+/// reason, and the same padding so the next object would still be aligned. The
+/// two differences are that the type id is the array type's rather than
+/// `TYPE_ID_STR`, and that `aux` counts elements rather than bytes.
+///
+/// The elements are scalars, which inference has already insisted on -- so
+/// nothing here holds a reference, and an object the collector never traces
+/// cannot hide one.
+fn define_arrays(
+    module: &mut JITModule,
+    program: &hir::Program,
+    store: &mut TypeStore,
+    instance_type_ids: &HashMap<String, u32>,
+) -> Result<Vec<cranelift_module::DataId>, CodegenError> {
+    let mut ids = Vec::with_capacity(program.arrays.len());
+    for (i, array) in program.arrays.iter().enumerate() {
+        let key = store.show(&array.ty);
+        let type_id = *instance_type_ids
+            .get(&key)
+            .unwrap_or_else(|| panic!("no type id registered for `{key}`"));
+        let elem_ty = match store.resolve(&array.ty) {
+            Type::Con(TyCon::Array, args) => args[0].clone(),
+            other => unreachable!("`{}` is not an array", store.show(&other)),
+        };
+        let stride = layout::size_of(store, &elem_ty) as usize;
+
+        let mut bytes =
+            Vec::with_capacity(wsharp_runtime::HEADER_SIZE as usize + array.values.len() * stride);
+        bytes.extend_from_slice(&meta_word(type_id, FLAG_IMMORTAL).to_ne_bytes());
+        bytes.extend_from_slice(&(array.values.len() as u64).to_ne_bytes());
+        for value in &array.values {
+            // The low `stride` bytes, in the machine's own order -- which is
+            // little-endian on both architectures this collector supports,
+            // since the stack walker reads the frame pointer with inline
+            // assembly written for exactly those two.
+            bytes.extend_from_slice(&value.to_ne_bytes()[..stride]);
+        }
+        bytes.resize(align_up(bytes.len() as u32) as usize, 0);
+
+        let mut desc = DataDescription::new();
+        desc.define(bytes.into_boxed_slice());
+        desc.set_align(wsharp_runtime::header::ALIGN as u64);
+
+        // Writable, though nothing should write it: inference rejects writing
+        // an element through the `const`'s own name, but an alias -- `var a =
+        // K;` -- is a local holding the same address and is not caught. A
+        // read-only page would turn that mistake into a fault with no message,
+        // which is worse than the mistake. See the ROADMAP.
+        let id = module
+            .declare_data(&format!("wsharp$array${i}"), Linkage::Local, true, false)
+            .map_err(|e| err("could not declare a `const` array", e))?;
+        module
+            .define_data(id, &desc)
+            .map_err(|e| err("could not define a `const` array", e))?;
+        ids.push(id);
     }
     Ok(ids)
 }
