@@ -9,6 +9,10 @@
 // A binding whose name does not match the reference it was written from is a
 // binding nobody can check.
 #![allow(non_camel_case_types)]
+// Structure fields and the enumeration values passed as arguments keep their
+// documented spelling too, for the same reason the function names do.
+#![allow(non_snake_case)]
+#![allow(non_upper_case_globals)]
 #![allow(clippy::upper_case_acronyms)]
 
 use super::{Errno, Fd};
@@ -51,9 +55,52 @@ unsafe extern "system" {
     fn GetFileAttributesW(path: *const u16) -> DWORD;
     fn GetStdHandle(which: DWORD) -> HANDLE;
     fn GetLastError() -> DWORD;
-    #[cfg(test)]
     fn DeleteFileW(path: *const u16) -> BOOL;
+    fn CreateDirectoryW(path: *const u16, security: *mut c_void) -> BOOL;
+    fn RemoveDirectoryW(path: *const u16) -> BOOL;
+    fn MoveFileExW(from: *const u16, to: *const u16, flags: DWORD) -> BOOL;
+    fn GetFileAttributesExW(path: *const u16, level: DWORD, info: *mut c_void) -> BOOL;
+    fn FindFirstFileW(pattern: *const u16, data: *mut WIN32_FIND_DATAW) -> HANDLE;
+    fn FindNextFileW(handle: HANDLE, data: *mut WIN32_FIND_DATAW) -> BOOL;
+    fn FindClose(handle: HANDLE) -> BOOL;
+    fn GetEnvironmentVariableW(name: *const u16, buf: *mut u16, size: DWORD) -> DWORD;
 }
+
+/// What `GetFileAttributesExW` fills in at `GetFileExInfoStandard`.
+///
+/// Declared where the POSIX `struct stat` is not, and the difference is the
+/// point: this struct's layout is documented, fixed, and the same on every
+/// Windows, while `struct stat` differs by system and by architecture. It is
+/// the one call that answers both questions this layer asks about a path.
+#[repr(C)]
+struct WIN32_FILE_ATTRIBUTE_DATA {
+    dwFileAttributes: DWORD,
+    ftCreationTime: FILETIME,
+    ftLastAccessTime: FILETIME,
+    ftLastWriteTime: FILETIME,
+    nFileSizeHigh: DWORD,
+    nFileSizeLow: DWORD,
+}
+
+/// What a directory walk hands back. `cAlternateFileName` is the 8.3 name and
+/// is never read here, but it is part of the struct the caller must supply.
+#[repr(C)]
+struct WIN32_FIND_DATAW {
+    dwFileAttributes: DWORD,
+    ftCreationTime: FILETIME,
+    ftLastAccessTime: FILETIME,
+    ftLastWriteTime: FILETIME,
+    nFileSizeHigh: DWORD,
+    nFileSizeLow: DWORD,
+    dwReserved0: DWORD,
+    dwReserved1: DWORD,
+    cFileName: [u16; 260],
+    cAlternateFileName: [u16; 14],
+}
+
+const GetFileExInfoStandard: DWORD = 0;
+const MOVEFILE_REPLACE_EXISTING: DWORD = 0x0000_0001;
+const FILE_ATTRIBUTE_DIRECTORY: DWORD = 0x0000_0010;
 
 // Bytes from the system's generator. Neither kernel32 nor ws2_32 has it, so
 // this is a third library -- and `BCryptGenRandom` is the documented modern
@@ -142,6 +189,13 @@ const ERROR_ACCESS_DENIED: i32 = 5;
 const ERROR_BROKEN_PIPE: i32 = 109;
 /// What a `write` that made no progress reports. There is no `EIO` here.
 pub(crate) const EIO: i32 = 31; // ERROR_GEN_FAILURE
+const ERROR_FILE_EXISTS: i32 = 80;
+const ERROR_DIR_NOT_EMPTY: i32 = 145;
+const ERROR_ALREADY_EXISTS: i32 = 183;
+/// "The directory name is invalid" -- what Windows says where Unix says
+/// `ENOTDIR`.
+const ERROR_DIRECTORY: i32 = 267;
+const ERROR_NO_MORE_FILES: i32 = 18;
 
 /// `INVALID_HANDLE_VALUE`, which is -1 rather than null -- and null is a
 /// perfectly ordinary failure return from some other calls, so the two are not
@@ -170,6 +224,9 @@ pub(crate) fn error_tag(e: i32) -> i64 {
         ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => crate::builtins::ERROR_NOT_FOUND,
         ERROR_ACCESS_DENIED => crate::builtins::ERROR_PERMISSION_DENIED,
         ERROR_BROKEN_PIPE => crate::builtins::ERROR_BROKEN_PIPE,
+        ERROR_FILE_EXISTS | ERROR_ALREADY_EXISTS => crate::builtins::ERROR_ALREADY_EXISTS,
+        ERROR_DIRECTORY => crate::builtins::ERROR_NOT_A_DIRECTORY,
+        ERROR_DIR_NOT_EMPTY => crate::builtins::ERROR_DIRECTORY_NOT_EMPTY,
         _ => crate::builtins::ERROR_IO_FAILED,
     }
 }
@@ -295,7 +352,6 @@ pub(crate) fn stdin() -> Fd {
     (unsafe { GetStdHandle(STD_INPUT_HANDLE) }) as Fd
 }
 
-#[cfg(test)]
 pub(crate) fn remove(path: &[u8]) -> Result<(), Errno> {
     let path = wide_path(path)?;
     if unsafe { DeleteFileW(path.as_ptr()) } != 0 {
@@ -303,6 +359,147 @@ pub(crate) fn remove(path: &[u8]) -> Result<(), Errno> {
     } else {
         Err(last_error())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Directories, and the two facts about a path a store needs
+// ---------------------------------------------------------------------------
+
+/// UTF-16 back to the bytes everything above this layer speaks.
+fn narrow(name: &[u16]) -> Vec<u8> {
+    let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    String::from_utf16_lossy(&name[..end]).into_bytes()
+}
+
+pub(crate) fn mkdir(path: &[u8]) -> Result<(), Errno> {
+    let path = wide_path(path)?;
+    if unsafe { CreateDirectoryW(path.as_ptr(), core::ptr::null_mut()) } != 0 {
+        Ok(())
+    } else {
+        Err(last_error())
+    }
+}
+
+pub(crate) fn rmdir(path: &[u8]) -> Result<(), Errno> {
+    let path = wide_path(path)?;
+    if unsafe { RemoveDirectoryW(path.as_ptr()) } != 0 {
+        Ok(())
+    } else {
+        Err(last_error())
+    }
+}
+
+/// Replace `to` with `from`.
+///
+/// `MOVEFILE_REPLACE_EXISTING` is what makes this the same operation Unix's
+/// `rename` is: without it Windows refuses when the destination exists, and an
+/// atomic install would stop being atomic. It does *not* replace an existing
+/// **directory** -- Windows has no equivalent for that -- which is why the
+/// store publishes a directory by renaming into a name nothing holds yet.
+pub(crate) fn rename(from: &[u8], to: &[u8]) -> Result<(), Errno> {
+    let from = wide_path(from)?;
+    let to = wide_path(to)?;
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING) } != 0 {
+        Ok(())
+    } else {
+        Err(last_error())
+    }
+}
+
+fn attributes(path: &[u8]) -> Result<WIN32_FILE_ATTRIBUTE_DATA, Errno> {
+    let path = wide_path(path)?;
+    let mut data = WIN32_FILE_ATTRIBUTE_DATA {
+        dwFileAttributes: 0,
+        ftCreationTime: FILETIME { low: 0, high: 0 },
+        ftLastAccessTime: FILETIME { low: 0, high: 0 },
+        ftLastWriteTime: FILETIME { low: 0, high: 0 },
+        nFileSizeHigh: 0,
+        nFileSizeLow: 0,
+    };
+    let ok = unsafe {
+        GetFileAttributesExW(
+            path.as_ptr(),
+            GetFileExInfoStandard,
+            (&raw mut data).cast::<c_void>(),
+        )
+    };
+    if ok == 0 { Err(last_error()) } else { Ok(data) }
+}
+
+pub(crate) fn is_dir(path: &[u8]) -> bool {
+    match attributes(path) {
+        Ok(data) => data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+        Err(_) => false,
+    }
+}
+
+pub(crate) fn file_size(path: &[u8]) -> Result<i64, Errno> {
+    let data = attributes(path)?;
+    Ok(((u64::from(data.nFileSizeHigh) << 32) | u64::from(data.nFileSizeLow)) as i64)
+}
+
+pub(crate) fn read_dir(path: &[u8]) -> Result<Vec<Vec<u8>>, Errno> {
+    // `FindFirstFileW` takes a pattern rather than a directory, so the
+    // wildcard is appended here. Win32 accepts `/` as a separator, which is
+    // what lets everything above this layer use one spelling.
+    let mut pattern = path.to_vec();
+    while pattern.last() == Some(&b'/') || pattern.last() == Some(&b'\\') {
+        pattern.pop();
+    }
+    pattern.extend_from_slice(b"/*");
+    let pattern = wide_path(&pattern)?;
+
+    let mut data = WIN32_FIND_DATAW {
+        dwFileAttributes: 0,
+        ftCreationTime: FILETIME { low: 0, high: 0 },
+        ftLastAccessTime: FILETIME { low: 0, high: 0 },
+        ftLastWriteTime: FILETIME { low: 0, high: 0 },
+        nFileSizeHigh: 0,
+        nFileSizeLow: 0,
+        dwReserved0: 0,
+        dwReserved1: 0,
+        cFileName: [0; 260],
+        cAlternateFileName: [0; 14],
+    };
+    let handle = unsafe { FindFirstFileW(pattern.as_ptr(), &raw mut data) };
+    if handle == invalid_handle() {
+        return Err(last_error());
+    }
+    let mut names = Vec::new();
+    loop {
+        let name = narrow(&data.cFileName);
+        if name != b"." && name != b".." {
+            names.push(name);
+        }
+        if unsafe { FindNextFileW(handle, &raw mut data) } == 0 {
+            let e = last_error();
+            unsafe { FindClose(handle) };
+            // The end of the listing is reported as a failure with a code that
+            // means "there were no more", which is not a failure at all.
+            return if e.0 == ERROR_NO_MORE_FILES {
+                Ok(names)
+            } else {
+                Err(e)
+            };
+        }
+    }
+}
+
+pub(crate) fn env(name: &[u8]) -> Option<Vec<u8>> {
+    let name = wide_path(name).ok()?;
+    // Asked twice: the first call with no room answers with how much room it
+    // wants, including the terminator, and zero means the variable is not set.
+    let wanted = unsafe { GetEnvironmentVariableW(name.as_ptr(), core::ptr::null_mut(), 0) };
+    if wanted == 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; wanted as usize];
+    let written = unsafe { GetEnvironmentVariableW(name.as_ptr(), buf.as_mut_ptr(), wanted) };
+    if written == 0 || written >= wanted {
+        return None;
+    }
+    buf.truncate(written as usize);
+    Some(narrow(&buf))
 }
 
 // ---------------------------------------------------------------------------

@@ -306,6 +306,13 @@ wsharp run   <file.ws>    # compile and run main; exits with main's return value
 wsharp check <file.ws>    # type-check only
 ```
 
+Anything after the file is the program's, not the compiler's, and reaches it
+through `std/os`:
+
+```sh
+wsharp run prog.ws -- one two    # os.args() is ["one", "two"]
+```
+
 The process exits with the low byte of `main`'s return value, as a C program
 does, so `return 256;` exits 0. A compile error exits 1. A failure the type
 system allows but the program must not perform — `.?` on a null optional, a
@@ -350,6 +357,11 @@ when unset, empty or `0`.
 `@import` binds a module to a name; everything in it is reached through that
 name. A path is either a file next to the importing one or one of the
 library's. A module's names are private to it unless it writes `pub`.
+
+`std/io` reads and writes whole files; `std/fs` is the tree they sit in --
+`mkdir`, `read_dir`, `rename`, `remove`, and enough of a stat to tell a
+directory from a file and say how big one is. `std/path` is the arithmetic
+above both, and makes no syscall at all.
 
 ```zig
 const str  = @import("std/str");
@@ -519,7 +531,9 @@ Sessions are numbered by the original feature list:
       byte. `http.get("https://www.google.com/")` returns a page.
 - [ ] **11.** Package management, in a tool called **ingot**: git spoken rather
       than shelled out to, a content-addressed store, and a resolver that says
-      *why* a version was ruled out rather than that it was.
+      *why* a version was ruled out rather than that it was. Stage one is in —
+      a program can read its own command line and walk a directory, and
+      `struct stat` turned out not to be needed to do it.
 
 What is left, and where it plugs in, is in [ROADMAP.md](ROADMAP.md).
 Conventions and the invariants worth not breaking are in

@@ -6,15 +6,44 @@
 //! numbers.
 
 #![allow(non_camel_case_types)]
+// `DIR` is what the C header calls it, and a binding whose name does not match
+// the reference it was written from is a binding nobody can check.
+#![allow(clippy::upper_case_acronyms)]
 
 use super::{Errno, Fd};
 
 pub(crate) type c_int = i32;
+/// `mode_t` is 16 bits here and 32 on Linux. It reaches `mkdir` in a register
+/// either way, so the width is only ever visible in this declaration -- which
+/// is exactly why it should say what the header says.
+pub(crate) type mode_t = u16;
+
+/// The directory handle `opendir` answers with, opaque by design.
+pub(crate) type DIR = core::ffi::c_void;
+
+/// Where `d_name` starts in a `struct dirent`.
+///
+/// One number per system rather than a declared struct, for the reason this
+/// arm uses `poll(2)` rather than `kqueue`: `struct dirent` is *not the same
+/// struct* across this family, and a layout written from the macOS headers
+/// would be a declaration for FreeBSD that nobody had ever run. A single
+/// offset is one auditable fact per system, taken from that system's
+/// `<dirent.h>`, and getting one wrong produces an obviously wrong file name
+/// rather than a plausible one. Only macOS is exercised by CI, as with
+/// everything else in this file.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const D_NAME_OFFSET: usize = 21; // d_ino, d_seekoff, d_reclen, d_namlen, d_type
+#[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
+const D_NAME_OFFSET: usize = 24;
+#[cfg(target_os = "netbsd")]
+const D_NAME_OFFSET: usize = 13;
+#[cfg(target_os = "dragonfly")]
+const D_NAME_OFFSET: usize = 16;
 
 /// The C library, in a module of its own so that the wrappers below can keep
 /// the names the rest of the runtime calls them by.
 mod c {
-    use super::c_int;
+    use super::{DIR, c_int, mode_t};
 
     unsafe extern "C" {
         /// Variadic because it is: the third argument exists only when `O_CREAT`
@@ -25,8 +54,39 @@ mod c {
         pub(super) fn close(fd: c_int) -> c_int;
         pub(super) fn access(path: *const u8, mode: c_int) -> c_int;
         pub(super) fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
-        #[cfg(test)]
         pub(super) fn unlink(path: *const u8) -> c_int;
+        pub(super) fn mkdir(path: *const u8, mode: mode_t) -> c_int;
+        pub(super) fn rmdir(path: *const u8) -> c_int;
+        pub(super) fn rename(from: *const u8, to: *const u8) -> c_int;
+        /// `off_t` is 64 bits everywhere in this family that the collector's
+        /// inline assembly supports.
+        pub(super) fn lseek(fd: c_int, offset: i64, whence: c_int) -> i64;
+        pub(super) fn closedir(dir: *mut DIR) -> c_int;
+        pub(super) fn getenv(name: *const u8) -> *const u8;
+    }
+
+    // `opendir` and `readdir` are the *one* pair here whose symbol name is not
+    // the name in the manual page. macOS carries two directory ABIs -- the
+    // original 32-bit-inode one and the 64-bit-inode one every modern SDK
+    // compiles against -- and distinguishes them by an `$INODE64` suffix on
+    // x86-64 only; arm64 has never had the old ABI, so its symbols are
+    // unsuffixed. Linking the unsuffixed name on x86-64 macOS would get the
+    // old `struct dirent`, whose `d_name` starts at 8 rather than at 21, and
+    // every file name would come back as the tail of some other field.
+    unsafe extern "C" {
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86_64"),
+            link_name = "opendir$INODE64"
+        )]
+        pub(super) fn opendir(path: *const u8) -> *mut DIR;
+        /// The pointer is to a `struct dirent` whose layout differs across
+        /// this family. Only `d_name` is wanted, and where it starts is
+        /// [`D_NAME_OFFSET`].
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86_64"),
+            link_name = "readdir$INODE64"
+        )]
+        pub(super) fn readdir(dir: *mut DIR) -> *const u8;
         /// Bytes from the kernel's generator. Void return and no length cap,
         /// because it cannot fail: it is present on macOS and on every BSD,
         /// and reseeds itself across a fork. `getentropy` is the alternative
@@ -63,6 +123,7 @@ const O_WRONLY: c_int = 1;
 const O_CREAT: c_int = 0x0200;
 const O_TRUNC: c_int = 0x0400;
 const F_OK: c_int = 0;
+const SEEK_END: c_int = 2;
 
 /// Close-on-exec is set afterwards rather than asked for in the flags, because
 /// `O_CLOEXEC` is `0x1000000` on macOS and `0x00100000` on FreeBSD -- a
@@ -77,6 +138,11 @@ const ENOENT: c_int = 2;
 const EINTR: c_int = 4;
 pub(crate) const EIO: c_int = 5;
 const EACCES: c_int = 13;
+const EEXIST: c_int = 17;
+const ENOTDIR: c_int = 20;
+const EISDIR: c_int = 21;
+/// 66 here and 39 on Linux: the numbering agrees only up to 34.
+const ENOTEMPTY: c_int = 66;
 
 fn errno() -> Errno {
     Errno(unsafe { *c::errno_location() })
@@ -99,6 +165,9 @@ pub(crate) fn error_tag(e: c_int) -> i64 {
         EAGAIN => b::ERROR_WOULD_BLOCK,
         EHOSTUNREACH | ENETUNREACH => b::ERROR_NETWORK_UNREACHABLE,
         ERESOLVE => b::ERROR_HOST_NOT_FOUND,
+        EEXIST => b::ERROR_ALREADY_EXISTS,
+        ENOTDIR => b::ERROR_NOT_A_DIRECTORY,
+        ENOTEMPTY | EISDIR => b::ERROR_DIRECTORY_NOT_EMPTY,
         _ => b::ERROR_IO_FAILED,
     }
 }
@@ -184,7 +253,6 @@ pub(crate) fn stdin() -> Fd {
     0
 }
 
-#[cfg(test)]
 pub(crate) fn remove(path: &[u8]) -> Result<(), Errno> {
     let path = c_path(path)?;
     if unsafe { c::unlink(path.as_ptr()) } == 0 {
@@ -192,6 +260,94 @@ pub(crate) fn remove(path: &[u8]) -> Result<(), Errno> {
     } else {
         Err(errno())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Directories, and the two facts about a path a store needs
+// ---------------------------------------------------------------------------
+
+pub(crate) fn mkdir(path: &[u8]) -> Result<(), Errno> {
+    let path = c_path(path)?;
+    if unsafe { c::mkdir(path.as_ptr(), 0o777) } == 0 {
+        Ok(())
+    } else {
+        Err(errno())
+    }
+}
+
+pub(crate) fn rmdir(path: &[u8]) -> Result<(), Errno> {
+    let path = c_path(path)?;
+    if unsafe { c::rmdir(path.as_ptr()) } == 0 {
+        Ok(())
+    } else {
+        Err(errno())
+    }
+}
+
+pub(crate) fn rename(from: &[u8], to: &[u8]) -> Result<(), Errno> {
+    let from = c_path(from)?;
+    let to = c_path(to)?;
+    if unsafe { c::rename(from.as_ptr(), to.as_ptr()) } == 0 {
+        Ok(())
+    } else {
+        Err(errno())
+    }
+}
+
+/// Whether a path names a directory, asked by opening it as one.
+///
+/// No `struct stat` anywhere in this arm, deliberately: that struct has four
+/// different layouts across the five systems this file covers, and only one of
+/// them is ever run here.
+pub(crate) fn is_dir(path: &[u8]) -> bool {
+    let Ok(path) = c_path(path) else { return false };
+    let dir = unsafe { c::opendir(path.as_ptr()) };
+    if dir.is_null() {
+        return false;
+    }
+    unsafe { c::closedir(dir) };
+    true
+}
+
+/// How many bytes a file holds, by seeking to its end.
+pub(crate) fn file_size(path: &[u8]) -> Result<i64, Errno> {
+    let fd = open_read(path)?;
+    let end = unsafe { c::lseek(fd as c_int, 0, SEEK_END) };
+    close(fd);
+    if end < 0 { Err(errno()) } else { Ok(end) }
+}
+
+pub(crate) fn read_dir(path: &[u8]) -> Result<Vec<Vec<u8>>, Errno> {
+    let path = c_path(path)?;
+    let dir = unsafe { c::opendir(path.as_ptr()) };
+    if dir.is_null() {
+        return Err(errno());
+    }
+    let mut names = Vec::new();
+    loop {
+        // The end of the directory and a failure are the same null pointer, so
+        // `errno` is cleared before the call and read after it.
+        unsafe { *c::errno_location() = 0 };
+        let entry = unsafe { c::readdir(dir) };
+        if entry.is_null() {
+            let e = errno();
+            unsafe { c::closedir(dir) };
+            return if e.0 == 0 { Ok(names) } else { Err(e) };
+        }
+        let name = unsafe { super::c_string(entry.add(D_NAME_OFFSET)) };
+        if name != b"." && name != b".." {
+            names.push(name);
+        }
+    }
+}
+
+pub(crate) fn env(name: &[u8]) -> Option<Vec<u8>> {
+    let name = c_path(name).ok()?;
+    let value = unsafe { c::getenv(name.as_ptr()) };
+    if value.is_null() {
+        return None;
+    }
+    Some(unsafe { super::c_string(value) })
 }
 
 // ---------------------------------------------------------------------------

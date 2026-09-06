@@ -50,6 +50,13 @@ enum Command {
         /// an immediate, reproducible failure. Ruinously slow; for testing.
         #[arg(long)]
         gc_stress: bool,
+        /// What the program sees as `os.args()`.
+        ///
+        /// Everything after the file, or after `--` when an argument would
+        /// otherwise be read as one of this driver's own flags. Nothing is
+        /// interpreted on the way through.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 }
 
@@ -70,14 +77,26 @@ enum Emit {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let (path, emit, gc_stress, run) = match cli.command {
-        Command::Check { file, emit } => (file, emit, false, false),
+    let (path, emit, gc_stress, run, args) = match cli.command {
+        Command::Check { file, emit } => (file, emit, false, false, Vec::new()),
         Command::Run {
             file,
             emit,
             gc_stress,
-        } => (file, emit, gc_stress, true),
+            args,
+        } => (file, emit, gc_stress, true, args),
     };
+    // Published before anything is compiled, let alone run: `os.raw_args`
+    // reads process-wide storage that is written once, in the same class as
+    // the type registry and the stack maps.
+    //
+    // A `--` that clap left in front is dropped: it is this driver's
+    // punctuation, not the program's first argument.
+    let mut args: Vec<String> = args;
+    if args.first().map(String::as_str) == Some("--") {
+        args.remove(0);
+    }
+    wsharp_runtime::os::set_args(args.into_iter().map(String::into_bytes).collect());
 
     match drive(&path, emit, gc_stress, run) {
         Ok(code) => code,

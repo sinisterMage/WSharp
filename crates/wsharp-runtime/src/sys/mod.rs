@@ -127,6 +127,86 @@ pub(crate) fn exists(path: &[u8]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Directories
+// ---------------------------------------------------------------------------
+//
+// A store needs more of a filesystem than reading and writing a whole file:
+// somewhere to put things, a way to list what is there, and `rename`, which is
+// what makes an install atomic. What it does *not* need is `stat` -- and the
+// arms are much better off for that, because `struct stat` has a different
+// layout on every system in the BSD family and a versioned symbol on Linux,
+// while the two questions actually being asked ("is this a directory?" and
+// "how big is it?") each have an answer that is one number.
+
+pub(crate) fn mkdir(path: &[u8]) -> Result<(), Errno> {
+    imp::mkdir(path)
+}
+
+pub(crate) fn rmdir(path: &[u8]) -> Result<(), Errno> {
+    imp::rmdir(path)
+}
+
+pub(crate) fn remove(path: &[u8]) -> Result<(), Errno> {
+    imp::remove(path)
+}
+
+/// Move a path, replacing whatever was at the destination.
+///
+/// The one call a content-addressed store cannot do without: a fetch writes
+/// into a temporary directory and then becomes visible in one step, so an
+/// interrupted install leaves rubbish rather than a half-written package.
+pub(crate) fn rename(from: &[u8], to: &[u8]) -> Result<(), Errno> {
+    imp::rename(from, to)
+}
+
+pub(crate) fn is_dir(path: &[u8]) -> bool {
+    imp::is_dir(path)
+}
+
+pub(crate) fn file_size(path: &[u8]) -> Result<i64, Errno> {
+    imp::file_size(path)
+}
+
+/// What a directory holds, without `.` and `..`.
+///
+/// The order is the filesystem's, which is not sorted and is not stable across
+/// systems. Anything that hashes a tree has to sort for itself.
+pub(crate) fn read_dir(path: &[u8]) -> Result<Vec<Vec<u8>>, Errno> {
+    imp::read_dir(path)
+}
+
+/// One environment variable, or nothing.
+///
+/// Bytes rather than text, for the reason a path is bytes: `HOME` is whatever
+/// the system put there.
+pub(crate) fn env(name: &[u8]) -> Option<Vec<u8>> {
+    imp::env(name)
+}
+
+/// A NUL-terminated C string, copied out.
+///
+/// Shared by the arms because all three read one out of a structure the
+/// platform owns -- a directory entry's name, or the environment.
+///
+/// Not on Windows, which has no C strings to read: a path there is UTF-16 and
+/// a directory entry's name arrives inside a struct, so that arm narrows
+/// instead.
+///
+/// # Safety
+/// `p` must be non-null and point at a NUL-terminated byte string that stays
+/// valid for the length of the copy.
+#[cfg(not(target_os = "windows"))]
+pub(crate) unsafe fn c_string(p: *const u8) -> Vec<u8> {
+    let mut len = 0;
+    // SAFETY: the caller promises a terminator, so the walk stops inside the
+    // allocation it was given.
+    while unsafe { *p.add(len) } != 0 {
+        len += 1;
+    }
+    unsafe { std::slice::from_raw_parts(p, len) }.to_vec()
+}
+
+// ---------------------------------------------------------------------------
 // Entropy, and the clock
 // ---------------------------------------------------------------------------
 
@@ -281,7 +361,7 @@ mod tests {
         write_file(&path, b"short").expect("rewritten");
         assert_eq!(read_file(&path).expect("read back"), b"short");
 
-        let _ = imp::remove(&path);
+        let _ = remove(&path);
         assert!(!exists(&path), "and it is gone again");
     }
 
@@ -297,6 +377,80 @@ mod tests {
         );
     }
 
+    /// Everything a content-addressed store does to a directory, in the order
+    /// it does it. One test rather than six, because the interesting part is
+    /// that they compose: a listing has to see what was written, and a
+    /// `rename` has to be visible to the listing that follows it.
+    #[test]
+    fn a_directory_is_made_listed_renamed_and_removed() {
+        let root = temp_path("tree");
+        let _ = rmdir(&root);
+        mkdir(&root).expect("made");
+        assert!(is_dir(&root), "the directory is one");
+        assert!(
+            !is_dir(&join(&root, b"nothing")),
+            "and what is not there is not"
+        );
+
+        let one = join(&root, b"one.txt");
+        write_file(&one, b"hello").expect("written");
+        assert!(!is_dir(&one), "a file is not a directory");
+        assert_eq!(file_size(&one).expect("sized"), 5);
+
+        mkdir(&join(&root, b"sub")).expect("made");
+
+        // The order is the filesystem's, so the test sorts before comparing --
+        // which is exactly what anything hashing a tree has to do.
+        let mut names = read_dir(&root).expect("listed");
+        names.sort();
+        assert_eq!(
+            names,
+            vec![b"one.txt".to_vec(), b"sub".to_vec()],
+            "`.` and `..` are not entries anything wants"
+        );
+
+        let two = join(&root, b"two.txt");
+        rename(&one, &two).expect("renamed");
+        assert!(!exists(&one));
+        assert_eq!(read_file(&two).expect("read back"), b"hello");
+
+        // The two failures a store meets on its ordinary path, each of which
+        // it tells apart from the other.
+        assert_eq!(
+            error_tag(mkdir(&root).expect_err("already there")),
+            crate::builtins::ERROR_ALREADY_EXISTS
+        );
+        assert_eq!(
+            error_tag(rmdir(&root).expect_err("not empty")),
+            crate::builtins::ERROR_DIRECTORY_NOT_EMPTY,
+            "`ENOTEMPTY` is 39 on Linux and 66 on the BSDs, and neither is \
+             what Windows reports"
+        );
+
+        remove(&two).expect("removed");
+        rmdir(&join(&root, b"sub")).expect("removed");
+        rmdir(&root).expect("removed");
+        assert!(!exists(&root), "and the tree is gone");
+    }
+
+    #[test]
+    fn listing_something_that_is_not_a_directory_fails() {
+        let path = temp_path("notadir");
+        write_file(&path, b"x").expect("written");
+        assert!(
+            read_dir(&path).is_err(),
+            "a file is not a directory, whatever the platform calls that"
+        );
+        let _ = remove(&path);
+    }
+
+    fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
+        let mut out = dir.to_vec();
+        out.push(b'/');
+        out.extend_from_slice(name);
+        out
+    }
+
     /// A file larger than the read buffer, so the loop in `read_to_end` runs
     /// more than once -- which is the part `std::fs::read` used to do for us.
     #[test]
@@ -305,7 +459,7 @@ mod tests {
         let contents: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
         write_file(&path, &contents).expect("written");
         assert_eq!(read_file(&path).expect("read back"), contents);
-        let _ = imp::remove(&path);
+        let _ = remove(&path);
     }
 
     #[test]
@@ -318,7 +472,7 @@ mod tests {
             lines.push(line);
         }
         imp::close(fd);
-        let _ = imp::remove(&path);
+        let _ = remove(&path);
         assert_eq!(
             lines,
             vec![

@@ -8,7 +8,12 @@
 //! // exit: 3             expected exit status (default 0)
 //! // error: <substring>  the program must fail to compile, saying this
 //! // panic: <substring>  the program must die with a W# panic saying this
+//! // args: one two       what the program sees as `os.args()`
 //! ```
+//!
+//! `args:` splits on whitespace, so an argument containing a space cannot be
+//! written -- which is a limitation rather than a decision, and the day a case
+//! needs one is the day to give the line a quoting rule.
 //!
 //! `error:` may be given more than once; every substring must then appear.
 //! A `panic:` case must exit with status 101 (the runtime's panic status) and
@@ -30,6 +35,7 @@ struct Expectations {
     exit: i32,
     errors: Vec<String>,
     panic: Option<String>,
+    args: Vec<String>,
 }
 
 fn parse_expectations(source: &str) -> Expectations {
@@ -37,6 +43,7 @@ fn parse_expectations(source: &str) -> Expectations {
     let mut exit = 0;
     let mut errors = Vec::new();
     let mut panic = None;
+    let mut args = Vec::new();
     for line in source.lines() {
         let Some(rest) = line.trim_start().strip_prefix("//") else {
             continue;
@@ -50,6 +57,8 @@ fn parse_expectations(source: &str) -> Expectations {
             errors.push(v.trim().to_string());
         } else if let Some(v) = rest.strip_prefix("panic:") {
             panic = Some(v.trim().to_string());
+        } else if let Some(v) = rest.strip_prefix("args:") {
+            args.extend(v.split_whitespace().map(str::to_string));
         }
     }
     Expectations {
@@ -57,6 +66,7 @@ fn parse_expectations(source: &str) -> Expectations {
         exit,
         errors,
         panic,
+        args,
     }
 }
 
@@ -77,6 +87,9 @@ fn check_case_with(path: &Path, flags: &[&str]) -> Result<(), String> {
         .arg("run")
         .args(flags)
         .arg(path)
+        // After the file, because `run` collects its trailing arguments -- the
+        // same way a user would pass them.
+        .args(&expected.args)
         .output()
         .map_err(|e| format!("could not run the compiler: {e}"))?;
 

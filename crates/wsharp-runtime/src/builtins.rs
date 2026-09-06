@@ -518,6 +518,117 @@ fn library() -> Vec<Builtin> {
             ret: BuiltinTy::Bool,
             ptr: crate::io::ws_io_exists as *const u8,
         },
+        // ---- std/fs: the rest of a filesystem ----
+        //
+        // A separate module from `std/io`, which is about a file's contents.
+        // These are about the tree it sits in, and a program that only reads
+        // and writes files should not have to know they exist.
+        Builtin {
+            module: FS_MODULE,
+            name: "mkdir",
+            params: &[BuiltinTy::Str],
+            ret: BuiltinTy::ErrUnion(
+                &BuiltinTy::Void,
+                &[
+                    "NotFound",
+                    "PermissionDenied",
+                    "AlreadyExists",
+                    "NotADirectory",
+                    "IoFailed",
+                ],
+            ),
+            ptr: crate::fs::ws_fs_mkdir as *const u8,
+        },
+        Builtin {
+            module: FS_MODULE,
+            name: "rmdir",
+            params: &[BuiltinTy::Str],
+            ret: BuiltinTy::ErrUnion(
+                &BuiltinTy::Void,
+                &[
+                    "NotFound",
+                    "PermissionDenied",
+                    "DirectoryNotEmpty",
+                    "NotADirectory",
+                    "IoFailed",
+                ],
+            ),
+            ptr: crate::fs::ws_fs_rmdir as *const u8,
+        },
+        Builtin {
+            module: FS_MODULE,
+            name: "remove",
+            params: &[BuiltinTy::Str],
+            ret: BuiltinTy::ErrUnion(
+                &BuiltinTy::Void,
+                &[
+                    "NotFound",
+                    "PermissionDenied",
+                    "DirectoryNotEmpty",
+                    "IoFailed",
+                ],
+            ),
+            ptr: crate::fs::ws_fs_remove as *const u8,
+        },
+        Builtin {
+            module: FS_MODULE,
+            name: "rename",
+            params: &[BuiltinTy::Str, BuiltinTy::Str],
+            ret: BuiltinTy::ErrUnion(
+                &BuiltinTy::Void,
+                &[
+                    "NotFound",
+                    "PermissionDenied",
+                    "AlreadyExists",
+                    "DirectoryNotEmpty",
+                    "NotADirectory",
+                    "IoFailed",
+                ],
+            ),
+            ptr: crate::fs::ws_fs_rename as *const u8,
+        },
+        Builtin {
+            module: FS_MODULE,
+            name: "is_dir",
+            params: &[BuiltinTy::Str],
+            ret: BuiltinTy::Bool,
+            ptr: crate::fs::ws_fs_is_dir as *const u8,
+        },
+        Builtin {
+            module: FS_MODULE,
+            name: "size",
+            params: &[BuiltinTy::Str],
+            ret: BuiltinTy::ErrUnion(
+                &BuiltinTy::I64,
+                &["NotFound", "PermissionDenied", "IoFailed"],
+            ),
+            ptr: crate::fs::ws_fs_size as *const u8,
+        },
+        Builtin {
+            module: FS_MODULE,
+            name: "raw_read_dir",
+            params: &[BuiltinTy::Str],
+            ret: BuiltinTy::ErrUnion(
+                &BuiltinTy::Str,
+                &["NotFound", "PermissionDenied", "NotADirectory", "IoFailed"],
+            ),
+            ptr: crate::fs::ws_fs_raw_read_dir as *const u8,
+        },
+        // ---- std/os: the process's own arguments and environment ----
+        Builtin {
+            module: OS_MODULE,
+            name: "raw_args",
+            params: &[],
+            ret: BuiltinTy::Str,
+            ptr: crate::os::ws_os_raw_args as *const u8,
+        },
+        Builtin {
+            module: OS_MODULE,
+            name: "env",
+            params: &[BuiltinTy::Str],
+            ret: BuiltinTy::Optional(&BuiltinTy::Str),
+            ptr: crate::os::ws_os_env as *const u8,
+        },
         // Copy an array out of this worker's heap and build it again, which
         // is what sending it somewhere does. Exposed for the reason the `gc_*`
         // counters are: the deep copy is a mechanism the language depends on,
@@ -890,6 +1001,14 @@ pub fn builtin_errors() -> &'static [&'static str] {
         // What a library raises for something it can do in principle and
         // cannot yet -- `https://`, until there is a TLS client to hand it to.
         "NotSupported",
+        // The filesystem, past reading and writing whole files. Appended, like
+        // everything else here, because the number is the identity.
+        "AlreadyExists",
+        "NotADirectory",
+        // `rmdir` on a directory that still holds something, and `remove` on a
+        // directory -- one name, because both mean "there is something in the
+        // way and it is not this call's business to move it".
+        "DirectoryNotEmpty",
     ]
 }
 
@@ -917,6 +1036,9 @@ pub const ERROR_HOST_NOT_FOUND: i64 = 13;
 pub const ERROR_NETWORK_UNREACHABLE: i64 = 14;
 pub const ERROR_BAD_FORMAT: i64 = 15;
 pub const ERROR_NOT_SUPPORTED: i64 = 16;
+pub const ERROR_ALREADY_EXISTS: i64 = 17;
+pub const ERROR_NOT_A_DIRECTORY: i64 = 18;
+pub const ERROR_DIRECTORY_NOT_EMPTY: i64 = 19;
 
 /// The module the HTTP status lattice lives in.
 ///
@@ -929,6 +1051,12 @@ pub const BROKER_MODULE: &str = "std/broker";
 /// The standard library's sockets.
 pub const NET_MODULE: &str = "std/net";
 pub const BITS_MODULE: &str = "std/bits";
+/// Directories, and the two facts about a path a store needs.
+pub const FS_MODULE: &str = "std/fs";
+/// The process's own arguments and environment.
+pub const OS_MODULE: &str = "std/os";
+/// Path arithmetic, which is all W# and touches no syscall.
+pub const PATH_MODULE: &str = "std/path";
 /// The two rotates, which the code generator recognises by name and lowers
 /// inline rather than calling. See [`BuiltinTy::IntVar`].
 pub const BITS_ROTL: &str = "rotl";
@@ -980,6 +1108,9 @@ pub fn std_module_sources() -> &'static [(&'static str, &'static str)] {
         (X509_MODULE, include_str!("std/x509.ws")),
         (TLS_MODULE, include_str!("std/tls.ws")),
         (MATH_MODULE, include_str!("std/math.ws")),
+        (FS_MODULE, include_str!("std/fs.ws")),
+        (OS_MODULE, include_str!("std/os.ws")),
+        (PATH_MODULE, include_str!("std/path.ws")),
         (BROKER_MODULE, include_str!("std/broker.ws")),
         (NET_MODULE, include_str!("std/net.ws")),
         (HTTP_MODULE, include_str!("std/http.ws")),
@@ -1280,6 +1411,9 @@ mod tests {
             ("NetworkUnreachable", ERROR_NETWORK_UNREACHABLE),
             ("BadFormat", ERROR_BAD_FORMAT),
             ("NotSupported", ERROR_NOT_SUPPORTED),
+            ("AlreadyExists", ERROR_ALREADY_EXISTS),
+            ("NotADirectory", ERROR_NOT_A_DIRECTORY),
+            ("DirectoryNotEmpty", ERROR_DIRECTORY_NOT_EMPTY),
         ];
         assert_eq!(
             names.len(),

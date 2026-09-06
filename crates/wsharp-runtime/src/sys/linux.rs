@@ -5,16 +5,34 @@
 //! not, and glibc and musl both export exactly these names.
 
 #![allow(non_camel_case_types)]
+// `DIR` is what the C header calls it, and a binding whose name does not match
+// the reference it was written from is a binding nobody can check.
+#![allow(clippy::upper_case_acronyms)]
 
 use super::{Errno, Fd};
 
 pub(crate) type c_int = i32;
 pub(crate) type c_uint = u32;
+pub(crate) type mode_t = u32;
+
+/// The directory handle `opendir` answers with, which is opaque by design --
+/// nothing here reads a field of it.
+pub(crate) type DIR = core::ffi::c_void;
+
+/// Where `d_name` starts in a `struct dirent`.
+///
+/// One number rather than a declared struct, because the struct is the part
+/// that differs -- `d_ino`, `d_off`, `d_reclen`, `d_type`, and then the name at
+/// 19 here, 21 on macOS and 24 on FreeBSD. `d_name` is NUL-terminated on every
+/// one of them, which is what makes the offset the only fact needed: reading
+/// the name is then a C string read, and a wrong offset produces an obviously
+/// wrong name rather than a plausible one.
+const D_NAME_OFFSET: usize = 19;
 
 /// The C library, in a module of its own so that the wrappers below can
 /// keep the names the rest of the runtime calls them by.
 mod c {
-    use super::{c_int, c_uint};
+    use super::{DIR, c_int, c_uint, mode_t};
 
     unsafe extern "C" {
         /// Variadic because it is: the third argument exists only when `O_CREAT` is
@@ -25,8 +43,20 @@ mod c {
         pub(super) fn write(fd: c_int, buf: *const u8, count: usize) -> isize;
         pub(super) fn close(fd: c_int) -> c_int;
         pub(super) fn access(path: *const u8, mode: c_int) -> c_int;
-        #[cfg(test)]
         pub(super) fn unlink(path: *const u8) -> c_int;
+        pub(super) fn mkdir(path: *const u8, mode: mode_t) -> c_int;
+        pub(super) fn rmdir(path: *const u8) -> c_int;
+        pub(super) fn rename(from: *const u8, to: *const u8) -> c_int;
+        /// `off_t` is 64 bits on both architectures this collector supports,
+        /// so this is `lseek` and not `lseek64`.
+        pub(super) fn lseek(fd: c_int, offset: i64, whence: c_int) -> i64;
+        pub(super) fn opendir(path: *const u8) -> *mut DIR;
+        /// The pointer is to a `struct dirent` whose layout differs by
+        /// platform. Only `d_name` is wanted, and where it starts is
+        /// [`D_NAME_OFFSET`].
+        pub(super) fn readdir(dir: *mut DIR) -> *const u8;
+        pub(super) fn closedir(dir: *mut DIR) -> c_int;
+        pub(super) fn getenv(name: *const u8) -> *const u8;
         /// `errno` is a macro in C, and this is what it expands to.
         pub(super) fn __errno_location() -> *mut c_int;
         /// Bytes from the kernel's generator. glibc has exported this since
@@ -48,12 +78,19 @@ const O_TRUNC: c_int = 0o1000;
 /// So that a spawned worker does not inherit a descriptor it never asked for.
 const O_CLOEXEC: c_int = 0o2000000;
 const F_OK: c_int = 0;
+const SEEK_END: c_int = 2;
 
 const EPERM: c_int = 1;
 const ENOENT: c_int = 2;
 const EINTR: c_int = 4;
 pub(crate) const EIO: c_int = 5;
 const EACCES: c_int = 13;
+const EEXIST: c_int = 17;
+const ENOTDIR: c_int = 20;
+const EISDIR: c_int = 21;
+/// The one code in this set that is *not* shared with the BSDs, which have it
+/// at 66: the numbering agrees only up to 34.
+const ENOTEMPTY: c_int = 39;
 
 /// The last failure on this thread.
 fn errno() -> Errno {
@@ -77,6 +114,9 @@ pub(crate) fn error_tag(e: c_int) -> i64 {
         EAGAIN => b::ERROR_WOULD_BLOCK,
         EHOSTUNREACH | ENETUNREACH => b::ERROR_NETWORK_UNREACHABLE,
         ERESOLVE => b::ERROR_HOST_NOT_FOUND,
+        EEXIST => b::ERROR_ALREADY_EXISTS,
+        ENOTDIR => b::ERROR_NOT_A_DIRECTORY,
+        ENOTEMPTY | EISDIR => b::ERROR_DIRECTORY_NOT_EMPTY,
         _ => b::ERROR_IO_FAILED,
     }
 }
@@ -160,7 +200,6 @@ pub(crate) fn stdin() -> Fd {
     0
 }
 
-#[cfg(test)]
 pub(crate) fn remove(path: &[u8]) -> Result<(), Errno> {
     let path = c_path(path)?;
     if unsafe { c::unlink(path.as_ptr()) } == 0 {
@@ -168,6 +207,104 @@ pub(crate) fn remove(path: &[u8]) -> Result<(), Errno> {
     } else {
         Err(errno())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Directories, and the two facts about a path a store needs
+// ---------------------------------------------------------------------------
+
+pub(crate) fn mkdir(path: &[u8]) -> Result<(), Errno> {
+    let path = c_path(path)?;
+    // 0o777 as C would write it, exactly as `create_write` passes 0o666: the
+    // process umask takes it from there.
+    if unsafe { c::mkdir(path.as_ptr(), 0o777) } == 0 {
+        Ok(())
+    } else {
+        Err(errno())
+    }
+}
+
+pub(crate) fn rmdir(path: &[u8]) -> Result<(), Errno> {
+    let path = c_path(path)?;
+    if unsafe { c::rmdir(path.as_ptr()) } == 0 {
+        Ok(())
+    } else {
+        Err(errno())
+    }
+}
+
+pub(crate) fn rename(from: &[u8], to: &[u8]) -> Result<(), Errno> {
+    let from = c_path(from)?;
+    let to = c_path(to)?;
+    if unsafe { c::rename(from.as_ptr(), to.as_ptr()) } == 0 {
+        Ok(())
+    } else {
+        Err(errno())
+    }
+}
+
+/// Whether a path names a directory.
+///
+/// Asked by opening it as one rather than by reading a `struct stat`, which is
+/// the field-layout minefield this arm exists to stay out of. `opendir` fails
+/// with `ENOENT` for a path that is not there and `ENOTDIR` for one that is a
+/// file, and both answers are the same "no" here.
+pub(crate) fn is_dir(path: &[u8]) -> bool {
+    let Ok(path) = c_path(path) else { return false };
+    let dir = unsafe { c::opendir(path.as_ptr()) };
+    if dir.is_null() {
+        return false;
+    }
+    unsafe { c::closedir(dir) };
+    true
+}
+
+/// How many bytes a file holds, by seeking to its end.
+///
+/// The same trade as `is_dir`: `lseek` answers with an `off_t`, which is one
+/// number with one meaning, where `stat` answers with a struct whose shape is
+/// different on every system in the family.
+pub(crate) fn file_size(path: &[u8]) -> Result<i64, Errno> {
+    let fd = open_read(path)?;
+    let end = unsafe { c::lseek(fd as c_int, 0, SEEK_END) };
+    close(fd);
+    if end < 0 { Err(errno()) } else { Ok(end) }
+}
+
+pub(crate) fn read_dir(path: &[u8]) -> Result<Vec<Vec<u8>>, Errno> {
+    let path = c_path(path)?;
+    let dir = unsafe { c::opendir(path.as_ptr()) };
+    if dir.is_null() {
+        return Err(errno());
+    }
+    let mut names = Vec::new();
+    loop {
+        // `readdir` reports the end of the directory and a failure the same
+        // way -- a null pointer -- so `errno` is cleared first and read after,
+        // which is what the manual page says to do and the only way to tell
+        // the two apart.
+        unsafe { *c::__errno_location() = 0 };
+        let entry = unsafe { c::readdir(dir) };
+        if entry.is_null() {
+            let e = errno();
+            unsafe { c::closedir(dir) };
+            return if e.0 == 0 { Ok(names) } else { Err(e) };
+        }
+        let name = unsafe { super::c_string(entry.add(D_NAME_OFFSET)) };
+        // `.` and `..` are entries every directory has and nothing wants.
+        if name != b"." && name != b".." {
+            names.push(name);
+        }
+    }
+}
+
+pub(crate) fn env(name: &[u8]) -> Option<Vec<u8>> {
+    let name = c_path(name).ok()?;
+    let value = unsafe { c::getenv(name.as_ptr()) };
+    if value.is_null() {
+        return None;
+    }
+    Some(unsafe { super::c_string(value) })
 }
 
 // ---------------------------------------------------------------------------

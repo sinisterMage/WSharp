@@ -362,6 +362,9 @@ A module system, and four modules behind it.
 | `std/list` | `List[T]` and `new`, `with_capacity`, `from`, `len`, `capacity`, `get`, `set`, `push`, `pop`, `insert`, `remove`, `extend`, `clear`, `iter`, `next`, `to_array` |
 | `std/math` | `abs`, `min`, `max`, `sign`, `sqrt`, `pow`, `floor`, `ceil`, `round`, `trunc`, `ipow` |
 | `std/io` | `read_file`, `read_line`, `write_file`, `exists` |
+| `std/fs` | `mkdir`, `rmdir`, `remove`, `rename`, `is_dir`, `size`, `read_dir`, `mkdir_all`, `remove_tree` (item 11) |
+| `std/os` | `args`, `get`, `home`, `temp_dir` (item 11) |
+| `std/path` | `join`, `dirname`, `basename`, `extension`, `is_absolute`, `normalise` (item 11) |
 | `std/http` | the 27 status types, moved out of the global namespace; since item 8, an HTTP/1.1 client and server over `std/net` |
 | `std/broker` | `Topic[M]`, `Consumer[M]` and `topic`, `publish`, `subscribe`, `next`, `commit`, `seek`, `len` |
 | `std/net` | `Socket`, `Listener`, `Poller`, `Event`, `Datagrams`, `Peer`, `Datagram` and `connect`, `listen`, `accept`, `read`, `write`, `write_all`, `read_exactly`, `read_all`, `set_nonblocking`, `poller`, `watch`, `wait`, `udp`, `send_to`, `receive`, `reply`, `close` (item 8); and since item 10, `read_into`, `write_bytes`, `write_all_bytes`, `read_exactly_into` over a `[]u8` |
@@ -1600,11 +1603,86 @@ The decisions taken in advance about these two stages, and how they turned out:
 
 ---
 
-## 11. Package management — **after 10**
+## 11. Package management — **in progress**
 
 Item 6 left one line: *"No package management. An import is a relative path or
 a library one; there is nothing that fetches anything."* This is that, and it
 has a name: **ingot**.
+
+Five stages, as item 10 had five, and for the same reason: each one is worth
+having before the next exists.
+
+| Stage | What it is | State |
+|---|---|---|
+| One | `argv`, the environment, and a real filesystem | **done** |
+| Two | TOML, the manifest and lockfile, and the content-addressed store | to do |
+| Three | Semantic versions, and a PubGrub resolver that explains itself | to do |
+| Four | Git spoken rather than shelled out to: inflate, pkt-line, a packfile | to do |
+| Five | The loader hook, and the re-export a package facade needs | to do |
+
+### Stage one — the language can see the world — **done**
+
+Everything item 11 needs and nothing it is, which is what makes it worth having
+on its own: a program can now read its own command line and walk a directory.
+
+| Piece | Where |
+|---|---|
+| `mkdir`, `rmdir`, `remove`, `rename`, `is_dir`, `file_size`, `read_dir`, `env`, on three arms | `sys/{mod,linux,bsd,windows}.rs` |
+| `std/fs` — the builtins, and `read_dir`, `mkdir_all`, `remove_tree` above them | `fs.rs`, `std/fs.ws` |
+| `std/os` — `args`, `get`, `home`, `temp_dir` | `os.rs`, `std/os.ws` |
+| `std/path` — `join`, `dirname`, `basename`, `extension`, `is_absolute`, `normalise` | `std/path.ws` |
+| `wsharp run prog.ws -- a b c`, and `// args:` in a case header | `wsharp-cli/src/main.rs`, `tests/cases.rs` |
+
+**`struct stat` is not declared anywhere, and that is the interesting decision.**
+The obvious way to answer "is this a directory, and how big is it" is a
+`stat(2)`, and the obvious way to bind one is to declare `struct stat`. That
+struct has a different layout on macOS, FreeBSD, NetBSD and OpenBSD, and is a
+versioned symbol on glibc whose shape differs by architecture — so the BSD arm
+would carry four declarations, three of which nobody here can run. It is
+`struct kevent` again, and it gets the same answer: pick the interface that
+hides the difference. `is_dir` is `opendir` succeeding and `file_size` is
+`lseek` to the end, and neither needs a field offset.
+
+What made that possible was **dropping `modified`**. A timestamp is the third
+thing a `stat` is for, and the store was going to use it to decide whether a
+manifest was newer than its lockfile. It should not: a checkout does not
+preserve mtimes and two machines do not agree about them. The lockfile records
+the manifest's *hash* instead, which is both more correct and what removed the
+struct.
+
+`readdir` is where the difference could not be hidden, because a directory
+entry is a struct and nothing wraps it. Each arm carries `d_name`'s offset and
+nothing else — 19 on Linux, 21 on macOS, 24 on FreeBSD and OpenBSD, 13 on
+NetBSD, 16 on DragonFly — which is one auditable fact per system rather than
+five declared layouts, and which works because POSIX guarantees the name is
+NUL-terminated. macOS needs one thing more: `readdir` is `readdir$INODE64` on
+x86-64 and plain `readdir` on arm64, and linking the unsuffixed name on x86-64
+gets the *old* directory ABI, whose `d_name` is at 8. Only arm64 macOS is in
+CI, so that is a trap nothing here would have caught.
+
+**Three more things fell out rather than being chosen.**
+
+- **A builtin still may not allocate an array**, so `fs.raw_read_dir` and
+  `os.raw_args` answer with one `str` of four-byte big-endian lengths and their
+  bytes, and `std/os.unpack` cuts it up. That is `crypto.raw_system_roots`'s
+  shape, and length prefixes rather than a separator mean the encoding says
+  nothing about what a name may contain.
+- **The command line is process-wide state.** `main` takes no arguments — the
+  type checker says so — and the one word a compiled `main` receives is the
+  closure environment pointer every W# function takes. So `os::set_args`
+  publishes them into a `OnceLock` before anything is compiled, which is the
+  third thing in this runtime allowed to be process-wide and qualifies for the
+  same reason the other two do: frozen before any generated code runs.
+- **The separator is `/` everywhere, Windows included.** Every Win32 path call
+  accepts one, and one spelling is what keeps a lockfile written on one machine
+  readable on another. A `\` that arrives from outside is normalised away and
+  none is ever produced.
+
+`std/fs.mkdir_all` checks before each `mkdir` rather than catching
+`AlreadyExists`, because W# has no way to re-raise a caught error — which is
+the first thing this item has found that the language cannot say, and it is
+noted rather than fixed: the store publishes by `rename` precisely so that two
+processes racing is not a case anything has to get right.
 
 ### The name
 
@@ -1639,13 +1717,11 @@ package manager* rather than about Julia:
 
 ### What it needs, and what is missing today
 
-- **`argv`.** There is none. Nothing in the prelude or in `std` exposes the
-  command line, so a package manager written in W# cannot read its own verb.
-  This is the first thing to build and the easiest to overlook.
-- **A filesystem beyond four functions.** `std/io` reads a file, writes a file,
-  reads a line and asks whether a path exists. A store needs `mkdir`,
-  `readdir`, `rename`, `remove` and a stat that distinguishes a directory from
-  a file -- and `rename` is what makes an install atomic.
+- ~~**`argv`.**~~ Done in stage one, along with the environment, which is what
+  `~/.wsharp` is found through.
+- ~~**A filesystem beyond four functions.**~~ Done in stage one. It turned out
+  to need *less* than this asked for: not a stat, but the two questions a stat
+  was wanted for.
 - **Git, spoken rather than shelled out to.** Smart-HTTP v2 over item 10's TLS:
   pkt-line framing, ref discovery, want/have negotiation, and then a packfile,
   which means zlib inflate and delta resolution. Inflate is a few hundred lines

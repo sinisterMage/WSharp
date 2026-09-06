@@ -82,6 +82,11 @@ Things that differ between the arms, each of which cost time:
 | A Windows `SOCKET` | Not a file descriptor and not a `HANDLE`: `closesocket`, not `CloseHandle`; `recv`, not `ReadFile`. |
 | `SO_REUSEADDR` on Windows | Lets a second socket bind a port another is *actively listening on*. The right port of the Unix workaround is to do nothing at all. |
 | `getaddrinfo` failure | Reports `EAI_*` codes, which are negative on glibc and small positive numbers on macOS -- so they would collide with `errno`. Each arm translates them to one synthetic `ERESOLVE` instead. |
+| `struct stat` | **Not declared anywhere, on purpose.** It has a different layout on macOS, FreeBSD, NetBSD and OpenBSD, and is a versioned symbol on glibc. The two questions this layer actually asks each have a one-number answer instead: `is_dir` is `opendir` succeeding, and `size` is `lseek` to the end. Dropping `modified` is what made that possible, and the store hashes rather than comparing timestamps anyway. |
+| `struct dirent` | `d_name` starts at 19 on Linux, 21 on macOS, 24 on FreeBSD and OpenBSD, 13 on NetBSD and 16 on DragonFly. POSIX guarantees it is NUL-terminated, so each arm carries the *offset* and nothing else -- one auditable fact per system, where a whole declared struct would be five. |
+| `readdir` on macOS | The symbol is `readdir$INODE64` on x86-64 and plain `readdir` on arm64. Linking the unsuffixed name on x86-64 gets the *old* `struct dirent`, whose `d_name` is at 8 rather than 21, and every file name comes back as the tail of another field. Same for `opendir`; `closedir` is unsuffixed. |
+| `ENOTEMPTY` | 39 on Linux and 66 on the BSDs -- the numbering agrees only up to 34, and this is the first code past it that ordinary filesystem work meets. |
+| `MoveFileExW` | Needs `MOVEFILE_REPLACE_EXISTING` to be the operation Unix's `rename` is; without it Windows refuses when the destination exists. It still will not replace an existing *directory*, which is why the store publishes by renaming into a name nothing holds yet. |
 
 **Never lay out a `sockaddr` by hand.** `getaddrinfo` produces addresses and
 everything else consumes them, which is what keeps byte order and the BSDs'
@@ -509,6 +514,24 @@ extra `sin_len` byte out of this code entirely.
   module must name the other's types and W# has no re-export. `SigKey` and
   `verify_signature` live where a public key comes from, and `std/tls` imports
   them.
+- **A builtin that answers with a list of strings answers with one blob.** A
+  builtin may not allocate an array, so `fs.raw_read_dir` and `os.raw_args`
+  hand back a `str` of four-byte big-endian lengths and their bytes, and
+  `std/os.unpack` cuts it up in W#. Length prefixes rather than a separator
+  byte, so the encoding says nothing about what a name may contain and an empty
+  list is an empty blob rather than a case to special-case. `crypto.raw_system_roots`
+  and `std/x509.split_blob` are the original of the shape.
+- **The command line is process-wide state, and that is allowed.** `main` takes
+  no arguments and the one word a compiled `main` receives is the closure
+  environment pointer, so the arguments arrive out of band: `os::set_args`
+  publishes them into a `OnceLock` before anything is compiled. It qualifies
+  for the same exemption the type registry and the stack maps do -- frozen
+  before any generated code runs, never written again.
+- **The path separator is `/` on every platform, including Windows.** Every
+  Win32 path call accepts one, `sys/windows.rs` appends its listing wildcard to
+  one, and one spelling is what keeps a lockfile written on one machine
+  readable on another. `std/path.normalise` turns a `\` that arrives from
+  outside into one; nothing here ever produces one.
 - **The closure environment is dead after the prologue.** Captures are copied
   into declared locals before the first safepoint and `env` is never read
   again, so it is not a root and need not be. Re-reading it after a call would
@@ -540,9 +563,17 @@ nix-shell --run "cargo test --workspace"
   // panic: <substring>  must die with a W# panic saying this
   ```
 
+  `// args: one two` is what the program sees as `os.args()`; it splits on
+  whitespace, so an argument containing one cannot yet be written.
+
   The harness (`crates/wsharp-cli/tests/cases.rs`) runs the built binary as a
   subprocess, so stdout is captured for free and the test does exactly what a
   user would.
+- **A case that touches the filesystem builds its own directory and removes
+  it.** `os.temp_dir()` says where, and the name carries `crypto.random` bytes,
+  because the suite runs a second time under `--gc-stress` and the two runs may
+  overlap. `/tmp` hardcoded is what `tests/cases/io.ws` does and is the reason
+  it is the one case the Windows runner has ever had trouble with.
 - Parser tests compare against the s-expression dump (`wsharp_syntax::dump`),
   which makes precedence bugs obvious.
 - **Fixtures a case imports live in `tests/cases/modules/`.** The harness runs
