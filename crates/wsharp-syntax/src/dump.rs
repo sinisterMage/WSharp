@@ -60,7 +60,8 @@ impl Printer {
                     .map(|f| format!(" ({} {})", f.name, ty(&f.ty)))
                     .collect();
                 self.line(&format!(
-                    "(struct {}{}{}{}",
+                    "({}struct {}{}{}{}",
+                    vis(s.is_public),
                     s.name,
                     generics(&s.generics),
                     parent,
@@ -73,12 +74,19 @@ impl Printer {
                     c.ty.as_ref()
                         .map(|t| format!(" : {}", ty(t)))
                         .unwrap_or_default();
-                self.line(&format!("(const {}{} {}", c.name, annot, expr(&c.value)));
+                self.line(&format!(
+                    "({}const {}{} {}",
+                    vis(c.is_public),
+                    c.name,
+                    annot,
+                    expr(&c.value)
+                ));
                 self.push_close();
             }
             Item::Fn(f) => {
                 self.line(&format!(
-                    "(fn {}{} {}",
+                    "({}fn {}{} {}",
+                    vis(f.is_public),
                     f.name,
                     generics(&f.func.generics),
                     sig(&f.func)
@@ -204,6 +212,12 @@ impl Printer {
         }
         self.push_close();
     }
+}
+
+/// `pub ` for a declaration another module may name, and nothing otherwise --
+/// so every dump written before visibility existed still reads the same.
+fn vis(is_public: bool) -> &'static str {
+    if is_public { "pub " } else { "" }
 }
 
 /// ` [T U]` for a declaration's type parameters, or nothing when it has none.

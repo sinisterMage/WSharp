@@ -203,7 +203,11 @@ impl Parser {
                         return;
                     }
                 }
-                TokenKind::Fn | TokenKind::Const | TokenKind::Var if depth == 0 => return,
+                TokenKind::Pub | TokenKind::Fn | TokenKind::Const | TokenKind::Var
+                    if depth == 0 =>
+                {
+                    return;
+                }
                 _ => {}
             }
             self.bump();
@@ -252,8 +256,25 @@ impl Parser {
 
     fn item(&mut self) -> Option<Item> {
         match self.peek() {
-            TokenKind::Fn => self.fn_decl().map(Item::Fn),
-            TokenKind::Const => self.const_or_struct(),
+            TokenKind::Pub => {
+                let at = self.span();
+                self.bump();
+                match self.peek() {
+                    TokenKind::Fn => self.fn_decl(Some(at)).map(Item::Fn),
+                    TokenKind::Const => self.const_or_struct(Some(at)),
+                    other => {
+                        let found = other.describe();
+                        self.error_with_help(
+                            self.span(),
+                            format!("expected a declaration after `pub`, found {found}"),
+                            "`pub` goes in front of a `fn` or a `const`",
+                        );
+                        None
+                    }
+                }
+            }
+            TokenKind::Fn => self.fn_decl(None).map(Item::Fn),
+            TokenKind::Const => self.const_or_struct(None),
             TokenKind::Var => {
                 let span = self.span();
                 self.error_with_help(
@@ -275,14 +296,21 @@ impl Parser {
         }
     }
 
-    fn fn_decl(&mut self) -> Option<FnDecl> {
-        let start = self.span();
+    /// `at` is where a `pub` in front of this was written, which is where the
+    /// declaration then starts.
+    fn fn_decl(&mut self, at: Option<Span>) -> Option<FnDecl> {
+        let start = at.unwrap_or_else(|| self.span());
         self.expect(TokenKind::Fn)?;
         let name = self.ident()?;
         let generics = self.generic_params()?;
         let func = self.func_rest(start, generics)?;
         let span = start.to(func.span);
-        Some(FnDecl { name, func, span })
+        Some(FnDecl {
+            name,
+            func,
+            is_public: at.is_some(),
+            span,
+        })
     }
 
     /// `[T, U]` naming a declaration's or a literal's type parameters.
@@ -361,8 +389,8 @@ impl Parser {
         })
     }
 
-    fn const_or_struct(&mut self) -> Option<Item> {
-        let start = self.span();
+    fn const_or_struct(&mut self, at: Option<Span>) -> Option<Item> {
+        let start = at.unwrap_or_else(|| self.span());
         self.expect(TokenKind::Const)?;
         let name = self.ident()?;
         let ty = if self.eat(TokenKind::Colon) {
@@ -405,6 +433,7 @@ impl Parser {
             let span = start.to(self.prev_span());
             return Some(Item::Struct(StructDecl {
                 name,
+                is_public: at.is_some(),
                 generics,
                 parent,
                 fields,
@@ -417,6 +446,7 @@ impl Parser {
         let span = start.to(self.prev_span());
         Some(Item::Const(ConstDecl {
             name,
+            is_public: at.is_some(),
             ty,
             value,
             span,

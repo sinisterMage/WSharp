@@ -9,7 +9,7 @@ const array = @import("std/array");
 ///
 /// An empty separator yields the whole string, rather than every character:
 /// splitting on nothing is much more often a bug than a request.
-fn split(s: str, sep: str) []str {
+pub fn split(s: str, sep: str) []str {
     if (len(sep) == 0) { return []str{ s }; }
 
     var out = []str{};
@@ -28,7 +28,7 @@ fn split(s: str, sep: str) []str {
 }
 
 /// `s` repeated `n` times.
-fn repeat(s: str, n: i64) str {
+pub fn repeat(s: str, n: i64) str {
     var out = "";
     var i = 0;
     while (i < n) : (i += 1) { out = concat(out, s); }
@@ -36,13 +36,13 @@ fn repeat(s: str, n: i64) str {
 }
 
 /// Whether `s` starts with `prefix`.
-fn starts_with(s: str, prefix: str) bool {
+pub fn starts_with(s: str, prefix: str) bool {
     if (len(prefix) > len(s)) { return false; }
     return eq(substr(s, 0, len(prefix)), prefix);
 }
 
 /// The pieces of `parts` with `sep` between them.
-fn join(parts: []str, sep: str) str {
+pub fn join(parts: []str, sep: str) str {
     var out = "";
     var first = true;
     for (parts) |p| {

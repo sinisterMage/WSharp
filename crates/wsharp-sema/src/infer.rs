@@ -378,6 +378,17 @@ struct Inferencer<'a> {
     error_ids: HashMap<String, hir::ErrorId>,
 
     frames: Vec<Frame>,
+    /// Qualified keys another module may *not* name. Private is the default, so
+    /// this records the exceptions rather than the rule -- and a name a module
+    /// declares is always visible to itself, which is why one flat set is
+    /// enough: a qualified lookup only ever crosses a module boundary, since a
+    /// module that imported itself would be a cycle.
+    private: HashSet<String>,
+    /// Spans a privacy error has already been reported at. One qualified name
+    /// is resolved more than once -- a call asks whether its callee is an
+    /// overload set, a builtin, and then a value -- and the reader wants to be
+    /// told once.
+    reported_private: HashSet<Span>,
     /// The name the *next* frame pushed should bind to the function it is the
     /// body of, so that a `fn` literal bound to a `const` can recurse. Consumed
     /// by [`Inferencer::infer_function`]; set only by
@@ -434,6 +445,8 @@ impl<'a> Inferencer<'a> {
             errors: Vec::new(),
             error_ids: HashMap::new(),
             frames: Vec::new(),
+            private: HashSet::new(),
+            reported_private: HashSet::new(),
             pending_self: None,
             constraints: Vec::new(),
             loop_depth: 0,
@@ -978,6 +991,22 @@ impl<'a> Inferencer<'a> {
     }
 
     fn collect_globals(&mut self) {
+        // What each module keeps to itself, recorded before any name is
+        // resolved through a module path. Structs and values share the key
+        // shape, so one set covers `struct_ids` and `globals` both.
+        for m in 0..self.modules.len() {
+            for item in &self.modules[m].ast.items {
+                let public = match item {
+                    ast::Item::Fn(d) => d.is_public,
+                    ast::Item::Struct(d) => d.is_public,
+                    ast::Item::Const(d) => d.is_public,
+                };
+                if !public {
+                    let key = self.key_in(m, item.name().as_str());
+                    self.private.insert(key);
+                }
+            }
+        }
         // First, so that their ids are the ones the library's own functions
         // return. A builtin cannot look an error up by name: it is compiled
         // long before the program that catches it is read.
@@ -1338,7 +1367,14 @@ impl<'a> Inferencer<'a> {
                 let args: Vec<Type> = args.iter().map(|a| self.resolve_type_expr(a)).collect();
                 let name = segments.last().expect("a path has a last segment");
                 let found = match self.split_path(segments) {
-                    Some(module) => self.lookup_struct_in(&module, name.as_str()),
+                    Some(module) => {
+                        let found = self.lookup_struct_in(&module, name.as_str());
+                        if found.is_some() {
+                            let key = format!("{module}.{name}");
+                            self.check_visible(&key, name);
+                        }
+                        found
+                    }
                     // No module prefix, so it is an ordinary name with type
                     // arguments: `Box[i64]`.
                     None if segments.len() == 1 => self.lookup_struct(name.as_str()),
@@ -2380,7 +2416,13 @@ impl<'a> Inferencer<'a> {
             .as_ref()
             .and_then(|path| self.globals.get(&format!("{path}.{name}")));
         if let Some(GlobalRef::Func(ids)) = found {
-            return Some(ids.clone());
+            let ids = ids.clone();
+            if let Some(path) = &module {
+                let key = format!("{path}.{name}");
+                let at = Ident::new(name, span);
+                self.check_visible(&key, &at);
+            }
+            return Some(ids);
         }
         self.error(span, format!("`{shown}` cannot be iterated")).help = Some(format!(
             "a `for` over a struct calls `iter` and `next` from the module that declares it; \
@@ -2890,7 +2932,44 @@ impl<'a> Inferencer<'a> {
         if path == HTTP_MODULE {
             self.lookup_struct_in(HTTP_MODULE, name.as_str());
         }
-        self.globals.get(&format!("{path}.{name}")).cloned()
+        let key = format!("{path}.{name}");
+        let found = self.globals.get(&key).cloned();
+        if found.is_some() {
+            self.check_visible(&key, name);
+        }
+        found
+    }
+
+    /// Report a name this module is not allowed to see, once per span.
+    ///
+    /// Reported rather than hidden: a private name that resolved to nothing
+    /// would come back as "cannot find", which sends the reader looking for a
+    /// spelling mistake instead of at the declaration that is right there.
+    fn check_visible(&mut self, key: &str, name: &Ident) {
+        // A module always sees its own, whatever it said. Belt and braces: a
+        // qualified name cannot reach the module it is written in today, since
+        // a module that imported itself would be a cycle -- but the protocol
+        // lookup below resolves in a *type's* module, which may well be this
+        // one.
+        let here = format!("{}.", self.modules[self.current].path);
+        if key.starts_with(&here) {
+            return;
+        }
+        if !self.private.contains(key) || !self.reported_private.insert(name.span) {
+            return;
+        }
+        // No secondary label pointing at the declaration, tempting as it is: a
+        // `Span` carries no file, and the renderer lays a diagnostic's labels
+        // out in the file its primary span falls in. The declaration is in
+        // another one by construction.
+        self.error(
+            name.span,
+            format!("`{name}` is private to the module that declares it"),
+        )
+        .help = Some(format!(
+            "everything is private unless it says otherwise; write `pub` in front of `{name}` \
+             to let other modules name it"
+        ));
     }
 
     /// A value named through a module: `http.NotFound404`, `math.abs`.
@@ -2902,6 +2981,7 @@ impl<'a> Inferencer<'a> {
         }
         let key = format!("{path}.{name}");
         let global = self.globals.get(&key).cloned()?;
+        self.check_visible(&key, name);
         Some(self.global_as_value(global, name))
     }
 

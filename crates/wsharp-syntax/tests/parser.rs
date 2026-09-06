@@ -56,6 +56,29 @@ fn function_with_and_without_annotations() {
 }
 
 #[test]
+fn pub_marks_a_declaration_visible() {
+    let dump = ast("pub fn f() void { }\nfn g() void { }");
+    assert!(dump.contains("(pub fn f "), "{dump}");
+    // Absent by default, so every dump written before visibility existed still
+    // reads the same.
+    assert!(dump.contains("(fn g "), "{dump}");
+    assert!(!dump.contains("(pub fn g "), "{dump}");
+
+    let dump = ast("pub const P = struct { x: i64 };\npub const N = 1;");
+    assert!(dump.contains("(pub struct P (x i64))"), "{dump}");
+    assert!(dump.contains("(pub const N 1)"), "{dump}");
+}
+
+#[test]
+fn pub_needs_a_declaration_after_it() {
+    let errs = errors("pub var x = 1;");
+    assert!(
+        errs.iter().any(|e| e.contains("after `pub`")),
+        "unexpected errors: {errs:?}"
+    );
+}
+
+#[test]
 fn arithmetic_precedence() {
     assert_eq!(body("const x = 1 + 2 * 3;"), "(const x (+ 1 (* 2 3)))");
     assert_eq!(body("const x = (1 + 2) * 3;"), "(const x (* (+ 1 2) 3))");

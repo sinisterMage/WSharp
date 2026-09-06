@@ -401,13 +401,35 @@ A module system, and four modules behind it.
   the boundary as the two words a `#[repr(C)]` pair is returned in. The tag is
   an index into the program's error table plus one, so the library's error
   names are interned before any program's — `builtin_errors()` fixes them.
+- **Visibility is private by default, and only qualified lookup checks it.**
+  `pub` in front of a `fn`, a `const` or a struct is what lets another module
+  name it. The check goes in the three places a *qualified* name is resolved --
+  a value, a callee, and a type -- and nowhere near `global()`, because an
+  unqualified name can only ever mean this module's own or the prelude's and
+  both are always visible. That also means the flat table needed no second
+  dimension: one set of the keys that are *not* public says everything, since a
+  qualified name cannot reach the module it is written in without that module
+  importing itself, which is a cycle.
+
+  A private name is reported rather than hidden. Resolving to nothing would
+  come back as "cannot find", which sends the reader looking for a spelling
+  mistake instead of at the declaration that is right there. One name is
+  resolved more than once -- a call asks whether its callee is an overload set,
+  then a builtin, then a value -- so the reported spans are remembered and the
+  reader is told once. There is no secondary label pointing at the
+  declaration, tempting as it is: a `Span` carries no file, and the renderer
+  lays a diagnostic's labels out in the file its primary span falls in, which
+  is by construction not the one the declaration is in.
+
+  `std/list.reserve` is the demonstration: growing is that module's business,
+  and a caller that reserved the wrong amount would be a caller that had to
+  know about the doubling.
 - **Builtins are keyed by a qualified symbol.** `std/str.len` and
   `std/array.len` are two functions that source code calls `len`; the symbol
   table has no notion of a module, so `Builtin::symbol()` supplies one.
 
 ### What is left
 
-- **No visibility.** Everything in a module is public; there is no `pub`.
 - **No package management.** An import is a relative path or a library one;
   there is nothing that fetches anything.
 - **`catch` and `orelse` still take an expression, not a block**, which is felt
@@ -559,4 +581,3 @@ These are deliberate limitations, each with a clear fix:
 - **No sized integer types**, no unsigned types, no bitwise operators.
 - **x86-64 and aarch64 only.** The collector reads the frame pointer with
   inline assembly; other architectures get a `compile_error!`.
-- **No visibility in modules.** Everything a module declares is public.

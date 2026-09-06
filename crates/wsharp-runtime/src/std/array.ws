@@ -11,7 +11,7 @@
 // type.
 
 /// `a` followed by `b`.
-fn concat[T](a: []T, b: []T) []T {
+pub fn concat[T](a: []T, b: []T) []T {
     var out = new(len(a) + len(b));
     var i = 0;
     for (a) |v| {
@@ -29,7 +29,7 @@ fn concat[T](a: []T, b: []T) []T {
 ///
 /// A new array each time: an array's length is in its header, so growing one
 /// in place would mean a capacity the type does not have.
-fn push[T](a: []T, v: T) []T {
+pub fn push[T](a: []T, v: T) []T {
     var out = new(len(a) + 1);
     var i = 0;
     for (a) |x| {
@@ -44,7 +44,7 @@ fn push[T](a: []T, v: T) []T {
 ///
 /// Clamped because a slice is usually computed from a search that may have
 /// found nothing, and every caller would otherwise have to check first.
-fn slice[T](a: []T, from: i64, to: i64) []T {
+pub fn slice[T](a: []T, from: i64, to: i64) []T {
     var start = from;
     if (start < 0) { start = 0; }
     if (start > len(a)) { start = len(a); }
@@ -61,7 +61,7 @@ fn slice[T](a: []T, from: i64, to: i64) []T {
 }
 
 /// `n` copies of `v`.
-fn repeat[T](n: i64, v: T) []T {
+pub fn repeat[T](n: i64, v: T) []T {
     var count = n;
     if (count < 0) { count = 0; }
     var out = new(count);

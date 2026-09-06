@@ -76,7 +76,7 @@ everywhere.** They are checked when written and inferred when not.
 | Growable | `std/list` — a backing array plus a count, so `push` is amortised constant time |
 | Iterating | `for (xs) \|x\|` over an array walks it by index; over anything else it calls `iter` and `next` from the module that declares its type |
 | Generics | `fn first[T](a: []T) T`, `const Box = struct[T] { value: T };`, `fn [T](x: T) T` — inferred when not written |
-| Modules | `const http = @import("std/http");`, then `http.NotFound404` |
+| Modules | `const http = @import("std/http");`, then `http.NotFound404`; `pub` is what another module may name |
 | Structs | `const P = struct { x: i64 };`, `P{ .x = 1 }`, `p.x` |
 | Subtyping | `const Sub = struct : Base { };` — a subtype widens implicitly |
 | Singletons | a struct with no fields is also a value: its sole instance |
@@ -291,7 +291,7 @@ when unset, empty or `0`.
 
 `@import` binds a module to a name; everything in it is reached through that
 name. A path is either a file next to the importing one or one of the
-library's.
+library's. A module's names are private to it unless it writes `pub`.
 
 ```zig
 const str  = @import("std/str");
@@ -387,7 +387,10 @@ A few decisions worth knowing about:
   instead, compiled with your program so the collector's barriers apply to it.
 - **A module is a prefix on a name.** Names are stored qualified in one flat
   table, and an unqualified lookup tries the current module and then the
-  prelude; what a module cannot see is what it has no key for. Files are laid
+  prelude; what a module cannot see is what it has no key for. Everything is
+  private to its module unless it says `pub`, and only a *qualified* lookup
+  checks that -- an unqualified name can only mean this module's own or the
+  prelude's, and both are always visible. Files are laid
   end to end in one offset space, so a `Span` stays two `u32`s with no file in
   it and the renderer works out which file a span fell in.
 

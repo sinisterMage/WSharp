@@ -17,19 +17,19 @@ const array = @import("std/array");
 /// `items` is over-allocated: only the first `count` slots hold values the
 /// list is claiming. The rest read as null, because a hole is zeroed when an
 /// allocator takes it, which is exactly what the collector expects to find.
-const List = struct[T] { items: []T, count: i64 };
+pub const List = struct[T] { items: []T, count: i64 };
 
 /// An empty list, holding no backing array at all.
 ///
 /// The element type comes from what the list is used at, so
 /// `var xs = list.new(); list.push(xs, 1);` needs no annotation: a local
 /// binding is monomorphic, and `push` is what pins `T`.
-fn new[T]() List[T] {
+pub fn new[T]() List[T] {
     return List{ .items = []T{}, .count = 0 };
 }
 
 /// An empty list with room for `n` before it has to grow.
-fn with_capacity[T](n: i64) List[T] {
+pub fn with_capacity[T](n: i64) List[T] {
     var room = n;
     if (room < 0) { room = 0; }
     var items: []T = array.new(room);
@@ -40,7 +40,7 @@ fn with_capacity[T](n: i64) List[T] {
 ///
 /// A copy rather than a borrow: the list would otherwise write through a
 /// caller's array, and `a` has no capacity of its own to grow into anyway.
-fn from[T](a: []T) List[T] {
+pub fn from[T](a: []T) List[T] {
     var out: []T = array.new(array.len(a));
     var i = 0;
     for (a) |v| {
@@ -51,12 +51,12 @@ fn from[T](a: []T) List[T] {
 }
 
 /// How many values `l` holds.
-fn len[T](l: List[T]) i64 {
+pub fn len[T](l: List[T]) i64 {
     return l.count;
 }
 
 /// How many `l` can hold before it next has to grow.
-fn capacity[T](l: List[T]) i64 {
+pub fn capacity[T](l: List[T]) i64 {
     return array.len(l.items);
 }
 
@@ -66,13 +66,13 @@ fn capacity[T](l: List[T]) i64 {
 /// backing array directly would happily hand back a spare slot. The message
 /// is the one an array gives, because there is no reason for a list to say
 /// less about the same mistake.
-fn get[T](l: List[T], i: i64) T {
+pub fn get[T](l: List[T], i: i64) T {
     if (i < 0 or i >= l.count) { panic_index(i, l.count); }
     return l.items[i];
 }
 
 /// `l[i] = v`.
-fn set[T](l: List[T], i: i64, v: T) void {
+pub fn set[T](l: List[T], i: i64, v: T) void {
     if (i < 0 or i >= l.count) { panic_index(i, l.count); }
     l.items[i] = v;
 }
@@ -81,14 +81,14 @@ fn set[T](l: List[T], i: i64, v: T) void {
 ///
 /// Doubling is what makes a run of pushes amortised constant time: each grow
 /// copies everything, but the copies are paid for by the pushes that fit.
-fn push[T](l: List[T], v: T) void {
+pub fn push[T](l: List[T], v: T) void {
     reserve(l, l.count + 1);
     l.items[l.count] = v;
     l.count = l.count + 1;
 }
 
 /// Append every element of `a`.
-fn extend[T](l: List[T], a: []T) void {
+pub fn extend[T](l: List[T], a: []T) void {
     reserve(l, l.count + array.len(a));
     for (a) |v| {
         l.items[l.count] = v;
@@ -101,7 +101,7 @@ fn extend[T](l: List[T], a: []T) void {
 /// Panics on an empty list, for the same reason `a[i]` panics rather than
 /// returning `?T`: an `orelse` in every caller costs more than the failures
 /// it catches.
-fn pop[T](l: List[T]) T {
+pub fn pop[T](l: List[T]) T {
     if (l.count == 0) { panic_index(0, 0); }
     l.count = l.count - 1;
     return l.items[l.count];
@@ -110,7 +110,7 @@ fn pop[T](l: List[T]) T {
 /// Insert `v` at `i`, shifting everything from there along.
 ///
 /// `i` may be the count, which appends; anything past it is out of range.
-fn insert[T](l: List[T], i: i64, v: T) void {
+pub fn insert[T](l: List[T], i: i64, v: T) void {
     if (i < 0 or i > l.count) { panic_index(i, l.count); }
     reserve(l, l.count + 1);
     var at = l.count;
@@ -122,7 +122,7 @@ fn insert[T](l: List[T], i: i64, v: T) void {
 }
 
 /// Remove and return the value at `i`, shifting everything after it back.
-fn remove[T](l: List[T], i: i64) T {
+pub fn remove[T](l: List[T], i: i64) T {
     if (i < 0 or i >= l.count) { panic_index(i, l.count); }
     const gone = l.items[i];
     var at = i;
@@ -138,7 +138,7 @@ fn remove[T](l: List[T], i: i64) T {
 /// The backing array goes too, rather than only the count: a list that has
 /// been cleared is usually one that is finished with, and keeping the array
 /// would keep every value in it alive.
-fn clear[T](l: List[T]) void {
+pub fn clear[T](l: List[T]) void {
     l.items = []T{};
     l.count = 0;
 }
@@ -148,7 +148,7 @@ fn clear[T](l: List[T]) void {
 /// `at` is the next index to hand out. Holding the list rather than its
 /// backing array is what makes `next` see a `push` that happened mid-loop --
 /// and see the count that goes with it, which a captured array could not.
-const Iter = struct[T] { list: List[T], at: i64 };
+pub const Iter = struct[T] { list: List[T], at: i64 };
 
 /// Where a `for (l) |v|` starts.
 ///
@@ -156,12 +156,12 @@ const Iter = struct[T] { list: List[T], at: i64 };
 /// produces null, and resolves both in the module that declares the type it
 /// is walking. So this is the whole of what makes a list iterable, and
 /// `to_array` is no longer the way to write the loop.
-fn iter[T](l: List[T]) Iter[T] {
+pub fn iter[T](l: List[T]) Iter[T] {
     return Iter{ .list = l, .at = 0 };
 }
 
 /// The next value, or null at the end.
-fn next[T](it: Iter[T]) ?T {
+pub fn next[T](it: Iter[T]) ?T {
     if (it.at >= it.list.count) { return null; }
     const v = it.list.items[it.at];
     it.at = it.at + 1;
@@ -172,7 +172,7 @@ fn next[T](it: Iter[T]) ?T {
 ///
 /// A copy, because the backing array is longer than the list and handing it
 /// out would expose the spare slots.
-fn to_array[T](l: List[T]) []T {
+pub fn to_array[T](l: List[T]) []T {
     var out: []T = array.new(l.count);
     var i = 0;
     while (i < l.count) : (i += 1) {
@@ -182,6 +182,9 @@ fn to_array[T](l: List[T]) []T {
 }
 
 /// Make sure `l` can hold `want` values without growing again.
+///
+/// Private: growing is this module's business, and a caller that reserved the
+/// wrong amount would be a caller that had to know about the doubling.
 ///
 /// Doubling from four: growing one slot at a time would make a run of pushes
 /// quadratic, which is the whole reason this type exists.

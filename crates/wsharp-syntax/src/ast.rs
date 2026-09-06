@@ -40,6 +40,10 @@ impl Item {
 pub struct FnDecl {
     pub name: Ident,
     pub func: Func,
+    /// Whether another module may name this. Everything is private to the
+    /// module it is declared in unless it says otherwise, which is what makes
+    /// a module's surface something it states rather than something it leaks.
+    pub is_public: bool,
     pub span: Span,
 }
 
@@ -69,6 +73,8 @@ pub struct Param {
 #[derive(Debug, Clone)]
 pub struct StructDecl {
     pub name: Ident,
+    /// See [`FnDecl::is_public`].
+    pub is_public: bool,
     /// Type parameters written as `struct[T] { .. }`. A generic struct is
     /// outside the dispatch lattice -- see `parent`.
     pub generics: Vec<Ident>,
@@ -89,6 +95,8 @@ pub struct FieldDecl {
 #[derive(Debug, Clone)]
 pub struct ConstDecl {
     pub name: Ident,
+    /// See [`FnDecl::is_public`].
+    pub is_public: bool,
     pub ty: Option<TypeExpr>,
     pub value: Expr,
     pub span: Span,
