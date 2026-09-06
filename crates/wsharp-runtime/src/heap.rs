@@ -45,7 +45,6 @@
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::cell::Cell;
 use std::ptr;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
 use crate::header::{
@@ -110,7 +109,8 @@ impl BlockState {
 }
 
 /// The statistics, kept outside the heap so that a thread allocating from its
-/// own buffer can maintain them without taking the lock.
+/// own buffer can maintain them without taking the lock. One set per worker,
+/// leaked so that its heap can hold a `&'static` to it.
 #[derive(Debug)]
 pub(crate) struct Counters {
     /// Cumulative, never reduced: what the program has asked for in total.
@@ -122,7 +122,7 @@ pub(crate) struct Counters {
 }
 
 impl Counters {
-    const fn new() -> Counters {
+    pub(crate) const fn new() -> Counters {
         Counters {
             bytes_allocated: AtomicUsize::new(0),
             objects_allocated: AtomicUsize::new(0),
@@ -147,8 +147,6 @@ impl Counters {
         self.live_bytes.fetch_sub(size, Ordering::Relaxed);
     }
 }
-
-static GLOBAL_COUNTERS: Counters = Counters::new();
 
 /// A space's side metadata.
 ///
@@ -579,12 +577,15 @@ pub struct Heap {
 unsafe impl Send for Heap {}
 
 impl Heap {
-    const fn new_global() -> Heap {
+    /// One worker's heap. Publishes its spaces into the shared directory, so
+    /// that the load barrier can answer questions about any address, and hands
+    /// out allocation buffers to the threads that belong to it.
+    pub(crate) fn new_worker(counters: &'static Counters) -> Heap {
         Heap {
             spaces: Vec::new(),
             bump: None,
             large: Vec::new(),
-            counters: &GLOBAL_COUNTERS,
+            counters,
             shared: true,
         }
     }
@@ -1060,10 +1061,13 @@ pub struct HeapStats {
     pub large_objects: usize,
 }
 
-static HEAP: Mutex<Heap> = Mutex::new(Heap::new_global());
-
+/// Run `f` on the heap of the worker this thread belongs to.
+///
+/// The one place the heap is reached, which is what made splitting it per
+/// worker a change to this function rather than to its seventeen callers.
 fn with_heap<R>(f: impl FnOnce(&mut Heap) -> R) -> R {
-    f(&mut HEAP.lock().unwrap_or_else(|e| e.into_inner()))
+    let worker = crate::worker::Worker::current();
+    f(&mut worker.heap.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// Allocate a zeroed object of `size` bytes (header included), stamp its
@@ -1138,6 +1142,25 @@ pub fn alloc_copy_shared(type_id: TypeId, size: u32) -> *mut u8 {
 /// Nothing may reference it afterwards.
 pub unsafe fn free_object(ptr: *mut u8, size: u32) {
     with_heap(|heap| heap.free(ptr, align_up(size.max(HEADER_SIZE)) as usize));
+}
+
+/// Every worker's heap added together, for the exit report.
+///
+/// A program's heap is all of its workers' heaps: no object is in two of them,
+/// so adding them up double-counts nothing.
+pub fn total_heap_stats() -> HeapStats {
+    let mut total = HeapStats::default();
+    flush_tlab_counters();
+    crate::worker::for_each_worker(|w| {
+        let s = w.heap.lock().unwrap_or_else(|e| e.into_inner()).stats();
+        total.bytes_allocated += s.bytes_allocated;
+        total.objects_allocated += s.objects_allocated;
+        total.live_objects += s.live_objects;
+        total.live_bytes += s.live_bytes;
+        total.blocks += s.blocks;
+        total.large_objects += s.large_objects;
+    });
+    total
 }
 
 pub fn heap_stats() -> HeapStats {

@@ -485,7 +485,7 @@ A module system, and four modules behind it.
 
 ---
 
-## 7. Multithreading — **designed, not built**
+## 7. Multithreading — **per-worker heaps built; the rest designed**
 
 The model, settled before anything is written so that the collector and the
 type system are not surprised by it later.
@@ -540,11 +540,35 @@ constraint rather than a check.
 stride that item 5 added: the collector already knows how to find every
 reference in an object, and copying one to another heap is the same walk.
 
-### What has to change first
+### What has been built
 
-- The heap's statics become per-worker. `HEAP`, the buffers, the phase and the
-  type registry are process-wide today; only the registry can stay that way,
-  because it is frozen before any code runs.
+**Per-worker heaps.** `worker::Worker` owns the heap, the write barrier's
+buffers, the phase machine, the mark parity and the statistics. A thread-local
+pointer says which worker a thread belongs to, created on demand — a thread
+that allocates is a worker by that fact alone — and a collector thread installs
+its worker's pointer on entry, so a copy it makes while evacuating lands in the
+heap the original came from.
+
+Three things stay process-wide, each for a reason that does not generalise:
+
+- **The type registry and the stack maps.** Frozen before any code runs.
+- **The space directory.** It answers "which space is this address in?", and
+  the load barrier asks it about whatever reference it was handed.
+- **The two flag words generated code reads.** Their addresses are compiled in
+  as constants, so they cannot be per-worker without teaching the barriers
+  thread-local access. They mean "*some* worker wants a pause" and "*some*
+  worker is moving" instead, counted rather than set, so that one worker
+  finishing its pause cannot silence another's request. The slow path asks the
+  current worker whether the request is its own; the cost is a false slow path
+  on an uninvolved worker, which is correct because both slow paths are
+  idempotent and rare because both flags are raised only around a pause.
+
+This landed with a single worker and changed nothing observable: the whole
+end-to-end suite passed unaltered, twice, and `WSHARP_GC_STATS` reported the
+same collections, roots, traces and objects moved as before, to the number.
+
+### What has to change next
+
 - `builtins.rs` gains `spawn`, the handle types, and the broker's operations —
   and the broker itself is the first part of the runtime that is not a leaf.
 - The stack walker is already per-thread and needs nothing.

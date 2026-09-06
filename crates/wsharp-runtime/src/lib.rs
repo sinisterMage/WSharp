@@ -14,18 +14,23 @@ pub mod mark;
 pub mod stackwalk;
 pub mod strings;
 pub mod types;
+pub mod worker;
 
 pub use builtins::{Builtin, BuiltinTy, builtins, runtime_symbols};
 pub use header::{HEADER_SIZE, TypeId};
 pub use heap::{HeapStats, heap_stats, in_heap, ws_alloc};
 pub use types::{TypeInfo, TypeLayout, info, layout_of, publish, register_type};
+pub use worker::Worker;
 
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::sync::Mutex;
 
-    /// Taken by every unit test that touches process-wide collector state --
-    /// the mark parity, the stress flag -- because the test binary runs its
-    /// tests in parallel and they all share one heap.
+    /// Taken by every unit test that touches process-wide collector state.
+    ///
+    /// That is now only the stress flag and the type registry: a test thread
+    /// is a worker of its own, so its heap, its buffers and its mark parity
+    /// are its own too, and the tests that used to contend over those no
+    /// longer can.
     pub static SERIAL: Mutex<()> = Mutex::new(());
 }

@@ -10,8 +10,7 @@
 //! [`crate::heap`] owns the memory, and [`crate::stackwalk`] owns finding
 //! roots.
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::header::{
@@ -19,6 +18,7 @@ use crate::header::{
     type_id_of,
 };
 use crate::heap::{in_heap, is_collectable};
+use crate::worker::Worker;
 use crate::mark;
 use crate::stackwalk::walk_roots;
 use crate::types;
@@ -81,18 +81,27 @@ pub(crate) struct Buffers {
 // lifetime of the process; the mutex makes concurrent access safe.
 unsafe impl Send for Buffers {}
 
-static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
-    logged: Vec::new(),
-    decrements: Vec::new(),
-    nursery: Vec::new(),
-    fresh: Vec::new(),
-    satb: Vec::new(),
-    to_scan: Vec::new(),
-    deferred_dead: Vec::new(),
-});
+impl Buffers {
+    pub(crate) const fn new() -> Buffers {
+        Buffers {
+            logged: Vec::new(),
+            decrements: Vec::new(),
+            nursery: Vec::new(),
+            fresh: Vec::new(),
+            satb: Vec::new(),
+            to_scan: Vec::new(),
+            deferred_dead: Vec::new(),
+        }
+    }
+}
 
+/// Run `f` on the buffers of the worker this thread belongs to.
 pub(crate) fn with_buffers<R>(f: impl FnOnce(&mut Buffers) -> R) -> R {
-    f(&mut BUFFERS.lock().unwrap_or_else(|e| e.into_inner()))
+    with_buffers_of(Worker::current(), f)
+}
+
+pub(crate) fn with_buffers_of<R>(worker: &Worker, f: impl FnOnce(&mut Buffers) -> R) -> R {
+    f(&mut worker.buffers.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// How many objects the barrier has logged since the last collection.
@@ -170,27 +179,22 @@ type SmallSnapshot = Vec<*mut u8>;
 /// a computational loop interruptible at all -- Cranelift's only safepoints are
 /// calls, and a loop need not contain one. The collector thread sets it when
 /// marking is done and the trace needs the program stopped to finish.
-static POLL: AtomicU8 = AtomicU8::new(0);
-
-/// The address generated code reads to see whether a collection is wanted.
-pub fn poll_flag_address() -> usize {
-    &POLL as *const AtomicU8 as usize
-}
-
-pub(crate) fn request_safepoint() {
-    POLL.store(1, Ordering::Release);
-}
-
-pub(crate) fn clear_poll() {
-    POLL.store(0, Ordering::Release);
-}
+pub use crate::worker::poll_flag_address;
+pub(crate) use crate::worker::{clear_poll, request_safepoint};
 
 /// The slow path of the loop safepoint check.
 ///
 /// # Safety
 /// Called from generated code with the frame chain intact.
 pub extern "C" fn ws_gc_poll() {
-    if POLL.swap(0, Ordering::AcqRel) == 0 {
+    if !crate::worker::poll_wanted() {
+        return;
+    }
+    // The word is shared, so another worker's request is what usually brings
+    // us here. Idempotent either way: a worker that was not asked for a pause
+    // simply goes back to what it was doing.
+    let worker = Worker::current();
+    if !crate::worker::take_safepoint_request(worker) {
         return;
     }
     unsafe { mark::safepoint() };
@@ -202,57 +206,46 @@ pub extern "C" fn ws_gc_poll() {
 /// One byte rather than a phase comparison because generated code tests it on
 /// a path that is taken on every field read: while it is zero the barrier
 /// costs a load, a test and a branch that falls through.
-static EVACUATING: AtomicU8 = AtomicU8::new(0);
+pub use crate::worker::evacuating_flag_address;
+pub(crate) use crate::worker::set_evacuating;
 
-/// The address generated code reads to see whether objects are moving.
-pub fn evacuating_flag_address() -> usize {
-    &EVACUATING as *const AtomicU8 as usize
-}
-
-pub(crate) fn set_evacuating(on: bool) {
-    EVACUATING.store(u8::from(on), Ordering::Release);
-}
-
+/// Whether *this* worker is moving objects.
 pub fn evacuating() -> bool {
-    EVACUATING.load(Ordering::Acquire) != 0
+    crate::worker::evacuating(Worker::current())
 }
 
 /// Collect at every allocation and check every root found.
+/// The one collector switch that stays process-wide: it is set once, before
+/// any code runs, and every worker wants the same answer.
 static STRESS: AtomicBool = AtomicBool::new(false);
-static COLLECTIONS: AtomicUsize = AtomicUsize::new(0);
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-/// The allocation count at which the next scheduled trace is due.
-static TRACE_AT: AtomicUsize = AtomicUsize::new(TRACE_EVERY_ALLOCATIONS);
-/// Roots the stack walk has enumerated, in total. Worth having because a walk
-/// that silently finds *nothing* would let every root check pass vacuously.
-static ROOTS_SEEN: AtomicUsize = AtomicUsize::new(0);
-static FREED: AtomicUsize = AtomicUsize::new(0);
-static TRACES: AtomicUsize = AtomicUsize::new(0);
-static MOVED: AtomicUsize = AtomicUsize::new(0);
-static PAUSES: AtomicUsize = AtomicUsize::new(0);
-static MAX_PAUSE_US: AtomicUsize = AtomicUsize::new(0);
-static TOTAL_PAUSE_US: AtomicUsize = AtomicUsize::new(0);
-/// Live bytes when the last trace finished sweeping: the growth trigger's
-/// point of comparison.
-static TRACE_BASELINE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Add one worker's counter up across every worker there is.
+///
+/// A program's collector did what all of its workers' collectors did, so the
+/// numbers a program asserts on are the totals.
+fn total(of: impl Fn(&Worker) -> usize) -> usize {
+    let mut sum = 0;
+    crate::worker::for_each_worker(|w| sum += of(w));
+    sum
+}
 
 /// Objects the collector has relocated.
 pub fn moved() -> usize {
-    MOVED.load(Ordering::Relaxed)
+    total(|w| w.stats.moved.load(Ordering::Relaxed))
 }
 
 /// Mark traces started.
 pub fn traces() -> usize {
-    TRACES.load(Ordering::Relaxed)
+    total(|w| w.stats.traces.load(Ordering::Relaxed))
 }
 
 /// Objects the collector has reclaimed.
 pub fn freed() -> usize {
-    FREED.load(Ordering::Relaxed)
+    total(|w| w.stats.freed.load(Ordering::Relaxed))
 }
 
 pub fn roots_seen() -> usize {
-    ROOTS_SEEN.load(Ordering::Relaxed)
+    total(|w| w.stats.roots_seen.load(Ordering::Relaxed))
 }
 
 pub fn set_stress(on: bool) {
@@ -264,39 +257,43 @@ pub fn stress() -> bool {
 }
 
 pub fn collections() -> usize {
-    COLLECTIONS.load(Ordering::Relaxed)
+    total(|w| w.stats.collections.load(Ordering::Relaxed))
 }
 
-pub(crate) fn note_trace_started() {
-    TRACES.fetch_add(1, Ordering::Relaxed);
+pub(crate) fn note_trace_started(worker: &Worker) {
+    worker.stats.traces.fetch_add(1, Ordering::Relaxed);
 }
 
-pub(crate) fn note_moved(n: usize) {
-    MOVED.fetch_add(n, Ordering::Relaxed);
+pub(crate) fn note_moved(worker: &Worker, n: usize) {
+    worker.stats.moved.fetch_add(n, Ordering::Relaxed);
 }
 
 /// A copy the program made for itself through the load barrier. Its fields
 /// need the same revisit the collector's own copies get.
 pub(crate) fn note_copy(copy: *mut u8) {
-    MOVED.fetch_add(1, Ordering::Relaxed);
-    with_buffers(|b| b.to_scan.push(copy));
+    let worker = Worker::current();
+    worker.stats.moved.fetch_add(1, Ordering::Relaxed);
+    with_buffers_of(worker, |b| b.to_scan.push(copy));
 }
 
-pub(crate) fn note_freed(n: usize) {
-    FREED.fetch_add(n, Ordering::Relaxed);
+pub(crate) fn note_freed(worker: &Worker, n: usize) {
+    worker.stats.freed.fetch_add(n, Ordering::Relaxed);
 }
 
-pub(crate) fn set_trace_baseline(live_bytes: usize) {
-    TRACE_BASELINE_BYTES.store(live_bytes, Ordering::Relaxed);
+pub(crate) fn set_trace_baseline(worker: &Worker, live_bytes: usize) {
+    worker
+        .stats
+        .trace_baseline_bytes
+        .store(live_bytes, Ordering::Relaxed);
 }
 
 /// Account for a pause that began at `started`. The maximum is the number
 /// that matters for a collector whose point is low latency.
-pub(crate) fn record_pause(started: Instant) {
+pub(crate) fn record_pause(worker: &Worker, started: Instant) {
     let us = started.elapsed().as_micros() as usize;
-    PAUSES.fetch_add(1, Ordering::Relaxed);
-    TOTAL_PAUSE_US.fetch_add(us, Ordering::Relaxed);
-    MAX_PAUSE_US.fetch_max(us, Ordering::Relaxed);
+    worker.stats.pauses.fetch_add(1, Ordering::Relaxed);
+    worker.stats.total_pause_us.fetch_add(us, Ordering::Relaxed);
+    worker.stats.max_pause_us.fetch_max(us, Ordering::Relaxed);
 }
 
 /// Whether an environment variable is set to something other than `0` or the
@@ -353,7 +350,10 @@ pub unsafe fn validate_roots() {
             }
         })
     };
-    ROOTS_SEEN.fetch_add(checked, Ordering::Relaxed);
+    Worker::current()
+        .stats
+        .roots_seen
+        .fetch_add(checked, Ordering::Relaxed);
     if let Some((slot, value)) = bad {
         eprintln!(
             "W# collector: stack slot {slot:p} was recorded as a heap reference \
@@ -371,7 +371,7 @@ pub fn report_if_asked() {
     if !env_flag("WSHARP_GC_STATS") {
         return;
     }
-    let heap = crate::heap::heap_stats();
+    let heap = crate::heap::total_heap_stats();
     let (funcs, safepoints) = crate::stackwalk::registered();
     eprintln!(
         "W# gc: {} collections, {} roots seen, {} freed, {} live of {} allocated \
@@ -386,9 +386,17 @@ pub fn report_if_asked() {
         heap.bytes_allocated,
         traces(),
         moved(),
-        PAUSES.load(Ordering::Relaxed),
-        MAX_PAUSE_US.load(Ordering::Relaxed),
-        TOTAL_PAUSE_US.load(Ordering::Relaxed),
+        total(|w| w.stats.pauses.load(Ordering::Relaxed)),
+        // The longest of any worker's, not the sum: a pause is what one
+        // program thread waited for, and workers pause independently.
+        {
+            let mut longest = 0;
+            crate::worker::for_each_worker(|w| {
+                longest = longest.max(w.stats.max_pause_us.load(Ordering::Relaxed));
+            });
+            longest
+        },
+        total(|w| w.stats.total_pause_us.load(Ordering::Relaxed)),
         heap.blocks,
         heap.large_objects,
     );
@@ -397,7 +405,7 @@ pub fn report_if_asked() {
 /// Let a trace in flight finish or stand down, so that the numbers printed at
 /// exit describe a heap nothing is still working on.
 pub fn quiesce() {
-    mark::quiesce();
+    crate::worker::for_each_worker(|w| mark::quiesce(w));
 }
 
 /// How often to collect: every this many objects allocated.
@@ -412,7 +420,7 @@ const COLLECT_EVERY: usize = 4096;
 /// collections so that `--gc-stress`, which collects at every allocation,
 /// traces on the same schedule as an ordinary run and the tests stay
 /// deterministic under both.
-const TRACE_EVERY_ALLOCATIONS: usize = 8 * COLLECT_EVERY;
+pub(crate) const TRACE_EVERY_ALLOCATIONS: usize = 8 * COLLECT_EVERY;
 
 /// ...and sooner than that if the live heap has doubled since the last trace
 /// -- a heap growing that fast is usually one counting is failing to keep up
@@ -429,6 +437,7 @@ const TRACE_GROWTH_FLOOR_BYTES: usize = 4 << 20;
 /// # Safety
 /// Must be called from `ws_alloc`, with the frame chain intact.
 pub unsafe fn on_allocation(object: *mut u8) {
+    let worker = Worker::current();
     // A trace that has finished marking is waiting for the program to stop so
     // it can finish. The object just allocated is not on any list yet and not
     // in any stack map, and neither matters: it is in the open block, which is
@@ -453,7 +462,7 @@ pub unsafe fn on_allocation(object: *mut u8) {
         }
         b.fresh.len() + b.nursery.len() >= COLLECT_EVERY
     });
-    let allocations = ALLOCATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    let allocations = worker.stats.allocations.fetch_add(1, Ordering::Relaxed) + 1;
     if !(stress() || due) {
         return;
     }
@@ -471,20 +480,24 @@ pub unsafe fn on_allocation(object: *mut u8) {
     // begins here, in the same pause: the roots just found are its snapshot,
     // and the object just allocated is on the nursery list, which is part of
     // that snapshot.
-    if trace_due(allocations) && mark::phase() == mark::Phase::Idle {
-        TRACE_AT.store(allocations + TRACE_EVERY_ALLOCATIONS, Ordering::Relaxed);
+    if trace_due(worker, allocations) && mark::phase() == mark::Phase::Idle {
+        worker
+            .stats
+            .trace_at
+            .store(allocations + TRACE_EVERY_ALLOCATIONS, Ordering::Relaxed);
         unsafe { mark::start_with_roots(roots) };
     }
 }
 
 /// A threshold rather than a modulus, because this is only consulted when a
 /// collection is due, and a due collection need not land on a round number.
-fn trace_due(allocations: usize) -> bool {
-    if allocations >= TRACE_AT.load(Ordering::Relaxed) {
+fn trace_due(worker: &Worker, allocations: usize) -> bool {
+    if allocations >= worker.stats.trace_at.load(Ordering::Relaxed) {
         return true;
     }
     let live = crate::heap::heap_stats().live_bytes;
-    live >= TRACE_GROWTH_FLOOR_BYTES && live >= 2 * TRACE_BASELINE_BYTES.load(Ordering::Relaxed)
+    live >= TRACE_GROWTH_FLOOR_BYTES
+        && live >= 2 * worker.stats.trace_baseline_bytes.load(Ordering::Relaxed)
 }
 
 /// One reference-counting collection. Returns the roots it found, so that a
@@ -509,7 +522,8 @@ fn trace_due(allocations: usize) -> bool {
 /// Must be called from a runtime function generated code called into, with the
 /// frame chain intact.
 pub unsafe fn collect() -> Vec<*mut u8> {
-    COLLECTIONS.fetch_add(1, Ordering::Relaxed);
+    let worker = Worker::current();
+    worker.stats.collections.fetch_add(1, Ordering::Relaxed);
     // Publish this thread's allocations before anything is taken off the live
     // count, so that a free can never run ahead of the allocation it undoes.
     crate::heap::flush_local_counters();
@@ -523,7 +537,10 @@ pub unsafe fn collect() -> Vec<*mut u8> {
             }
         })
     };
-    ROOTS_SEEN.fetch_add(roots.len(), Ordering::Relaxed);
+    worker
+        .stats
+        .roots_seen
+        .fetch_add(roots.len(), Ordering::Relaxed);
     roots.sort_unstable();
     roots.dedup();
     let rooted = |p: *mut u8| roots.binary_search(&p).is_ok();
@@ -618,7 +635,7 @@ pub unsafe fn collect() -> Vec<*mut u8> {
         unsafe { crate::heap::free_object(obj, size) };
         freed += 1;
     }
-    FREED.fetch_add(freed, Ordering::Relaxed);
+    worker.stats.freed.fetch_add(freed, Ordering::Relaxed);
 
     with_buffers(|b| {
         b.nursery.extend(survivors);

@@ -153,6 +153,18 @@ Things in this version that differ from older tutorials, each of which cost time
   dead, because that object may be the only path the snapshot had to something
   live; so the marker never tests `FLAG_DEAD`, and no block is recycled and no
   large object deallocated underneath it.
+- **Collector state belongs to a worker, not to the process.** `heap`,
+  `buffers`, the phase machine, the mark parity and the statistics all live on
+  `worker::Worker`, reached through a thread-local pointer; a collector thread
+  installs its worker's on entry, so a copy it makes while evacuating lands in
+  the heap the original came from. Three things stay process-wide on purpose,
+  and each for a reason that does not generalise: the type registry and the
+  stack maps (frozen before any code runs), the space directory (the load
+  barrier asks it about an arbitrary address), and the two flag words generated
+  code reads (their addresses are `iconst`-baked into the code). Those two mean
+  "*some* worker wants a pause" and "*some* worker is moving"; the slow path
+  asks the current worker whether the request is its own, and returns at once
+  when it is not.
 - **All three pauses run on the mutator thread**, inside a runtime call at a
   safepoint, because only the mutator can walk its own stack. The collector
   thread never touches the stack. The pause sites are `ws_gc_poll`,

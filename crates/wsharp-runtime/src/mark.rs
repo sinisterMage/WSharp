@@ -58,14 +58,14 @@
 //! asks for a pause by setting the poll byte; the program gets there at its
 //! next back edge or allocation.
 
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering};
-use std::sync::{Condvar, Mutex, Once};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::time::Instant;
 
 use crate::evacuate;
 use crate::gc::{self, with_buffers};
 use crate::header::{claim_mark, flip_mark_parity, is_marked, type_id_of};
 use crate::heap::{self, is_collectable};
+use crate::worker::Worker;
 use crate::stackwalk::walk_roots;
 use crate::types;
 
@@ -99,18 +99,18 @@ impl Phase {
     }
 }
 
-static PHASE: AtomicU8 = AtomicU8::new(Phase::Idle as u8);
-
-/// True from the initial pause until marking has finished: the window in which
-/// the barrier must record what the program overwrites and counting must not
-/// free.
-static TRACING: AtomicBool = AtomicBool::new(false);
-
-/// Set at exit to make the collector thread drop whatever it is doing.
-static ABANDON: AtomicBool = AtomicBool::new(false);
+/// The worker this thread belongs to.
+///
+/// Every function below is on one of exactly two threads -- the mutator, or
+/// the collector thread serving it -- and the collector installs its worker on
+/// entry, so this is the right one on both. `quiesce` is the exception and
+/// takes its worker: it runs on the main thread, for every worker in turn.
+fn me() -> &'static Worker {
+    Worker::current()
+}
 
 /// What the mutator hands the collector thread, and gets back.
-struct State {
+pub(crate) struct State {
     work: Vec<*mut u8>,
     /// Every slot the marker saw holding a reference into a block being
     /// emptied. The evacuation pause revisits exactly these rather than the
@@ -123,40 +123,61 @@ struct State {
 // Raw pointers into a heap that outlives the process.
 unsafe impl Send for State {}
 
-static STATE: Mutex<State> = Mutex::new(State {
-    work: Vec::new(),
-    remembered: Vec::new(),
-    cset: Vec::new(),
-});
-/// Signalled on every phase change and on abandon.
-static CHANGED: Condvar = Condvar::new();
-static THREAD: Once = Once::new();
+impl State {
+    pub(crate) const fn new() -> State {
+        State {
+            work: Vec::new(),
+            remembered: Vec::new(),
+            cset: Vec::new(),
+        }
+    }
+}
+
+fn state_of(w: &'static Worker) -> std::sync::MutexGuard<'static, State> {
+    w.mark.state.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn state() -> std::sync::MutexGuard<'static, State> {
-    STATE.lock().unwrap_or_else(|e| e.into_inner())
+    state_of(me())
 }
 
 pub fn phase() -> Phase {
-    Phase::from_u8(PHASE.load(Ordering::Acquire))
+    phase_of(me())
+}
+
+fn phase_of(w: &Worker) -> Phase {
+    Phase::from_u8(w.mark.phase.load(Ordering::Acquire))
 }
 
 /// Whether a trace is between its snapshot and the end of marking.
 pub(crate) fn tracing() -> bool {
-    TRACING.load(Ordering::Acquire)
+    me().mark.tracing.load(Ordering::Acquire)
 }
 
 /// Publish a phase change. The store happens under the state lock and the
 /// waiters check under it, so a wake-up cannot be lost.
 fn set_phase(phase: Phase) {
-    let _guard = state();
-    PHASE.store(phase as u8, Ordering::Release);
-    CHANGED.notify_all();
+    set_phase_of(me(), phase);
+}
+
+fn set_phase_of(w: &'static Worker, phase: Phase) {
+    let _guard = state_of(w);
+    w.mark.phase.store(phase as u8, Ordering::Release);
+    w.mark.changed.notify_all();
 }
 
 fn wait_until(ready: impl Fn() -> bool) {
-    let mut guard = state();
+    wait_until_on(me(), ready);
+}
+
+fn wait_until_on(w: &'static Worker, ready: impl Fn() -> bool) {
+    let mut guard = state_of(w);
     while !ready() {
-        guard = CHANGED.wait(guard).unwrap_or_else(|e| e.into_inner());
+        guard = w
+            .mark
+            .changed
+            .wait(guard)
+            .unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -177,7 +198,7 @@ fn wait_until(ready: impl Fn() -> bool) {
 pub(crate) unsafe fn start_with_roots(mut roots: Vec<*mut u8>) {
     debug_assert_eq!(phase(), Phase::Idle);
     let started = Instant::now();
-    gc::note_trace_started();
+    gc::note_trace_started(me());
 
     // Everything is now unmarked. Objects allocated from here on are stamped
     // with the new parity, so they are marked from birth.
@@ -205,10 +226,10 @@ pub(crate) unsafe fn start_with_roots(mut roots: Vec<*mut u8>) {
         s.remembered.clear();
         s.cset = cset;
     }
-    TRACING.store(true, Ordering::Release);
+    me().mark.tracing.store(true, Ordering::Release);
     ensure_thread();
     set_phase(Phase::Marking);
-    gc::record_pause(started);
+    gc::record_pause(me(), started);
 }
 
 /// The second pause: finish marking, then move everything the program is
@@ -240,7 +261,7 @@ unsafe fn finish_marking() {
         }
         work = more;
     }
-    TRACING.store(false, Ordering::Release);
+    me().mark.tracing.store(false, Ordering::Release);
 
     // Give the block this thread was allocating out of back to the heap, so
     // the sweep to come can see into it. Not at the trace's *start*: the
@@ -255,7 +276,7 @@ unsafe fn finish_marking() {
 
     if cset.is_empty() {
         finish_without_evacuation(remembered);
-        gc::record_pause(started);
+        gc::record_pause(me(), started);
         return;
     }
 
@@ -264,7 +285,7 @@ unsafe fn finish_marking() {
     // program loads out of the heap goes through the load barrier, so this is
     // what establishes the invariant that barrier maintains: nothing the
     // program holds is in a block that is being emptied.
-    gc::set_evacuating(true);
+    gc::set_evacuating(me(), true);
     unsafe {
         walk_roots(|slot| {
             let value = slot.read();
@@ -278,9 +299,9 @@ unsafe fn finish_marking() {
         let mut s = state();
         s.remembered = remembered;
     }
-    gc::clear_poll();
+    gc::clear_poll(me());
     set_phase(Phase::Evacuating);
-    gc::record_pause(started);
+    gc::record_pause(me(), started);
 }
 
 /// A trace with nothing to evacuate skips straight to sweeping.
@@ -290,7 +311,7 @@ fn finish_without_evacuation(remembered: Vec<*mut *mut u8>) {
         b.nursery.retain(|&p| unsafe { is_marked(p) });
         b.to_scan.clear();
     });
-    gc::clear_poll();
+    gc::clear_poll(me());
     set_phase(Phase::Sweeping);
 }
 
@@ -301,7 +322,14 @@ fn finish_without_evacuation(remembered: Vec<*mut *mut u8>) {
 /// Must be called from a runtime function generated code called into, with the
 /// frame chain intact and the phase `EvacDone`.
 unsafe fn finish_evacuation() {
-    debug_assert_eq!(phase(), Phase::EvacDone);
+    unsafe { finish_evacuation_on(me()) }
+}
+
+/// # Safety
+/// As [`finish_evacuation`], and `w` must be the worker whose heap this
+/// thread's stack refers to.
+unsafe fn finish_evacuation_on(w: &'static Worker) {
+    debug_assert_eq!(phase_of(w), Phase::EvacDone);
     let started = Instant::now();
     let remembered = std::mem::take(&mut state().remembered);
     let to_scan = with_buffers(|b| std::mem::take(&mut b.to_scan));
@@ -313,7 +341,7 @@ unsafe fn finish_evacuation() {
 
     heap::note_evacuated_blocks();
     let released = heap::release_evacuated();
-    gc::set_evacuating(false);
+    gc::set_evacuating(me(), false);
     state().cset.clear();
 
     // Counting from here must never name an unmarked object, because the sweep
@@ -323,9 +351,9 @@ unsafe fn finish_evacuation() {
     });
     debug_assert!(released > 0);
 
-    gc::clear_poll();
+    gc::clear_poll(me());
     set_phase(Phase::Sweeping);
-    gc::record_pause(started);
+    gc::record_pause(me(), started);
 }
 
 /// Run whichever pause is wanted. The safepoints call this.
@@ -394,25 +422,28 @@ pub unsafe fn run_full_trace() {
 /// objects for a program that has already returned is work for no observer.
 /// One that has is driven to the end instead, because half-moved is not a
 /// state the heap can be left in.
-pub fn quiesce() {
+pub fn quiesce(w: &'static Worker) {
     loop {
-        match phase() {
+        match phase_of(w) {
             Phase::Idle => return,
-            Phase::Sweeping => wait_until(|| phase() == Phase::Idle),
+            Phase::Sweeping => wait_until_on(w, || phase_of(w) == Phase::Idle),
             Phase::Marking | Phase::MarkDone => {
                 {
-                    let _guard = state();
-                    ABANDON.store(true, Ordering::Release);
-                    CHANGED.notify_all();
+                    let _guard = state_of(w);
+                    w.mark.abandon.store(true, Ordering::Release);
+                    w.mark.changed.notify_all();
                 }
-                wait_until(|| phase() == Phase::Idle);
+                wait_until_on(w, || phase_of(w) == Phase::Idle);
                 return;
             }
             // Safe on this thread for the same reason the pauses are: `main`
             // has returned, so the stack holds no generated frames and the
             // root walk finds nothing.
-            Phase::Evacuating => wait_until(|| phase() != Phase::Evacuating),
-            Phase::EvacDone => unsafe { finish_evacuation() },
+            Phase::Evacuating => wait_until_on(w, || phase_of(w) != Phase::Evacuating),
+            // Its own worker's, driven from here: `main` is over, so this
+            // thread's stack is the only one that could hold a root and it
+            // holds none.
+            Phase::EvacDone => unsafe { finish_evacuation_on(w) },
         }
     }
 }
@@ -422,17 +453,21 @@ pub fn quiesce() {
 // ---------------------------------------------------------------------------
 
 fn ensure_thread() {
-    THREAD.call_once(|| {
-        let spawned = std::thread::Builder::new()
-            .name("wsharp-gc".into())
-            .spawn(|| {
-                // A panic here would leave the program waiting for a phase
-                // that never comes. Failing loudly is the only honest option.
-                if std::panic::catch_unwind(collector_main).is_err() {
-                    eprintln!("W# collector: the collector thread panicked");
-                    std::process::abort();
-                }
-            });
+    let worker = me();
+    worker.mark.thread.call_once(|| {
+        let name = format!("wsharp-gc-{}", worker.id);
+        let spawned = std::thread::Builder::new().name(name).spawn(move || {
+            // The collector allocates -- every evacuated object is a copy --
+            // and those copies belong in the heap the originals came from, so
+            // this thread joins the worker it serves rather than becoming one.
+            crate::worker::install(worker);
+            // A panic here would leave the program waiting for a phase
+            // that never comes. Failing loudly is the only honest option.
+            if std::panic::catch_unwind(collector_main).is_err() {
+                eprintln!("W# collector: the collector thread panicked");
+                std::process::abort();
+            }
+        });
         if let Err(e) = spawned {
             eprintln!("W# collector: could not start the collector thread: {e}");
             std::process::abort();
@@ -441,7 +476,11 @@ fn ensure_thread() {
 }
 
 fn abandoning() -> bool {
-    ABANDON.load(Ordering::Acquire)
+    abandoning_on(me())
+}
+
+fn abandoning_on(w: &Worker) -> bool {
+    w.mark.abandon.load(Ordering::Acquire)
 }
 
 fn collector_main() {
@@ -502,7 +541,7 @@ fn mark_concurrently() {
         // Phase first, poll second: the mutator checks the phase when the poll
         // fires, and must find the pause wanted.
         set_phase(Phase::MarkDone);
-        gc::request_safepoint();
+        gc::request_safepoint(me());
     }
 }
 
@@ -522,9 +561,9 @@ fn evacuate_concurrently() {
         // name objects that had not moved when it was taken.
         with_buffers(|buffers| buffers.to_scan.append(&mut copies));
     }
-    gc::note_moved(moved);
+    gc::note_moved(me(), moved);
     set_phase(Phase::EvacDone);
-    gc::request_safepoint();
+    gc::request_safepoint(me());
 }
 
 /// Mark everything reachable from `work`, noting every reference into a block
@@ -580,8 +619,8 @@ fn sweep() {
         }
     }
     freed += heap::sweep_large(&is_garbage);
-    gc::note_freed(freed);
-    gc::set_trace_baseline(heap::heap_stats().live_bytes);
+    gc::note_freed(me(), freed);
+    gc::set_trace_baseline(me(), heap::heap_stats().live_bytes);
 }
 
 /// Stand down from a trace that will not be finished. Only reachable before
@@ -598,8 +637,8 @@ fn abandon() {
         s.remembered.clear();
         s.cset.clear();
     }
-    TRACING.store(false, Ordering::Release);
-    gc::clear_poll();
-    ABANDON.store(false, Ordering::Release);
+    me().mark.tracing.store(false, Ordering::Release);
+    gc::clear_poll(me());
+    me().mark.abandon.store(false, Ordering::Release);
     set_phase(Phase::Idle);
 }

@@ -242,18 +242,26 @@ unsafe fn rc_update(ptr: *const u8, f: impl Fn(u32) -> u32) -> u32 {
 /// flipping it, which unmarks everything at once. The allocator stamps new
 /// objects with the current value, so anything born during a trace is already
 /// marked -- which a snapshot-at-the-beginning marker requires anyway.
-static MARK_PARITY: AtomicU64 = AtomicU64::new(0);
+///
+/// One parity per worker, not one per process: flipping it unmarks a whole
+/// heap, and a worker's trace has no business unmarking anyone else's. The
+/// allocator therefore reads it through the current worker, which is a
+/// thread-local load and a branch on a path that already does an atomic store.
 const MARKED_BIT: u64 = FLAG_MARKED << FLAG_SHIFT;
 
 /// The current parity, ready to be or-ed into a fresh meta word.
 pub fn mark_parity() -> u64 {
-    MARK_PARITY.load(Ordering::Relaxed)
+    crate::worker::Worker::current()
+        .parity
+        .load(Ordering::Relaxed)
 }
 
-/// Unmark every object in the heap at once. Only the trace's initial pause
-/// does this, with the program stopped.
+/// Unmark every object in this worker's heap at once. Only the trace's initial
+/// pause does this, with the program stopped.
 pub fn flip_mark_parity() {
-    MARK_PARITY.fetch_xor(MARKED_BIT, Ordering::AcqRel);
+    crate::worker::Worker::current()
+        .parity
+        .fetch_xor(MARKED_BIT, Ordering::AcqRel);
 }
 
 /// # Safety
