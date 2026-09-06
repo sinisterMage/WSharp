@@ -447,6 +447,16 @@ Sessions are numbered by the original feature list:
       Linux, macOS/BSD and Windows arms, a readiness API, and a *safe region*
       that lets a thread block in a syscall while its collector walks the
       stack it left behind. `std/net` and `std/http` are on top of it.
+- [ ] **9.** Sized and unsigned integers, and bitwise operators. `i64` is the
+      right default and the wrong only choice the moment a program computes on
+      bytes: SHA-256 is addition modulo 2^32, and none of it can be written
+      here yet.
+- [ ] **10.** TLS 1.3, written in W#, with certificate chains verified against
+      the platform's own root store — which is what turns `https://` from
+      `error.NotSupported` into a connection.
+- [ ] **11.** Package management: git spoken rather than shelled out to, a
+      content-addressed store, and a resolver that says *why* a version was
+      ruled out rather than that it was.
 
 What is left, and where it plugs in, is in [ROADMAP.md](ROADMAP.md).
 Conventions and the invariants worth not breaking are in

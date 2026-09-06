@@ -485,7 +485,8 @@ A module system, and four modules behind it.
 ### What is left
 
 - **No package management.** An import is a relative path or a library one;
-  there is nothing that fetches anything.
+  there is nothing that fetches anything. That is item 11, and the hook it
+  needs is one branch in `Loader::follow`.
 
 ---
 
@@ -808,7 +809,8 @@ readiness API is what lets one worker serve many connections.
 - **`kqueue` and IOCP**, per the decision above: an upgrade behind the existing
   `Poller`, wanted when a program has thousands of sockets rather than tens.
 - **No TLS**, so `https://` is `error.NotSupported` rather than a connection
-  that quietly speaks the wrong protocol. That is the next item.
+  that quietly speaks the wrong protocol. That is item 10, and item 9 comes
+  first because the ciphers cannot be written without it.
 - **No connection pooling.** The HTTP client opens a socket per request and
   sends `Connection: close`, which is the honest shape for a client with no
   pool. `Conn`, `send_request` and `read_response` are exposed so that a
@@ -816,6 +818,233 @@ readiness API is what lets one worker serve many connections.
 - **A failed request leaks its socket.** W# has no `defer`, so a `try` that
   leaves `http.request` early skips the `close` below it. The process closes
   everything at exit, so this is a leak within one run rather than a leak.
+
+---
+
+## 9. Sized and unsigned integers, and bitwise operators — **next**
+
+W# has one integer type. `i64` is the right default and the wrong *only* choice
+the moment a program computes on bytes rather than merely moving them: SHA-256
+is defined on 32-bit words that wrap, ChaCha20 on 32-bit add, xor and rotate,
+X25519 on the limbs of a much wider number. None of that can be written here
+today, which is why this comes before TLS rather than beside it.
+
+It is not only crypto, and item 8 met it twice while being built. `std/net.wait`
+decodes a readiness bitmask with `bits % 2 == 1` and `bits >= 2` because there
+is no `&`. `std/http.parse_hex` exists because a chunk header is base 16 and
+`str.parse_int` is decimal. Both are arithmetic standing in for bit work.
+
+### What it needs
+
+- **The types.** `u8`, `u16`, `u32`, `u64` beside `i8`, `i16`, `i32` and the
+  `i64` that already exists. Not `usize`: this language has no pointer
+  arithmetic to size, and a type whose width depends on the target is a type
+  whose overflow depends on the target.
+- **Unsigned arithmetic wraps; signed arithmetic still traps.** SHA-256 *is*
+  addition modulo 2^32, so a checked `+` would make it unwritable. A signed
+  overflow is a bug in every program that is not doing this, and it keeps the
+  panic it has.
+- **`& | ^ << >> ~`**, and a rotate. Rotate is not a C operator, is one
+  instruction on both targets, and is what every one of these algorithms is
+  written in terms of -- so it is a builtin (`bits.rotl(x, n)`) rather than a
+  shift-shift-or pattern the code generator has to recognise and would
+  sometimes miss.
+- **`>>` differs by signedness**: logical on an unsigned type, arithmetic on a
+  signed one. That difference is most of the reason the two kinds are worth
+  distinguishing.
+- **A literal has to stop being an `i64`.** "Integer literals are always `i64`"
+  is a smaller follow-up today; it becomes load-bearing here, because `0xff`
+  has to be a `u8` in one place and a `u32` in another. Either a `comptime_int`
+  that takes the type it is used at, or suffixes, and the first is much nicer
+  to write.
+
+### Decisions worth recording in advance
+
+- **Conversions are written, never inferred.** A silent widening is how a
+  32-bit hash becomes a 64-bit one that is right for a while. `u32(x)` truncates
+  and says so.
+- **`Number` has to say what it means.** The abstract type lists `i64` and
+  `f64` today, and it is what `math.min` is generic over. Listing all eleven
+  numeric types makes `min` work everywhere and makes every *other* constrained
+  generic over `Number` have to work for `u8` too. This is a real decision, not
+  a table edit, and it should be made before the types land rather than after
+  something depends on the answer.
+- **The collector does not care.** These are scalars: no header, no reference,
+  no barrier. `layout.rs` and `repr.rs` have to agree about their sizes, which
+  is the invariant a test already checks.
+- **Dispatch does not care either.** A scalar's type is always statically
+  known, so no runtime test is ever emitted for one -- exactly as item 4 found
+  for the abstract types it added.
+
+### What it costs
+
+Eight new types is eight more rows in every table that enumerates them, and
+every one of `unify`, `layout::place`, `repr::slot_types` and the arithmetic
+lowering grows a case. The interesting risk is not that, though: it is that
+inference currently has exactly one integer type and therefore never has to
+*choose* one. The moment a literal can be any of eight, every place a type
+variable is defaulted needs an answer, and getting that wrong is a program that
+compiles and computes something else.
+
+---
+
+## 10. TLS 1.3, written in W# — **after 9**
+
+Item 8 left `https://` as `error.NotSupported` rather than a connection that
+quietly speaks the wrong protocol. This is what removes it -- and what the
+package manager needs before it can fetch anything from a host it did not
+already trust.
+
+### Why in W# rather than in the runtime
+
+The rule that governs the boundary would *permit* the other answer: a cipher is
+a pure byte-to-byte transform, which is exactly what a builtin may be. So the
+reason is not the collector's; it is that a language which cannot express
+SHA-256 has a hole in it, and the fastest way to find out where the hole is, is
+to try. The handshake and X.509 have to be W# regardless -- both build object
+graphs, and item 6's rule sends those to `.ws` files.
+
+### What it needs
+
+| Piece | Notes |
+|---|---|
+| Hashes | SHA-256 and SHA-384; HMAC and HKDF on top |
+| Ciphers | AES-128-GCM and AES-256-GCM, ChaCha20-Poly1305 |
+| Key exchange | X25519, and P-256 for a server that will not do better |
+| Signatures | Ed25519 and ECDSA P-256 to speak TLS 1.3; RSA PKCS#1 v1.5 and PSS to *verify certificates*, which is a different and larger problem |
+| Record layer | Framing, sequence numbers, key updates, the 1.2-shaped outer header 1.3 keeps for middleboxes |
+| Handshake | ClientHello through Finished, plus HelloRetryRequest |
+| X.509 | DER parsing, validity and name checking, chain building |
+| Root store | Three platforms, three answers |
+
+### Decisions worth recording in advance
+
+- **Constant time cannot be promised, and saying so is part of the design.**
+  W# compiles through Cranelift, which is free to turn a branchless expression
+  into a branch and a conditional move into a jump. There is no `black_box`, no
+  way to pin a secret away from a comparison the optimiser invented. So the
+  implementation should be written constant-time *by construction* -- no
+  secret-dependent indices, no early-exit compares -- and the ROADMAP should
+  say plainly that this is a best effort against a local attacker rather than a
+  guarantee. Anyone who needs the guarantee needs a reviewed C library and an
+  FFI, which is a different item.
+- **TLS 1.3 only.** No 1.2, no fallback, no downgrade dance. A client that
+  cannot talk to a 1.2-only server is a client that fails loudly on a server
+  that should be upgraded, and every hour spent on 1.2 is an hour spent on the
+  version with the worse security story.
+- **RSA is for certificates, not for the handshake.** 1.3 does not do RSA key
+  exchange, but most of the certificate chain on the public internet is still
+  RSA-signed -- so a bignum `modexp` is unavoidable even though nothing in the
+  handshake wants one. An ECDSA-only client would fail against a large share of
+  real hosts, and failing to verify is not an option.
+- **The root store is a fourth arm-shaped problem.** `/etc/ssl/certs` and a
+  handful of distribution-specific paths on Linux, the Keychain on macOS, the
+  system store on Windows -- three implementations behind one question, which
+  is exactly the shape `sys/` already has. Bundling a copy of Mozilla's list
+  instead would make the build reproducible and the trust decisions stale, and
+  staleness in a trust store is the failure mode that matters.
+- **A TLS connection is a `Socket` by another name.** `tls.connect` returns
+  something with `read`, `write` and `close`, so `std/http` takes either and
+  neither knows which -- which is what makes `https://` a one-line change
+  there rather than a second client.
+
+### What it costs
+
+This is the first thing in the tree where being wrong is a security problem
+rather than a crash. A collector bug shows up as a failing test; a certificate
+chain accepted when it should not have been shows up as nothing at all. The
+mitigation is not cleverness, it is test vectors: RFC 8448's traced handshake,
+Wycheproof for the primitives, and a corpus of certificates that must be
+rejected with the reason each is rejected for. Those go in before the code they
+check, not after.
+
+---
+
+## 11. Package management — **after 10**
+
+Item 6 left one line: *"No package management. An import is a relative path or
+a library one; there is nothing that fetches anything."* This is that.
+
+### The shape, and where it comes from
+
+Modelled on [Ajt](https://github.com/sinisterMage/Ajt.jl), an alternative
+client for Julia's package ecosystem, for the parts that are about *being a
+package manager* rather than about Julia:
+
+- **Resolving, installing and building are separate verbs.** Nothing compiles
+  because something else was fetched. `wsharp add` records an intent, `resolve`
+  chooses versions, `install` makes the store satisfy the lockfile, and
+  `build` is a thing you asked for.
+- **`verify` answers with its exit status** -- ready, needs installing, needs
+  resolving, broken -- so a CI script can ask without parsing anything.
+- **Output is tab-separated**, so a shell can cut it up.
+- **`why` prints the dependency paths that explain an entry**, because "what
+  pulled this in" is the question a lockfile never answers on its own.
+- **A resolver that explains itself.** The thing Ajt is actually built around:
+  a solver that tracks *why* each version was ruled out, so a conflict comes
+  back as something to act on rather than as "unsatisfiable". PubGrub is the
+  algorithm; the traceable derivation is the point.
+
+### What it needs, and what is missing today
+
+- **`argv`.** There is none. Nothing in the prelude or in `std` exposes the
+  command line, so a package manager written in W# cannot read its own verb.
+  This is the first thing to build and the easiest to overlook.
+- **A filesystem beyond four functions.** `std/io` reads a file, writes a file,
+  reads a line and asks whether a path exists. A store needs `mkdir`,
+  `readdir`, `rename`, `remove` and a stat that distinguishes a directory from
+  a file -- and `rename` is what makes an install atomic.
+- **Git, spoken rather than shelled out to.** Smart-HTTP v2 over item 10's TLS:
+  pkt-line framing, ref discovery, want/have negotiation, and then a packfile,
+  which means zlib inflate and delta resolution. Inflate is a few hundred lines
+  and wants item 9's bit operations; delta resolution is where the surprises
+  are.
+- **A manifest and a lockfile format**, and a parser for it in W#. TOML is what
+  everyone expects and is more grammar than this needs; a small line-oriented
+  format is a day's work and a lifetime of explaining why it is not TOML. Worth
+  deciding deliberately rather than by accident.
+- **A content-addressed store**, keyed by tree hash, under `~/.wsharp` -- with
+  `gc` to remove what no environment can reach, which is the half of a store
+  people forget until a disk fills.
+
+### Decisions worth recording in advance
+
+- **The loader hook is one branch.** `Loader::follow` in
+  `crates/wsharp-cli/src/load.rs` has exactly two rules today -- a `std` path
+  stands for itself, anything else is relative to the importing file. A package
+  path is a third, and *nothing downstream changes*: a module's identity is
+  already its canonical path, so sema, code generation and the parser need no
+  edit at all. That is the single most encouraging fact about this item.
+- **Two versions of a package are two modules.** They live at different paths,
+  so they are distinct modules with distinct nominal struct types -- which is
+  almost certainly right, and which will produce a type error saying two
+  identically-named types do not match, with nothing to say why. The diagnostic
+  is the work, not the semantics.
+- **A package facade needs re-export, and W# has none.** A package of more than
+  one file cannot present a single entry point: there is no `pub use`, and a
+  `const x = @import(..)` binding is a module rather than a value, so it cannot
+  be reached through. This is the one part of this item that needs new work in
+  the type checker, and it should be decided early because it changes what a
+  package is allowed to look like.
+- **One executable stops being a complete installation.** `.forgejo/workflows/release.yml`
+  notes that the standard library is `include_str!`'d into the binary, so a
+  release is one file. A package store is the first thing that puts state
+  beside it. That is fine and worth doing on purpose, with the store's location
+  answerable from the CLI rather than assumed.
+- **Written in W#**, which is the point rather than a flourish: a resolver, a
+  hash, a protocol and a file format is a broad enough program to find out
+  what the language is actually missing -- and every gap it finds is one a user
+  would have found instead.
+
+### What it costs
+
+A package manager is judged on the day it goes wrong, which means the work is
+mostly in the failure paths: a half-written store, an interrupted fetch, a
+lockfile from a newer version, two packages that cannot agree. W# has no
+`defer`, and item 8 already left a socket leaking on an error path because of
+it -- a store is where that stops being cosmetic. Atomic rename, a temporary
+directory per fetch, and a `verify` that can tell "not installed" from "damaged"
+are not polish here; they are the feature.
 
 ---
 
@@ -833,9 +1062,11 @@ These are deliberate limitations, each with a clear fix:
 - **`==` is limited to `i64`, `f64`, `bool` and `str`.** Structs still need a
   decision about identity versus structural equality.
 - **Integer literals are always `i64`.** No `comptime_int` coercion, so `1.0`
-  must be written where an `f64` is wanted.
+  must be written where an `f64` is wanted. Item 9 makes this load-bearing:
+  `0xff` has to be a `u8` in one place and a `u32` in another.
 - **`%` is integer-only.** Cranelift has no float remainder, and a float `%`
   is rejected by inference rather than emulated.
-- **No sized integer types**, no unsigned types, no bitwise operators.
+- **No sized integer types**, no unsigned types, no bitwise operators. Now
+  item 9 rather than a follow-up: crypto cannot be written without them.
 - **x86-64 and aarch64 only.** The collector reads the frame pointer with
   inline assembly; other architectures get a `compile_error!`.
