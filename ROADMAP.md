@@ -5,7 +5,9 @@ Cranelift JIT. Sessions 3–4 delivered the garbage collector and multiple
 dispatch. Session 5 delivered arrays, explicit generics, the standard library
 and the module system — everything the original feature list asked for.
 Session 6 closed what item 5 had left open: a growable array, and `fn` literals
-that generalise.
+that generalise. Session 7 delivered item 8: the operating system declared by
+hand on three platform arms, a safe region that lets a thread block without
+stalling its collector, and `std/net` and `std/http` above them.
 
 This file records what was built and why it was built that way, the limitations
 that were chosen rather than stumbled into, and — for the items still ahead —
@@ -340,13 +342,14 @@ A module system, and four modules behind it.
 
 | Module | Contents |
 |---|---|
-| `std/str` | `len`, `concat`, `eq`, `substr`, `find`, `split`, `join`, `repeat`, `starts_with`, `from_int`, `from_float` |
+| `std/str` | `len`, `concat`, `eq`, `substr`, `find`, `split`, `join`, `repeat`, `starts_with`, `from_int`, `from_float`, and — since item 8 — `byte_at`, `from_byte`, `parse_int`, `to_lower`, `trim` |
 | `std/array` | `len`, `new`, `concat`, `push`, `slice`, `repeat` |
 | `std/list` | `List[T]` and `new`, `with_capacity`, `from`, `len`, `capacity`, `get`, `set`, `push`, `pop`, `insert`, `remove`, `extend`, `clear`, `iter`, `next`, `to_array` |
 | `std/math` | `abs`, `min`, `max`, `sign`, `sqrt`, `pow`, `floor`, `ceil`, `round`, `trunc`, `ipow` |
 | `std/io` | `read_file`, `read_line`, `write_file`, `exists` |
-| `std/http` | the 27 status types, moved out of the global namespace |
+| `std/http` | the 27 status types, moved out of the global namespace; since item 8, an HTTP/1.1 client and server over `std/net` |
 | `std/broker` | `Topic[M]`, `Consumer[M]` and `topic`, `publish`, `subscribe`, `next`, `commit`, `seek`, `len` |
+| `std/net` | `Socket`, `Listener`, `Poller`, `Event`, `Datagrams`, `Peer`, `Datagram` and `connect`, `listen`, `accept`, `read`, `write`, `write_all`, `read_exactly`, `read_all`, `set_nonblocking`, `poller`, `watch`, `wait`, `udp`, `send_to`, `receive`, `reply`, `close` (item 8) |
 
 `==` on `str` works, comparing contents. The prelude — `print`, `assert`, the
 `gc_*` counters — stays global, because every module has it without asking.
@@ -659,7 +662,9 @@ abstract type's does.
   nothing above the log would know.
 - **One broker, in one process.** Named topics are what let two workers that
   have never met agree on one, and the same naming is what a networked broker
-  would use -- but item 8's non-blocking I/O has to land first.
+  would use. Item 8 has landed, so nothing is in the way of that now except
+  writing it: `std/net` is the transport and `transfer::encode` is already the
+  wire format.
 - **A handle must be in a variable to be called through.** `w.f(a)` is
   recognised from the shape -- an object that is a local holding a handle,
   rather than a module path -- so a handle in a struct field or straight out of
@@ -672,57 +677,145 @@ abstract type's does.
 
 ---
 
-## 8. Direct libc calls for I/O and networking — **before v0.5**
+## 8. Direct libc calls for I/O and networking — **done**
 
-`std/io` goes through `std::fs` and `std::io` today, so the platform work is
-Rust's and W# inherits its portability for free. That is the right trade while
-the library is four functions; it stops being the right trade the moment
-networking arrives, and this is the item that has to land before it does.
+`std/io` went through Rust's `std::fs` and `std::io`, which was the right trade
+while the library was four functions and stopped being one the moment
+networking arrived. It is now hand-declared syscalls on three named platform
+arms, with `std/net` and `std/http` on top of them.
 
-### Why move
+### Settled first: the safe region
 
-- **Flags and error codes are not reachable.** `std::fs::read` opens a file one
-  way. `O_NONBLOCK`, `O_DIRECT`, `O_CLOEXEC` and the rest are not expressible,
-  and `io_error_tag` currently maps `std::io::ErrorKind` — a portable
-  approximation — where `errno` is the real answer.
-- **Networking needs non-blocking I/O and a readiness API**, which means
-  `epoll` on Linux, `kqueue` on the BSDs and macOS, and IOCP on Windows. None
-  of that is in `std`, so the socket half would end up hand-written regardless;
-  doing the file half the same way keeps one layer rather than two.
-- **A blocking syscall is a hole in the safepoint protocol.** All three
-  collector pauses run on the mutator thread, because only a mutator can walk
-  its own stack — so a thread parked in `read(2)` cannot answer a pause
-  request, and the trace waits for the disk. Today that is a stall in a
-  single-threaded program. With item 7's workers it is one worker's heap
-  blocked on another's slow client, which is exactly the failure a worker model
-  exists to avoid. Non-blocking I/O plus a readiness loop is the fix, and it is
-  the same fix networking wants.
+The blocker this item named was not the syscalls. It was that **a blocking
+syscall is a hole in the safepoint protocol**: all three collector pauses run
+on the mutator, because only a mutator can walk its own stack, so a thread
+parked in `read(2)` cannot answer a pause request and its trace waits for the
+disk. With workers that is one worker's heap held up by another's slow client.
 
-### Decisions worth recording in advance
+The way out is that a *blocked* thread's stack is frozen, and a frozen stack
+can be walked by anyone. So `worker::blocking` records the frame pointer its
+stack starts at, says the worker is parked, and makes the call; the collector
+claims it and runs the pause itself, walking from that recorded frame. Leaving
+the region is a compare-exchange rather than a store, because a mutator
+resuming while its stack is being read is the one race that matters.
 
-- **Hand-declared bindings, not the `libc` crate.** `libc` is not in the local
-  registry cache, so adding it would break the offline build that the pinned
-  Cranelift version exists to preserve — the same argument that settled MMTk in
-  item 3. It would also end `wsharp-runtime`'s leaf-crate property: it has zero
-  dependencies today, and that is worth more than a few dozen `extern "C"`
-  declarations are worth avoiding.
-- **Windows is a third arm, not a variation.** It has no libc worth targeting:
-  `CreateFileW`/`ReadFile`, and WSA for sockets. Pretending otherwise behind a
-  `#[cfg(unix)]`/`#[cfg(not(unix))]` split would put the difference in the
-  wrong place. Three arms, named for what they are.
-- **The W# side does not change.** `crates/wsharp-runtime/src/io.rs` is the
-  only file in the tree that touches the outside world, and the builtin table
-  rows, the string object layout and the `!T` tag encoding are all above it.
-  A program that calls `io.read_file` is unaffected, which is what makes this a
-  port rather than a redesign.
+`mark::quiesce` already had one thread drive another worker's pause, justified
+by that worker's stack holding no roots. The recorded frame pointer is what
+generalises it to a worker whose stack holds plenty.
 
-### What it costs
+Two consequences fell out rather than being chosen. A worker gives its
+allocation buffer back and publishes its counters on the way *in*, because
+those live on the thread and not in the worker -- a collector running the pause
+would otherwise retire its own buffer and leave the mutator's block open, and
+an open block is never swept, recycled or evacuated. And the runtime's pinned
+roots do not travel, because they are on the thread too: a collector declines a
+parked worker whose `pinned_depth` is not zero and waits for it, as everything
+did before.
 
-Portability becomes ours. `std::fs` currently handles path encoding, retry on
-`EINTR`, short reads and the difference between a file and a pipe; each of
-those becomes a thing to get right, per platform, with a test. That is the
-price of the control, and it is worth paying only because networking cannot be
-had without it.
+**Blocking is now safe; non-blocking is for scale.** That is worth stating
+plainly, because it inverts the reason this item gave for wanting a readiness
+API. `epoll` is not what keeps the collector alive -- the safe region is. A
+readiness API is what lets one worker serve many connections.
+
+### What was built
+
+| Piece | Where |
+|---|---|
+| The safe region: park, record, hand the stack to the collector, and the handshake that leaves it | `worker.rs` — `blocking`, `claim_parked`, `walk_worker_roots` |
+| A stack walk that starts from a recorded frame rather than the caller's | `stackwalk.rs` — `walk_roots_from` |
+| The collector's half: run the pause for a mutator that cannot | `mark.rs` — `wait_or_serve`, `serve_parked` |
+| Hand-declared syscalls, three arms, no new dependency | `sys/{mod,linux,bsd,windows}.rs` |
+| `std/io` ported onto them, with `errno` where `ErrorKind` was | `io.rs`, `sys/mod.rs` |
+| TCP, UDP, names and a readiness API | `net.rs`, `sys/*` |
+| `std/net`: `Socket`, `Listener`, `Poller`, and the loops that must be W# | `std/net.ws` |
+| `std/http`: HTTP/1.1 client and server, chunked decoding, and `status_of` | `std/http.ws` |
+| Byte-level `str`: `byte_at`, `from_byte`, `parse_int`, `to_lower`, `trim` | `strings.rs` |
+
+### Decisions worth recording
+
+- **Hand-declared bindings, not the `libc` crate** — but not for the reason
+  this item used to give. It said `libc` was not in the local registry cache;
+  it is, and has been all along, as a transitive dependency of
+  `cranelift-jit`. The half of the argument that stands is the one that was
+  always doing the work: `wsharp-runtime` has **zero dependencies**, and that
+  is worth more than a few dozen `extern "C"` declarations are worth avoiding.
+- **`getaddrinfo`, not a resolver of our own.** Names are the one place where
+  writing it by hand would have meant reimplementing the hosts file, NSS and
+  the search domains -- and getting IPv6 wrong. It blocks, which the safe
+  region has already made safe, so the reason to avoid it went away before the
+  code was written.
+- **Addresses are never laid out by hand.** `getaddrinfo` produces them and
+  everything else consumes them, so no `sockaddr_in` is built here and no port
+  is byte-swapped here. An IPv6 address then costs nothing extra: it is a
+  longer one. `SockAddr` carries the family the resolver reported rather than
+  reading it back out of the bytes, because `sockaddr` starts with a `u16`
+  family on Linux and Windows and a `u8` length then a `u8` family on the BSDs.
+- **`poll(2)` on the BSDs, not `kqueue`, and `WSAPoll` on Windows, not IOCP.**
+  Both are deviations from what this item asked for, and each has its own
+  reason. `struct kevent` is *not the same struct* across the family --
+  FreeBSD 12 added an `ext[4]` tail macOS does not have -- so a binding written
+  from the macOS headers and tested on the macOS runner would be a declaration
+  for FreeBSD that nobody had ever run, laid out wrongly, failing silently.
+  IOCP is a different model altogether: completion rather than readiness, which
+  would push buffers-handed-to-the-kernel through every layer above for a
+  scalability win nothing here needs yet. `Poller` is the interface both hide
+  behind, and either can be replaced without anything above it changing.
+- **One error set for the whole of `std/net`.** A builtin's set is written in
+  its row, because it is compiled long before the program that catches it; the
+  wrappers in `std/net.ws` pass results through each other constantly, and one
+  set means they compose without a widening at every step. The cost is a
+  `catch` that can name an error a particular call would not raise.
+- **`WouldBlock` is an error name, not a special case.** On a non-blocking
+  socket it is the ordinary answer, and a program is expected to catch it and
+  come back.
+- **A datagram's sender is a handle too.** Replying needs no host, no port and
+  no address formatting: `receive` remembers where the message came from and
+  `reply` sends back to it, so the address never leaves the runtime as text and
+  IPv6 costs nothing extra. The pair is assembled in W# because one builtin
+  answers with one value -- the same split the poller's `wait` and
+  `ready_socket` use.
+- **A socket handle is a number.** A socket belongs to the process rather than
+  to any one worker's heap, exactly as a broker topic does, so it is an index
+  into a table and W# holds the index in a one-field struct. What makes it
+  typed is `std/net.ws`: a `Listener` accepts and a `Socket` reads and writes.
+- **`!void` had to be made writable first.** `std/io.write_file` returns one,
+  so the type existed -- but no W# function could produce one: `return;` was
+  checked against the declared type directly rather than against the payload,
+  and falling through is rejected. A valueless `return` in a function returning
+  `!void` now means "finished, and nothing went wrong", which is the success
+  tag with no payload beside it. `std/net.write_all` is the first caller.
+- **A module can now name its own lazily materialised types.** `std/http` is
+  the only module whose contents are a table in the compiler rather than
+  declarations in a file, and once it had a source file of its own it could not
+  mention `Ok200` even though every program importing it can. `lookup_struct`
+  goes through `lookup_struct_in` for the current module, which changes nothing
+  anywhere else.
+
+### Traps met on the way, each of which cost time
+
+| Thing | Reality |
+|---|---|
+| `struct addrinfo` | `ai_canonname` comes **before** `ai_addr` on the BSDs and Windows, and after it on Linux. `ai_addrlen` is `socklen_t` on Unix and `size_t` on Windows. |
+| `epoll_event` | `#[repr(C, packed)]` on x86-64 **only**. Elsewhere it has the natural padding, and reading one layout through the other shifts `data` by four bytes. |
+| `O_NONBLOCK` | `0o4000` on Linux, `0x4` on the BSDs. `O_CLOEXEC` differs again between macOS and FreeBSD, which is why the BSD arm sets it with `fcntl` instead. |
+| `errno` numbering | The same up to 34 and different above it: `EAGAIN` is 11 on Linux and 35 on the BSDs. |
+| A Windows `SOCKET` | Not a file descriptor and not a `HANDLE`. `closesocket`, not `CloseHandle`; `recv`, not `ReadFile`. |
+| `SO_REUSEADDR` on Windows | Means something else — it lets a second socket bind a port another is *actively listening on*. The right port of the Unix workaround is to do nothing. |
+| `EINTR`, short reads, path encoding | All ours now. `std::fs` did them; `sys` does them once, above the arms. |
+
+### What is left
+
+- **`kqueue` and IOCP**, per the decision above: an upgrade behind the existing
+  `Poller`, wanted when a program has thousands of sockets rather than tens.
+- **No TLS**, so `https://` is `error.NotSupported` rather than a connection
+  that quietly speaks the wrong protocol. That is the next item.
+- **No connection pooling.** The HTTP client opens a socket per request and
+  sends `Connection: close`, which is the honest shape for a client with no
+  pool. `Conn`, `send_request` and `read_response` are exposed so that a
+  protocol wanting to reuse a socket can.
+- **A failed request leaks its socket.** W# has no `defer`, so a `try` that
+  leaves `http.request` early skips the `close` below it. The process closes
+  everything at exit, so this is a leak within one run rather than a leak.
 
 ---
 

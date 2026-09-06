@@ -10,15 +10,28 @@
 # and every `run:` here is a bare command with no pipes, `&&` or redirection,
 # because the default shell differs between these two machines.
 #
-# Runs when this file changes, or on demand.
+# Runs when this file changes, when a platform arm does, or on demand.
+#
+# The path filter is the point rather than a saving. `crates/wsharp-runtime/src/sys/`
+# is three hand-written bindings to three operating systems, and only one of them
+# can be run on the machine the work is done on -- the other two are checked with
+# `cargo check --target` and believed. These runners are where they are actually
+# executed, so a change to one has to reach them.
 
 name: Smoke
 
 on:
   workflow_dispatch:
   push:
+    branches: [main]
     paths:
       - ".forgejo/workflows/smoke.yml"
+      - "crates/wsharp-runtime/src/sys/**"
+      - "crates/wsharp-runtime/src/net.rs"
+      - "crates/wsharp-runtime/src/io.rs"
+      - "crates/wsharp-runtime/src/worker.rs"
+      - "crates/wsharp-runtime/src/stackwalk.rs"
+      - "crates/wsharp-runtime/src/std/**"
 
 env:
   CARGO_TERM_COLOR: always
@@ -47,6 +60,13 @@ jobs:
         run: cc --version
 
       - uses: actions/checkout@v4
+
+      # The BSD arm: `sys/bsd.rs` is the only binding here that this project's
+      # own machine cannot run at all. Kept as its own step so a regression says
+      # which half broke rather than that some test failed.
+      - name: The sockets and the syscalls under them
+        timeout-minutes: 10
+        run: cargo test --workspace --locked sys
 
       # The real question: `rust-toolchain.toml` pins 1.95, so this also shows
       # whether rustup is present to honour it.
@@ -80,6 +100,12 @@ jobs:
       - name: The example that crashed
         timeout-minutes: 5
         run: cargo run --locked --bin wsharp -- run examples/library.ws
+
+      # The Windows arm: `CreateFileW`, Winsock and `WSAPoll`, none of which
+      # this project's own machine can run.
+      - name: The sockets and the syscalls under them
+        timeout-minutes: 10
+        run: cargo test --workspace --locked sys
 
       # No longer skipping `every_case_*`. They hung because the suite reaches
       # `tests/cases/io.ws`, the one case that calls those builtins, and a

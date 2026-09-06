@@ -28,7 +28,6 @@ use crate::header::{
 };
 
 use crate::heap;
-use crate::stackwalk::walk_roots;
 use crate::types;
 
 /// Blocks with at most this many occupied lines are worth evacuating: mostly
@@ -178,7 +177,8 @@ unsafe fn fix_fields(obj: *mut u8) {
 /// # Safety
 /// The evacuation pause, after the copying and before the blocks are released.
 pub(crate) unsafe fn fix_references(remembered: &[*mut *mut u8], scan: &[*mut u8]) {
-    unsafe { walk_roots(|slot| fix_slot(slot)) };
+    let worker = crate::worker::Worker::current();
+    unsafe { crate::worker::walk_worker_roots(worker, |slot| fix_slot(slot)) };
     crate::worker::for_each_pinned_slot(|slot| unsafe { fix_slot(slot) });
     for &slot in remembered {
         unsafe { fix_slot(slot) };
@@ -215,7 +215,8 @@ pub(crate) unsafe fn verify_no_stale_references() {
             stale += 1;
         }
     };
-    unsafe { walk_roots(|slot| check(slot.read())) };
+    let worker = crate::worker::Worker::current();
+    unsafe { crate::worker::walk_worker_roots(worker, |slot| check(slot.read())) };
     crate::worker::for_each_pinned_slot(|slot| check(unsafe { slot.read() }));
     heap::for_each_object(true, |obj| {
         if !unsafe { is_marked(obj) } {

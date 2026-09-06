@@ -74,6 +74,10 @@ impl Jit {
         // Every worker still parked on its queue would keep the process alive,
         // and one in the middle of a trace would be left half way through it.
         wsharp_runtime::rpc::stop_all();
+        // Sockets the program left open. The kernel would close them anyway;
+        // doing it here releases a listener's port before the next process
+        // wants it, which in a test suite is immediately.
+        wsharp_runtime::net::close_all();
         // A trace may still be in flight; settle it so the report is stable.
         wsharp_runtime::gc::quiesce();
         wsharp_runtime::gc::report_if_asked();

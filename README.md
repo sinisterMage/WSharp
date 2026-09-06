@@ -315,14 +315,33 @@ fn main() i64 {
 }
 ```
 
+```zig
+const net  = @import("std/net");
+const http = @import("std/http");
+
+fn main() i64 {
+    const l = net.listen("127.0.0.1", 8080, 16) catch return 1;
+    const c = http.connection(net.accept(l) catch return 2);
+    const request = http.read_request(c) catch return 3;
+    http.respond(c, 200, "text/plain", request.path) catch return 4;
+    return 0;
+}
+```
+
+A blocking read is safe here rather than merely tolerated: a builtin that blocks
+does so inside a *safe region*, so the collector can walk this worker's stack and
+run its pauses while the thread waits on the network. `std/net.poller` is for
+serving many connections from one worker, not for keeping the collector alive.
+
 | Module | |
 |---|---|
-| `std/str` | `len` `concat` `eq` `substr` `find` `split` `join` `repeat` `starts_with` `from_int` `from_float` |
+| `std/str` | `len` `concat` `eq` `substr` `find` `split` `join` `repeat` `starts_with` `from_int` `from_float` `byte_at` `from_byte` `parse_int` `to_lower` `trim` |
 | `std/array` | `len` `new` `concat` `push` `slice` `repeat` |
 | `std/list` | `List[T]`, a growable array: `new` `with_capacity` `from` `len` `capacity` `get` `set` `push` `pop` `insert` `remove` `extend` `clear` `iter` `next` `to_array` |
 | `std/math` | `abs` `min` `max` `sign` `sqrt` `pow` `floor` `ceil` `round` `trunc` `ipow` |
 | `std/io` | `read_file` `read_line` `write_file` `exists` — the fallible ones name their errors, e.g. `!{NotFound, PermissionDenied, IoFailed}str` |
-| `std/http` | the 27 HTTP status types, materialised on first mention |
+| `std/net` | TCP: `Socket` `Listener` and `connect` `listen` `accept` `read` `write` `write_all` `read_exactly` `read_all` `set_nonblocking` `close`. UDP: `Datagrams` `Peer` `Datagram` and `udp` `send_to` `receive` `reply`. Readiness: `Poller` `Event` and `poller` `watch` `wait`. IPv4 or IPv6, with the family the resolver's choice |
+| `std/http` | the 27 HTTP status types, materialised on first mention, plus an HTTP/1.1 client and server: `get` `post` `request` `read_request` `respond` `header` `status_of` |
 | `std/broker` | `Topic[M]` `Consumer[M]` and `topic` `publish` `subscribe` `next` `commit` `seek` `len` |
 
 A **prelude** needs no import, because every module has it:
@@ -338,7 +357,7 @@ A **prelude** needs no import, because every module has it:
 | `gc_live_objects()`, `gc_live_bytes()`, `gc_collections()`, `gc_traces()` | the collector's counters, for asserting on it |
 
 Half the library is written in W# rather than Rust — `std/array`, `std/list`,
-`std/math` and `str.split` are `.ws` files compiled with your program,
+`std/math`, `std/net`, `std/http` and `str.split` are `.ws` files compiled with your program,
 monomorphised per element type and dropped when nothing calls them. The rule that draws the line
 is worth knowing if you add to it: **a builtin may read and write bytes, and
 anything that moves a *reference* from one object into another is written in
@@ -424,10 +443,10 @@ Sessions are numbered by the original feature list:
       system
 - [x] **7.** Multithreading — workers with their own heaps, talking by typed
       RPC or through a Kafka-shaped message broker
-- [ ] **8.** Direct libc calls for I/O, and the networking that needs them.
-      Before v0.5: `std/io` goes through Rust's `std` today, which cannot
-      express non-blocking I/O — and a thread parked in a blocking read cannot
-      answer a collector pause.
+- [x] **8.** The operating system declared by hand — files and sockets on
+      Linux, macOS/BSD and Windows arms, a readiness API, and a *safe region*
+      that lets a thread block in a syscall while its collector walks the
+      stack it left behind. `std/net` and `std/http` are on top of it.
 
 What is left, and where it plugs in, is in [ROADMAP.md](ROADMAP.md).
 Conventions and the invariants worth not breaking are in

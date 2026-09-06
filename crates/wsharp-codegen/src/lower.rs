@@ -803,7 +803,7 @@ impl Trans<'_, '_> {
             hir::Stmt::Return(value) => {
                 let values = match value {
                     Some(e) => self.expr(e),
-                    None => Slots::new(),
+                    None => self.valueless_return(),
                 };
                 if !self.terminated {
                     self.b.ins().return_(&values);
@@ -917,6 +917,21 @@ impl Trans<'_, '_> {
     ///
     /// Every expression in the language flows through here, which is what makes
     /// this the one place rooting has to be right. See [`Trans::gc_root`].
+    /// What a `return;` with no value yields.
+    ///
+    /// Ordinarily nothing. In a function returning `!void` it is the success
+    /// tag: the union is one word, because there is no payload beside it, and
+    /// `return;` there means "finished, and nothing went wrong".
+    fn valueless_return(&mut self) -> Slots {
+        let ret = self.func.ret.clone();
+        let slots = self.slots_of(&ret);
+        let mut out = Slots::new();
+        for ty in slots {
+            out.push(self.b.ins().iconst(ty, repr::ERROR_OK));
+        }
+        out
+    }
+
     fn expr(&mut self, expr: &hir::Expr) -> Slots {
         let values = self.expr_inner(expr);
         self.gc_root(&expr.ty, &values);

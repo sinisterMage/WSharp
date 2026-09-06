@@ -941,7 +941,14 @@ impl<'a> Inferencer<'a> {
     /// one is never created, so it costs no type id, no registry entry and no
     /// singleton. Ancestors come along because the lattice needs them.
     fn lookup_struct(&mut self, name: &str) -> Option<StructId> {
-        self.struct_named(name)
+        // Through `lookup_struct_in` rather than a plain map lookup, so that a
+        // module can name its own lazily materialised types. That is only ever
+        // `std/http`, which is the one module whose contents are a table in the
+        // compiler rather than declarations in a file -- and which, once it had
+        // a source file of its own, could not otherwise mention `Ok200` even
+        // though every program that imports it can.
+        let module = self.modules[self.current].path.clone();
+        self.lookup_struct_in(&module, name)
     }
 
     /// A struct named through a module: `http.NotFound404`.
@@ -1979,7 +1986,18 @@ impl<'a> Inferencer<'a> {
                         Some(hir::Stmt::Return(Some(value)))
                     }
                     None => {
-                        self.expect(&Type::void(), &ret, *span, "this `return`");
+                        // `return;` in a function returning `!void` means
+                        // "finished, and nothing went wrong". There is no
+                        // payload to wrap -- the union is the tag alone -- so
+                        // this checks against the payload rather than going
+                        // through `coerce`, which exists to build a value.
+                        // Without it `!void` would be a type a builtin can
+                        // return and no W# function can.
+                        let target = match self.store.resolve(&ret) {
+                            Type::Con(TyCon::ErrUnion, args) => args[0].clone(),
+                            _ => ret.clone(),
+                        };
+                        self.expect(&Type::void(), &target, *span, "this `return`");
                         Some(hir::Stmt::Return(None))
                     }
                 }

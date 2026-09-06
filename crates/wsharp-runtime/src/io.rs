@@ -18,8 +18,18 @@
 //! The tag is an index into the program's error table plus one, with zero
 //! meaning success. That is why the table's first entries are fixed: see
 //! [`crate::builtins::builtin_errors`].
+//!
+//! The operating system is reached through [`crate::sys`], which declares it by
+//! hand, rather than through Rust's `std::fs` and `std::io`. What that buys is
+//! `errno` instead of a portable approximation of it, and one layer instead of
+//! two once sockets arrive. What it costs is that path encoding, `EINTR` and
+//! short reads are now ours to get right; they are handled in `sys`, once.
+//!
+//! Every call here is made inside a safe region, so a slow disk or a terminal
+//! nobody is typing at cannot stall this worker's collector.
 
 use crate::strings::{alloc_str, str_bytes};
+use crate::sys;
 
 /// A `!str` as it crosses the boundary: the tag in a whole word, then the
 /// payload. W# narrows the tag on the way in.
@@ -34,15 +44,33 @@ pub struct FallibleStr {
 }
 
 impl FallibleStr {
-    fn ok(value: *mut u8) -> FallibleStr {
+    pub(crate) fn ok(value: *mut u8) -> FallibleStr {
         FallibleStr { tag: 0, value }
     }
 
-    fn err(tag: i64) -> FallibleStr {
+    pub(crate) fn err(tag: i64) -> FallibleStr {
         FallibleStr {
             tag,
             value: std::ptr::null_mut(),
         }
+    }
+}
+
+/// A `!i64` as it crosses the boundary: the same two-word shape, for every
+/// builtin whose answer is a number that might not exist.
+#[repr(C)]
+pub struct FallibleI64 {
+    pub tag: i64,
+    pub value: i64,
+}
+
+impl FallibleI64 {
+    pub(crate) fn ok(value: i64) -> FallibleI64 {
+        FallibleI64 { tag: 0, value }
+    }
+
+    pub(crate) fn err(tag: i64) -> FallibleI64 {
+        FallibleI64 { tag, value: 0 }
     }
 }
 
@@ -53,12 +81,17 @@ impl FallibleStr {
 /// storage laid out as a [`FallibleStr`].
 pub unsafe extern "C" fn ws_io_read_file(out: *mut FallibleStr, path: *const u8) {
     unsafe { crate::gc::checkpoint() };
-    // Read before allocating: the allocation is a safepoint, and `path` is a
-    // Rust local that no stack map describes.
-    let path = String::from_utf8_lossy(unsafe { str_bytes(path) }).into_owned();
-    let result = match std::fs::read(&path) {
+    // Copy the path out before allocating *and* before blocking: an allocation
+    // is a safepoint, a safe region is a window in which a collection can run,
+    // and `path` names a heap object that no stack map describes.
+    //
+    // The bytes are taken as they are rather than through a lossy conversion to
+    // text. A W# `str` is arbitrary bytes and so is a Unix path.
+    let path = unsafe { str_bytes(path) }.to_vec();
+    let read = crate::worker::blocking(|| sys::read_file(&path));
+    let result = match read {
         Ok(bytes) => FallibleStr::ok(alloc_str(&bytes)),
-        Err(e) => FallibleStr::err(io_error_tag(&e)),
+        Err(e) => FallibleStr::err(sys::error_tag(e)),
     };
     // After the allocation, never before: `out` points into the caller's frame,
     // which no stack map describes, so a reference parked there would be
@@ -75,14 +108,13 @@ pub unsafe extern "C" fn ws_io_read_file(out: *mut FallibleStr, path: *const u8)
 /// `out` must point at writable storage laid out as a [`FallibleStr`].
 pub unsafe extern "C" fn ws_io_read_line(out: *mut FallibleStr) {
     unsafe { crate::gc::checkpoint() };
-    let mut line = String::new();
-    let result = match std::io::stdin().read_line(&mut line) {
-        Ok(0) => FallibleStr::err(crate::builtins::ERROR_END_OF_FILE),
-        Ok(_) => {
-            let trimmed = line.trim_end_matches(['\n', '\r']);
-            FallibleStr::ok(alloc_str(trimmed.as_bytes()))
-        }
-        Err(e) => FallibleStr::err(io_error_tag(&e)),
+    // The blocking call this whole mechanism exists for: a program waiting on a
+    // terminal waits indefinitely, and its collector must not wait with it.
+    let read = crate::worker::blocking(|| sys::read_line(sys::stdin()));
+    let result = match read {
+        Ok(Some(line)) => FallibleStr::ok(alloc_str(&line)),
+        Ok(None) => FallibleStr::err(crate::builtins::ERROR_END_OF_FILE),
+        Err(e) => FallibleStr::err(sys::error_tag(e)),
     };
     unsafe { out.write(result) };
 }
@@ -95,11 +127,11 @@ pub unsafe extern "C" fn ws_io_read_line(out: *mut FallibleStr) {
 /// must be null or point at W# string objects.
 pub unsafe extern "C" fn ws_io_write_file(path: *const u8, contents: *const u8) -> i64 {
     unsafe { crate::gc::checkpoint() };
-    let path = String::from_utf8_lossy(unsafe { str_bytes(path) }).into_owned();
+    let path = unsafe { str_bytes(path) }.to_vec();
     let bytes = unsafe { str_bytes(contents) }.to_vec();
-    match std::fs::write(&path, &bytes) {
+    match crate::worker::blocking(|| sys::write_file(&path, &bytes)) {
         Ok(()) => 0,
-        Err(e) => io_error_tag(&e),
+        Err(e) => sys::error_tag(e),
     }
 }
 
@@ -109,19 +141,6 @@ pub unsafe extern "C" fn ws_io_write_file(path: *const u8, contents: *const u8) 
 /// must be null or point at W# string objects.
 pub unsafe extern "C" fn ws_io_exists(path: *const u8) -> bool {
     unsafe { crate::gc::checkpoint() };
-    let path = String::from_utf8_lossy(unsafe { str_bytes(path) }).into_owned();
-    std::path::Path::new(&path).exists()
-}
-
-/// Which error a failure is, as a tag.
-///
-/// Only the distinctions a program can act on: whether the file was there, and
-/// whether it was allowed to look. Everything else is one error, because a
-/// caller that wanted more detail could not have got it portably anyway.
-fn io_error_tag(e: &std::io::Error) -> i64 {
-    match e.kind() {
-        std::io::ErrorKind::NotFound => crate::builtins::ERROR_NOT_FOUND,
-        std::io::ErrorKind::PermissionDenied => crate::builtins::ERROR_PERMISSION_DENIED,
-        _ => crate::builtins::ERROR_IO_FAILED,
-    }
+    let path = unsafe { str_bytes(path) }.to_vec();
+    crate::worker::blocking(|| sys::exists(&path))
 }

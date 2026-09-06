@@ -71,6 +71,10 @@ pub(crate) struct Stats {
     pub(crate) traces: AtomicUsize,
     pub(crate) moved: AtomicUsize,
     pub(crate) pauses: AtomicUsize,
+    /// Of those, the ones a collector ran for a mutator parked in a syscall.
+    /// Worth counting for the reason the root count is: a safe region that is
+    /// never actually used would let its tests pass without testing anything.
+    pub(crate) served_pauses: AtomicUsize,
     pub(crate) max_pause_us: AtomicUsize,
     pub(crate) total_pause_us: AtomicUsize,
     /// Live bytes when the last trace finished sweeping: the growth trigger's
@@ -78,11 +82,33 @@ pub(crate) struct Stats {
     pub(crate) trace_baseline_bytes: AtomicUsize,
 }
 
+/// A worker running normally: it answers its own pause requests.
+pub(crate) const RUNNING: u8 = 0;
+/// Parked in a syscall. Its stack is frozen and `parked_fp` says where it is,
+/// so its collector may walk it and run the pause on its behalf.
+pub(crate) const PARKED: u8 = 1;
+/// A collector has claimed a parked worker and is walking it. The mutator must
+/// not resume until it is let go.
+pub(crate) const SCANNING: u8 = 2;
+
 pub struct Worker {
     pub(crate) id: usize,
     pub(crate) heap: Mutex<Heap>,
     pub(crate) buffers: Mutex<Buffers>,
     pub(crate) mark: MarkState,
+    /// [`RUNNING`], [`PARKED`] or [`SCANNING`]: the safe-region handshake.
+    pub(crate) parked: AtomicU8,
+    /// Where this worker's stack was when it parked. Meaningful only while
+    /// `parked` is not [`RUNNING`], and published before it is set.
+    pub(crate) parked_fp: AtomicUsize,
+    /// The length of this thread's [`PINNED`] list, where another thread can
+    /// read it. A parked worker's stack is walkable; that list is not, because
+    /// it is on the thread rather than in it.
+    pub(crate) pinned_depth: AtomicUsize,
+    /// Guards the handshake's wake-up. Its own lock rather than the mark
+    /// state's, because a pause takes that one.
+    pub(crate) park_lock: Mutex<()>,
+    pub(crate) park_changed: Condvar,
     /// "Marked" means the bit equals this. It flips in a trace's initial pause,
     /// which unmarks this worker's whole heap at once -- and only this
     /// worker's, which is the reason it cannot be shared.
@@ -145,6 +171,11 @@ impl Worker {
                 changed: Condvar::new(),
                 thread: Once::new(),
             },
+            parked: AtomicU8::new(RUNNING),
+            parked_fp: AtomicUsize::new(0),
+            pinned_depth: AtomicUsize::new(0),
+            park_lock: Mutex::new(()),
+            park_changed: Condvar::new(),
             parity: AtomicU64::new(0),
             stats: Stats {
                 collections: AtomicUsize::new(0),
@@ -155,6 +186,7 @@ impl Worker {
                 traces: AtomicUsize::new(0),
                 moved: AtomicUsize::new(0),
                 pauses: AtomicUsize::new(0),
+                served_pauses: AtomicUsize::new(0),
                 max_pause_us: AtomicUsize::new(0),
                 total_pause_us: AtomicUsize::new(0),
                 trace_baseline_bytes: AtomicUsize::new(0),
@@ -203,8 +235,12 @@ thread_local! {
     /// is the standing rule this list is the first user of.
     ///
     /// Thread-local rather than on the worker, for the same reason the stack
-    /// is: only the mutator ever holds one, and all three pauses run on the
-    /// mutator.
+    /// is: only the mutator ever holds one. That used to be the whole argument,
+    /// because all three pauses ran on the mutator; a safe region lets a
+    /// collector run one instead, and it can reach a parked worker's stack but
+    /// not its thread. So the length is mirrored onto the worker
+    /// (`pinned_depth`) and a collector declines any worker holding runtime
+    /// roots -- which no blocking builtin does, by construction.
     static PINNED: RefCell<Vec<*mut u8>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -222,14 +258,34 @@ impl Pinned {
     }
 
     pub(crate) fn add(&self, obj: *mut u8) {
-        PINNED.with(|p| p.borrow_mut().push(obj));
+        let depth = PINNED.with(|p| {
+            let mut list = p.borrow_mut();
+            list.push(obj);
+            list.len()
+        });
+        publish_depth(depth);
     }
 }
 
 impl Drop for Pinned {
     fn drop(&mut self) {
         PINNED.with(|p| p.borrow_mut().truncate(self.depth));
+        publish_depth(self.depth);
     }
+}
+
+/// Mirror the list's length onto the worker, where another thread can read it.
+///
+/// A parked worker's *stack* can be walked by its collector, because the stack
+/// is frozen and the frame pointer says where it is. This list cannot: it
+/// belongs to the thread rather than to the worker. So a collector offered a
+/// parked worker checks the length first and declines if the runtime is
+/// holding anything -- which no blocking builtin does, and which the assertion
+/// in [`blocking`] states.
+fn publish_depth(depth: usize) {
+    Worker::current()
+        .pinned_depth
+        .store(depth, Ordering::Release);
 }
 
 /// Visit the *address* of every pinned slot, so a moving collector can rewrite
@@ -240,6 +296,139 @@ pub(crate) fn for_each_pinned_slot(mut f: impl FnMut(*mut *mut u8)) {
             f(slot as *mut *mut u8);
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// The safe region
+// ---------------------------------------------------------------------------
+
+/// Run `f` outside the safepoint protocol, so that it may block.
+///
+/// All three pauses run on the mutator because only a mutator can walk its own
+/// stack, so a thread parked in `read(2)` cannot answer a pause request and its
+/// trace waits for the syscall. With workers that is one worker's heap held up
+/// by another's slow client, which is the failure a worker model exists to
+/// avoid.
+///
+/// The way out is that a blocked thread's stack is *frozen*, and a frozen stack
+/// can be walked by anyone. So this records where the stack is and says the
+/// worker is parked; its collector then walks the recorded chain and runs the
+/// pause itself. `mark::quiesce` already did this much for a worker whose stack
+/// held no roots -- the recorded frame pointer is what generalises it to one
+/// that does.
+///
+/// **While parked, a thread may touch nothing on the heap.** Everything `f`
+/// needs must already be copied into plain bytes. That is the same bargain an
+/// allocating builtin makes, and for the same reason: a Rust local is described
+/// by no stack map, so a reference held in one is invisible to the collection
+/// that runs while this blocks.
+///
+/// `#[inline(never)]` because the frame recorded is this one, and it has to
+/// stay live for as long as `f` runs.
+#[inline(never)]
+pub(crate) fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    let worker = Worker::current();
+    debug_assert_eq!(
+        worker.pinned_depth.load(Ordering::Acquire),
+        0,
+        "a safe region may not be entered while the runtime holds pinned roots: \
+         they are on the thread, and the thread is about to stop answering"
+    );
+    // Give the allocation buffer back before parking, because it is the one
+    // piece of this mutator that is on the *thread* and not in the worker: a
+    // collector running the pause from its own thread would retire its own
+    // buffer and leave this one open, and a block an allocator holds is never
+    // swept, recycled or evacuated. Publishing the counters is the same story.
+    // One buffer refill on the way out is nothing beside a syscall.
+    crate::heap::retire_local_buffer();
+    crate::heap::flush_local_counters();
+
+    // The frame pointer first, then the state: whoever sees `PARKED` must see
+    // a frame pointer that describes this stack.
+    worker
+        .parked_fp
+        .store(crate::stackwalk::current_frame_pointer(), Ordering::Relaxed);
+    worker.parked.store(PARKED, Ordering::Release);
+    // A collector that has already asked for a pause is asleep waiting for one
+    // that will not come until it runs it. Tell it that it can.
+    {
+        let _guard = worker.mark.state.lock().unwrap_or_else(|e| e.into_inner());
+        worker.mark.changed.notify_all();
+    }
+
+    let out = f();
+
+    unpark(worker);
+    out
+}
+
+/// Leave a safe region, waiting out a collector that is walking this stack.
+///
+/// Resuming mid-walk is the one race that matters, and it is why leaving is a
+/// compare-exchange rather than a store: losing it means the collector claimed
+/// this worker, and the only safe answer is to wait until it lets go.
+fn unpark(worker: &'static Worker) {
+    loop {
+        if worker
+            .parked
+            .compare_exchange(PARKED, RUNNING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return;
+        }
+        let guard = worker.park_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = worker
+            .park_changed
+            .wait_while(guard, |_| worker.parked.load(Ordering::Acquire) == SCANNING)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// Take a parked worker, so its pause can be run on this thread.
+///
+/// Declines a worker whose runtime roots are non-empty: that list lives on the
+/// parked thread and cannot be reached from here, so the honest answer is to
+/// wait for the mutator, exactly as everything did before safe regions.
+pub(crate) fn claim_parked(worker: &Worker) -> bool {
+    if worker.pinned_depth.load(Ordering::Acquire) != 0 {
+        return false;
+    }
+    worker
+        .parked
+        .compare_exchange(PARKED, SCANNING, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+/// Give a claimed worker back. It returns to being parked, not to running:
+/// only the thread that parked may decide it has stopped being blocked.
+pub(crate) fn release_parked(worker: &Worker) {
+    let _guard = worker.park_lock.lock().unwrap_or_else(|e| e.into_inner());
+    worker.parked.store(PARKED, Ordering::Release);
+    worker.park_changed.notify_all();
+}
+
+/// Whether this worker is parked and unclaimed, so a pause could be run for it.
+pub(crate) fn is_parked(worker: &Worker) -> bool {
+    worker.parked.load(Ordering::Acquire) == PARKED
+}
+
+/// Walk `worker`'s stack roots: this thread's own, or a parked worker's from
+/// the frame pointer it recorded.
+///
+/// Every root walk goes through here rather than calling the stack walker
+/// directly, because "whose stack, and where does it start" is exactly the
+/// question a safe region changes the answer to.
+///
+/// # Safety
+/// As [`crate::stackwalk::walk_roots`]. When walking a parked worker it must
+/// be held claimed -- [`claim_parked`] -- for the whole walk.
+pub(crate) unsafe fn walk_worker_roots(worker: &Worker, visit: impl FnMut(*mut *mut u8)) {
+    if worker.parked.load(Ordering::Acquire) == SCANNING {
+        let fp = worker.parked_fp.load(Ordering::Acquire);
+        unsafe { crate::stackwalk::walk_roots_from(fp, visit) };
+    } else {
+        unsafe { crate::stackwalk::walk_roots(visit) };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -349,10 +538,68 @@ mod tests {
         assert!(crate::heap::in_heap(theirs.1 as *mut u8));
     }
 
+    /// A parked worker can be claimed and walked, and it may not resume until
+    /// it is let go.
+    ///
+    /// That last part is the one race the handshake exists for: a mutator that
+    /// returned from its syscall and carried on while its collector was still
+    /// reading its stack would be a collector reading a stack that is being
+    /// rewritten underneath it.
+    #[test]
+    fn a_parked_worker_is_released_before_it_resumes() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (worker_tx, worker_rx) = mpsc::channel::<&'static Worker>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (left_tx, left_rx) = mpsc::channel::<()>();
+
+        let mutator = std::thread::spawn(move || {
+            let w = Worker::current();
+            worker_tx.send(w).expect("the test is listening");
+            // Parked for as long as the other thread keeps it waiting, which
+            // is what a syscall looks like from here.
+            blocking(|| go_rx.recv().expect("released"));
+            left_tx.send(()).expect("the test is listening");
+        });
+
+        let w = worker_rx.recv().expect("the mutator started");
+        while !is_parked(w) {
+            std::thread::yield_now();
+        }
+        assert!(claim_parked(w), "an unclaimed parked worker can be taken");
+        assert!(!claim_parked(w), "and only once");
+
+        // Its stack is walkable from this thread. Nothing generated is on it,
+        // so the walk finds nothing -- what matters is that it terminates.
+        let mut roots = 0;
+        unsafe { walk_worker_roots(w, |_| roots += 1) };
+
+        // Let the syscall return. The mutator must still not get past `unpark`.
+        go_tx.send(()).expect("the mutator is waiting");
+        assert!(
+            left_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "a mutator resumed while its stack was being walked"
+        );
+
+        release_parked(w);
+        // Generous on purpose: this is a hang detector, not a latency check,
+        // and a loaded machine must not fail it.
+        left_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("released, so it resumes");
+        mutator.join().expect("the mutator finished");
+    }
+
     /// The flag generated code reads means "*some* worker", so it stays raised
     /// while any worker is asking and falls only when the last one stops.
     #[test]
     fn the_shared_poll_flag_counts_workers() {
+        // The flag and its count are process-wide, and any trace anywhere in
+        // the test binary raises them.
+        let _serial = crate::test_support::SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let a = Worker::current();
         let b: &'static Worker = std::thread::spawn(Worker::current)
             .join()

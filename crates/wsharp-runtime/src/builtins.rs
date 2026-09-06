@@ -274,6 +274,41 @@ fn library() -> Vec<Builtin> {
             ptr: crate::strings::ws_str_from_float as *const u8,
         },
         Builtin {
+            module: STR_MODULE,
+            name: "byte_at",
+            params: &[BuiltinTy::Str, BuiltinTy::I64],
+            ret: BuiltinTy::I64,
+            ptr: crate::strings::ws_str_byte_at as *const u8,
+        },
+        Builtin {
+            module: STR_MODULE,
+            name: "from_byte",
+            params: &[BuiltinTy::I64],
+            ret: BuiltinTy::Str,
+            ptr: crate::strings::ws_str_from_byte as *const u8,
+        },
+        Builtin {
+            module: STR_MODULE,
+            name: "parse_int",
+            params: &[BuiltinTy::Str],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, &["BadFormat"]),
+            ptr: crate::strings::ws_str_parse_int as *const u8,
+        },
+        Builtin {
+            module: STR_MODULE,
+            name: "to_lower",
+            params: &[BuiltinTy::Str],
+            ret: BuiltinTy::Str,
+            ptr: crate::strings::ws_str_to_lower as *const u8,
+        },
+        Builtin {
+            module: STR_MODULE,
+            name: "trim",
+            params: &[BuiltinTy::Str],
+            ret: BuiltinTy::Str,
+            ptr: crate::strings::ws_str_trim as *const u8,
+        },
+        Builtin {
             module: ARRAY_MODULE,
             name: "len",
             params: &[ARRAY_OF_ELEM],
@@ -422,6 +457,156 @@ fn library() -> Vec<Builtin> {
             ptr: crate::broker::ws_broker_len as *const u8,
         },
         Builtin {
+            module: NET_MODULE,
+            name: "raw_connect",
+            params: &[BuiltinTy::Str, BuiltinTy::I64],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            ptr: crate::net::ws_net_connect as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_listen",
+            params: &[BuiltinTy::Str, BuiltinTy::I64, BuiltinTy::I64],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            ptr: crate::net::ws_net_listen as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_accept",
+            params: &[BuiltinTy::I64],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            ptr: crate::net::ws_net_accept as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_read",
+            params: &[BuiltinTy::I64, BuiltinTy::I64],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::Str, NET_ERRORS),
+            ptr: crate::net::ws_net_read as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_write",
+            params: &[BuiltinTy::I64, BuiltinTy::Str],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            ptr: crate::net::ws_net_write as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_local_port",
+            params: &[BuiltinTy::I64],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            ptr: crate::net::ws_net_local_port as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_set_nonblocking",
+            params: &[BuiltinTy::I64, BuiltinTy::Bool],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            ptr: crate::net::ws_net_set_nonblocking as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_close",
+            params: &[BuiltinTy::I64],
+            ret: BuiltinTy::Void,
+            ptr: crate::net::ws_net_close as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_udp",
+            params: &[BuiltinTy::Str, BuiltinTy::I64],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            ptr: crate::net::ws_net_udp as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_send_to",
+            params: &[
+                BuiltinTy::I64,
+                BuiltinTy::Str,
+                BuiltinTy::I64,
+                BuiltinTy::Str,
+            ],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            ptr: crate::net::ws_net_send_to as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_send_peer",
+            params: &[BuiltinTy::I64, BuiltinTy::I64, BuiltinTy::Str],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            ptr: crate::net::ws_net_send_peer as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_recv_from",
+            params: &[BuiltinTy::I64, BuiltinTy::I64],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::Str, NET_ERRORS),
+            ptr: crate::net::ws_net_recv_from as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_last_peer",
+            params: &[BuiltinTy::I64],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            ptr: crate::net::ws_net_last_peer as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_poller",
+            params: &[],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            ptr: crate::net::ws_net_poller as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_watch",
+            params: &[
+                BuiltinTy::I64,
+                BuiltinTy::I64,
+                BuiltinTy::Bool,
+                BuiltinTy::Bool,
+            ],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            ptr: crate::net::ws_net_watch as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_forget",
+            params: &[BuiltinTy::I64, BuiltinTy::I64],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            ptr: crate::net::ws_net_forget as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_wait",
+            params: &[BuiltinTy::I64, BuiltinTy::I64],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            ptr: crate::net::ws_net_wait as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_ready_socket",
+            params: &[BuiltinTy::I64, BuiltinTy::I64],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            ptr: crate::net::ws_net_ready_socket as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_ready_events",
+            params: &[BuiltinTy::I64, BuiltinTy::I64],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            ptr: crate::net::ws_net_ready_events as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
+            name: "raw_close_poller",
+            params: &[BuiltinTy::I64],
+            ret: BuiltinTy::Void,
+            ptr: crate::net::ws_net_close_poller as *const u8,
+        },
+        Builtin {
             module: ARRAY_MODULE,
             name: "new",
             params: &[BuiltinTy::I64],
@@ -516,6 +701,27 @@ pub fn builtin_errors() -> &'static [&'static str] {
         // mechanism -- so an RPC returns `!T` and this is what it raises.
         "WorkerDied",
         "SpawnFailed",
+        // The network. Appending is safe and rearranging is not: a tag is an
+        // index into this list, and a builtin compiled against one number
+        // cannot be caught by a program that interned another.
+        "ConnectionRefused",
+        "ConnectionReset",
+        "BrokenPipe",
+        "AddressInUse",
+        "TimedOut",
+        // Not a failure so much as an answer: on a non-blocking socket this is
+        // what "nothing to do yet" is called, and a program is expected to
+        // catch it and come back.
+        "WouldBlock",
+        "HostNotFound",
+        "NetworkUnreachable",
+        // What `str.parse_int` raises. Not a network error; it is here because
+        // this list is one flat numbering and appending is the only safe way
+        // to add to it.
+        "BadFormat",
+        // What a library raises for something it can do in principle and
+        // cannot yet -- `https://`, until there is a TLS client to hand it to.
+        "NotSupported",
     ]
 }
 
@@ -533,6 +739,16 @@ pub const ERROR_NOT_FOUND: i64 = 1;
 pub const ERROR_PERMISSION_DENIED: i64 = 2;
 pub const ERROR_IO_FAILED: i64 = 3;
 pub const ERROR_END_OF_FILE: i64 = 4;
+pub const ERROR_CONNECTION_REFUSED: i64 = 7;
+pub const ERROR_CONNECTION_RESET: i64 = 8;
+pub const ERROR_BROKEN_PIPE: i64 = 9;
+pub const ERROR_ADDRESS_IN_USE: i64 = 10;
+pub const ERROR_TIMED_OUT: i64 = 11;
+pub const ERROR_WOULD_BLOCK: i64 = 12;
+pub const ERROR_HOST_NOT_FOUND: i64 = 13;
+pub const ERROR_NETWORK_UNREACHABLE: i64 = 14;
+pub const ERROR_BAD_FORMAT: i64 = 15;
+pub const ERROR_NOT_SUPPORTED: i64 = 16;
 
 /// The module the HTTP status lattice lives in.
 ///
@@ -542,6 +758,29 @@ pub const ERROR_END_OF_FILE: i64 = 4;
 pub const HTTP_MODULE: &str = "std/http";
 /// The broker's module: named topics, partitioned logs, consumer groups.
 pub const BROKER_MODULE: &str = "std/broker";
+/// The standard library's sockets.
+pub const NET_MODULE: &str = "std/net";
+
+/// What any socket operation may raise.
+///
+/// One set for all of them rather than a tailored set each. A builtin's error
+/// set is written in its row because it is compiled long before the program
+/// that catches it, and the wrappers in `std/net.ws` pass these results through
+/// each other constantly -- one set means those compose without a widening at
+/// every step, and the cost is a `catch` that can name an error this particular
+/// call would not in practice raise.
+const NET_ERRORS: &[&str] = &[
+    "ConnectionRefused",
+    "ConnectionReset",
+    "BrokenPipe",
+    "AddressInUse",
+    "TimedOut",
+    "WouldBlock",
+    "HostNotFound",
+    "NetworkUnreachable",
+    "PermissionDenied",
+    "IoFailed",
+];
 
 /// The parts of the standard library written in W# rather than Rust.
 ///
@@ -558,6 +797,8 @@ pub fn std_module_sources() -> &'static [(&'static str, &'static str)] {
         (STR_MODULE, include_str!("std/str.ws")),
         (MATH_MODULE, include_str!("std/math.ws")),
         (BROKER_MODULE, include_str!("std/broker.ws")),
+        (NET_MODULE, include_str!("std/net.ws")),
+        (HTTP_MODULE, include_str!("std/http.ws")),
     ]
 }
 
@@ -806,6 +1047,51 @@ fn report_and_exit(reason: &str) -> ! {
 mod tests {
     use super::*;
     use crate::header::{FLAG_IMMORTAL, TYPE_ID_STR, meta_word};
+
+    /// Every `ERROR_*` constant is the position of its name in
+    /// [`builtin_errors`], plus one.
+    ///
+    /// The two are written down separately -- the names for the type checker to
+    /// intern, the numbers for the runtime to return -- and nothing but this
+    /// keeps them agreeing. Getting it wrong is silent: a builtin returns a tag
+    /// that names a different error, or one the program has no name for at all.
+    #[test]
+    fn every_error_constant_matches_its_position() {
+        let names = builtin_errors();
+        let expected = [
+            ("NotFound", ERROR_NOT_FOUND),
+            ("PermissionDenied", ERROR_PERMISSION_DENIED),
+            ("IoFailed", ERROR_IO_FAILED),
+            ("EndOfFile", ERROR_END_OF_FILE),
+            ("WorkerDied", ERROR_WORKER_DIED),
+            ("SpawnFailed", ERROR_SPAWN_FAILED),
+            ("ConnectionRefused", ERROR_CONNECTION_REFUSED),
+            ("ConnectionReset", ERROR_CONNECTION_RESET),
+            ("BrokenPipe", ERROR_BROKEN_PIPE),
+            ("AddressInUse", ERROR_ADDRESS_IN_USE),
+            ("TimedOut", ERROR_TIMED_OUT),
+            ("WouldBlock", ERROR_WOULD_BLOCK),
+            ("HostNotFound", ERROR_HOST_NOT_FOUND),
+            ("NetworkUnreachable", ERROR_NETWORK_UNREACHABLE),
+            ("BadFormat", ERROR_BAD_FORMAT),
+            ("NotSupported", ERROR_NOT_SUPPORTED),
+        ];
+        assert_eq!(
+            names.len(),
+            expected.len(),
+            "a name was added to `builtin_errors` without a tag beside it"
+        );
+        for (name, tag) in expected {
+            let index = names
+                .iter()
+                .position(|n| *n == name)
+                .unwrap_or_else(|| panic!("`{name}` is not in `builtin_errors`"));
+            assert_eq!(tag, index as i64 + 1, "the tag for `{name}` is wrong");
+        }
+        // The two names the type checker looks up by spelling.
+        assert_eq!(names[ERROR_WORKER_DIED as usize - 1], WORKER_DIED);
+        assert_eq!(names[ERROR_SPAWN_FAILED as usize - 1], SPAWN_FAILED);
+    }
 
     /// Build a string object the way the code generator emits literals, so the
     /// test exercises the same layout `ws_print_str` reads.

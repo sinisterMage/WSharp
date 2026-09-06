@@ -51,6 +51,38 @@ Things in this version that differ from older tutorials, each of which cost time
 | `icmp_imm` / `iadd_imm` | Deprecated; use the `_s` / `_u` variants that say how the immediate is extended. |
 | `FunctionBuilder::finalize` | **Must** be called per function, and takes a `TargetFrontendConfig`. It is what releases the shared `FunctionBuilderContext`; skip it and the *next* `FunctionBuilder::new` fails an assert with no hint about the real cause. |
 
+## The operating system
+
+`crates/wsharp-runtime/src/sys/` declares it by hand: three arms named for what
+they are (`linux.rs`, `bsd.rs`, `windows.rs`), no `libc` crate, because
+`wsharp-runtime` has zero dependencies and that is worth keeping. Everything
+that can be written once -- `EINTR` retries, short reads, trying each resolved
+address in turn -- is in `sys/mod.rs` instead, which is also the only part of
+the layer this machine's tests exercise.
+
+Cross-check the arms you cannot run before believing them:
+
+```sh
+nix-shell --run "cargo check -p wsharp-runtime --target x86_64-pc-windows-gnu --all-targets"
+nix-shell --run "cargo check -p wsharp-runtime --target aarch64-apple-darwin --all-targets"
+```
+
+Things that differ between the arms, each of which cost time:
+
+| Thing | Reality |
+|---|---|
+| `struct addrinfo` | `ai_canonname` comes **before** `ai_addr` on the BSDs and Windows, and after it on Linux. `ai_addrlen` is `socklen_t` on Unix and `size_t` on Windows. Each arm declares its own for this reason. |
+| `epoll_event` | `#[repr(C, packed)]` on x86-64 **only**; elsewhere it has the natural padding. The wrong one shifts `data` by four bytes and hands back a descriptor that is half of one. |
+| `O_NONBLOCK` | `0o4000` on Linux, `0x4` on the BSDs. `O_CLOEXEC` differs between macOS and FreeBSD, which is why the BSD arm sets close-on-exec with `fcntl` instead of asking for it in the flags. |
+| `errno` | The same up to 34 and different above it -- `EAGAIN` is 11 on Linux and 35 on the BSDs. |
+| A Windows `SOCKET` | Not a file descriptor and not a `HANDLE`: `closesocket`, not `CloseHandle`; `recv`, not `ReadFile`. |
+| `SO_REUSEADDR` on Windows | Lets a second socket bind a port another is *actively listening on*. The right port of the Unix workaround is to do nothing at all. |
+| `getaddrinfo` failure | Reports `EAI_*` codes, which are negative on glibc and small positive numbers on macOS -- so they would collide with `errno`. Each arm translates them to one synthetic `ERESOLVE` instead. |
+
+**Never lay out a `sockaddr` by hand.** `getaddrinfo` produces addresses and
+everything else consumes them, which is what keeps byte order and the BSDs'
+extra `sin_len` byte out of this code entirely.
+
 ## Invariants
 
 - **`hir::Program.funcs` is indexed by `FuncId`.** Never filter or reorder it —
@@ -65,9 +97,9 @@ Things in this version that differ from older tutorials, each of which cost time
   generation to shape registers. They must agree; a test in
   `wsharp-codegen/src/repr.rs` checks that they do.
 - **A builtin may read and write bytes; anything that moves a *reference* from
-  one object into another is written in W#.** This is why `std/array` and
-  `std/str.split` are `.ws` files compiled with the program rather than rows in
-  the builtin table. Generated code goes through the write barrier, the load
+  one object into another is written in W#.** This is why `std/array`,
+  `std/str.split`, `std/net` and `std/http` are `.ws` files compiled with the
+  program rather than rows in the builtin table. Generated code goes through the write barrier, the load
   barrier and the stack maps by construction; a Rust function has none of the
   three, and its arguments live in locals no stack map describes. `array.concat`
   was written in Rust first, and `--gc-stress` caught it: the memcpy'd
@@ -202,14 +234,40 @@ Things in this version that differ from older tutorials, each of which cost time
   asks the current worker whether the request is its own, and returns at once
   when it is not.
 - **All three pauses run on the mutator thread**, inside a runtime call at a
-  safepoint, because only the mutator can walk its own stack. The collector
-  thread never touches the stack. The pause sites are `ws_gc_poll`,
-  `on_allocation`, the `gc_trace*` builtins and exit — and so, transitively,
-  any builtin that allocates, since `ws_alloc` is where `on_allocation` lives.
-  Never one that does not: `print` holds its argument in a Rust local no stack
-  map describes, and pausing there would leave it stale. `on_allocation` is
-  safe because the object in flight is in the open block, which is never an
-  evacuation candidate, and on no list, so nothing judges it.
+  safepoint, because only the mutator can walk its own stack. The pause sites
+  are `ws_gc_poll`, `on_allocation`, the `gc_trace*` builtins and exit — and so,
+  transitively, any builtin that allocates, since `ws_alloc` is where
+  `on_allocation` lives. Never one that does not: `print` holds its argument in
+  a Rust local no stack map describes, and pausing there would leave it stale.
+  `on_allocation` is safe because the object in flight is in the open block,
+  which is never an evacuation candidate, and on no list, so nothing judges it.
+  The one exception is a worker parked in a safe region, next.
+- **A blocking call runs inside a safe region**, `worker::blocking`, and that is
+  the only thing a mutator may block in. A thread sitting in `read(2)` cannot
+  answer a pause request, so its trace would wait for the disk — and with
+  workers, one worker's heap would wait on another's slow client. Before
+  blocking it publishes the frame pointer its stack starts at and says it is
+  parked; the collector then walks that frozen chain and runs the pause itself.
+  Leaving the region is a compare-exchange rather than a store, because
+  resuming while the collector is still reading the stack is the one race the
+  handshake exists for.
+- **A safe region is the same bargain as an allocation.** Everything the
+  blocking call needs must be copied into plain bytes first, and nothing on the
+  heap may be touched inside it — for exactly the reason an allocating builtin
+  must copy first: a Rust local is described by no stack map, so a reference
+  held in one is invisible to the collection that runs while the thread is
+  parked. A worker also gives its allocation buffer back and publishes its
+  counters on the way in, because those live on the *thread* rather than in the
+  worker: a collector running the pause would otherwise retire its own buffer
+  and leave the mutator's block open, and a block an allocator holds is never
+  swept, recycled or evacuated.
+- **A parked worker's stack is a root set like any other**, and
+  `worker::walk_worker_roots` is the single door every root walk now goes
+  through, because "whose stack, and where does it start" is precisely what a
+  safe region changes the answer to. The runtime's own pinned roots are the one
+  thing that does not travel: they sit on the thread, so a collector declines a
+  parked worker whose `pinned_depth` is not zero and waits for it instead, as
+  everything did before safe regions existed.
 - **A forwarded header is an address, not flags.** Anything that reads a flag,
   a count, a size or a type id from an object in a block being emptied must
   test forwarding first -- `evacuate::forward`, `heap::evacuate_block` and
@@ -329,6 +387,17 @@ nix-shell --run "cargo test --workspace"
   show up as rare corruption rather than a failing test. Traces start on the
   same allocation schedule under stress as without it, so the concurrent
   paths run in both passes.
+- **A networking case binds port 0 and asks what it was given.** A hardcoded
+  port makes a test that fails whenever the machine happens to be using it.
+  Every case is also single-threaded: `connect` to a listening socket completes
+  into the backlog without anyone having called `accept`, so one thread can be
+  both ends and no case can deadlock in CI. `net::close_all` runs at exit so a
+  listener's port is released before the next case wants it.
+- **The safe region has a test that would pass without it.** A trace that
+  finishes while its mutator is parked proves nothing if the mutator happened
+  to park *after* the trace was over, so `served_pauses` is counted and
+  asserted on -- the same discipline as counting the roots a walk found.
+  `WSHARP_GC_STATS=1` reports it as "N served parked".
 - **The concurrent collector is tested from W#, not from Rust.** The phase
   machine needs a real mutator with real stack maps, so `gc_concurrent.ws`
   mutates the heap between `gc_trace_start()` and `gc_trace_finish()`,

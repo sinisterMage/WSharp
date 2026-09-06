@@ -20,7 +20,6 @@ use crate::header::{
 use crate::heap::{in_heap, is_collectable};
 use crate::worker::Worker;
 use crate::mark;
-use crate::stackwalk::walk_roots;
 use crate::types;
 
 /// What the write barrier has recorded since the last collection.
@@ -339,10 +338,11 @@ fn root_is_plausible(value: *mut u8) -> bool {
 /// # Safety
 /// Must be called from a runtime function that generated code called into.
 pub unsafe fn validate_roots() {
+    let worker = Worker::current();
     let mut checked = 0usize;
     let mut bad: Option<(*mut *mut u8, *mut u8)> = None;
     unsafe {
-        walk_roots(|slot| {
+        crate::worker::walk_worker_roots(worker, |slot| {
             checked += 1;
             let value = slot.read();
             if bad.is_none() && !root_is_plausible(value) {
@@ -350,7 +350,7 @@ pub unsafe fn validate_roots() {
             }
         })
     };
-    Worker::current()
+    worker
         .stats
         .roots_seen
         .fetch_add(checked, Ordering::Relaxed);
@@ -375,7 +375,7 @@ pub fn report_if_asked() {
     let (funcs, safepoints) = crate::stackwalk::registered();
     eprintln!(
         "W# gc: {} collections, {} roots seen, {} freed, {} live of {} allocated \
-         ({} live bytes of {}), {} traces, {} moved, {} pauses (max {} us, total {} us), \
+         ({} live bytes of {}), {} traces, {} moved, {} pauses ({} served parked, max {} us, total {} us), \
          {} blocks, {} large, {funcs} functions, {safepoints} safepoints",
         collections(),
         roots_seen(),
@@ -387,6 +387,7 @@ pub fn report_if_asked() {
         traces(),
         moved(),
         total(|w| w.stats.pauses.load(Ordering::Relaxed)),
+        total(|w| w.stats.served_pauses.load(Ordering::Relaxed)),
         // The longest of any worker's, not the sum: a pause is what one
         // program thread waited for, and workers pause independently.
         {
@@ -530,7 +531,7 @@ pub unsafe fn collect() -> Vec<*mut u8> {
 
     let mut roots: Vec<*mut u8> = Vec::new();
     unsafe {
-        walk_roots(|slot| {
+        crate::worker::walk_worker_roots(worker, |slot| {
             let value = slot.read();
             if is_collectable(value) {
                 roots.push(value);

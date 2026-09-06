@@ -112,12 +112,18 @@ pub fn function_at(pc: usize) -> Option<&'static FunctionCode> {
     candidate.contains(pc).then_some(candidate)
 }
 
-/// This function's own frame pointer.
+/// The frame pointer of the function this is inlined into.
 ///
-/// `#[inline(never)]` matters: inlined into a caller, the prologue this reads
-/// would be the caller's.
-#[inline(never)]
-fn frame_pointer() -> usize {
+/// `#[inline(always)]` is the whole point, and it is the opposite of what a
+/// helper usually wants: the caller needs *its own* frame, which stays live
+/// while it does something else, and not a helper's, which is gone the moment
+/// the helper returns. Reading a returned frame pointer after the fact is
+/// reading stack the next call is about to reuse.
+///
+/// Every user must therefore be `#[inline(never)]` itself, or the frame it
+/// records is its caller's.
+#[inline(always)]
+pub(crate) fn current_frame_pointer() -> usize {
     let fp: usize;
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -142,8 +148,28 @@ const MAX_FRAMES: usize = 1 << 16;
 /// # Safety
 /// Must be called from a runtime function that generated code called into --
 /// `ws_alloc` or the collector's poll -- with the frame chain intact.
-pub unsafe fn walk_roots(mut visit: impl FnMut(*mut *mut u8)) {
-    let mut fp = frame_pointer();
+#[inline(never)]
+pub unsafe fn walk_roots(visit: impl FnMut(*mut *mut u8)) {
+    // This frame's own pointer, which stays live for the call below. A helper's
+    // would not: the frame it named would be the one `walk_roots_from` is
+    // about to be given.
+    unsafe { walk_roots_from(current_frame_pointer(), visit) }
+}
+
+/// As [`walk_roots`], but starting from a frame pointer recorded elsewhere.
+///
+/// This is how a worker parked in a syscall is walked. Its stack is frozen for
+/// as long as it is blocked, so the thread that walks it need not be the one
+/// that owns it -- which is what lets a collector run a pause for a mutator
+/// that cannot answer one. Nothing in the walk is thread-dependent: the code
+/// table is published once and read-only afterwards.
+///
+/// # Safety
+/// `start_fp` must be a live frame pointer on a stack that is not running:
+/// either this thread's own, or a parked worker's `parked_fp`, held parked for
+/// the whole walk.
+pub unsafe fn walk_roots_from(start_fp: usize, mut visit: impl FnMut(*mut *mut u8)) {
+    let mut fp = start_fp;
     // Generated frames are contiguous: once the walk has entered them, the
     // first frame that is not generated code is where W# ends. That is a
     // sounder stop condition than waiting for a null frame pointer, which
@@ -195,6 +221,7 @@ pub unsafe fn walk_roots(mut visit: impl FnMut(*mut *mut u8)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::SERIAL;
 
     fn func(base: usize, len: usize, points: Vec<(u32, u32, Vec<u32>)>) -> FunctionCode {
         FunctionCode {
@@ -213,6 +240,9 @@ mod tests {
 
     #[test]
     fn a_program_counter_finds_its_function_and_safepoint() {
+        // `CODE` is process-wide, and publishing it is a store every other test
+        // that walks a stack reads. The test binary runs in parallel.
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         register_code(vec![
             func(0x3000, 0x100, vec![(0x20, 48, vec![0, 8])]),
             func(
@@ -248,6 +278,7 @@ mod tests {
 
     #[test]
     fn walking_a_stack_with_no_generated_frames_finds_nothing() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         register_code(Vec::new());
         let mut found = 0;
         unsafe { walk_roots(|_| found += 1) };
@@ -258,11 +289,36 @@ mod tests {
     fn the_frame_pointer_chain_is_readable() {
         // If this fails, `-Cforce-frame-pointers=yes` is not in effect and the
         // walk above would be reading garbage.
-        let fp = frame_pointer();
+        let fp = current_frame_pointer();
         assert_ne!(fp, 0);
         let parent = unsafe { (fp as *const usize).read() };
         assert!(parent > fp, "a parent frame sits at a higher address");
         let pc = unsafe { ((fp + 8) as *const usize).read() };
         assert_ne!(pc, 0, "the return address is present");
+    }
+
+    /// A frame pointer recorded in one function and walked from another names
+    /// the same chain -- which is the whole basis of walking a parked worker.
+    #[test]
+    fn a_recorded_frame_pointer_walks_the_same_chain() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        register_code(Vec::new());
+
+        #[inline(never)]
+        fn records() -> (usize, usize) {
+            // What a safe region records, and what the chain above it is.
+            let fp = current_frame_pointer();
+            let parent = unsafe { (fp as *const usize).read() };
+            (fp, parent)
+        }
+
+        let (fp, parent) = records();
+        // The frame is gone, but the chain it named still runs upwards through
+        // this test's own frame, which is live.
+        assert!(parent > fp);
+        // And a walk from it terminates rather than running away: with no
+        // generated code registered there is nothing to find, and the walk
+        // must still stop.
+        unsafe { walk_roots_from(current_frame_pointer(), |_| unreachable!()) };
     }
 }

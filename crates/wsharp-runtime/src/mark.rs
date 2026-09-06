@@ -57,6 +57,13 @@
 //! its argument in a Rust local no stack map describes. The collector thread
 //! asks for a pause by setting the poll byte; the program gets there at its
 //! next back edge or allocation.
+//!
+//! **Unless it is parked.** A mutator inside a blocking call cannot reach a
+//! safepoint until the call returns, so it enters a safe region first
+//! (`worker::blocking`) and records where its stack is. A stack that is not
+//! running can be walked by anyone, so the collector claims it and runs the
+//! pause here instead -- `wait_or_serve` below. That is the whole of what
+//! makes a syscall safe to sit in.
 
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::time::Instant;
@@ -66,7 +73,6 @@ use crate::gc::{self, with_buffers};
 use crate::header::{claim_mark, flip_mark_parity, is_marked, type_id_of};
 use crate::heap::{self, is_collectable};
 use crate::worker::Worker;
-use crate::stackwalk::walk_roots;
 use crate::types;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +187,56 @@ fn wait_until_on(w: &'static Worker, ready: impl Fn() -> bool) {
     }
 }
 
+/// Wait for `ready`, running the pause here if the mutator is parked in a
+/// syscall and so cannot run it itself.
+///
+/// This is the collector's half of the safe region, and without it the two
+/// threads wait for each other: the mutator is blocked and will not reach a
+/// safepoint until its syscall returns, and the collector is asleep until it
+/// does. The mutator notifies this condvar when it parks, which is what makes
+/// the sleep below wake at the right moment rather than on a timer.
+fn wait_or_serve(ready: impl Fn() -> bool) {
+    let w = me();
+    loop {
+        if ready() {
+            return;
+        }
+        if serve_parked(w) {
+            continue;
+        }
+        // The lock must be dropped before serving: a pause takes it.
+        let mut guard = state_of(w);
+        while !ready() && !servable(w) {
+            guard = w
+                .mark
+                .changed
+                .wait(guard)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// Whether a pause is outstanding and its mutator is parked.
+fn servable(w: &'static Worker) -> bool {
+    matches!(phase_of(w), Phase::MarkDone | Phase::EvacDone) && crate::worker::is_parked(w)
+}
+
+/// Run the pause this worker is waiting for, on its behalf.
+///
+/// Everything a pause touches is either the worker's heap and the collector's
+/// own lists -- which this thread may touch, because it *is* the collector --
+/// or the mutator's stack, which is frozen while it is parked and which
+/// `walk_worker_roots` reads from the frame pointer it recorded.
+fn serve_parked(w: &'static Worker) -> bool {
+    if !servable(w) || !crate::worker::claim_parked(w) {
+        return false;
+    }
+    unsafe { safepoint() };
+    w.stats.served_pauses.fetch_add(1, Ordering::Relaxed);
+    crate::worker::release_parked(w);
+    true
+}
+
 // ---------------------------------------------------------------------------
 // The mutator's side: the pauses
 // ---------------------------------------------------------------------------
@@ -292,7 +348,7 @@ unsafe fn finish_marking() {
             unsafe { slot.write(evacuate::evacuate_one(value)) };
         }
     };
-    unsafe { walk_roots(&mut move_root) };
+    unsafe { crate::worker::walk_worker_roots(me(), &mut move_root) };
     // The runtime's own roots go with the program's: a pinned object left in a
     // block being emptied would be written through after the block was gone.
     crate::worker::for_each_pinned_slot(move_root);
@@ -492,14 +548,16 @@ fn collector_main() {
             mark_concurrently();
         }
 
-        wait_until(|| matches!(phase(), Phase::Evacuating | Phase::Sweeping) || abandoning());
+        // From here the collector is waiting on a pause that only the mutator
+        // can run -- unless it is parked, in which case this thread runs it.
+        wait_or_serve(|| matches!(phase(), Phase::Evacuating | Phase::Sweeping) || abandoning());
         if abandoning() {
             abandon();
             continue;
         }
         if phase() == Phase::Evacuating {
             evacuate_concurrently();
-            wait_until(|| phase() == Phase::Sweeping || abandoning());
+            wait_or_serve(|| phase() == Phase::Sweeping || abandoning());
             if abandoning() {
                 abandon();
                 continue;
@@ -643,4 +701,85 @@ fn abandon() {
     gc::clear_poll(me());
     me().mark.abandon.store(false, Ordering::Release);
     set_phase(Phase::Idle);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::header::TYPE_ID_FIRST_USER;
+    use crate::heap::ws_alloc;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// Start a trace, park the mutator in a "syscall", and wait for the trace
+    /// to reach `Idle`. Returns how many of its pauses the collector ran on the
+    /// mutator's behalf.
+    fn trace_with_a_parked_mutator() -> usize {
+        let (worker_tx, worker_rx) = mpsc::channel::<&'static Worker>();
+        let (parked_tx, parked_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let mutator = std::thread::spawn(move || {
+            let worker = Worker::current();
+            for _ in 0..64 {
+                ws_alloc(TYPE_ID_FIRST_USER, 32, 0);
+            }
+            // Start a trace and then stop answering, which is what a thread
+            // sitting in `read(2)` does.
+            unsafe { trace_start() };
+            worker_tx.send(worker).expect("the test is listening");
+            crate::worker::blocking(|| {
+                parked_tx.send(()).expect("the test is listening");
+                release_rx.recv().expect("the test releases us")
+            });
+        });
+
+        let worker = worker_rx.recv().expect("the mutator started a trace");
+        parked_rx.recv().expect("the mutator parked");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while phase_of(worker) != Phase::Idle {
+            assert!(
+                Instant::now() < deadline,
+                "the trace stalled in {:?} with its mutator parked",
+                phase_of(worker)
+            );
+            std::thread::yield_now();
+        }
+
+        release_tx.send(()).expect("the mutator is parked");
+        mutator.join().expect("the mutator finished");
+        worker.stats.served_pauses.load(Ordering::Relaxed)
+    }
+
+    /// A trace runs to completion while its mutator is parked in a syscall.
+    ///
+    /// This is the whole of what the safe region buys. Without it the collector
+    /// finishes marking, sets `MarkDone`, asks for a pause -- and then waits for
+    /// a thread that will not reach a safepoint until its syscall returns.
+    ///
+    /// The count is checked, not just the completion, and for the reason the
+    /// root count is: a mutator that happened to park *after* its trace had
+    /// already finished would reach `Idle` without the parked path ever having
+    /// run, and the test would pass having tested nothing. That ordering is
+    /// possible -- parking is a few atomics and the collector has a thread to
+    /// start -- so this tries again rather than asserting on one race.
+    ///
+    /// Each attempt is a fresh worker tracing a heap of its own -- the mark
+    /// parity is per worker -- but asking for a pause raises the process-wide
+    /// poll flag, so this takes `SERIAL` like everything else that does.
+    #[test]
+    fn a_trace_finishes_while_its_mutator_is_parked() {
+        // The mark parity is per worker, but asking for a pause raises the
+        // process-wide poll flag, which another test asserts on.
+        let _serial = crate::test_support::SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for _ in 0..8 {
+            if trace_with_a_parked_mutator() > 0 {
+                return;
+            }
+        }
+        panic!("no pause was ever run for a parked mutator: the safe region is untested");
+    }
 }
