@@ -47,7 +47,7 @@ The whole example is in [`examples/status.ws`](examples/status.ws).
 | Types | dynamic; annotations optional and advisory | Hindley-Milner; annotations optional and **checked** |
 | Generics | one method, specialised at run time | monomorphised at compile time; unreachable copies dropped |
 | Values | boxed by default | unboxed — `i64`, `f64`, `bool`, optionals and error unions live in registers |
-| Errors | exceptions | `?T` optionals and `!T` error unions, Zig-style |
+| Errors | exceptions | `?T` optionals and `!T` error unions, Zig-style, with the error set inferred into the type |
 | Collector | generational, stop-the-world | reference counting with a coalescing barrier, a concurrent mark trace for cycles, and compaction |
 | Aimed at | arrays, notebooks, science | services, tools, systems |
 
@@ -82,13 +82,23 @@ everywhere.** They are checked when written and inferred when not.
 | Singletons | a struct with no fields is also a value: its sole instance |
 | Optionals | `null`, `a orelse b`, `a.?`, `if (a) \|v\| { }`, `while (a) \|v\| { }` |
 | Errors | `error.Name`, `try f()`, `f() catch 0`, `f() catch \|e\| ...`, `f() catch return false`, `f() catch { log(); 0 }` |
+| Error sets | `!i64` infers which errors; `!{NotFound, IoFailed}str` writes them down and is checked |
 | Operators | `+ - * /`, `%` (integers only), `== != < <= > >=` (non-chaining), `and or !` |
 
 `==` compares `str` by contents, so a string built at run time equals a literal.
 
-One limit worth knowing before it surprises you: the `e` bound by `catch |e|`
-is opaque, because `!T` has a single global error set rather than one per
-function. See [ROADMAP.md](ROADMAP.md).
+`!T` says *which* errors: the set is inferred from what a function raises and
+propagates, or written down and checked. So the `e` bound by `catch |e|` is
+something worth testing.
+
+```zig
+fn risky(n: i64) !i64 {            // fn(i64) !{Negative, Zero}i64
+    if (n < 0) { return error.Negative; }
+    if (n == 0) { return error.Zero; }
+    return n;
+}
+const v = risky(n) catch |e| if (e == error.Negative) 0 else -1;
+```
 
 Some things that follow from optional annotations:
 
@@ -309,7 +319,7 @@ fn main() i64 {
 | `std/array` | `len` `new` `concat` `push` `slice` `repeat` |
 | `std/list` | `List[T]`, a growable array: `new` `with_capacity` `from` `len` `capacity` `get` `set` `push` `pop` `insert` `remove` `extend` `clear` `iter` `next` `to_array` |
 | `std/math` | `abs` `min` `max` `sign` `sqrt` `pow` `floor` `ceil` `round` `trunc` `ipow` |
-| `std/io` | `read_file` `read_line` `write_file` `exists` — the fallible ones return `!str` |
+| `std/io` | `read_file` `read_line` `write_file` `exists` — the fallible ones name their errors, e.g. `!{NotFound, PermissionDenied, IoFailed}str` |
 | `std/http` | the 27 HTTP status types, materialised on first mention |
 
 A **prelude** needs no import, because every module has it:

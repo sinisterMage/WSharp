@@ -509,10 +509,27 @@ impl Parser {
             }
             TokenKind::Bang => {
                 self.bump();
+                // `!{A, B}T` names the errors; a bare `!T` leaves them to
+                // inference. Unambiguous because a type never starts with `{`.
+                let errors = if self.at(&TokenKind::LBrace) {
+                    self.bump();
+                    let mut names = Vec::new();
+                    while !self.at(&TokenKind::RBrace) && !self.at_eof() {
+                        names.push(self.ident()?);
+                        if !self.eat(TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(TokenKind::RBrace)?;
+                    Some(names)
+                } else {
+                    None
+                };
                 let inner = self.type_expr()?;
                 Some(TypeExpr::ErrUnion {
                     span: start.to(inner.span()),
                     inner: Box::new(inner),
+                    errors,
                 })
             }
             TokenKind::Fn => {

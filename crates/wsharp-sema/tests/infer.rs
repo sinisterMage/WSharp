@@ -239,7 +239,60 @@ fn a_plain_value_coerces_into_an_error_union_return() {
             return n;
         }
     "#;
-    assert_eq!(sig(src, "risky"), "fn(i64) !i64");
+    // The set is inferred from what the body raises, so the signature says
+    // which error and not merely that there is one.
+    assert_eq!(sig(src, "risky"), "fn(i64) !{Negative}i64");
+}
+
+#[test]
+fn an_error_set_is_the_union_of_what_a_body_raises_and_propagates() {
+    let src = r#"
+        fn risky(n: i64) !i64 {
+            if (n < 0) { return error.Negative; }
+            if (n == 0) { return error.Zero; }
+            return n;
+        }
+        fn chain(n: i64) !i64 { return try risky(n) + 1; }
+        fn safe(n: i64) !i64 { return n; }
+    "#;
+    assert_eq!(sig(src, "risky"), "fn(i64) !{Negative, Zero}i64");
+    // `try` propagates, so the caller's set covers the callee's.
+    assert_eq!(sig(src, "chain"), "fn(i64) !{Negative, Zero}i64");
+    // Nothing raised, nothing propagated: the empty set, which prints as the
+    // bare `!i64` every signature was before sets existed.
+    assert_eq!(sig(src, "safe"), "fn(i64) !i64");
+}
+
+#[test]
+fn a_written_error_set_is_checked() {
+    let ok = r#"
+        fn risky(n: i64) !{Negative}i64 {
+            if (n < 0) { return error.Negative; }
+            return n;
+        }
+    "#;
+    assert_eq!(sig(ok, "risky"), "fn(i64) !{Negative}i64");
+
+    // Written down, so it says exactly what may be raised.
+    let bad = r#"
+        fn wrong(n: i64) !{Negative}i64 {
+            if (n == 0) { return error.Zero; }
+            return n;
+        }
+    "#;
+    assert_error(bad, "`error.Zero` is not one of `{Negative}`");
+}
+
+#[test]
+fn try_cannot_propagate_past_a_written_set() {
+    let src = r#"
+        fn risky(n: i64) !i64 {
+            if (n < 0) { return error.Negative; }
+            return n;
+        }
+        fn narrow(n: i64) !{Other}i64 { return try risky(n); }
+    "#;
+    assert_error(src, "which this function cannot raise");
 }
 
 #[test]
@@ -1138,7 +1191,7 @@ fn the_sample_program_typechecks() {
     assert_eq!(sig(src, "fib"), "fn(i64) i64");
     assert_eq!(sig(src, "id"), "fn(T) T");
     assert_eq!(sig(src, "lookup"), "fn(i64) ?i64");
-    assert_eq!(sig(src, "risky"), "fn(i64) !i64");
+    assert_eq!(sig(src, "risky"), "fn(i64) !{Negative}i64");
     assert!(a.program.entry.is_some());
 }
 

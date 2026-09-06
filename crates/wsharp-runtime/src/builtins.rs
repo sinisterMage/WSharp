@@ -22,8 +22,12 @@ pub enum BuiltinTy {
     Array(&'static BuiltinTy),
     /// `?T`.
     Optional(&'static BuiltinTy),
-    /// `!T`.
-    ErrUnion(&'static BuiltinTy),
+    /// `!T`, over the error names the implementation can actually produce.
+    ///
+    /// Written out rather than left open: a builtin is compiled long before
+    /// the program that catches its errors, so what it can raise is a fact
+    /// about the row and nothing else can work it out.
+    ErrUnion(&'static BuiltinTy, &'static [&'static str]),
     /// A type variable, numbered within one signature: every `Var(0)` in a row
     /// is the same type, and each *use* of the builtin gets its own.
     ///
@@ -301,21 +305,24 @@ fn library() -> Vec<Builtin> {
             module: IO_MODULE,
             name: "read_file",
             params: &[BuiltinTy::Str],
-            ret: BuiltinTy::ErrUnion(&BuiltinTy::Str),
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::Str, &["NotFound", "PermissionDenied", "IoFailed"]),
             ptr: crate::io::ws_io_read_file as *const u8,
         },
         Builtin {
             module: IO_MODULE,
             name: "read_line",
             params: &[],
-            ret: BuiltinTy::ErrUnion(&BuiltinTy::Str),
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::Str, &["IoFailed", "EndOfFile"]),
             ptr: crate::io::ws_io_read_line as *const u8,
         },
         Builtin {
             module: IO_MODULE,
             name: "write_file",
             params: &[BuiltinTy::Str, BuiltinTy::Str],
-            ret: BuiltinTy::ErrUnion(&BuiltinTy::Void),
+            ret: BuiltinTy::ErrUnion(
+                &BuiltinTy::Void,
+                &["NotFound", "PermissionDenied", "IoFailed"],
+            ),
             ptr: crate::io::ws_io_write_file as *const u8,
         },
         Builtin {

@@ -17,7 +17,7 @@
 //! Annotations are optional everywhere. When present they seed the type
 //! directly; when absent a fresh variable is used and inference fills it in.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use wsharp_runtime::header::{HEADER_SIZE, TYPE_ID_FIRST_USER, align_up};
 use wsharp_syntax::Diagnostic;
@@ -197,6 +197,25 @@ enum Constraint {
     /// [`Constraint::HasField`] is: `a[0]` in a function with no annotation
     /// meets the question before anything can answer it.
     Indexable { obj: Type, elem: Type, span: Span },
+    /// `set` must contain these errors, and if it is still a variable then it
+    /// is *made* to: an inferred error set is the union of what its function
+    /// can actually raise, and this is where each contribution is recorded.
+    ErrorSetHas {
+        set: Type,
+        errors: Vec<hir::ErrorId>,
+        /// Whether a still-open set should be *made* to contain these, or only
+        /// checked against them. Raising an error widens the set it is raised
+        /// into; naming one in a comparison must not, or `e == error.X` would
+        /// quietly claim that `X` can happen.
+        widens: bool,
+        span: Span,
+    },
+    /// `sub` must be a subset of `sup`.
+    ///
+    /// What `try` needs: propagating a callee's errors is only sound if this
+    /// function's set already covers them. Not unification, because the two
+    /// sets are genuinely allowed to differ.
+    ErrorSubset { sub: Type, sup: Type, span: Span },
     /// `obj` must be a struct with field `field`, whose type is `result`.
     HasField {
         obj: Type,
@@ -218,6 +237,8 @@ impl Constraint {
             Constraint::Numeric { ty, .. }
             | Constraint::Equatable { ty, .. }
             | Constraint::Member { ty, .. } => [ty, ty],
+            Constraint::ErrorSetHas { set, .. } => [set, set],
+            Constraint::ErrorSubset { sub, sup, .. } => [sub, sup],
             Constraint::Indexable { obj, elem, .. } => [obj, elem],
             Constraint::HasField { obj, result, .. } => [obj, result],
         }
@@ -374,8 +395,6 @@ struct Inferencer<'a> {
 
     strings: Vec<String>,
     string_ids: HashMap<String, hir::StrId>,
-    errors: Vec<String>,
-    error_ids: HashMap<String, hir::ErrorId>,
 
     frames: Vec<Frame>,
     /// Qualified keys another module may *not* name. Private is the default, so
@@ -442,8 +461,6 @@ impl<'a> Inferencer<'a> {
             funcs: Vec::new(),
             strings: Vec::new(),
             string_ids: HashMap::new(),
-            errors: Vec::new(),
-            error_ids: HashMap::new(),
             frames: Vec::new(),
             private: HashSet::new(),
             reported_private: HashSet::new(),
@@ -576,7 +593,7 @@ impl<'a> Inferencer<'a> {
                 structs: self.structs,
                 funcs,
                 strings: self.strings,
-                errors: self.errors,
+                errors: self.store.error_names().to_vec(),
                 entry,
             },
             store: self.store,
@@ -1400,7 +1417,20 @@ impl<'a> Inferencer<'a> {
             }
             ast::TypeExpr::Array { elem, .. } => Type::array(self.resolve_type_expr(elem)),
             ast::TypeExpr::Optional { inner, .. } => Type::optional(self.resolve_type_expr(inner)),
-            ast::TypeExpr::ErrUnion { inner, .. } => Type::err_union(self.resolve_type_expr(inner)),
+            ast::TypeExpr::ErrUnion { inner, errors, .. } => {
+                let inner = self.resolve_type_expr(inner);
+                // A written set is fixed and checked; an unwritten one is a
+                // variable the solver fills in with what the body raises.
+                let set = match errors {
+                    Some(names) => {
+                        let ids: Vec<hir::ErrorId> =
+                            names.iter().map(|n| self.intern_error(n.as_str())).collect();
+                        self.store.err_set(ids)
+                    }
+                    None => self.store.fresh_err_set(),
+                };
+                Type::err_union(inner, set)
+            }
             ast::TypeExpr::Fn { params, ret, .. } => {
                 let params = params.iter().map(|p| self.resolve_type_expr(p)).collect();
                 let ret = self.resolve_type_expr(ret);
@@ -2678,7 +2708,19 @@ impl<'a> Inferencer<'a> {
             ast::Expr::ErrorLit { name, .. } => {
                 let id = self.intern_error(name.as_str());
                 let payload = self.store.fresh();
-                self.lit(hir::ExprKind::Err(id), Type::err_union(payload), span)
+                // A fresh set rather than the singleton `{name}` itself: this
+                // literal is about to be unified with whatever it is returned
+                // into, and the *union* of every such contribution is what
+                // that function's set should be. The constraint is what
+                // records the contribution; the solver adds them up.
+                let set = self.store.fresh_err_set();
+                self.constraints.push(Constraint::ErrorSetHas {
+                    set: set.clone(),
+                    errors: vec![id],
+                    widens: true,
+                    span,
+                });
+                self.lit(hir::ExprKind::Err(id), Type::err_union(payload, set), span)
             }
 
             ast::Expr::Unary {
@@ -2819,16 +2861,31 @@ impl<'a> Inferencer<'a> {
             ast::Expr::Try { expr: inner, .. } => {
                 let inner = self.infer_expr(inner);
                 let payload = self.store.fresh();
+                let raised = self.store.fresh_err_set();
                 self.expect(
                     &inner.ty,
-                    &Type::err_union(payload.clone()),
+                    &Type::err_union(payload.clone(), raised.clone()),
                     inner.span,
                     "the operand of `try`",
                 );
                 // `try` propagates, so the enclosing function must be fallible.
                 let ret = self.frames.last().expect("in a function").ret.clone();
                 let out = self.store.fresh();
-                if self.store.unify(&ret, &Type::err_union(out)).is_err() {
+                let propagated = self.store.fresh_err_set();
+                // Subset rather than unification: propagating a callee's
+                // errors only needs this function's set to *cover* them, and
+                // two functions that raise different things must still be able
+                // to call each other.
+                self.constraints.push(Constraint::ErrorSubset {
+                    sub: raised,
+                    sup: propagated.clone(),
+                    span,
+                });
+                if self
+                    .store
+                    .unify(&ret, &Type::err_union(out, propagated))
+                    .is_err()
+                {
                     let shown = self.store.show(&ret);
                     self.error(span, "`try` in a function that cannot fail")
                         .help = Some(format!(
@@ -2850,17 +2907,19 @@ impl<'a> Inferencer<'a> {
             } => {
                 let inner = self.infer_expr(inner);
                 let payload = self.store.fresh();
+                let caught = self.store.fresh_err_set();
                 self.expect(
                     &inner.ty,
-                    &Type::err_union(payload.clone()),
+                    &Type::err_union(payload.clone(), caught.clone()),
                     inner.span,
                     "the operand of `catch`",
                 );
                 self.frame().scopes.push(Vec::new());
+                let error_ty = Type::error(caught);
                 let capture_local = capture.as_ref().map(|name| {
                     let local =
                         self.frame()
-                            .add_local(name.as_str(), Type::error(), false, name.span);
+                            .add_local(name.as_str(), error_ty, false, name.span);
                     self.frame().bind_local(name.as_str(), local);
                     local
                 });
@@ -3383,6 +3442,26 @@ impl<'a> Inferencer<'a> {
             };
         }
 
+        // `e == error.X`. The literal is an error *union* everywhere else, and
+        // a bare tag here; only the comparison says which of the two it is, so
+        // it is coerced rather than unified.
+        let (lhs, rhs) = match (
+            self.store.resolve(&lhs.ty),
+            self.store.resolve(&rhs.ty),
+            op.is_comparison(),
+        ) {
+            (Type::Con(TyCon::Error, _), _, true) => {
+                let want = lhs.ty.clone();
+                let rhs = self.coerce(rhs, &want, "the right operand");
+                (lhs, rhs)
+            }
+            (_, Type::Con(TyCon::Error, _), true) => {
+                let want = rhs.ty.clone();
+                let lhs = self.coerce(lhs, &want, "the left operand");
+                (lhs, rhs)
+            }
+            _ => (lhs, rhs),
+        };
         self.expect(&rhs.ty, &lhs.ty, rhs.span, "the right operand");
         let ty = if op.is_comparison() {
             if op.is_ordering() {
@@ -4356,6 +4435,40 @@ impl<'a> Inferencer<'a> {
             return expr;
         }
         let resolved = self.store.resolve(target);
+        // `error.X` written where an `error` value is wanted -- next to a
+        // `catch |e|` binding, in practice. The literal is one tag either way,
+        // so only its type changes; what it must *not* do is widen the set it
+        // is being compared against, which is why the constraint only checks.
+        if let Type::Con(TyCon::Error, args) = &resolved
+            && let hir::ExprKind::Err(id) = &expr.kind
+        {
+            self.constraints.push(Constraint::ErrorSetHas {
+                set: args[0].clone(),
+                errors: vec![*id],
+                widens: false,
+                span: expr.span,
+            });
+            return hir::Expr {
+                kind: expr.kind,
+                ty: resolved,
+                span: expr.span,
+            };
+        }
+        // A narrower error set where a wider one is wanted. Free at run time --
+        // the tag is the same number -- and exactly the widening `try` does
+        // through `ErrorSubset`, arriving here instead when the value is
+        // returned or assigned rather than propagated.
+        if let (Type::Con(TyCon::ErrUnion, want), Type::Con(TyCon::ErrUnion, have)) =
+            (&resolved, &self.store.resolve(&expr.ty))
+            && let (Some(want_set), Some(have_set)) = (
+                self.store.as_err_set(&want[1]),
+                self.store.as_err_set(&have[1]),
+            )
+            && have_set.iter().all(|e| want_set.contains(e))
+            && self.store.try_unify(&have[0].clone(), &want[0].clone())
+        {
+            return expr;
+        }
         let wrap = match &resolved {
             Type::Con(TyCon::Optional, args) => Some((args[0].clone(), true)),
             Type::Con(TyCon::ErrUnion, args) => Some((args[0].clone(), false)),
@@ -4422,19 +4535,97 @@ impl<'a> Inferencer<'a> {
         id
     }
 
+    /// The id of an error name.
+    ///
+    /// The table lives on the [`TypeStore`] rather than here, because an error
+    /// set is part of a type now and a type has to be printable. Two tables
+    /// would be two numberings, and a builtin's set is interned from the
+    /// runtime's row rather than from source.
     fn intern_error(&mut self, name: &str) -> hir::ErrorId {
-        if let Some(&id) = self.error_ids.get(name) {
-            return id;
-        }
-        let id = self.errors.len() as hir::ErrorId;
-        self.errors.push(name.to_string());
-        self.error_ids.insert(name.to_string(), id);
-        id
+        self.store.intern_error(name)
     }
 
     // -----------------------------------------------------------------------
     // Constraint solving and fix-ups
     // -----------------------------------------------------------------------
+
+    /// Work out every error set the group left open, before anything is checked.
+    ///
+    /// An inferred set is the union of what its function raises directly and
+    /// what it propagates, and propagation chains: `a` may `try` `b`, which
+    /// may `try` `c`. So the contributions are gathered, the `try` edges are
+    /// followed to a fixed point, and each still-open set is bound to the union
+    /// that reaches it. A set nothing contributes to is left alone rather than
+    /// bound to the empty set -- it may still be a *parameter's*, and pinning
+    /// it here would decide for a caller what its argument may raise.
+    fn solve_error_sets(&mut self, constraints: &[Constraint]) {
+        let mut union: HashMap<TypeVarId, BTreeSet<hir::ErrorId>> = HashMap::new();
+        let mut edges: Vec<(TypeVarId, TypeVarId)> = Vec::new();
+
+        for constraint in constraints {
+            match constraint {
+                Constraint::ErrorSetHas {
+                    set, errors, widens, ..
+                } => {
+                    if !widens {
+                        continue;
+                    }
+                    if let Type::Var(v) = self.store.resolve(set) {
+                        union.entry(v).or_default().extend(errors.iter().copied());
+                    }
+                }
+                Constraint::ErrorSubset { sub, sup, .. } => {
+                    let Type::Var(v) = self.store.resolve(sup) else {
+                        continue;
+                    };
+                    match self.store.resolve(sub) {
+                        Type::Var(u) => edges.push((u, v)),
+                        _ => {
+                            if let Some(members) = self.store.as_err_set(sub) {
+                                union.entry(v).or_default().extend(members);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Terminates: every round either adds an element to some set or stops,
+        // and the elements come from a finite table.
+        loop {
+            let mut changed = false;
+            for &(from, to) in &edges {
+                let Some(src) = union.get(&from).cloned() else {
+                    continue;
+                };
+                let dst = union.entry(to).or_default();
+                let before = dst.len();
+                dst.extend(src);
+                changed |= dst.len() != before;
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        for (var, errors) in union {
+            if !matches!(self.store.resolve(&Type::Var(var)), Type::Var(_)) {
+                continue;
+            }
+            let set = self.store.err_set(errors);
+            let _ = self.store.unify(&Type::Var(var), &set);
+        }
+    }
+
+    /// `{NotFound, IoFailed}` for a diagnostic.
+    fn show_err_set(&mut self, errors: &[hir::ErrorId]) -> String {
+        let names: Vec<String> = errors
+            .iter()
+            .map(|&e| self.store.error_name(e).to_string())
+            .collect();
+        format!("{{{}}}", names.join(", "))
+    }
 
     fn solve_constraints(&mut self) {
         let constraints = std::mem::take(&mut self.constraints);
@@ -4452,8 +4643,55 @@ impl<'a> Inferencer<'a> {
             }
         }
 
+        self.solve_error_sets(&constraints);
+
         for constraint in constraints {
             match constraint {
+                Constraint::ErrorSetHas {
+                    set, errors, span, ..
+                } => {
+                    // A set still open here is one nothing pinned; it is closed
+                    // to the empty set at monomorphisation, along with every
+                    // instantiation of it. Only a decided set can be wrong.
+                    let Some(members) = self.store.as_err_set(&set) else {
+                        continue;
+                    };
+                    for error in errors {
+                        if members.contains(&error) {
+                            continue;
+                        }
+                        let name = self.store.error_name(error).to_string();
+                        let shown = self.show_err_set(&members);
+                        self.error(span, format!("`error.{name}` is not one of `{shown}`"))
+                            .help = Some(
+                            "the error set here is written down, so it says exactly what may \
+                             be raised -- add this name to it, or raise one it already has"
+                                .into(),
+                        );
+                    }
+                }
+                Constraint::ErrorSubset { sub, sup, span } => {
+                    let (Some(sub), Some(sup)) =
+                        (self.store.as_err_set(&sub), self.store.as_err_set(&sup))
+                    else {
+                        continue;
+                    };
+                    let missing: Vec<hir::ErrorId> =
+                        sub.iter().copied().filter(|e| !sup.contains(e)).collect();
+                    if missing.is_empty() {
+                        continue;
+                    }
+                    let names = self.show_err_set(&missing);
+                    let shown = self.show_err_set(&sup);
+                    self.error(
+                        span,
+                        format!("`try` propagates `{names}`, which this function cannot raise"),
+                    )
+                    .help = Some(format!(
+                        "this function's error set is `{shown}`; widen it, or catch what it \
+                         does not cover"
+                    ));
+                }
                 Constraint::Numeric {
                     ty,
                     span,
@@ -4509,7 +4747,14 @@ impl<'a> Inferencer<'a> {
                         // which takes a call; code generation emits it, so
                         // nothing here has to know that it is not one
                         // instruction like the others.
-                        Type::Con(TyCon::I64 | TyCon::F64 | TyCon::Bool | TyCon::Str, _) => {}
+                        // An error is its tag, so comparing two is comparing
+                        // two integers -- which is what makes the `e` a
+                        // `catch |e|` binds worth having now that its set says
+                        // what it can be.
+                        Type::Con(
+                            TyCon::I64 | TyCon::F64 | TyCon::Bool | TyCon::Str | TyCon::Error,
+                            _,
+                        ) => {}
                         t => {
                             let shown = self.store.show(&t);
                             self.error(
@@ -4517,7 +4762,9 @@ impl<'a> Inferencer<'a> {
                                 format!("`{shown}` values cannot be compared with `==`"),
                             )
                             .help = Some(
-                                "only `i64`, `f64`, `bool` and `str` can be compared so far".into(),
+                                "only `i64`, `f64`, `bool`, `str` and `error` can be compared \
+                                 so far"
+                                    .into(),
                             );
                         }
                     }

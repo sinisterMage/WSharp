@@ -187,7 +187,7 @@ fn abi_slots(ty: BuiltinTy) -> SmallVec<[AbiParam; 2]> {
         // C promotes narrow integer arguments, so say so explicitly.
         BuiltinTy::Bool => smallvec![AbiParam::new(types::I8).uext()],
         BuiltinTy::Str | BuiltinTy::Array(_) => smallvec![AbiParam::new(PTR)],
-        BuiltinTy::Optional(inner) | BuiltinTy::ErrUnion(inner) => {
+        BuiltinTy::Optional(inner) | BuiltinTy::ErrUnion(inner, _) => {
             let mut out: SmallVec<[AbiParam; 2]> = smallvec![AbiParam::new(types::I64)];
             out.extend(abi_slots(*inner));
             out
@@ -200,7 +200,7 @@ fn abi_slots(ty: BuiltinTy) -> SmallVec<[AbiParam; 2]> {
 fn tag_type_of(ty: BuiltinTy) -> Option<ir::Type> {
     match ty {
         BuiltinTy::Optional(_) => Some(OPTION_TAG),
-        BuiltinTy::ErrUnion(_) => Some(ERROR_TAG),
+        BuiltinTy::ErrUnion(..) => Some(ERROR_TAG),
         _ => None,
     }
 }
@@ -1160,10 +1160,13 @@ impl Trans<'_, '_> {
 
         self.switch(alt_block);
         if let Some(local) = capture {
-            // `catch |e|` binds the error, which is the tag less the offset that
-            // keeps zero meaning success.
-            let code = self.b.ins().iadd_imm_s(tag, -1);
-            self.def_local(local, &[code]);
+            // `catch |e|` binds the tag itself, unadjusted. It used to bind the
+            // tag less one, so that the number was the error's index -- which
+            // nothing could observe. Now that `e == error.X` is a comparison a
+            // program can write, the two spellings have to be the same number,
+            // and the tag is the one `error.X` already lowers to. Zero is never
+            // one of them, because zero means success.
+            self.def_local(local, &[tag]);
         }
         let value = self.expr(alt);
         let args = Self::args_of(&value);

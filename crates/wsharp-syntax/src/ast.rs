@@ -120,7 +120,15 @@ pub enum TypeExpr {
     /// `?T`
     Optional { inner: Box<TypeExpr>, span: Span },
     /// `!T`
-    ErrUnion { inner: Box<TypeExpr>, span: Span },
+    ErrUnion {
+        inner: Box<TypeExpr>,
+        /// `!{NotFound, IoFailed}str` names the errors it can carry, and is
+        /// then checked. `None` -- a bare `!str` -- leaves the set to
+        /// inference, which is what makes writing one a choice rather than an
+        /// obligation.
+        errors: Option<Vec<Ident>>,
+        span: Span,
+    },
     /// `fn(i64, i64) i64`
     Fn {
         params: Vec<TypeExpr>,

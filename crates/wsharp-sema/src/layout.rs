@@ -109,7 +109,8 @@ mod tests {
     fn tagged_types_nest() {
         let mut s = TypeStore::new();
         assert_eq!(slot_count(&mut s, &Type::optional(Type::i64())), 2);
-        assert_eq!(slot_count(&mut s, &Type::err_union(Type::i64())), 2);
+        let empty = s.err_set(Vec::new());
+        assert_eq!(slot_count(&mut s, &Type::err_union(Type::i64(), empty)), 2);
         // A tag on a tag on a payload.
         assert_eq!(
             slot_count(&mut s, &Type::optional(Type::optional(Type::i64()))),

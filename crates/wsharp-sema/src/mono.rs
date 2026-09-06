@@ -130,16 +130,12 @@ impl Mono<'_> {
         self.current = Some((def.name.clone(), def.span, false));
 
         def.ret = self.apply(&def.ret, subst);
-        for local in &mut def.locals {
-            let ty = local.ty.clone();
-            let resolved = self.store.resolve_deep(&ty);
-            local.ty = if subst.is_empty() {
-                resolved
-            } else {
-                self.store.subst_vars(&resolved, subst)
-            };
-            let local_ty = local.ty.clone();
-            self.note_if_unresolved(&local_ty);
+        for i in 0..def.locals.len() {
+            // Through `apply` rather than open-coded, so that a local's type
+            // gets the same treatment a return type does -- including having
+            // its error sets closed, which the `e` a `catch |e|` binds needs.
+            let ty = def.locals[i].ty.clone();
+            def.locals[i].ty = self.apply(&ty, subst);
         }
 
         let mut body = std::mem::take(&mut def.body);
@@ -195,8 +191,29 @@ impl Mono<'_> {
         } else {
             self.store.subst_vars(&resolved, subst)
         };
+        let out = self.close_error_sets(&out);
         self.note_if_unresolved(&out);
         out
+    }
+
+    /// Give every error set nothing decided its honest answer: the empty set.
+    ///
+    /// A set left open by the solver is one no `error.X` and no `try` ever
+    /// reached, in this function or at this call site. That is a function that
+    /// raises nothing, not a function whose errors are unknown -- so it is
+    /// closed here rather than reported as an unresolved type, which is what
+    /// `note_if_unresolved` would otherwise do to every infallible `!T`.
+    fn close_error_sets(&mut self, ty: &Type) -> Type {
+        match self.store.resolve(ty) {
+            // Standing alone -- as the type argument of a call to a function
+            // whose set nothing pinned -- as well as in place.
+            Type::Var(v) if self.store.is_err_set_var(v) => self.store.err_set(Vec::new()),
+            Type::Var(_) => ty.clone(),
+            Type::Con(con, args) => {
+                let args = args.iter().map(|a| self.close_error_sets(a)).collect();
+                Type::Con(con, args)
+            }
+        }
     }
 
     /// The substitution to specialise `callee` under, given the type arguments

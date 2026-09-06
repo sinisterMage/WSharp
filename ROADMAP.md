@@ -401,6 +401,36 @@ A module system, and four modules behind it.
   the boundary as the two words a `#[repr(C)]` pair is returned in. The tag is
   an index into the program's error table plus one, so the library's error
   names are interned before any program's — `builtin_errors()` fixes them.
+- **An error set is a second type argument, and `unify` was not touched.**
+  `!T` is `Con(ErrUnion, [payload, set])`, and a set is an interned
+  `TyCon::ErrorSet`. Two error unions therefore unify by unifying their sets --
+  which merges two variables, or binds one to a written set -- while *widening*
+  a smaller set into a larger one is `coerce`'s job. That is exactly where
+  widening a subtype into its supertype already lived, and works for the same
+  reason: by the time anything asks, unification has bound whichever side was a
+  variable. Putting the set inside the constructor instead would have made
+  `!{A}T` and `!{A, B}T` a hard mismatch and broken `try` outright.
+
+  An unwritten set is inferred, and inference is a little dataflow rather than
+  a rule: `error.X` contributes `{X}` to the set it is raised into, `try`
+  contributes a *subset edge* from callee to caller, and the edges are followed
+  to a fixed point before anything is checked. `!{A, B}T` written down is
+  closed instead, and then the same contributions are checked against it.
+
+  A set nothing decides is *not* an error. `fn f() !i64 { return 1; }` has the
+  empty set and prints as the bare `!i64` every signature was before -- so the
+  variable is left alone through generalisation, which is what lets
+  `fn twice(f: fn(i64) !i64, ..)` be generic over what its argument raises, and
+  is closed to the empty set at monomorphisation instead. That needed the store
+  to know which variables stand for a set, because one standing alone as a call
+  site's type argument is indistinguishable from any other unresolved variable.
+
+  Two consequences fell out. A builtin's set has to be written in its row --
+  it is compiled long before the program that catches it. And `catch |e|` now
+  binds the tag *unadjusted*: it used to bind the tag less one so the number
+  was the error's index, which nothing could observe, but `e == error.X` is a
+  comparison a program can write and the two spellings have to be the same
+  number.
 - **A `catch` or an `orelse` takes a block, and two different things wanted
   there decide its shape.** One is a value to use instead, after doing
   something first: a block whose last expression is written *without* a `;` is
@@ -452,8 +482,6 @@ A module system, and four modules behind it.
 
 - **No package management.** An import is a relative path or a library one;
   there is nothing that fetches anything.
-- **The errors a function can raise are not in its type.** `!T` has a single
-  global error set, so a caller cannot see which errors `read_file` has.
 
 ---
 

@@ -59,6 +59,12 @@ pub fn slot_types(store: &mut TypeStore, ty: &Type) -> SlotTypes {
         // An abstract type classifies values but never describes one, which is
         // why inference turns a parameter annotated with one into an ordinary
         // variable: nothing downstream of it can carry this constructor.
+        // A set is an argument of `!T` and of `error`, and neither recurses
+        // into it: it refines what a tag may hold, and the tag is a whole slot
+        // whatever the set says.
+        Type::Con(TyCon::ErrorSet(_), _) => {
+            unreachable!("an error set is not a value")
+        }
         Type::Con(TyCon::Abstract(_), _) => {
             unreachable!("an abstract type reached code generation")
         }
@@ -87,6 +93,7 @@ mod tests {
     fn slot_types_agree_with_the_layout_used_for_struct_fields() {
         let mut s = TypeStore::new();
         let point = s.declare_struct("Point");
+        let empty = s.err_set(Vec::new());
         let cases = [
             Type::i64(),
             Type::f64(),
@@ -97,7 +104,7 @@ mod tests {
             Type::func(vec![Type::i64()], Type::i64()),
             Type::optional(Type::i64()),
             Type::optional(Type::str()),
-            Type::err_union(Type::f64()),
+            Type::err_union(Type::f64(), empty),
             Type::optional(Type::optional(Type::i64())),
             Type::optional(Type::void()),
         ];
@@ -116,8 +123,9 @@ mod tests {
             &slot_types(&mut s, &Type::optional(Type::i64()))[..],
             &[OPTION_TAG, types::I64]
         );
+        let empty = s.err_set(Vec::new());
         assert_eq!(
-            &slot_types(&mut s, &Type::err_union(Type::f64()))[..],
+            &slot_types(&mut s, &Type::err_union(Type::f64(), empty))[..],
             &[ERROR_TAG, types::F64]
         );
     }

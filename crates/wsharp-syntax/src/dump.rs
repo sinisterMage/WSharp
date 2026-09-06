@@ -340,7 +340,16 @@ fn ty(t: &TypeExpr) -> String {
             }
         }
         TypeExpr::Optional { inner, .. } => format!("?{}", ty(inner)),
-        TypeExpr::ErrUnion { inner, .. } => format!("!{}", ty(inner)),
+        TypeExpr::ErrUnion { inner, errors, .. } => {
+            let set = errors
+                .as_ref()
+                .map(|names| {
+                    let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+                    format!("{{{}}}", names.join(", "))
+                })
+                .unwrap_or_default();
+            format!("!{set}{}", ty(inner))
+        }
         TypeExpr::Fn { params, ret, .. } => {
             let ps: Vec<String> = params.iter().map(ty).collect();
             format!("fn({}) {}", ps.join(", "), ty(ret))

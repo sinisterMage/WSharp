@@ -8,11 +8,16 @@
 //! generalisation a cheap traversal of the type instead of a scan of the whole
 //! environment.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 pub type TypeVarId = u32;
 pub type StructId = u32;
+/// Index into [`TypeStore`]'s table of interned error sets.
+pub type ErrSetId = u32;
+/// Index into [`TypeStore`]'s table of error names, and what a `!T`'s runtime
+/// tag is (plus one, so that zero can mean success).
+pub type ErrorId = u32;
 /// Index into [`wsharp_runtime::builtins::abstract_types`].
 pub type AbstractId = u32;
 
@@ -37,11 +42,23 @@ pub enum TyCon {
     Fn,
     /// `?T`, one argument.
     Optional,
-    /// `!T`, one argument. Session 1 has a single global error set, so the
-    /// error side needs no type argument.
+    /// `!T`: two arguments, the payload and the set of errors it may carry.
+    ///
+    /// The set is an ordinary type argument rather than part of the
+    /// constructor, so that `unify` needs no special case: two error unions
+    /// unify by unifying their sets, which merges two variables or binds one
+    /// to a written set. Widening a *smaller* set into a larger one is
+    /// `coerce`'s job, exactly as widening a subtype into its supertype is,
+    /// and for the same reason -- by the time anything asks, unification has
+    /// already bound whichever side was a variable.
     ErrUnion,
-    /// The type of an error value, as bound by `catch |e|`.
+    /// The type of an error value, as bound by `catch |e|`. One argument: the
+    /// set it can be drawn from.
     Error,
+    /// A set of error names, interned. Appears only as the second argument of
+    /// [`TyCon::ErrUnion`] and the argument of [`TyCon::Error`], so nothing
+    /// that walks a value's shape ever meets one.
+    ErrorSet(ErrSetId),
     /// `[]T`, one argument. A heap object whose header holds the element
     /// count; the elements follow it inline, as a string's bytes do.
     Array,
@@ -75,8 +92,9 @@ impl Type {
     pub fn str() -> Type {
         Type::prim(TyCon::Str)
     }
-    pub fn error() -> Type {
-        Type::prim(TyCon::Error)
+    /// The type `catch |e|` binds, over a set of errors.
+    pub fn error(set: Type) -> Type {
+        Type::Con(TyCon::Error, vec![set])
     }
 
     pub fn func(mut params: Vec<Type>, ret: Type) -> Type {
@@ -93,8 +111,9 @@ impl Type {
         Type::Con(TyCon::Optional, vec![inner])
     }
 
-    pub fn err_union(inner: Type) -> Type {
-        Type::Con(TyCon::ErrUnion, vec![inner])
+    /// `!T` over a named set of errors.
+    pub fn err_union(inner: Type, set: Type) -> Type {
+        Type::Con(TyCon::ErrUnion, vec![inner, set])
     }
 
     pub fn strukt(id: StructId) -> Type {
@@ -122,7 +141,11 @@ impl Type {
         match t {
             B::Array(inner) => Type::array(Type::from_builtin_with(*inner, store, vars)),
             B::Optional(inner) => Type::optional(Type::from_builtin_with(*inner, store, vars)),
-            B::ErrUnion(inner) => Type::err_union(Type::from_builtin_with(*inner, store, vars)),
+            B::ErrUnion(inner, errors) => {
+                let ids: Vec<ErrorId> = errors.iter().map(|e| store.intern_error(e)).collect();
+                let set = store.err_set(ids);
+                Type::err_union(Type::from_builtin_with(*inner, store, vars), set)
+            }
             B::Var(n) => vars.entry(n).or_insert_with(|| store.fresh()).clone(),
             simple => Type::from_builtin(simple),
         }
@@ -136,7 +159,7 @@ impl Type {
     pub fn from_builtin(t: wsharp_runtime::BuiltinTy) -> Type {
         use wsharp_runtime::BuiltinTy as B;
         match t {
-            B::Array(_) | B::Optional(_) | B::ErrUnion(_) | B::Var(_) => {
+            B::Array(_) | B::Optional(_) | B::ErrUnion(..) | B::Var(_) => {
                 unreachable!("`{t:?}` needs a type store; use `from_builtin_with`")
             }
             B::I64 => Type::i64(),
@@ -239,6 +262,25 @@ pub struct TypeStore {
     /// [`TypeStore::unify`]), only the constraint solver and overload selection
     /// do.
     struct_parents: Vec<Option<StructId>>,
+    /// Error names, in declaration order. An error value is one of these
+    /// indices, and its runtime tag is the index plus one.
+    ///
+    /// Kept here rather than beside the rest of inference because `show` needs
+    /// them: a set is part of a type now, and a type has to be printable.
+    error_names: Vec<String>,
+    error_ids: HashMap<String, ErrorId>,
+    /// Interned error sets, each sorted and deduplicated so that two spellings
+    /// of the same set are the same id -- which is what lets `unify` compare
+    /// two written sets with `==` and get the right answer.
+    err_sets: Vec<Vec<ErrorId>>,
+    err_set_ids: HashMap<Vec<ErrorId>, ErrSetId>,
+    /// Variables standing for an error set rather than for a value's type.
+    ///
+    /// Worth knowing apart, because one nothing ever pins means "raises
+    /// nothing" rather than "could not be worked out" -- so it is closed to
+    /// the empty set instead of being reported. Instantiation carries the mark
+    /// across, or a generic function's set would lose it at every call.
+    err_set_vars: HashSet<TypeVarId>,
 }
 
 impl Default for TypeStore {
@@ -248,6 +290,82 @@ impl Default for TypeStore {
 }
 
 impl TypeStore {
+    /// The id of an error name, interning it if this is the first mention.
+    pub fn intern_error(&mut self, name: &str) -> ErrorId {
+        if let Some(&id) = self.error_ids.get(name) {
+            return id;
+        }
+        let id = self.error_names.len() as ErrorId;
+        self.error_names.push(name.to_string());
+        self.error_ids.insert(name.to_string(), id);
+        id
+    }
+
+    /// Every error name, indexed by id -- what `hir::Program.errors` becomes.
+    pub fn error_names(&self) -> &[String] {
+        &self.error_names
+    }
+
+    pub fn error_name(&self, id: ErrorId) -> &str {
+        self.error_names
+            .get(id as usize)
+            .map(String::as_str)
+            .unwrap_or("?")
+    }
+
+    /// The type standing for a set of errors, interned so that two spellings
+    /// of the same set are one id.
+    pub fn err_set(&mut self, errors: impl IntoIterator<Item = ErrorId>) -> Type {
+        let mut errors: Vec<ErrorId> = errors.into_iter().collect();
+        errors.sort_unstable();
+        errors.dedup();
+        let id = match self.err_set_ids.get(&errors) {
+            Some(&id) => id,
+            None => {
+                let id = self.err_sets.len() as ErrSetId;
+                self.err_sets.push(errors.clone());
+                self.err_set_ids.insert(errors, id);
+                id
+            }
+        };
+        Type::Con(TyCon::ErrorSet(id), Vec::new())
+    }
+
+    /// A fresh variable standing for an error set nothing has decided yet.
+    pub fn fresh_err_set(&mut self) -> Type {
+        let ty = self.fresh();
+        if let Type::Var(v) = ty {
+            self.err_set_vars.insert(v);
+        }
+        ty
+    }
+
+    pub fn is_err_set_var(&self, v: TypeVarId) -> bool {
+        self.err_set_vars.contains(&v)
+    }
+
+    pub fn err_set_members(&self, id: ErrSetId) -> &[ErrorId] {
+        self.err_sets.get(id as usize).map_or(&[], Vec::as_slice)
+    }
+
+    /// The members of a type that is a set, if it has been decided yet.
+    pub fn as_err_set(&mut self, ty: &Type) -> Option<Vec<ErrorId>> {
+        match self.resolve(ty) {
+            Type::Con(TyCon::ErrorSet(id), _) => Some(self.err_set_members(id).to_vec()),
+            _ => None,
+        }
+    }
+
+    /// `{NotFound, IoFailed}`, or nothing at all for the empty set.
+    fn set_text(&self, id: ErrSetId) -> String {
+        let members = self.err_set_members(id);
+        if members.is_empty() {
+            return String::new();
+        }
+        let names: Vec<&str> = members.iter().map(|&e| self.error_name(e)).collect();
+        format!("{{{}}}", names.join(", "))
+    }
+
     pub fn new() -> TypeStore {
         TypeStore {
             slots: Vec::new(),
@@ -255,6 +373,11 @@ impl TypeStore {
             trail: Vec::new(),
             struct_names: Vec::new(),
             struct_parents: Vec::new(),
+            error_names: Vec::new(),
+            error_ids: HashMap::new(),
+            err_sets: Vec::new(),
+            err_set_ids: HashMap::new(),
+            err_set_vars: HashSet::new(),
         }
     }
 
@@ -553,7 +676,20 @@ impl TypeStore {
         if scheme.vars.is_empty() {
             return (scheme.ty.clone(), Vec::new());
         }
-        let fresh: Vec<Type> = (0..scheme.vars.len()).map(|_| self.fresh()).collect();
+        // A quantified error-set variable stays one through instantiation:
+        // its meaning -- "nothing decided this, so it raises nothing" -- has to
+        // survive to the call site that leaves it undecided.
+        let fresh: Vec<Type> = scheme
+            .vars
+            .iter()
+            .map(|&v| {
+                if self.is_err_set_var(v) {
+                    self.fresh_err_set()
+                } else {
+                    self.fresh()
+                }
+            })
+            .collect();
         let map: HashMap<TypeVarId, Type> = scheme
             .vars
             .iter()
@@ -606,6 +742,9 @@ impl TypeStore {
                 TyCon::Void => "void".into(),
                 TyCon::Str => "str".into(),
                 TyCon::Error => "error".into(),
+                // Never printed on its own: a set is only ever an argument of
+                // the two constructors above, which render it themselves.
+                TyCon::ErrorSet(id) => self.set_text(id),
                 TyCon::Struct(id) => {
                     let name = self.struct_name(id).to_string();
                     if args.is_empty() {
@@ -619,7 +758,17 @@ impl TypeStore {
                 TyCon::Abstract(id) => abstract_name(id).to_string(),
                 TyCon::Array => format!("[]{}", self.write_ty(&args[0], names)),
                 TyCon::Optional => format!("?{}", self.write_ty(&args[0], names)),
-                TyCon::ErrUnion => format!("!{}", self.write_ty(&args[0], names)),
+                TyCon::ErrUnion => {
+                    // An empty or still-unsolved set prints as bare `!T`, which
+                    // is what every signature looked like before sets existed
+                    // and is still the right thing for a function that cannot
+                    // fail.
+                    let set = match self.resolve(&args[1]) {
+                        Type::Con(TyCon::ErrorSet(id), _) => self.set_text(id),
+                        _ => String::new(),
+                    };
+                    format!("!{set}{}", self.write_ty(&args[0], names))
+                }
                 TyCon::Fn => {
                     let (ret, params) = args.split_last().expect("fn type has a return type");
                     let mut out = String::from("fn(");
@@ -764,7 +913,8 @@ mod tests {
         let mut s = TypeStore::new();
         let point = s.declare_struct("Point");
         assert_eq!(s.show(&Type::optional(Type::i64())), "?i64");
-        assert_eq!(s.show(&Type::err_union(Type::strukt(point))), "!Point");
+        let empty = s.err_set(Vec::new());
+        assert_eq!(s.show(&Type::err_union(Type::strukt(point), empty)), "!Point");
         assert_eq!(
             s.show(&Type::func(vec![Type::str(), Type::bool()], Type::void())),
             "fn(str, bool) void"
