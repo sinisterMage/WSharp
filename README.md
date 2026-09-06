@@ -82,6 +82,8 @@ everywhere.** They are checked when written and inferred when not.
 | Messages | `std/broker` — named topics, partitioned logs, consumer groups with their own offsets, and replay |
 | Bytes | `std/bytes` — `[]u8` as a buffer, the bridge to and from `str`, word accessors and hex |
 | Crypto | `std/hash` — SHA-2, HMAC, HKDF; `std/cipher` — ChaCha20-Poly1305 and AES-GCM; `std/crypto` — the system's generator |
+| Key agreement | `std/curve25519` — X25519; `std/p256` — ECDH on NIST P-256, with the key-share validation RFC 8446 requires |
+| Signatures | `std/rsa` — PKCS#1 v1.5 and PSS verification, over `std/bignum`'s Montgomery arithmetic |
 | Structs | `const P = struct { x: i64 };`, `P{ .x = 1 }`, `p.x` |
 | Subtyping | `const Sub = struct : Base { };` — a subtype widens implicitly |
 | Singletons | a struct with no fields is also a value: its sole instance |
@@ -356,6 +358,15 @@ serving many connections from one worker, not for keeping the collector alive.
 | `std/net` | TCP: `Socket` `Listener` and `connect` `listen` `accept` `read` `write` `write_all` `read_exactly` `read_all` `set_nonblocking` `close`. UDP: `Datagrams` `Peer` `Datagram` and `udp` `send_to` `receive` `reply`. Readiness: `Poller` `Event` and `poller` `watch` `wait`. IPv4 or IPv6, with the family the resolver's choice |
 | `std/http` | the 27 HTTP status types, materialised on first mention, plus an HTTP/1.1 client and server: `get` `post` `request` `read_request` `respond` `header` `status_of` |
 | `std/broker` | `Topic[M]` `Consumer[M]` and `topic` `publish` `subscribe` `next` `commit` `seek` `len` |
+| `std/bytes` | `[]u8` as a buffer, and the bridge to and from `str`: `new` `of` `to_str` `slice` `concat` `copy` `fill` `xor` `equal`, the big- and little-endian word accessors, `to_hex` `from_hex` |
+| `std/hash` | SHA-256, SHA-384 and SHA-512, one-shot and incremental, plus `hmac` `hkdf_extract` `hkdf_expand` — written once over a `Hash` value that says a block size, a digest size and how to hash |
+| `std/cipher` | ChaCha20, Poly1305, ChaCha20-Poly1305; AES-128/256, GHASH, AES-GCM. Constant-time by construction: no table is indexed by a secret byte, so AES's S-box is computed in GF(2^8) and GHASH is 128 shifts |
+| `std/crypto` | `random` — the system's generator, which is the kernel's |
+| `std/time` | `now` — seconds since the Unix epoch |
+| `std/bignum` | fixed-width unsigned limbs and Montgomery arithmetic: `from_be` `to_be` `cmp` `add` `sub` `mont` `mont_mul` `mont_add` `mont_sub` `to_mont` `from_mont` `modexp`. A limb is 32 bits, which is what makes a 64x64 → 128 product unnecessary |
+| `std/curve25519` | `x25519` `x25519_base` — and the small-order check on the *output*, which is the one a list of bad encodings misses |
+| `std/p256` | `derive` `ecdh` `valid` — ECDH on secp256r1, with a Montgomery ladder over Jacobian points |
+| `std/rsa` | `public_key` `verify_pkcs1` `verify_pss` — verification only, since TLS 1.3 does no RSA key exchange. The encoded message is built and compared, never parsed |
 
 A **prelude** needs no import, because every module has it:
 
@@ -369,8 +380,8 @@ A **prelude** needs no import, because every module has it:
 | `gc_trace_start()`, `gc_trace_finish()` | the two halves of a trace, so a program can mutate the heap while the collector thread marks it |
 | `gc_live_objects()`, `gc_live_bytes()`, `gc_collections()`, `gc_traces()` | the collector's counters, for asserting on it |
 
-Half the library is written in W# rather than Rust — `std/array`, `std/list`,
-`std/math`, `std/net`, `std/http` and `str.split` are `.ws` files compiled with your program,
+Most of the library is written in W# rather than Rust — `std/array`, `std/list`,
+`std/math`, `std/net`, `std/http`, all of the cryptography and `str.split` are `.ws` files compiled with your program,
 monomorphised per element type and dropped when nothing calls them. The rule that draws the line
 is worth knowing if you add to it: **a builtin may read and write bytes, and
 anything that moves a *reference* from one object into another is written in

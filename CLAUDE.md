@@ -168,6 +168,30 @@ extra `sin_len` byte out of this code entirely.
   live in the state and are made at `init`; a 64-byte digest and a 64 KiB one
   both cost six objects, which is checkable with `gc_live_objects()` and worth
   checking after touching one.
+- **A builtin call is a stack walk under `--gc-stress`, so hoist `array.len`
+  out of a loop.** `gc::checkpoint` runs at the top of *every* runtime entry
+  point (`strings.rs` — `ws_array_len` is the one that bites) and validates
+  every root the stack maps describe. That is the right thing for the collector
+  and the wrong thing in a loop condition: `while (i < array.len(a))` walks the
+  stack once per iteration. Read the length into a local, or take it as a
+  parameter, and let the inner loops of anything numeric call nothing at all.
+  A back-edge safepoint costs nothing here by contrast — `ws_gc_poll` does not
+  collect under stress, only `on_allocation` does.
+- **A limb is 32 bits, because there is no 64x64 -> 128 product.** `std/bignum`,
+  `std/p256` and anything else doing multi-precision arithmetic hold 32-bit
+  values and accumulate in a `u64`, which is what makes `t + a*b + carry` fit:
+  `(2^32-1)^2 + 2*(2^32-1)` is exactly `2^64 - 1`. Widening a limb to 64 bits
+  needs `bits.mulhi`, which does not exist. `std/curve25519` is the same rule
+  one level down — sixteen 16-bit limbs in `i64`s, so a schoolbook product and
+  its 38-fold stay near 2^41.
+- **Field arithmetic takes its output and its scratch from the caller.** A
+  scalar multiplication runs its ladder 255 or 256 times over ten-odd field
+  operations, so a routine that allocated a temporary would be thousands of
+  collections under `--gc-stress`. One `Work` struct per operation, holding
+  every temporary, is the shape — and it is what lets `x25519` cost fourteen
+  objects whatever the ladder does. Aliasing an output with an input is then
+  free and is relied on everywhere: assemble into scratch and write the result
+  out last.
 - **A top-level `const` array is immortal data, and read-only.** It is emitted
   beside the string literals with `FLAG_IMMORTAL` (`codegen/src/lib.rs` --
   `define_arrays`), so it needs no roots and no startup initialiser, which is
@@ -470,6 +494,14 @@ nix-shell --run "cargo test --workspace"
   every `.ws` directly in `tests/cases`, and a file with no `main` is not a
   case; `read_dir` does not recurse, so a subdirectory is where an imported
   module goes.
+- **A vector with no publication is made twice.** RSA's published vectors are
+  1024-bit and SHA-1, which `std/rsa` does not carry, so `rsa_pkcs1.ws` and
+  `rsa_pss.ws` build every encoded message from RFC 8017's text, sign it with
+  the raw private exponent, and then ask a second implementation about each one
+  — the *forgeries* included, which is the half that matters, because a
+  verifier that accepts too much passes every test written from the valid side.
+  `node`'s `crypto` and `python3`'s `pow`/`hashlib` are the two available here;
+  `openssl` is not installed.
 - **A cryptographic case is checked against an independent implementation,
   not against memory.** Every primitive in `std/hash` and `std/cipher` has its
   published vectors -- FIPS 180-4, RFC 4231, RFC 5869, RFC 8439, FIPS 197, and

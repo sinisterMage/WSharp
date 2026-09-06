@@ -829,6 +829,14 @@ pub const HASH_MODULE: &str = "std/hash";
 pub const CRYPTO_MODULE: &str = "std/crypto";
 /// The wall clock.
 pub const TIME_MODULE: &str = "std/time";
+/// Fixed-width unsigned integers and Montgomery arithmetic.
+pub const BIGNUM_MODULE: &str = "std/bignum";
+/// X25519, on Curve25519.
+pub const CURVE25519_MODULE: &str = "std/curve25519";
+/// ECDH on NIST P-256.
+pub const P256_MODULE: &str = "std/p256";
+/// RSA signature verification: PKCS#1 v1.5 and PSS.
+pub const RSA_MODULE: &str = "std/rsa";
 
 /// The error names the library can raise, in the order their ids are assigned.
 ///
@@ -949,6 +957,10 @@ pub fn std_module_sources() -> &'static [(&'static str, &'static str)] {
         (CRYPTO_MODULE, include_str!("std/crypto.ws")),
         (HASH_MODULE, include_str!("std/hash.ws")),
         (CIPHER_MODULE, include_str!("std/cipher.ws")),
+        (BIGNUM_MODULE, include_str!("std/bignum.ws")),
+        (CURVE25519_MODULE, include_str!("std/curve25519.ws")),
+        (P256_MODULE, include_str!("std/p256.ws")),
+        (RSA_MODULE, include_str!("std/rsa.ws")),
         (MATH_MODULE, include_str!("std/math.ws")),
         (BROKER_MODULE, include_str!("std/broker.ws")),
         (NET_MODULE, include_str!("std/net.ws")),

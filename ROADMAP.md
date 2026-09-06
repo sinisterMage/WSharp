@@ -14,6 +14,11 @@ Session 9 began item 10 and delivered its symmetric half: byte buffers, the
 system's generator, SHA-2, HMAC, HKDF, ChaCha20-Poly1305 and AES-GCM, each
 against its published vectors — and, because writing them is what finds the
 holes, the one thing the language turned out to be missing, a `const` table.
+Session 10 delivered item 10's stages two and three, the asymmetric half:
+X25519 and P-256 for key agreement, a fixed-width bignum with Montgomery
+arithmetic, and RSA PKCS#1 v1.5 and PSS verification above it — all of it W#,
+with no compiler change at all, because a 32-bit limb is what makes the 64x64
+product item 9 reserved a place for unnecessary.
 
 This file records what was built and why it was built that way, the limitations
 that were chosen rather than stumbled into, and — for the items still ahead —
@@ -361,6 +366,10 @@ A module system, and four modules behind it.
 | `std/cipher` | ChaCha20, Poly1305, ChaCha20-Poly1305; AES-128/256, GHASH, AES-GCM (item 10) |
 | `std/crypto` | `random` — the system's generator (item 10) |
 | `std/time` | `now` — seconds since the Unix epoch (item 10) |
+| `std/bignum` | fixed-width limbs and Montgomery arithmetic: `from_be`, `to_be`, `cmp`, `add`, `sub`, `mont`, `mont_mul`, `mont_add`, `mont_sub`, `to_mont`, `from_mont`, `modexp` (item 10) |
+| `std/curve25519` | `x25519`, `x25519_base` (item 10) |
+| `std/p256` | `derive`, `ecdh`, `valid` (item 10) |
+| `std/rsa` | `public_key`, `verify_pkcs1`, `verify_pss` (item 10) |
 
 `==` on `str` works, comparing contents. The prelude — `print`, `assert`, the
 `gc_*` counters — stays global, because every module has it without asking.
@@ -966,16 +975,19 @@ Doing it turned up two things:
   reached for, and both are written without one — five 26-bit limbs in `u64`s
   for the first, two `u64` halves and 128 shifts for the second. Neither is a
   workaround; both are the shape a portable implementation has anyway. What is
-  still missing is a 64x64 -> 128 product, and the one place it is genuinely
-  wanted is RSA's `modexp`; `bits.mulhi` is one table row and one arm in
-  `lower.rs` when that day comes.
+  still missing is a 64x64 -> 128 product, and this used to name RSA's `modexp`
+  as the one place it was genuinely wanted. **Stage three of item 10 wrote that
+  `modexp` and did not want it.** A 32-bit limb makes `t + a*b + carry` at most
+  `2^64 - 1` exactly, so the whole bignum is ordinary `u64` arithmetic;
+  `bits.mulhi` would halve the limb count and buy nothing measurable, and is
+  still one table row and one arm in `lower.rs` if a caller ever appears.
 - **An overload set distinguished only by integer width needs the conversion
   written at the call.** A literal argument settles to its default before the
   overload is chosen, because which overload is meant is a question about the
   argument's type.
 
 
-## 10. TLS 1.3, written in W# — **in progress: the symmetric half is done**
+## 10. TLS 1.3, written in W# — **in progress: stages one to three are done**
 
 Item 8 left `https://` as `error.NotSupported` rather than a connection that
 quietly speaks the wrong protocol. Removing it is what this item is for -- and
@@ -983,9 +995,11 @@ what the package manager needs before it can fetch anything from a host it did
 not already trust.
 
 It is also by a wide margin the largest item in the tree, so it is being built
-in stages, and this section records the first of them rather than pretending
-the whole thing landed at once. **Stage one is the byte plumbing and every
-symmetric primitive TLS 1.3 uses.** The stages after it are listed at the end.
+in stages rather than pretended into one commit. **Stage one is the byte
+plumbing and every symmetric primitive TLS 1.3 uses. Stages two and three are
+the asymmetric half: two curves for key agreement, and a bignum and RSA for
+verifying a certificate's signature.** The stages after them are listed at the
+end.
 
 ### Why in W# rather than in the runtime
 
@@ -1003,7 +1017,9 @@ top-level `const` could only be a literal, so not one of them could be written
 down. Nothing else was missing. That is a better result than the item expected,
 and the fix is described below.
 
-### What was built
+### Stage one: the byte plumbing, and every symmetric primitive
+
+#### What was built
 
 | Piece | Where |
 |---|---|
@@ -1018,7 +1034,7 @@ and the fix is described below.
 | AES-128 and AES-256, GHASH, and AES-GCM | same |
 | Published vectors for every one of them | `tests/cases/{hash_*,cipher_*,bytes_ops,crypto_random}.ws` |
 
-### Decisions worth recording
+#### Decisions worth recording
 
 - **Constant time is a construction, not a guarantee, and the code says so.**
   W# compiles through Cranelift, which is free to turn a branchless expression
@@ -1080,15 +1096,121 @@ and the fix is described below.
   It is checkable, and checked -- a 64-byte digest and a 64 KiB one both cost
   six objects.
 
-### What it costs, and how that was paid
+### Stages two and three: two curves, a bignum, and RSA
+
+The asymmetric half, and it landed in one commit rather than two because the
+two stages turned out to want the same code. Stage two is X25519 and P-256, the
+two key-agreement groups a TLS 1.3 client offers; stage three is a bignum and
+RSA signature verification, which is what reading a certificate chain needs.
+P-256's field is that bignum's Montgomery multiplication at eight limbs, so
+splitting them would have meant either writing a second modular multiplication
+or moving the bignum across the boundary anyway.
+
+#### What was built
+
+| Piece | Where |
+|---|---|
+| Fixed-width limb arithmetic, 32 bits to a limb, with the carry and the borrow as return values | `std/bignum.ws` |
+| Montgomery form: CIOS multiplication, modular add and subtract, and `R^2 mod n` without a division | same |
+| `modexp`, square and multiply, for a public exponent | same |
+| X25519, on TweetNaCl's sixteen-limb field, with the ladder of RFC 7748 section 5 | `std/curve25519.ws` |
+| The small-order check, on the output rather than on the input | same |
+| P-256: Jacobian points, `dbl-2001-b` and `add-2007-bl`, and a Montgomery ladder over them | `std/p256.ws` |
+| Key-share validation: length, form, both coordinates below p, and on the curve | same |
+| RSA PKCS#1 v1.5 and PSS verification, generic over the hash by value | `std/rsa.ws` |
+| MGF1, and the three DigestInfo prefixes as `const` tables | same |
+| Published vectors for the curves, and vectors built twice for RSA | `tests/cases/{bignum_ops,curve25519_*,p256_*,rsa_*}.ws` |
+
+#### Decisions worth recording
+
+- **A limb is 32 bits, and so `bits.mulhi` was never needed.** Item 9 left a
+  place for a 64x64 -> 128 product and named RSA's `modexp` as the one caller
+  that genuinely wanted it. It does not: with 32-bit limbs the largest quantity
+  any of this computes is `t + a*b + carry`, which is at most
+  `(2^32-1)^2 + 2*(2^32-1)`, and that is exactly `2^64 - 1`. Not one bit spare
+  and not one needed. **So both stages are pure W#** -- the only Rust in the
+  whole change is four lines registering four modules, and the language grew
+  nothing at all.
+- **One Montgomery multiplication serves both a curve and a signature scheme.**
+  P-256's modulus is a Solinas prime and the quick way to reduce modulo it is a
+  page of shifted additions with signed corrections. That page exists only to
+  be faster, in a file where being wrong is a security problem and where
+  nothing is fast enough for the difference to matter. Sharing `bignum`'s CIOS
+  is the same trade the computed AES S-box was.
+- **Nothing divides.** The one place a bignum usually needs a remainder is
+  `R^2 mod n`, and that is `64*limbs` doublings with a masked conditional
+  subtract instead. RSA verification needs no remainder and neither does the
+  curve, so a division would have been code with no caller -- which is exactly
+  why `std/cipher` still has no AES decryption.
+- **RSA verifies and never signs, and that changes what the code is.** TLS 1.3
+  does no RSA key exchange, so the private exponent has no caller. Everything
+  that is left is public: the modulus, the exponent, the signature and the
+  message. `modexp` is therefore an ordinary square-and-multiply that says out
+  loud that it is not constant time, and it is seventeen multiplications rather
+  than two thousand, because a public exponent is 65537.
+- **The encoded message is built and compared, never parsed.** Every historical
+  PKCS#1 v1.5 break is an *acceptance* bug -- a verifier that walks the encoding
+  left to right and is content with eight bytes of padding and a correct
+  DigestInfo, whatever follows. There is exactly one byte string a valid
+  signature can decrypt to, so producing it and comparing is both the shortest
+  implementation and the strictest one. `rsa_pkcs1.ws` includes that forgery.
+- **X25519's field is sixteen limbs of sixteen bits.** TweetNaCl's shape rather
+  than ref10's ten limbs of twenty-five and a half. Every partial product is at
+  most 2^32, sixteen of them 2^36, and the fold that wraps 2^256 back down
+  multiplies by 38 to reach about 2^41 -- twenty-two bits of headroom for a
+  schoolbook multiplication anyone can check by reading it. That is the third
+  time this item has taken the auditable side of that trade, after AES's
+  computed S-box and GHASH's 128 shifts, and it is the same argument each time.
+- **X25519's weak-point check is on the output.** Curve25519 has a subgroup of
+  order eight, and a peer sending a point from it forces the shared secret to
+  zero whatever the local key is. A check against a list of the small-order
+  *encodings* misses `p`, `p+1` and `p-1`, which are only small once they are
+  reduced; a check that the answer is not zero cannot miss any of them.
+  `curve25519_reject.ws` is all seven.
+- **P-256's check is on the input, and for the opposite reason.** Its cofactor
+  is one, so there is no small subgroup to land in and nothing to catch on the
+  way out. What there is instead is the invalid-curve attack: a point that is
+  not on P-256 at all but is on some curve with a smooth group, which leaks the
+  private key a few bits per exchange. So the peer's key share is checked to be
+  a well-formed uncompressed point, with both coordinates below the modulus,
+  that satisfies the curve equation -- and RFC 8446 section 4.2.8.2 says so too.
+- **`pt_add` is exception-free because of the ladder, not because of the
+  formula.** `add-2007-bl` cannot add a point to itself, and the Montgomery
+  ladder is what rules that out: its two accumulators satisfy `R1 - R0 = P`
+  throughout and `P` is never the identity, so they are never equal. The case
+  that *is* reachable is an operand at infinity -- `R0` starts there -- and that
+  is settled by selecting the other operand with a mask, because which one it
+  was is a fact about the scalar. The argument is in the code, because it is
+  the thing a reviewer has to check rather than read.
+- **Scratch belongs to the caller, all the way down.** Every field and point
+  routine writes into storage handed to it, and one `Work` is built per
+  operation. The result is that an X25519 costs fourteen objects and a P-256
+  exchange about sixty, whatever the 255 ladder steps inside them do -- which is
+  what lets `curve25519_x25519.ws` keep RFC 7748's thousand-round iterated
+  vector at full length and take the same two seconds under `--gc-stress` as
+  without it. A ladder that allocated per step would be a quarter of a million
+  collections there.
+- **`array.len` is a builtin, and a builtin is a stack walk under
+  `--gc-stress`.** `gc::checkpoint` runs at the top of every runtime entry
+  point and validates every root the stack maps describe. That is the right
+  thing for the collector and the wrong thing in a loop condition, so lengths
+  are read once into a local and the inner loops call nothing at all. This is
+  new, and general, and is now in CLAUDE.md.
+- **Nothing new was asked of the language.** Stage one found exactly one hole
+  and closed it; these two stages found none. Two curves, a bignum, two
+  signature schemes and 2,100 lines of W# needed no lexer, parser, inference or
+  code-generator change -- which is a better answer than item 9's "no `u128`"
+  decision had any right to expect.
+
+### What being wrong costs here, and how that is paid
 
 This is the first thing in the tree where being wrong is a security problem
 rather than a crash. A collector bug shows up as a failing test; a wrong hash
 shows up as nothing at all until something signs with it. The mitigation is not
 cleverness, it is test vectors, and every primitive here has its published ones:
 FIPS 180-4 for SHA-2, RFC 4231 for HMAC, RFC 5869 for HKDF, RFC 8439 for
-ChaCha20 and Poly1305, FIPS 197 for AES, and McGrew and Viega's original cases
-for GCM.
+ChaCha20 and Poly1305, FIPS 197 for AES, McGrew and Viega's original cases for
+GCM, RFC 7748 for X25519 and RFC 5903 for P-256.
 
 Two habits are worth writing down because both caught something. Vectors were
 **checked against an independent implementation** rather than transcribed from
@@ -1098,18 +1220,51 @@ for each *way* of being wrong: a changed ciphertext, a changed tag, changed
 additional data that is not itself transmitted, the wrong nonce, the wrong key,
 and a truncation that leaves no room for a tag.
 
+**RSA has no published vector this library could use**, because the ones that
+exist are 1024-bit and SHA-1 and this only carries the three SHA-2 prefixes TLS
+1.3 allows. So its vectors were *made*, and made twice: a key from one
+implementation, every encoded message built from RFC 8017's text and signed with
+the raw private exponent, and then every one of them handed back to that first
+implementation, which agreed about all eighteen. That is what makes the forged
+ones worth having -- and the forgeries are the point, because a verifier that
+accepts too much passes every test written from the valid side. Between them
+`rsa_pkcs1.ws` and `rsa_pss.ws` make twenty-two refusals, each a different way
+of being wrong -- the AEAD discipline applied where acceptance rather than
+rejection is the historical failure.
+
 ### What is left
 
-The stages after this one, in the order they have to happen:
+The stages after these, in the order they have to happen:
 
 | Stage | Contents |
 |---|---|
-| 2 | X25519, and P-256 for a server that will not do better |
-| 3 | A bignum, and RSA PKCS#1 v1.5 and PSS -- to *verify certificates*, since 1.3 does no RSA key exchange, and most of the public internet's chain is still RSA-signed |
 | 4 | Ed25519 and ECDSA P-256; the record layer; ClientHello through Finished, plus HelloRetryRequest |
 | 5 | X.509: DER parsing, validity and name checking, chain building; the root store on three platforms; `https://` |
 
-And the decisions already taken about them:
+Each has a module waiting for it. Ed25519 lives on the field `std/curve25519`
+already has, which is why that module is named for the curve rather than for
+the function; ECDSA is `std/p256`'s existing point arithmetic plus arithmetic
+modulo the group order, and it is *public*, so it wants the ordinary addition
+`pt_add` already is rather than anything new.
+
+Three smaller things are left behind these stages:
+
+- **No 1.2-style RSA key transport and no RSA signing**, deliberately, per the
+  decision above. If a signing key ever has a caller, it needs a constant-time
+  `modexp` and the Chinese remainder theorem, and neither is written.
+- **A public exponent may be any size.** `modexp` costs one modular
+  multiplication per exponent bit, so a certificate carrying a 2048-bit
+  exponent would cost two thousand of them rather than seventeen. That is a
+  policy question about certificates rather than about arithmetic, so it
+  belongs to stage five's parser rather than here -- but it is not checked
+  anywhere yet, and it should be.
+- **P-256's scalar multiplication is a bare ladder with no window.** Two point
+  operations per bit, where a four-bit window with a constant-time table scan
+  would be a quarter of the additions. An exchange costs about four
+  milliseconds, which is nothing beside a network round trip, so the window is
+  an optimisation waiting for a reason.
+
+And the decisions already taken about stages four and five:
 
 - **TLS 1.3 only.** No 1.2, no fallback, no downgrade dance. A client that
   cannot talk to a 1.2-only server fails loudly against a server that should be
