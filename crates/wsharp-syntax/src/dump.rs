@@ -214,6 +214,85 @@ impl Printer {
     }
 }
 
+/// One statement on a single line, for a block written inside an expression.
+///
+/// The line-based printer above cannot help here: an expression prints inline,
+/// and a `catch` block is one.
+fn stmt_inline(stmt: &Stmt) -> String {
+    match stmt {
+        Stmt::Let(l) => {
+            let kw = if l.mutable { "var" } else { "const" };
+            let annot =
+                l.ty.as_ref()
+                    .map(|t| format!(" : {}", ty(t)))
+                    .unwrap_or_default();
+            format!("({kw} {}{} {})", l.name, annot, expr(&l.init))
+        }
+        Stmt::Assign(a) => {
+            let op = a.op.map(|o| o.text()).unwrap_or("");
+            format!("(assign{} {} {})", op, expr(&a.target), expr(&a.value))
+        }
+        Stmt::Expr(e) => expr(e),
+        Stmt::Return { value: Some(v), .. } => format!("(return {})", expr(v)),
+        Stmt::Return { value: None, .. } => "(return)".to_string(),
+        Stmt::Break(_) => "(break)".to_string(),
+        Stmt::Continue(_) => "(continue)".to_string(),
+        Stmt::Block(b) => format!("(block {})", block_inline(b)),
+        Stmt::If(i) => {
+            let cap = i
+                .capture
+                .as_ref()
+                .map(|c| format!(" |{c}|"))
+                .unwrap_or_default();
+            let els = match i.else_.as_deref() {
+                Some(ElseBranch::Block(b)) => format!(" (else {})", block_inline(b)),
+                Some(ElseBranch::If(inner)) => {
+                    format!(" (else {})", stmt_inline(&Stmt::If(inner.clone())))
+                }
+                None => String::new(),
+            };
+            format!(
+                "(if {}{} {}{})",
+                expr(&i.cond),
+                cap,
+                block_inline(&i.then),
+                els
+            )
+        }
+        Stmt::While(w) => {
+            let cap = w
+                .capture
+                .as_ref()
+                .map(|c| format!(" |{c}|"))
+                .unwrap_or_default();
+            let cont = w
+                .cont
+                .as_deref()
+                .map(|c| format!(" (continue-expr {})", stmt_inline(c)))
+                .unwrap_or_default();
+            format!(
+                "(while {}{}{} {})",
+                expr(&w.cond),
+                cap,
+                cont,
+                block_inline(&w.body)
+            )
+        }
+        Stmt::For(f) => {
+            let cap = match &f.index {
+                Some(index) => format!(" |{} {}|", f.value, index),
+                None => format!(" |{}|", f.value),
+            };
+            format!("(for {}{} {})", expr(&f.iter), cap, block_inline(&f.body))
+        }
+    }
+}
+
+fn block_inline(block: &Block) -> String {
+    let parts: Vec<String> = block.stmts.iter().map(stmt_inline).collect();
+    parts.join(" ")
+}
+
 /// `pub ` for a declaration another module may name, and nothing otherwise --
 /// so every dump written before visibility existed still reads the same.
 fn vis(is_public: bool) -> &'static str {
@@ -303,6 +382,13 @@ pub fn expr(e: &Expr) -> String {
         }
         Expr::Index { obj, index, .. } => format!("(index {} {})", expr(obj), expr(index)),
         Expr::Import { path, .. } => format!("(import {path:?})"),
+        Expr::Block { stmts, value, .. } => {
+            let mut parts: Vec<String> = stmts.iter().map(stmt_inline).collect();
+            if let Some(v) = value {
+                parts.push(expr(v));
+            }
+            format!("(block {})", parts.join(" "))
+        }
         Expr::StructLit { path, fields, .. } => {
             let fs: Vec<String> = fields
                 .iter()

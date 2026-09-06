@@ -825,6 +825,7 @@ impl Trans<'_, '_> {
 
     fn expr_inner(&mut self, expr: &hir::Expr) -> Slots {
         match &expr.kind {
+            hir::ExprKind::Block { stmts, value } => self.value_block(&expr.ty, stmts, value),
             hir::ExprKind::Int(v) => SmallVec::from_slice(&[self.b.ins().iconst(types::I64, *v)]),
             hir::ExprKind::Float(v) => SmallVec::from_slice(&[self.b.ins().f64const(*v)]),
             hir::ExprKind::Bool(v) => {
@@ -1172,7 +1173,37 @@ impl Trans<'_, '_> {
         self.b.block_params(merge).iter().copied().collect()
     }
 
-    /// `try e` -- yield the payload, or return the error from this function.
+    /// The block form of a `catch` or an `orelse`.
+    ///
+    /// With no trailing value the block left by returning, breaking or
+    /// continuing, so nothing after it runs -- but the operator it belongs to
+    /// still merges values of a fixed shape, and Cranelift will not let
+    /// anything be appended to a block that has already ended. A block of its
+    /// own, with no predecessors, is where the placeholders are made; it is
+    /// unreachable and falls out in optimisation.
+    fn value_block(
+        &mut self,
+        ty: &Type,
+        stmts: &[hir::Stmt],
+        value: &Option<Box<hir::Expr>>,
+    ) -> Slots {
+        for stmt in stmts {
+            self.stmt(stmt);
+        }
+        match value {
+            Some(v) => self.expr(v),
+            None => {
+                if self.terminated {
+                    let dead = self.b.create_block();
+                    self.switch(dead);
+                }
+                let tys = self.slots_of(ty);
+                self.zeros(&tys)
+            }
+        }
+    }
+
+    /// `try e` -- yield the payload, or return the error from this function.    /// `try e` -- yield the payload, or return the error from this function.
     fn try_expr(&mut self, inner: &hir::Expr) -> Slots {
         let value = self.expr(inner);
         let tag = value[0];

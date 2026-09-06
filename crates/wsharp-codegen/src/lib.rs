@@ -442,6 +442,14 @@ fn types_in_stmt(stmt: &hir::Stmt, out: &mut Vec<Type>) {
 fn types_in_expr(expr: &hir::Expr, out: &mut Vec<Type>) {
     out.push(expr.ty.clone());
     match &expr.kind {
+        hir::ExprKind::Block { stmts, value } => {
+            for stmt in stmts {
+                types_in_stmt(stmt, out);
+            }
+            if let Some(v) = value {
+                types_in_expr(v, out);
+            }
+        }
         hir::ExprKind::Unary { expr, .. }
         | hir::ExprKind::Some(expr)
         | hir::ExprKind::Ok(expr)

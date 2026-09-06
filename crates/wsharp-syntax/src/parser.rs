@@ -655,6 +655,12 @@ impl Parser {
     fn expr_or_assign_stmt(&mut self) -> Option<Stmt> {
         let start = self.span();
         let target = self.expr()?;
+        self.finish_expr_stmt(start, target)
+    }
+
+    /// What follows an expression written where a statement was expected: an
+    /// assignment operator, or the `;` that makes it a statement on its own.
+    fn finish_expr_stmt(&mut self, start: Span, target: Expr) -> Option<Stmt> {
         let op = match self.peek() {
             TokenKind::Eq => None,
             TokenKind::PlusEq => Some(BinOp::Add),
@@ -924,7 +930,7 @@ impl Parser {
                     TokenKind::Orelse => {
                         p.enter("expression")?;
                         p.bump();
-                        let alt = p.add_expr()?;
+                        let alt = p.alternative()?;
                         let span = lhs.span().to(alt.span());
                         lhs = Expr::Orelse {
                             expr: Box::new(lhs),
@@ -936,7 +942,7 @@ impl Parser {
                         p.enter("expression")?;
                         p.bump();
                         let capture = p.opt_capture()?;
-                        let alt = p.add_expr()?;
+                        let alt = p.alternative()?;
                         let span = lhs.span().to(alt.span());
                         lhs = Expr::Catch {
                             expr: Box::new(lhs),
@@ -1038,6 +1044,125 @@ impl Parser {
         self.scoped(|p| {
             p.enter("expression")?;
             p.unary_expr()
+        })
+    }
+
+    /// The right-hand side of a `catch` or an `orelse`.
+    ///
+    /// Three spellings, because two different things are wanted there. An
+    /// ordinary expression is the value to use instead. A `{ .. }` block is for
+    /// when something has to *happen* first, and its last expression -- written
+    /// without a `;` -- is the value. And a bare `return`, `break` or
+    /// `continue` is the one-statement spelling of a block that produces no
+    /// value at all, which is what makes `f() catch return false;` the line it
+    /// reads as.
+    ///
+    /// The `{` fork is unambiguous: a struct literal is `Path{ .. }`, and no
+    /// expression starts with a bare brace.
+    fn alternative(&mut self) -> Option<Expr> {
+        let start = self.span();
+        match self.peek() {
+            TokenKind::LBrace => self.value_block(start),
+            TokenKind::Return | TokenKind::Break | TokenKind::Continue => {
+                let stmt = self.leaving_stmt(start)?;
+                let span = start.to(self.prev_span());
+                Some(Expr::Block {
+                    stmts: vec![stmt],
+                    value: None,
+                    span,
+                })
+            }
+            _ => self.add_expr(),
+        }
+    }
+
+    /// `return e`, `break` or `continue` written where a value was expected,
+    /// and so *without* the `;` a statement carries -- that `;` belongs to
+    /// whatever statement the whole expression is part of.
+    ///
+    /// The operand is a full expression rather than one precedence level
+    /// tighter: an alternative that never comes back has nothing to hand an
+    /// operator on its right, so taking the rest is the only reading.
+    fn leaving_stmt(&mut self, start: Span) -> Option<Stmt> {
+        match self.peek() {
+            TokenKind::Break => {
+                self.bump();
+                Some(Stmt::Break(start.to(self.prev_span())))
+            }
+            TokenKind::Continue => {
+                self.bump();
+                Some(Stmt::Continue(start.to(self.prev_span())))
+            }
+            _ => {
+                self.expect(TokenKind::Return)?;
+                let value = if self.at_value_end() {
+                    None
+                } else {
+                    Some(self.expr()?)
+                };
+                Some(Stmt::Return {
+                    value,
+                    span: start.to(self.prev_span()),
+                })
+            }
+        }
+    }
+
+    /// Whether the current token can only close something, so a `return` in
+    /// front of it returns nothing.
+    fn at_value_end(&self) -> bool {
+        matches!(
+            self.peek(),
+            TokenKind::Semi
+                | TokenKind::RBrace
+                | TokenKind::RParen
+                | TokenKind::RBracket
+                | TokenKind::Comma
+                | TokenKind::Eof
+        )
+    }
+
+    /// `{ stmt; stmt; value }` -- an ordinary block whose last item may be an
+    /// expression with no `;`, which is what the block produces.
+    fn value_block(&mut self, start: Span) -> Option<Expr> {
+        self.scoped(|p| {
+            p.enter("block")?;
+            p.expect(TokenKind::LBrace)?;
+            let mut stmts = Vec::new();
+            let mut value = None;
+            while !p.at(&TokenKind::RBrace) && !p.at_eof() {
+                let before = p.pos;
+                if starts_statement(p.peek()) {
+                    match p.stmt() {
+                        Some(s) => stmts.push(s),
+                        None => p.recover_to_stmt(),
+                    }
+                } else {
+                    // An expression here is either a statement or the block's
+                    // value, and only what follows it says which.
+                    let at = p.span();
+                    match p.expr() {
+                        Some(e) if p.at(&TokenKind::RBrace) => value = Some(Box::new(e)),
+                        Some(e) => match p.finish_expr_stmt(at, e) {
+                            Some(s) => stmts.push(s),
+                            None => p.recover_to_stmt(),
+                        },
+                        None => p.recover_to_stmt(),
+                    }
+                }
+                if p.pos == before {
+                    p.bump();
+                }
+                if value.is_some() {
+                    break;
+                }
+            }
+            p.expect(TokenKind::RBrace)?;
+            Some(Expr::Block {
+                stmts,
+                value,
+                span: start.to(p.prev_span()),
+            })
         })
     }
 
@@ -1307,6 +1432,25 @@ impl Parser {
 }
 
 /// The identifiers making up a dotted path, if that is all the expression is.
+/// Whether this token can only begin a statement, never an expression.
+///
+/// What [`Parser::value_block`] needs to tell a statement from the expression
+/// it may end with, before either has been parsed.
+fn starts_statement(kind: &TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Const
+            | TokenKind::Var
+            | TokenKind::Return
+            | TokenKind::Break
+            | TokenKind::Continue
+            | TokenKind::If
+            | TokenKind::While
+            | TokenKind::For
+            | TokenKind::LBrace
+    )
+}
+
 fn path_of(expr: &Expr) -> Option<Vec<Ident>> {
     match expr {
         Expr::Ident(name) => Some(vec![name.clone()]),

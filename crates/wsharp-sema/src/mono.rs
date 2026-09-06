@@ -276,6 +276,14 @@ impl Mono<'_> {
     fn rewrite_expr(&mut self, expr: &mut hir::Expr, subst: &Subst) {
         expr.ty = self.apply(&expr.ty, subst);
         match &mut expr.kind {
+            hir::ExprKind::Block { stmts, value } => {
+                for stmt in stmts {
+                    self.rewrite_stmt(stmt, subst);
+                }
+                if let Some(v) = value {
+                    self.rewrite_expr(v, subst);
+                }
+            }
             hir::ExprKind::Call { callee, args } => {
                 match callee {
                     hir::Callee::Static { func, targs } => {

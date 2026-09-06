@@ -56,6 +56,41 @@ fn function_with_and_without_annotations() {
 }
 
 #[test]
+fn catch_and_orelse_take_a_block() {
+    assert_eq!(
+        body("const x = f() catch { g(); 0 };"),
+        "(const x (catch (call f) (block (call g) 0)))"
+    );
+    assert_eq!(
+        body("const x = a orelse { 1 };"),
+        "(const x (orelse a (block 1)))"
+    );
+    // A block that leaves rather than producing a value.
+    assert_eq!(
+        body("const x = f() catch { h(); return 0; };"),
+        "(const x (catch (call f) (block (call h) (return 0))))"
+    );
+}
+
+#[test]
+fn catch_takes_a_bare_leaving_statement() {
+    // The `;` belongs to the `const`, not to the `return`, which is what makes
+    // this the one line it reads as.
+    assert_eq!(
+        body("const x = f() catch return 0;"),
+        "(const x (catch (call f) (block (return 0))))"
+    );
+    assert_eq!(
+        body("const x = a orelse continue;"),
+        "(const x (orelse a (block (continue))))"
+    );
+    assert_eq!(
+        body("const x = f() catch |e| return;"),
+        "(const x (catch |e| (call f) (block (return))))"
+    );
+}
+
+#[test]
 fn pub_marks_a_declaration_visible() {
     let dump = ast("pub fn f() void { }\nfn g() void { }");
     assert!(dump.contains("(pub fn f "), "{dump}");

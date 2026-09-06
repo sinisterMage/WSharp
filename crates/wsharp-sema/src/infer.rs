@@ -2431,6 +2431,48 @@ impl<'a> Inferencer<'a> {
         None
     }
 
+    /// `{ stmt; stmt; value }`, the block form of a `catch` or an `orelse`.
+    ///
+    /// A block that ends in an expression has that expression's type. A block
+    /// with no trailing expression has to *leave* instead -- `return`, `break`
+    /// or `continue` -- and then its type is a fresh variable: it produces
+    /// nothing, so it fits wherever it is written, which is what makes
+    /// `f() catch return false;` check in a function returning `bool` and in
+    /// one returning `str` alike. That is the whole of "diverging" here; no
+    /// `noreturn` type is needed for it.
+    fn infer_value_block(
+        &mut self,
+        stmts: &'a [ast::Stmt],
+        value: &'a Option<Box<ast::Expr>>,
+        span: Span,
+    ) -> hir::Expr {
+        self.frame().scopes.push(Vec::new());
+        let lowered: Vec<hir::Stmt> = stmts.iter().filter_map(|s| self.infer_stmt(s)).collect();
+        let value = value.as_deref().map(|v| self.infer_expr(v));
+        self.frame().scopes.pop();
+
+        let ty = match &value {
+            Some(v) => v.ty.clone(),
+            None if stmts_terminate(stmts) => self.store.fresh(),
+            None => {
+                self.error(span, "this block never produces a value").help = Some(
+                    "end it with an expression and no `;`, or leave with `return`, `break` \
+                     or `continue`"
+                        .into(),
+                );
+                self.store.fresh()
+            }
+        };
+        hir::Expr {
+            kind: hir::ExprKind::Block {
+                stmts: lowered,
+                value: value.map(Box::new),
+            },
+            ty,
+            span,
+        }
+    }
+
     fn infer_if_stmt(&mut self, if_stmt: &'a ast::IfStmt) -> Option<hir::Stmt> {
         let (cond, capture) = self.infer_condition(&if_stmt.cond, if_stmt.capture.as_ref());
         self.frame().scopes.push(Vec::new());
@@ -2618,6 +2660,7 @@ impl<'a> Inferencer<'a> {
     fn infer_expr(&mut self, expr: &'a ast::Expr) -> hir::Expr {
         let span = expr.span();
         match expr {
+            ast::Expr::Block { stmts, value, .. } => self.infer_value_block(stmts, value, span),
             ast::Expr::Int(v, _) => self.lit(hir::ExprKind::Int(*v), Type::i64(), span),
             ast::Expr::Float(v, _) => self.lit(hir::ExprKind::Float(*v), Type::f64(), span),
             ast::Expr::Bool(v, _) => self.lit(hir::ExprKind::Bool(*v), Type::bool(), span),
@@ -4796,7 +4839,11 @@ fn is_place_base(expr: &ast::Expr) -> bool {
 /// through instead of returning or jumping. Used both to require a `return` on
 /// every path and to guarantee code generation can terminate every basic block.
 fn block_terminates(block: &ast::Block) -> bool {
-    block.stmts.iter().any(stmt_terminates)
+    stmts_terminate(&block.stmts)
+}
+
+fn stmts_terminate(stmts: &[ast::Stmt]) -> bool {
+    stmts.iter().any(stmt_terminates)
 }
 
 /// The standard library's module of HTTP status types, which are materialised
@@ -4900,6 +4947,14 @@ fn collect_deps_if(s: &ast::IfStmt, out: &mut HashSet<String>) {
 
 fn collect_deps_expr(expr: &ast::Expr, out: &mut HashSet<String>) {
     match expr {
+        ast::Expr::Block { stmts, value, .. } => {
+            for stmt in stmts {
+                collect_deps_stmt(stmt, out);
+            }
+            if let Some(v) = value {
+                collect_deps_expr(v, out);
+            }
+        }
         ast::Expr::Ident(name) => {
             out.insert(name.to_string());
         }
@@ -5093,6 +5148,14 @@ fn patch_targs_expr(expr: &mut hir::Expr, targs_for: &HashMap<hir::FuncId, Vec<T
         }
     };
     match &mut expr.kind {
+        hir::ExprKind::Block { stmts, value } => {
+            for stmt in stmts {
+                patch_targs_stmt(stmt, targs_for);
+            }
+            if let Some(v) = value {
+                patch_targs_expr(v, targs_for);
+            }
+        }
         hir::ExprKind::Call { callee, args } => {
             match callee {
                 hir::Callee::Static { func, targs } => fill(func, targs),
@@ -5221,6 +5284,14 @@ fn fixup_stmt(stmt: &mut hir::Stmt, structs: &[hir::StructDef], store: &mut Type
 fn fixup_expr(expr: &mut hir::Expr, structs: &[hir::StructDef], store: &mut TypeStore) {
     expr.ty = store.resolve_deep(&expr.ty);
     match &mut expr.kind {
+        hir::ExprKind::Block { stmts, value } => {
+            for stmt in stmts {
+                fixup_stmt(stmt, structs, store);
+            }
+            if let Some(v) = value {
+                fixup_expr(v, structs, store);
+            }
+        }
         hir::ExprKind::Field {
             obj,
             strukt,

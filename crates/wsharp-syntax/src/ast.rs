@@ -332,6 +332,18 @@ pub enum Expr {
     },
     /// `@import("std/http")` -- names a module. Only legal as the value of a
     /// top-level `const`, which is what binds the name it is reached by.
+    /// `{ stmt; stmt; value }` on the right of a `catch` or an `orelse`.
+    ///
+    /// The last thing in it may be an expression with no `;`, which is the
+    /// value the whole block takes. A block with no such expression has to
+    /// leave some other way -- `return`, `break`, `continue` -- because the
+    /// operator it belongs to still has to produce something; a bare
+    /// `f() catch return 0` is the one-statement spelling of that.
+    Block {
+        stmts: Vec<Stmt>,
+        value: Option<Box<Expr>>,
+        span: Span,
+    },
     Import {
         path: Box<str>,
         span: Span,
@@ -359,6 +371,7 @@ impl Expr {
             | Expr::Field { span, .. }
             | Expr::ArrayLit { span, .. }
             | Expr::Index { span, .. }
+            | Expr::Block { span, .. }
             | Expr::Import { span, .. }
             | Expr::StructLit { span, .. }
             | Expr::Try { span, .. }

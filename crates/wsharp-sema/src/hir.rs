@@ -269,6 +269,15 @@ pub enum ExprKind {
     /// An error value.
     Err(ErrorId),
     /// `e orelse alt`
+    /// `{ stmt; stmt; value }` -- the block form of a `catch` or an `orelse`.
+    ///
+    /// `value` is what the block produces. `None` means it never produces
+    /// anything: every path out of it returns, breaks or continues, and the
+    /// type inference gave the whole expression is whatever its context wanted.
+    Block {
+        stmts: Vec<Stmt>,
+        value: Option<Box<Expr>>,
+    },
     Orelse {
         expr: Box<Expr>,
         alt: Box<Expr>,

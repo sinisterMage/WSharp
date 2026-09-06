@@ -401,6 +401,26 @@ A module system, and four modules behind it.
   the boundary as the two words a `#[repr(C)]` pair is returned in. The tag is
   an index into the program's error table plus one, so the library's error
   names are interned before any program's — `builtin_errors()` fixes them.
+- **A `catch` or an `orelse` takes a block, and two different things wanted
+  there decide its shape.** One is a value to use instead, after doing
+  something first: a block whose last expression is written *without* a `;` is
+  that value. The other is to give up -- and a block that never produces a
+  value has to leave, by `return`, `break` or `continue`. Inference gives that
+  second kind a *fresh type variable*, which is the whole of "diverging" here:
+  it produces nothing, so it fits wherever it is written, and
+  `f() catch return false;` checks in a function returning `bool` and in one
+  returning `str` alike with no `noreturn` type anywhere.
+
+  The one-statement spelling has no braces, because the `;` there belongs to
+  the statement the whole expression is part of rather than to the `return`.
+  And the `{` fork is unambiguous for a reason that was already true: a struct
+  literal is `Path{ .. }`, and no expression starts with a bare brace.
+
+  Code generation needed one thing it had not needed before. A block with no
+  value has already ended by the time the operator wants to merge, and
+  Cranelift will not let anything be appended to a block that ended -- so the
+  placeholder values the merge still expects are made in a block of their own,
+  with no predecessors, which falls out in optimisation.
 - **Visibility is private by default, and only qualified lookup checks it.**
   `pub` in front of a `fn`, a `const` or a struct is what lets another module
   name it. The check goes in the three places a *qualified* name is resolved --
@@ -432,8 +452,6 @@ A module system, and four modules behind it.
 
 - **No package management.** An import is a relative path or a library one;
   there is nothing that fetches anything.
-- **`catch` and `orelse` still take an expression, not a block**, which is felt
-  most in I/O code: `f() catch return false;` cannot be written.
 - **The errors a function can raise are not in its type.** `!T` has a single
   global error set, so a caller cannot see which errors `read_file` has.
 
@@ -572,8 +590,6 @@ These are deliberate limitations, each with a clear fix:
   an annotation instead.
 - **`==` is limited to `i64`, `f64`, `bool` and `str`.** Structs still need a
   decision about identity versus structural equality.
-- **No block expressions.** `catch`/`orelse` take an expression, not a block,
-  which is felt most in I/O code: `f() catch return false;` cannot be written.
 - **Integer literals are always `i64`.** No `comptime_int` coercion, so `1.0`
   must be written where an `f64` is wanted.
 - **`%` is integer-only.** Cranelift has no float remainder, and a float `%`

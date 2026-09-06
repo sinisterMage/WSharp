@@ -81,7 +81,7 @@ everywhere.** They are checked when written and inferred when not.
 | Subtyping | `const Sub = struct : Base { };` — a subtype widens implicitly |
 | Singletons | a struct with no fields is also a value: its sole instance |
 | Optionals | `null`, `a orelse b`, `a.?`, `if (a) \|v\| { }`, `while (a) \|v\| { }` |
-| Errors | `error.Name`, `try f()`, `f() catch 0`, `f() catch \|e\| ...` |
+| Errors | `error.Name`, `try f()`, `f() catch 0`, `f() catch \|e\| ...`, `f() catch return false`, `f() catch { log(); 0 }` |
 | Operators | `+ - * /`, `%` (integers only), `== != < <= > >=` (non-chaining), `and or !` |
 
 `==` compares `str` by contents, so a string built at run time equals a literal.
