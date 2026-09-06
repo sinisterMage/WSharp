@@ -264,6 +264,13 @@ struct Frame {
     captured_names: HashMap<String, hir::LocalId>,
     scopes: Vec<Vec<(String, Binding)>>,
     ret: Type,
+    /// The local this function's own name is bound to inside its body, for a
+    /// `fn` literal that may recurse. See [`hir::FuncDef::self_local`].
+    self_local: Option<hir::LocalId>,
+    /// Whether the body actually named itself. A literal that did not is left
+    /// exactly as it was before recursion was allowed, down to the roots the
+    /// collector sees.
+    self_used: bool,
 }
 
 impl Frame {
@@ -366,6 +373,11 @@ struct Inferencer<'a> {
     error_ids: HashMap<String, hir::ErrorId>,
 
     frames: Vec<Frame>,
+    /// The name the *next* frame pushed should bind to the function it is the
+    /// body of, so that a `fn` literal bound to a `const` can recurse. Consumed
+    /// by [`Inferencer::infer_function`]; set only by
+    /// [`Inferencer::infer_fn_literal_named`].
+    pending_self: Option<(String, Type)>,
     constraints: Vec<Constraint>,
     loop_depth: usize,
     /// The type parameters in scope, innermost last. A `fn` literal inside a
@@ -417,6 +429,7 @@ impl<'a> Inferencer<'a> {
             errors: Vec::new(),
             error_ids: HashMap::new(),
             frames: Vec::new(),
+            pending_self: None,
             constraints: Vec::new(),
             loop_depth: 0,
             type_scopes: Vec::new(),
@@ -1670,7 +1683,16 @@ impl<'a> Inferencer<'a> {
             captured_names: HashMap::new(),
             scopes: vec![Vec::new()],
             ret: ret.clone(),
+            self_local: None,
+            self_used: false,
         };
+        // Bound before the parameters, so a parameter of the same name shadows
+        // it -- the ordinary rule, and the one a reader expects.
+        if let Some((name, ty)) = self.pending_self.take() {
+            let local = frame.add_local(&name, ty, false, self.fn_spans[id as usize]);
+            frame.bind_local(&name, local);
+            frame.self_local = Some(local);
+        }
         for (param, ty) in func.params.iter().zip(&params) {
             let local = frame.add_local(param.name.as_str(), ty.clone(), false, param.span);
             frame.bind_local(param.name.as_str(), local);
@@ -1714,6 +1736,10 @@ impl<'a> Inferencer<'a> {
             body,
             scheme: Scheme::mono(fn_ty),
             is_closure: self.fn_is_closure[id as usize],
+            // Only when the body named itself: an unused self local would make
+            // the code generator keep the environment as a root in every
+            // literal, which is a change no existing program asked for.
+            self_local: frame.self_used.then_some(frame.self_local).flatten(),
             span: self.fn_spans[id as usize],
         });
         capture_sources
@@ -1946,7 +1972,8 @@ impl<'a> Inferencer<'a> {
         // type parameter of the function this sits in -- has had its level
         // lowered by `occurs_and_adjust` on the way out, and is left alone.
         self.store.enter_level();
-        let (id, fn_ty, capture_sources) = self.infer_fn_literal(func, span);
+        let (id, fn_ty, capture_sources) =
+            self.infer_fn_literal_named(func, span, Some(let_stmt.name.as_str()));
         self.store.exit_level();
 
         let scheme = self.generalize_definition(&fn_ty);
@@ -3730,10 +3757,38 @@ impl<'a> Inferencer<'a> {
         func: &'a ast::Func,
         span: Span,
     ) -> (hir::FuncId, Type, Vec<hir::LocalId>) {
+        self.infer_fn_literal_named(func, span, None)
+    }
+
+    /// The same, with the name the literal knows itself by inside its own body.
+    ///
+    /// A literal bound to a `const` may name itself. The name is bound to the
+    /// literal's *own closure value*, which the environment pointer already
+    /// holds: a literal is only ever entered through a closure, and a call
+    /// passes that closure as the environment. So the recursive reference
+    /// needs no allocation, and needs nothing new from monomorphisation
+    /// either -- the closure at the outer use site already points at the
+    /// specialisation this body is, which is why polymorphic recursion is out
+    /// of reach here for exactly the reason Hindley-Milner puts it out of
+    /// reach everywhere else.
+    ///
+    /// The signature is worked out *before* the body, and `schemes[id]` stays
+    /// `None` throughout it, so a self-use takes the monomorphic arm of
+    /// [`Inferencer::func_type`] exactly as a recursive `fn` declaration's
+    /// does.
+    fn infer_fn_literal_named(
+        &mut self,
+        func: &'a ast::Func,
+        span: Span,
+        self_name: Option<&str>,
+    ) -> (hir::FuncId, Type, Vec<hir::LocalId>) {
         let name = Ident::new(format!("closure@{}", span.start), span);
         let id = self.declare_function(&name, func, span, true);
         let fn_ty = self.signature_type(id, func);
         self.fn_types[id as usize] = fn_ty.clone();
+        if let Some(self_name) = self_name {
+            self.pending_self = Some((self_name.to_string(), fn_ty.clone()));
+        }
         let capture_sources = self.infer_function(id);
         (id, fn_ty, capture_sources)
     }
@@ -3855,6 +3910,15 @@ impl<'a> Inferencer<'a> {
     /// intervening closure if it is found further out.
     fn lookup_at(&mut self, depth: usize, name: &str) -> Option<Binding> {
         if let Some(binding) = self.frames[depth].find(name) {
+            // A name that turned out to be this frame's own is what decides
+            // whether the function needs its environment kept as a value.
+            // Noted here rather than in `find`, because two callers use that
+            // only to ask whether a name is shadowed.
+            if let Binding::Local(id) = &binding
+                && self.frames[depth].self_local == Some(*id)
+            {
+                self.frames[depth].self_used = true;
+            }
             return Some(binding);
         }
         if let Some(&id) = self.frames[depth].captured_names.get(name) {

@@ -355,6 +355,87 @@ fn a_const_fn_literal_generalises() {
 }
 
 #[test]
+fn a_const_fn_literal_may_name_itself() {
+    // The literal's own closure value is the environment it was entered with,
+    // so the recursive reference is an ordinary local rather than a second
+    // closure -- and the body stays monomorphic, which is why the generic
+    // version below recurses at one type per instantiation.
+    let src = r#"
+        fn main() i64 {
+            const fact = fn (n) { if (n <= 1) { return 1; } return n * fact(n - 1); };
+            return fact(5);
+        }
+    "#;
+    assert_eq!(sig(src, "main"), "fn() i64");
+    let a = analysis(src);
+    let closure = a
+        .program
+        .funcs
+        .iter()
+        .find(|f| f.is_closure)
+        .expect("a closure was created");
+    assert!(
+        closure.self_local.is_some(),
+        "a body that names itself holds its own closure value"
+    );
+    assert!(
+        closure.captures.is_empty(),
+        "the self reference is the environment, not a capture of the frame above"
+    );
+}
+
+#[test]
+fn a_generic_const_fn_literal_may_name_itself() {
+    let src = r#"
+        const array = @import("std/array");
+        fn main() i64 {
+            const count = fn [T](a: []T, i: i64) i64 {
+                if (i >= array.len(a)) { return 0; }
+                return 1 + count(a, i + 1);
+            };
+            print_int(count([]str{ "a" }, 0));
+            return count([]i64{ 1, 2 }, 0);
+        }
+    "#;
+    assert_eq!(sig(src, "main"), "fn() i64");
+}
+
+#[test]
+fn a_fn_literal_that_never_names_itself_keeps_no_self_local() {
+    // Worth asserting: an unused self local would make the code generator keep
+    // the environment as a root in every literal, which no existing program
+    // asked for.
+    let src = r#"
+        fn main() i64 {
+            const id = fn (x) { return x; };
+            return id(1);
+        }
+    "#;
+    let a = analysis(src);
+    let closure = a
+        .program
+        .funcs
+        .iter()
+        .find(|f| f.is_closure)
+        .expect("a closure was created");
+    assert!(closure.self_local.is_none());
+}
+
+#[test]
+fn a_var_fn_literal_cannot_name_itself() {
+    // A `var` is a storage location that holds nothing yet when the literal is
+    // built, so there is no value for the body to name. The same reason it
+    // does not generalise.
+    let src = r#"
+        fn main() i64 {
+            var f = fn (n) { return f(n); };
+            return f(1);
+        }
+    "#;
+    assert_error(src, "cannot find `f`");
+}
+
+#[test]
 fn a_fn_literal_may_name_type_parameters() {
     let src = r#"
         fn main() i64 {

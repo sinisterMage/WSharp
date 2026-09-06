@@ -106,6 +106,16 @@ pub struct FuncDef {
     pub scheme: Scheme,
     /// True for `fn` literals, which are reached only through a closure value.
     pub is_closure: bool,
+    /// The local holding this function's own closure value, for a `fn` literal
+    /// whose body names itself.
+    ///
+    /// A literal is only ever entered through a closure value, and a call
+    /// passes that value as the environment pointer -- so the environment *is*
+    /// a closure for this function at this instantiation, and the recursive
+    /// reference costs a register rather than an allocation. `None` when the
+    /// body never names itself, which is every function written before
+    /// recursion was allowed here.
+    pub self_local: Option<LocalId>,
     pub span: Span,
 }
 

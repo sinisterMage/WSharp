@@ -600,6 +600,16 @@ impl Trans<'_, '_> {
             next += width;
         }
 
+        // A literal that names itself holds its own closure value, and that
+        // value is the environment: a literal is only ever entered through a
+        // closure, and a call passes that closure as the environment pointer.
+        // Copied into a declared local here, before the first safepoint, so
+        // the recursive reference is an ordinary rooted local rather than a
+        // re-read of `env` after something could have moved it.
+        if let Some(local) = self.func.self_local {
+            self.def_local(local, &[env]);
+        }
+
         // The environment is a heap reference like any other, so a function
         // that actually reads it declares it a root.
         //
@@ -611,7 +621,7 @@ impl Trans<'_, '_> {
         // load barrier that resolves forwarding with a call -- are both things
         // the collector already wants. A function with no captures never reads
         // `env` at all and is left alone.
-        if !self.func.captures.is_empty() {
+        if !self.func.captures.is_empty() || self.func.self_local.is_some() {
             self.b.declare_value_needs_stack_map(env);
         }
 

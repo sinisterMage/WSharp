@@ -258,6 +258,20 @@ in-group calls, once the group has generalised. See item 5.
   so quantifying such a variable would give the same body two different types
   depending on which of the two ways it was written. `const add = fn (a, b)
   { return a + b; };` is `i64` for exactly the reason the declaration is.
+- **A `fn` literal names itself through its environment.** `const f = fn (x)
+  { .. f(x) .. };` used to fail, because the name was bound by the statement it
+  is the initialiser of and so was not in scope in its own body. Binding it
+  first is only half the fix; the other half is what the name means. A literal
+  is only ever entered *through* a closure value, and a call passes that value
+  as the environment pointer -- so the environment already *is* a closure for
+  this function at this instantiation. The name binds to it, copied into a
+  declared local in the prologue beside the captures, and the recursive
+  reference costs a register rather than an allocation. Monomorphisation needed
+  nothing: the closure the outer use site built already points at the
+  specialisation the body is, which is also why polymorphic recursion stays out
+  of reach here for the same reason Hindley-Milner puts it out of reach for a
+  declaration. A `var` still cannot, and for the reason it does not generalise:
+  the location holds nothing yet when the literal is built.
 - **Captures are snapshotted at the definition.** Each use builds its own
   closure object, so a captured `var` assigned in between would otherwise
   change what the closure sees. The definition emits one hidden local per
@@ -291,10 +305,6 @@ in-group calls, once the group has generalised. See item 5.
 
 - **No array covariance**, deliberately: `[]Sub` is not a `[]Base`, because a
   write through the second would break the first.
-- **A generic `fn` literal cannot be recursive.** `const f = fn (x) { return
-  f(x); };` cannot see `f`, because the name is bound by the statement it is
-  the initialiser of. A declaration is the way to write a recursive generic
-  function, and it works.
 - **A definition builds its closure at each use.** A call through one is an
   indirect call on a freshly materialised closure, so it allocates an
   environment object per use rather than per binding. Cheap, and the price of

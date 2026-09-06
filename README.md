@@ -70,7 +70,7 @@ everywhere.** They are checked when written and inferred when not.
 | Abstract types | `Number` stands for `i64` and `f64`, so an overload can claim "any number" while another claims `i64` |
 | Control flow | `if (c) { } else { }`, `while (c) : (i += 1) { }`, `for (xs) \|x\| { }`, `break`, `continue` |
 | Expressions | `if (c) a else b`, `fn (a, b) { ... }` closures |
-| Closures | `const id = fn (x) { return x; };` generalises, and `fn [T](a: []T) T` writes the parameters out |
+| Closures | `const id = fn (x) { return x; };` generalises, may name itself, and `fn [T](a: []T) T` writes the parameters out |
 | Literals | `42`, `0xff`, `0b1010`, `0o17`, `1_000_000`, `2.5`, `"text"` with `\n \t \r \0 \\ \"` |
 | Arrays | `[]i64{ 1, 2, 3 }`, `a[i]`, `for (a) \|v, i\| { }`; an index out of range panics |
 | Growable | `std/list` — a backing array plus a count, so `push` is amortised constant time |
