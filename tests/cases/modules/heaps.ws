@@ -20,3 +20,15 @@ pub fn collect(s: State) i64 {
     gc_collect();
     return gc_collections();
 }
+
+/// A whole mark trace, on this worker's heap and this worker's collector
+/// thread. Synchronous: cycles are reclaimed by the time it returns.
+///
+/// This is what the per-worker split is for. The trace's three pauses run on
+/// *this* mutator, and no other worker stops for them.
+pub fn trace(s: State) i64 {
+    var i = 0;
+    while (i < 2000) : (i += 1) { s.kept = array.new(4); }
+    gc_trace();
+    return gc_traces();
+}

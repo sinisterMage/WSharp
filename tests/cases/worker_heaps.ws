@@ -11,6 +11,8 @@
 // expect: true
 // expect: 7
 // expect: true
+// expect: true
+// expect: true
 const heaps = @import("./modules/heaps.ws");
 const array = @import("std/array");
 
@@ -38,6 +40,12 @@ fn main() i64 {
     for ([]i64{ 3, 4 }) |v| { sum += v; }
     print_int(sum);
     print_bool(copied > 0);
+
+    // A whole mark trace, on the worker's heap and its own collector thread.
+    // This is what the per-worker split is for: the trace's three pauses run
+    // on that mutator, and this one never stops for them.
+    print_bool((w.trace() catch -1) >= 1);
+    print_bool(gc_traces() >= 1);
 
     @join(w) catch return 2;
     return 0;
