@@ -143,12 +143,35 @@ fn clear[T](l: List[T]) void {
     l.count = 0;
 }
 
+/// A walk over `l`, from the front.
+///
+/// `at` is the next index to hand out. Holding the list rather than its
+/// backing array is what makes `next` see a `push` that happened mid-loop --
+/// and see the count that goes with it, which a captured array could not.
+const Iter = struct[T] { list: List[T], at: i64 };
+
+/// Where a `for (l) |v|` starts.
+///
+/// `for` over anything but an array calls `iter` and then `next` until it
+/// produces null, and resolves both in the module that declares the type it
+/// is walking. So this is the whole of what makes a list iterable, and
+/// `to_array` is no longer the way to write the loop.
+fn iter[T](l: List[T]) Iter[T] {
+    return Iter{ .list = l, .at = 0 };
+}
+
+/// The next value, or null at the end.
+fn next[T](it: Iter[T]) ?T {
+    if (it.at >= it.list.count) { return null; }
+    const v = it.list.items[it.at];
+    it.at = it.at + 1;
+    return v;
+}
+
 /// The values `l` holds, as an array of exactly `count` elements.
 ///
 /// A copy, because the backing array is longer than the list and handing it
-/// out would expose the spare slots. This is also how a list is iterated:
-/// `for` walks an array, and teaching it a standard-library struct would put
-/// `std/list` inside the type checker.
+/// out would expose the spare slots.
 fn to_array[T](l: List[T]) []T {
     var out: []T = array.new(l.count);
     var i = 0;

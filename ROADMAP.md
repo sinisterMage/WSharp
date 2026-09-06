@@ -287,6 +287,20 @@ in-group calls, once the group has generalised. See item 5.
   gets two. **The code generator did not change at all** -- each specialisation
   is an ordinary `FuncId` with a closure layout of its own, and a call through
   a definition is the indirect call it always was.
+- **`for` asks the type's own module how to walk it.** A `for` whose subject
+  is not an array desugars to `while (M.next([iter])) |v|`, with `iter` and
+  `next` resolved in the module that *declares* the subject's type -- so
+  `for (xs)` over a list needs no import beyond the list, and `std/list` says
+  how a list is iterated without the type checker knowing it exists. `?T` is
+  what says the walk is over, which makes the desugaring `while (c) |v|`
+  exactly, back-edge safepoint and all. Two consequences worth stating: a
+  subject whose type is still a variable takes the array path and records
+  `Indexable`, because the protocol has to be chosen where the loop is built
+  and there is nothing yet to choose it from; and a `for` names `iter` and
+  `next` as dependencies of *every* module it imports, because which one
+  applies is not knowable before inference. Over-approximating there is sound
+  rather than merely convenient -- a dependency only matters inside a cycle,
+  and a library's iterator never calls back into the program using it.
 - **The growable array is a library type, not a language one.** `List[T]` is
   an ordinary generic struct in an ordinary `.ws` file; nothing in the lexer,
   the parser, inference or the code generator knows it exists. That it could
@@ -309,10 +323,6 @@ in-group calls, once the group has generalised. See item 5.
   indirect call on a freshly materialised closure, so it allocates an
   environment object per use rather than per binding. Cheap, and the price of
   needing no new calling convention -- but it is a cost, not a nothing.
-- **`for` does not iterate a list.** `for` desugars to a `while` over an
-  array, so a list is walked as `for (list.to_array(xs))` and pays for a copy.
-  Teaching `for` about `List` would put a standard-library struct inside the
-  type checker; an iterator protocol is the honest fix, and it is not item 5's.
 - **`pop` and `remove` leave the vacated tail slot holding its old
   reference.** The collector walks every element the header claims, so that
   object stays alive until the slot is overwritten, the list grows or the list
@@ -332,7 +342,7 @@ A module system, and four modules behind it.
 |---|---|
 | `std/str` | `len`, `concat`, `eq`, `substr`, `find`, `split`, `join`, `repeat`, `starts_with`, `from_int`, `from_float` |
 | `std/array` | `len`, `new`, `concat`, `push`, `slice`, `repeat` |
-| `std/list` | `List[T]` and `new`, `with_capacity`, `from`, `len`, `capacity`, `get`, `set`, `push`, `pop`, `insert`, `remove`, `extend`, `clear`, `to_array` |
+| `std/list` | `List[T]` and `new`, `with_capacity`, `from`, `len`, `capacity`, `get`, `set`, `push`, `pop`, `insert`, `remove`, `extend`, `clear`, `iter`, `next`, `to_array` |
 | `std/math` | `abs`, `min`, `max`, `sign`, `sqrt`, `pow`, `floor`, `ceil`, `round`, `trunc`, `ipow` |
 | `std/io` | `read_file`, `read_line`, `write_file`, `exists` |
 | `std/http` | the 27 status types, moved out of the global namespace |

@@ -74,6 +74,7 @@ everywhere.** They are checked when written and inferred when not.
 | Literals | `42`, `0xff`, `0b1010`, `0o17`, `1_000_000`, `2.5`, `"text"` with `\n \t \r \0 \\ \"` |
 | Arrays | `[]i64{ 1, 2, 3 }`, `a[i]`, `for (a) \|v, i\| { }`; an index out of range panics |
 | Growable | `std/list` — a backing array plus a count, so `push` is amortised constant time |
+| Iterating | `for (xs) \|x\|` over an array walks it by index; over anything else it calls `iter` and `next` from the module that declares its type |
 | Generics | `fn first[T](a: []T) T`, `const Box = struct[T] { value: T };`, `fn [T](x: T) T` — inferred when not written |
 | Modules | `const http = @import("std/http");`, then `http.NotFound404` |
 | Structs | `const P = struct { x: i64 };`, `P{ .x = 1 }`, `p.x` |
@@ -306,7 +307,7 @@ fn main() i64 {
 |---|---|
 | `std/str` | `len` `concat` `eq` `substr` `find` `split` `join` `repeat` `starts_with` `from_int` `from_float` |
 | `std/array` | `len` `new` `concat` `push` `slice` `repeat` |
-| `std/list` | `List[T]`, a growable array: `new` `with_capacity` `from` `len` `capacity` `get` `set` `push` `pop` `insert` `remove` `extend` `clear` `to_array` |
+| `std/list` | `List[T]`, a growable array: `new` `with_capacity` `from` `len` `capacity` `get` `set` `push` `pop` `insert` `remove` `extend` `clear` `iter` `next` `to_array` |
 | `std/math` | `abs` `min` `max` `sign` `sqrt` `pow` `floor` `ceil` `round` `trunc` `ipow` |
 | `std/io` | `read_file` `read_line` `write_file` `exists` — the fallible ones return `!str` |
 | `std/http` | the 27 HTTP status types, materialised on first mention |

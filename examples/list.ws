@@ -25,10 +25,10 @@ fn path(n: i64) list.List[i64] {
 
 fn show(xs: list.List[i64]) str {
     var out = "";
-    // A list is iterated by copying it into an array: `for` walks an array,
-    // and teaching it a standard-library struct would put `std/list` inside
-    // the type checker.
-    for (list.to_array(xs)) |v, i| {
+    // A list is walked directly: `for` over anything but an array calls `iter`
+    // and `next` from the module that declares the type, so `std/list` says
+    // how a list is iterated without the type checker knowing it exists.
+    for (xs) |v, i| {
         if (i > 0) { out = str.concat(out, " -> "); }
         out = str.concat(out, str.from_int(v));
     }

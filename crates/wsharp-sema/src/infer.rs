@@ -251,6 +251,11 @@ enum Binding {
     },
 }
 
+/// The names a `for` over a non-array subject calls, resolved in the module
+/// that declares the subject's type. Two rather than one because an iterator
+/// has state the subject does not: `iter` makes it, `next` advances it.
+const PROTOCOL_NAMES: &[&str] = &["iter", "next"];
+
 /// One function being inferred. A stack of these models nesting: a `fn` literal
 /// pushes a frame, and a name resolved past a frame boundary becomes a capture.
 struct Frame {
@@ -1493,6 +1498,24 @@ impl<'a> Inferencer<'a> {
                     },
                     None => self.key_in(module, &name),
                 };
+                // The `for` protocol resolves in the module that declares the
+                // subject's type, which inference has not run yet to know. So
+                // every `iter` and `next` this module can see is a dependency.
+                //
+                // Over-approximating is sound rather than merely convenient: a
+                // dependency only matters when it is part of a cycle, and a
+                // library's iterator never calls back into the program using
+                // it -- so `std/list.next` is simply inferred and generalised
+                // first. An iterable declared in the same file genuinely does
+                // belong in the same binding group.
+                if PROTOCOL_NAMES.contains(&name.as_str()) {
+                    for path in self.imports[module].values() {
+                        let key = format!("{path}.{name}");
+                        if let Some(GlobalRef::Func(ids)) = self.globals.get(&key) {
+                            deps.extend(ids.iter().map(|id| *id as usize));
+                        }
+                    }
+                }
                 let callees = match self.globals.get(&key) {
                     Some(GlobalRef::Func(ids)) => ids,
                     Some(GlobalRef::FuncValue(index)) => &self.fn_consts[*index].ids,
@@ -2050,6 +2073,14 @@ impl<'a> Inferencer<'a> {
     fn infer_for_stmt(&mut self, for_stmt: &'a ast::ForStmt) -> Option<hir::Stmt> {
         let span = for_stmt.span;
         let iter = self.infer_expr(&for_stmt.iter);
+        // An array is walked by index, which is a load and a compare and needs
+        // no library at all. Anything else has to say how it is walked, and a
+        // struct is the only other thing that can. A subject still a variable
+        // takes the array path too, and so records `Indexable`: the protocol
+        // has to be chosen here, and there is nothing yet to choose it from.
+        if let Type::Con(TyCon::Struct(id), _) = self.store.resolve(&iter.ty) {
+            return self.infer_for_protocol(for_stmt, iter, id);
+        }
         let elem = self.element_of(&iter.ty, for_stmt.iter.span());
         let arr_ty = iter.ty.clone();
 
@@ -2172,6 +2203,190 @@ impl<'a> Inferencer<'a> {
                 },
             ],
         }))
+    }
+
+    /// `for (xs) |x| { .. }` over something that is not an array.
+    ///
+    /// The subject's own module says how it is walked: `iter` turns it into an
+    /// iterator and `next` produces `?T` until it produces null, which is
+    /// exactly the shape `while (cond) |v|` already has. So this desugars to
+    ///
+    /// ```text
+    /// { const [iter] = M.iter(xs); while (M.next([iter])) |x| { .. } }
+    /// ```
+    ///
+    /// and inherits the back-edge safepoint, `break`, `continue` and the
+    /// lowering from `while`, as the array form does.
+    ///
+    /// Resolved in the module that *declares the type* rather than in the one
+    /// the loop is written in. A `for` over a `List` would otherwise need
+    /// `list.next` in scope, which would make the protocol a thing the caller
+    /// has to import rather than a thing the type has.
+    fn infer_for_protocol(
+        &mut self,
+        for_stmt: &'a ast::ForStmt,
+        subject: hir::Expr,
+        strukt: StructId,
+    ) -> Option<hir::Stmt> {
+        let span = for_stmt.span;
+        let at = for_stmt.iter.span();
+
+        // Everything that can fail is resolved before a scope is opened, so a
+        // failure leaves the frame exactly as it found it.
+        let iter_ids = self.protocol_fn(strukt, "iter", at)?;
+        let next_ids = self.protocol_fn(strukt, "next", at)?;
+
+        let iter_name = Ident::new("iter", at);
+        let iterator = self.dispatched_call(&iter_name, &iter_ids, vec![subject], at);
+        let iter_ty = iterator.ty.clone();
+
+        // The scope holding the hidden locals, so the user's body cannot see
+        // them and a nested `for` gets its own.
+        self.frame().scopes.push(Vec::new());
+        let iter_local = self.frame().add_local("[iter]", iter_ty.clone(), false, span);
+        let index_local = for_stmt
+            .index
+            .as_ref()
+            .map(|_| self.frame().add_local("[index]", Type::i64(), true, span));
+
+        let next_name = Ident::new("next", at);
+        let cond = self.dispatched_call(
+            &next_name,
+            &next_ids,
+            vec![hir::Expr {
+                kind: hir::ExprKind::Local(iter_local),
+                ty: iter_ty,
+                span,
+            }],
+            at,
+        );
+        // `next` is what says when the walk is over, so it has to be able to
+        // say so: an optional, whose null is the end.
+        let elem = self.store.fresh();
+        let want = Type::optional(elem.clone());
+        let cond_ty = cond.ty.clone();
+        let cond = if self.store.try_unify(&cond_ty, &want) {
+            cond
+        } else {
+            let shown = self.store.show(&cond_ty);
+            self.error(at, format!("`next` must return an optional, not `{shown}`"))
+                .help = Some(
+                "a `for` stops when `next` produces null, so it needs somewhere to put that"
+                    .into(),
+            );
+            hir::Expr {
+                kind: hir::ExprKind::Null,
+                ty: want,
+                span,
+            }
+        };
+
+        // `[index] += 1`, as the continue expression, so an explicit
+        // `continue` still advances the count. `next` advances the walk itself,
+        // because the condition is what calls it.
+        let cont = index_local.map(|index| {
+            let index_ref = || hir::Expr {
+                kind: hir::ExprKind::Local(index),
+                ty: Type::i64(),
+                span,
+            };
+            Box::new(hir::Stmt::Assign {
+                place: hir::Place::Local(index),
+                value: hir::Expr {
+                    kind: hir::ExprKind::Binary {
+                        op: BinOp::Add,
+                        lhs: Box::new(index_ref()),
+                        rhs: Box::new(hir::Expr {
+                            kind: hir::ExprKind::Int(1),
+                            ty: Type::i64(),
+                            span,
+                        }),
+                    },
+                    ty: Type::i64(),
+                    span,
+                },
+            })
+        });
+
+        // The user's bindings, in a scope of their own so the body sees them.
+        self.frame().scopes.push(Vec::new());
+        let value_local =
+            self.frame()
+                .add_local(for_stmt.value.as_str(), elem, false, for_stmt.value.span);
+        self.frame()
+            .bind_local(for_stmt.value.as_str(), value_local);
+        let mut prologue = Vec::new();
+        if let (Some(name), Some(index)) = (&for_stmt.index, index_local) {
+            let local = self
+                .frame()
+                .add_local(name.as_str(), Type::i64(), false, name.span);
+            self.frame().bind_local(name.as_str(), local);
+            prologue.push(hir::Stmt::Let {
+                local,
+                init: hir::Expr {
+                    kind: hir::ExprKind::Local(index),
+                    ty: Type::i64(),
+                    span,
+                },
+            });
+        }
+
+        self.loop_depth += 1;
+        let mut body = self.infer_block(&for_stmt.body);
+        self.loop_depth -= 1;
+        self.frame().scopes.pop();
+
+        prologue.append(&mut body.stmts);
+        let body = hir::Block { stmts: prologue };
+
+        self.frame().scopes.pop();
+
+        let mut stmts = vec![hir::Stmt::Let {
+            local: iter_local,
+            init: iterator,
+        }];
+        if let Some(index) = index_local {
+            stmts.push(hir::Stmt::Let {
+                local: index,
+                init: hir::Expr {
+                    kind: hir::ExprKind::Int(0),
+                    ty: Type::i64(),
+                    span,
+                },
+            });
+        }
+        stmts.push(hir::Stmt::While {
+            cond,
+            capture: Some(value_local),
+            cont,
+            body,
+        });
+        Some(hir::Stmt::Block(hir::Block { stmts }))
+    }
+
+    /// The overload set of `name` in the module that declares `strukt`.
+    fn protocol_fn(
+        &mut self,
+        strukt: StructId,
+        name: &str,
+        span: Span,
+    ) -> Option<Vec<hir::FuncId>> {
+        let shown = self.structs[strukt as usize].name.clone();
+        let module = self
+            .struct_decl_of
+            .get(&strukt)
+            .map(|&(m, _)| self.modules[m].path.clone());
+        let found = module
+            .as_ref()
+            .and_then(|path| self.globals.get(&format!("{path}.{name}")));
+        if let Some(GlobalRef::Func(ids)) = found {
+            return Some(ids.clone());
+        }
+        self.error(span, format!("`{shown}` cannot be iterated")).help = Some(format!(
+            "a `for` over a struct calls `iter` and `next` from the module that declares it; \
+             `{shown}` has no `{name}`"
+        ));
+        None
     }
 
     fn infer_if_stmt(&mut self, if_stmt: &'a ast::IfStmt) -> Option<hir::Stmt> {
@@ -3223,7 +3438,24 @@ impl<'a> Inferencer<'a> {
         args: &'a [ast::Expr],
         span: Span,
     ) -> hir::Expr {
-        let mut hir_args: Vec<hir::Expr> = args.iter().map(|a| self.infer_expr(a)).collect();
+        let hir_args = args.iter().map(|a| self.infer_expr(a)).collect();
+        self.dispatched_call(name, ids, hir_args, span)
+    }
+
+    /// The same, over arguments that have already been inferred.
+    ///
+    /// Split out for the `for` desugaring, which builds its call to `iter` and
+    /// `next` out of hidden locals rather than out of source: an iterable's
+    /// module may well have more than one of each, and choosing between them is
+    /// the dispatcher's job rather than a second, worse one written here.
+    fn dispatched_call(
+        &mut self,
+        name: &Ident,
+        ids: &[hir::FuncId],
+        mut hir_args: Vec<hir::Expr>,
+        span: Span,
+    ) -> hir::Expr {
+        let arity = hir_args.len();
         let arg_tys: Vec<Type> = hir_args.iter().map(|a| a.ty.clone()).collect();
 
         let mut cands: Vec<Candidate> = Vec::new();
@@ -3236,7 +3468,7 @@ impl<'a> Inferencer<'a> {
                 self.store.rollback_to(snapshot);
                 continue;
             };
-            if params.len() != args.len() {
+            if params.len() != arity {
                 wrong_arity += 1;
                 self.store.rollback_to(snapshot);
                 continue;
@@ -3289,7 +3521,7 @@ impl<'a> Inferencer<'a> {
             let list = shown.join(", ");
             let n = ids.len();
             let message = if wrong_arity == n {
-                format!("no overload of `{name}` takes {} arguments", args.len())
+                format!("no overload of `{name}` takes {arity} arguments")
             } else {
                 format!("no overload of `{name}` accepts ({list})")
             };
@@ -4566,6 +4798,12 @@ fn collect_deps_stmt(stmt: &ast::Stmt, out: &mut HashSet<String>) {
         ast::Stmt::For(s) => {
             collect_deps_expr(&s.iter, out);
             collect_deps_block(&s.body, out);
+            // A `for` over anything but an array calls `iter` and `next`, and
+            // which module's is not knowable before inference. Naming them here
+            // is what puts them in dependency order; see `PROTOCOL_NAMES`.
+            for name in PROTOCOL_NAMES {
+                out.insert((*name).to_string());
+            }
         }
     }
 }
