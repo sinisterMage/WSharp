@@ -884,15 +884,27 @@ impl Trans<'_, '_> {
                     self.def_local(*local, &payload);
                 }
                 self.block(then);
+                let then_falls_through = !self.terminated;
                 self.jump_to(merge, NO_ARGS);
 
                 self.switch(else_block);
                 if let Some(els) = els {
                     self.block(els);
                 }
+                let else_falls_through = !self.terminated;
                 self.jump_to(merge, NO_ARGS);
 
-                self.switch(merge);
+                // Only switch to the merge if something can actually get
+                // there. When both arms leave -- `if (c) { return a; } else
+                // { return b; }` -- nothing jumps to it, and switching would
+                // leave an unterminated block for the epilogue below to close
+                // with a valueless `return`, which is a signature mismatch in
+                // any function that returns something. A block that is created
+                // and never switched to is never added to the layout, so the
+                // unused one costs nothing and the verifier never sees it.
+                if then_falls_through || else_falls_through {
+                    self.switch(merge);
+                }
             }
 
             hir::Stmt::While {

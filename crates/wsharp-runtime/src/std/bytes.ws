@@ -123,6 +123,34 @@ pub fn put_be64(b: []u8, at: i64, v: u64) void {
     return;
 }
 
+/// The big-endian 16- and 24-bit integers at `at`.
+///
+/// Answered as an `i64` rather than as a `u16`, which is a deviation from the
+/// accessors above and a deliberate one: every one of these in TLS and in DER
+/// is a *length*, an index into a buffer is an `i64` in this language, and a
+/// `u16` here would put a conversion at every single use. There is no 24-bit
+/// type to be faithful to in the second case anyway.
+pub fn be16(b: []u8, at: i64) i64 {
+    return (i64(b[at]) << 8) | i64(b[at + 1]);
+}
+
+pub fn put_be16(b: []u8, at: i64, v: i64) void {
+    b[at] = u8(v >> 8);
+    b[at + 1] = u8(v);
+    return;
+}
+
+pub fn be24(b: []u8, at: i64) i64 {
+    return (i64(b[at]) << 16) | (i64(b[at + 1]) << 8) | i64(b[at + 2]);
+}
+
+pub fn put_be24(b: []u8, at: i64, v: i64) void {
+    b[at] = u8(v >> 16);
+    b[at + 1] = u8(v >> 8);
+    b[at + 2] = u8(v);
+    return;
+}
+
 /// The little-endian `u32` at `at` -- ChaCha20's word order, and Poly1305's.
 pub fn le32(b: []u8, at: i64) u32 {
     return u32(b[at]) | (u32(b[at + 1]) << 8)
@@ -144,6 +172,144 @@ pub fn le64(b: []u8, at: i64) u64 {
 pub fn put_le64(b: []u8, at: i64, v: u64) void {
     put_le32(b, at, u32(v));
     put_le32(b, at + 4, u32(v >> 32));
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// A growable buffer
+// ---------------------------------------------------------------------------
+//
+// `List[T]` is the growable array and would serve, but a `List[u8]` is a call
+// per byte and its backing store is not a `[]u8` anything else here accepts.
+// This is the same idea specialised: a `[]u8` whose header length is the
+// capacity and a `used` beside it, so `taken` hands back exactly what was
+// written and every builtin above can be pointed straight at `data`.
+//
+// The reason it exists at all is length prefixes. Every message in TLS and
+// every value in DER is written `length, then contents`, and the length is not
+// known until the contents are. `open16` writes a placeholder and answers with
+// where it went; `close16` goes back and fills it in. Doing that against an
+// immutable `str` would mean assembling the contents separately and
+// concatenating, which is the quadratic shape `to_hex` above already avoids.
+
+pub const Buf = struct { data: []u8, used: i64 };
+
+/// A buffer that can hold `capacity` bytes before it has to grow.
+pub fn buf(capacity: i64) Buf {
+    var n = capacity;
+    if (n < 16) { n = 16; }
+    return Buf{ .data = new(n), .used = 0 };
+}
+
+/// Make room for `extra` more bytes, doubling as `std/list` does.
+fn reserve(b: Buf, extra: i64) void {
+    const need = b.used + extra;
+    if (need <= array.len(b.data)) { return; }
+    var cap = array.len(b.data);
+    while (cap < need) : (cap *= 2) { }
+    const bigger = new(cap);
+    copy(bigger, 0, b.data, 0, b.used);
+    b.data = bigger;
+    return;
+}
+
+pub fn put_u8(b: Buf, v: i64) void {
+    reserve(b, 1);
+    b.data[b.used] = u8(v);
+    b.used += 1;
+    return;
+}
+
+pub fn put_u16(b: Buf, v: i64) void {
+    reserve(b, 2);
+    put_be16(b.data, b.used, v);
+    b.used += 2;
+    return;
+}
+
+pub fn put_u24(b: Buf, v: i64) void {
+    reserve(b, 3);
+    put_be24(b.data, b.used, v);
+    b.used += 3;
+    return;
+}
+
+pub fn put_u32(b: Buf, v: u32) void {
+    reserve(b, 4);
+    put_be32(b.data, b.used, v);
+    b.used += 4;
+    return;
+}
+
+/// Append `src[at..at+n]`.
+pub fn put_bytes(b: Buf, src: []u8, at: i64, n: i64) void {
+    reserve(b, n);
+    copy(b.data, b.used, src, at, n);
+    b.used += n;
+    return;
+}
+
+/// Append the whole of `src`.
+pub fn put_all(b: Buf, src: []u8) void {
+    put_bytes(b, src, 0, array.len(src));
+    return;
+}
+
+/// Append the bytes of `s`.
+pub fn put_str(b: Buf, s: str) void {
+    const n = text.len(s);
+    reserve(b, n);
+    raw_from_str(b.data, b.used, s);
+    b.used += n;
+    return;
+}
+
+/// Write `n` zero bytes as a placeholder for a length, and answer with where
+/// they went. `close8`, `close16` and `close24` fill one in.
+///
+/// Three widths rather than one taking a parameter, because TLS uses all three
+/// and a `close` that had to be told the width again is a `close` that can be
+/// told the wrong one.
+pub fn open8(b: Buf) i64 { put_u8(b, 0); return b.used - 1; }
+
+pub fn close8(b: Buf, mark: i64) void {
+    b.data[mark] = u8(b.used - mark - 1);
+    return;
+}
+
+pub fn open16(b: Buf) i64 { put_u16(b, 0); return b.used - 2; }
+
+pub fn close16(b: Buf, mark: i64) void {
+    put_be16(b.data, mark, b.used - mark - 2);
+    return;
+}
+
+pub fn open24(b: Buf) i64 { put_u24(b, 0); return b.used - 3; }
+
+pub fn close24(b: Buf, mark: i64) void {
+    put_be24(b.data, mark, b.used - mark - 3);
+    return;
+}
+
+/// Everything written so far, as a buffer of its own.
+pub fn taken(b: Buf) []u8 { return slice(b.data, 0, b.used); }
+
+/// Forget everything written, keeping the capacity.
+pub fn reset(b: Buf) void {
+    b.used = 0;
+    return;
+}
+
+/// Forget the first `n` bytes and shift the rest down.
+///
+/// What a record reader does with the bytes it has consumed. `copy` is a
+/// memmove, so the overlap is safe.
+pub fn drop_front(b: Buf, n: i64) void {
+    var k = n;
+    if (k < 0) { k = 0; }
+    if (k > b.used) { k = b.used; }
+    copy(b.data, 0, b.data, k, b.used - k);
+    b.used -= k;
     return;
 }
 

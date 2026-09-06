@@ -837,6 +837,12 @@ pub const CURVE25519_MODULE: &str = "std/curve25519";
 pub const P256_MODULE: &str = "std/p256";
 /// RSA signature verification: PKCS#1 v1.5 and PSS.
 pub const RSA_MODULE: &str = "std/rsa";
+/// Distinguished Encoding Rules, which X.509 is written in.
+pub const DER_MODULE: &str = "std/der";
+/// Public keys and certificates.
+pub const X509_MODULE: &str = "std/x509";
+/// TLS 1.3.
+pub const TLS_MODULE: &str = "std/tls";
 
 /// The error names the library can raise, in the order their ids are assigned.
 ///
@@ -961,6 +967,9 @@ pub fn std_module_sources() -> &'static [(&'static str, &'static str)] {
         (CURVE25519_MODULE, include_str!("std/curve25519.ws")),
         (P256_MODULE, include_str!("std/p256.ws")),
         (RSA_MODULE, include_str!("std/rsa.ws")),
+        (DER_MODULE, include_str!("std/der.ws")),
+        (X509_MODULE, include_str!("std/x509.ws")),
+        (TLS_MODULE, include_str!("std/tls.ws")),
         (MATH_MODULE, include_str!("std/math.ws")),
         (BROKER_MODULE, include_str!("std/broker.ws")),
         (NET_MODULE, include_str!("std/net.ws")),

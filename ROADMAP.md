@@ -18,7 +18,10 @@ Session 10 delivered item 10's stages two and three, the asymmetric half:
 X25519 and P-256 for key agreement, a fixed-width bignum with Montgomery
 arithmetic, and RSA PKCS#1 v1.5 and PSS verification above it — all of it W#,
 with no compiler change at all, because a 32-bit limb is what makes the 64x64
-product item 9 reserved a place for unnecessary.
+product item 9 reserved a place for unnecessary. Session 11 delivered stage
+four, the protocol: Ed25519 and ECDSA, a strict DER reader, the record layer
+and the handshake at both ends — replayed against RFC 8448's published traces
+byte for byte, and run against itself over every suite and both groups.
 
 This file records what was built and why it was built that way, the limitations
 that were chosen rather than stumbled into, and — for the items still ahead —
@@ -987,7 +990,7 @@ Doing it turned up two things:
   argument's type.
 
 
-## 10. TLS 1.3, written in W# — **in progress: stages one to three are done**
+## 10. TLS 1.3, written in W# — **in progress: stages one to four are done**
 
 Item 8 left `https://` as `error.NotSupported` rather than a connection that
 quietly speaks the wrong protocol. Removing it is what this item is for -- and
@@ -998,8 +1001,9 @@ It is also by a wide margin the largest item in the tree, so it is being built
 in stages rather than pretended into one commit. **Stage one is the byte
 plumbing and every symmetric primitive TLS 1.3 uses. Stages two and three are
 the asymmetric half: two curves for key agreement, and a bignum and RSA for
-verifying a certificate's signature.** The stages after them are listed at the
-end.
+verifying a certificate's signature. Stage four is the protocol itself: two
+more signature schemes, the record layer, and the handshake.** The stage after
+them is listed at the end.
 
 ### Why in W# rather than in the runtime
 
@@ -1202,6 +1206,115 @@ or moving the bignum across the boundary anyway.
   code-generator change -- which is a better answer than item 9's "no `u128`"
   decision had any right to expect.
 
+### Stage four: two signature schemes, the record layer, and the handshake
+
+Stages two and three left the asymmetric primitives in place and nothing above
+them. This is the protocol: the two signature schemes a TLS 1.3 client has to
+verify besides RSA, the record layer, and ClientHello through Finished --
+including HelloRetryRequest, which is the only part of the handshake that
+happens twice.
+
+It also has a **server**, which the item did not ask for. The reason is in the
+testing section below and is worth stating here: a client tested only against
+recorded bytes is a client whose *own* bytes nothing has ever read.
+
+#### What was built
+
+| Piece | Where |
+|---|---|
+| Ed25519, signing and verification, on the field `std/curve25519` already had | `std/curve25519.ws` |
+| ECDSA verification on P-256, with arithmetic modulo the group order | `std/p256.ws` |
+| Shamir's trick, so a verification is one ladder rather than two | same |
+| A strict DER reader: definite lengths, minimal encodings, no trailing data | `std/der.ws` |
+| Public keys as a dispatch lattice, and `SubjectPublicKeyInfo` | `std/x509.ws` |
+| The key schedule, `HKDF-Expand-Label` and every secret of RFC 8446 section 7.1 | `std/tls.ws` |
+| The record layer: nonces, the header as additional data, padding, the size limits | same |
+| ClientHello through Finished, both ends, with HelloRetryRequest and KeyUpdate | same |
+| A blocking `Session` over a `net.Socket`, and nothing else that knows a socket exists | same |
+| A growable byte buffer with length backpatching, which every message here is written with | `std/bytes.ws` |
+| RFC 8448's traces, replayed byte for byte | `tests/cases/tls_{schedule,rfc8448,ecdsa}.ws` |
+| A handshake between this library's two ends, over every suite and both groups | `tests/cases/tls_{loopback,socket}.ws` |
+| Nineteen ways to be refused | `tests/cases/tls_reject.ws` |
+
+#### Decisions worth recording
+
+- **The core takes bytes in and hands bytes out.** `feed` is given whatever
+  arrived and `pending` says what to send; nothing below `Session` knows a
+  socket exists. That is not an abstraction for its own sake. A handshake is a
+  *negotiation*, so a blocking `connect` writes its ClientHello and then waits
+  for a reply -- and one thread cannot be both ends of one, which is how every
+  other networking case in this tree is written. Splitting the core out is what
+  makes the whole of `tls_loopback.ws` single-threaded and deterministic, and
+  it is what lets RFC 8448 be replayed with no I/O at all.
+- **A cipher suite is a value, not an overload set**, for the reason
+  `std/hash.Hash` is: the suite is chosen at run time by the peer, so inside
+  the record layer there is no type to dispatch on. This is the third time that
+  shape has been forced rather than chosen.
+- **A public key *is* an overload set**, and that is the same argument the
+  other way. A key's algorithm is known when it is parsed and never changes, so
+  `RsaKey`, `EcdsaP256Key` and `Ed25519Key` are subtypes of `SigKey` and
+  `verify_signature` is three functions -- the dispatcher picks by the type id
+  in the header, and a fourth algorithm is a struct and a function rather than
+  an edit to a chain.
+- **`std/x509` sits below `std/tls`, not beside it.** A client verifies a
+  CertificateVerify with a key out of a certificate, so one module has to name
+  the other's types, and W# has no re-export. The one that owns `SigKey` is the
+  one everything imports, and a public key comes from a certificate -- so the
+  arrow points that way and there is no cycle to break.
+- **Ed25519 signs and RSA still does not.** The rule has not changed: a
+  signing key is written when it has a caller. This one has -- the server's
+  CertificateVerify -- and Ed25519 is the scheme this library can produce
+  without a constant-time exponentiation it does not have and without a nonce
+  whose generation is the classic way to lose a private key.
+- **ECDSA verifies and does not sign**, for the reason RSA does not, and its
+  code is allowed to be different *because* everything it touches is public.
+  `r`, `s`, the digest and the peer's key all travel in the clear, so a branch
+  on any of them leaks nothing -- which is what makes an addition with real
+  cases in it and a double-and-add that skips a zero digit legitimate here and
+  not in `ecdh`.
+- **The window landed where it is free, and the ladder was left alone.** Item
+  10 recorded that P-256's scalar multiplication is a bare ladder and that a
+  four-bit window would be a quarter of the additions. Verification is now a
+  second caller and gives it a reason, so `u1*G + u2*Q` is Shamir's trick: 256
+  doublings and about 192 additions where two ladders would be 512 of each.
+  Measured, a verification costs about 4.8 ms against an ECDH's 3.8, where two
+  ladders and an addition would be nearer 8.
+  The *secret* ladder is untouched, and that is a decision. A windowed ladder
+  can reach a step where the accumulator equals the table entry being added,
+  which `pt_add` cannot do; ruling it out needs either complete formulas or a
+  mask over an exception, where the Montgomery ladder rules it out by
+  construction. An exchange costs about four milliseconds against a network
+  round trip, and this file has twice already taken the auditable side of that
+  trade.
+- **DER is read strictly, and that is the feature.** A certificate is a signed
+  byte string, so any encoding this accepts but a second implementation
+  re-encodes differently is a signature that has been moved onto a different
+  meaning. Indefinite lengths, non-minimal lengths, integers with a spare
+  leading zero and trailing bytes are all refused, and `der_reject.ws` gives
+  each its own line. There is no writer, for the reason `std/cipher` has no AES
+  decryption.
+- **PKCS#1 v1.5 may sign a certificate and may not sign a CertificateVerify.**
+  RFC 8446 section 4.4.3 says so, and the reason is worth keeping in the code:
+  without the check, a signature made by a TLS 1.2 server could be replayed as
+  a 1.3 one. The 64 spaces and the context string in front of the signed
+  content are the other half of the same defence.
+- **The transcript is a buffer, not a running hash.** `std/hash`'s incremental
+  state has no clone, and the transcript is hashed at five different points; but
+  the deciding reason is that the *hash itself* is not known until the
+  ServerHello has been read, and the ClientHello comes before it. Holding the
+  bytes and digesting on demand is what a client that offers both SHA-256 and
+  SHA-384 suites has to do anyway.
+- **A HelloRetryRequest is the only message that rewrites history.** The first
+  ClientHello is replaced in the transcript by a synthetic message holding its
+  hash, which is what lets a server keep no state between the two flights. Both
+  ends implement it, and the server here sends a cookie and checks the echo --
+  not because it needs to, since it is stateful, but because a client's cookie
+  handling is otherwise code nothing runs.
+- **Compatibility mode is sent and accepted, and never hashed.** A 32-byte
+  session id and a ChangeCipherSpec record make a 1.3 handshake look like a
+  resumed 1.2 one to a middlebox. The record is not part of the transcript, and
+  one that is not a single `0x01` is refused.
+
 ### What being wrong costs here, and how that is paid
 
 This is the first thing in the tree where being wrong is a security problem
@@ -1220,6 +1333,27 @@ for each *way* of being wrong: a changed ciphertext, a changed tag, changed
 additional data that is not itself transmitted, the wrong nonce, the wrong key,
 and a truncation that leaves no room for a tag.
 
+**A protocol has published traces, and they are better than vectors.** RFC 8448
+writes whole TLS 1.3 handshakes down as bytes -- every record, and every secret
+behind them -- which makes three different kinds of test possible from one
+document. `tls_schedule.ws` checks the key schedule one derivation at a time, so
+a failure names which of the eleven is wrong rather than only that one is.
+`tls_rfc8448.ws` drives the client with the recorded server flight and compares
+every record it produces against the recorded one, byte for byte. And
+`tls_ecdsa.ws` does the same over section 6, whose server signs with ECDSA
+rather than RSA-PSS.
+
+The ClientHello is handed to the client rather than built by it, through a
+documented test hook, and that is a limitation worth stating: the recorded
+client offers extensions this one does not, so a hello built here would be a
+different message and nothing downstream could be compared at all. Everything
+after the hello is this implementation. What that leaves untested is the bytes
+this library *itself* produces first -- which is why stage four also has a
+server. `tls_loopback.ws` runs the two ends against each other over all three
+cipher suites, both groups and a HelloRetryRequest, and `tls_socket.ws` does it
+once more over a real socket with the server on a worker of its own, which is
+also two threads blocking in `read(2)` inside the collector's safe region.
+
 **RSA has no published vector this library could use**, because the ones that
 exist are 1024-bit and SHA-1 and this only carries the three SHA-2 prefixes TLS
 1.3 allows. So its vectors were *made*, and made twice: a key from one
@@ -1234,35 +1368,44 @@ rejection is the historical failure.
 
 ### What is left
 
-The stages after these, in the order they have to happen:
+One stage is left:
 
 | Stage | Contents |
 |---|---|
-| 4 | Ed25519 and ECDSA P-256; the record layer; ClientHello through Finished, plus HelloRetryRequest |
 | 5 | X.509: DER parsing, validity and name checking, chain building; the root store on three platforms; `https://` |
 
-Each has a module waiting for it. Ed25519 lives on the field `std/curve25519`
-already has, which is why that module is named for the curve rather than for
-the function; ECDSA is `std/p256`'s existing point arithmetic plus arithmetic
-modulo the group order, and it is *public*, so it wants the ordinary addition
-`pt_add` already is rather than anything new.
+Half of it is already in place. `std/der` reads the encoding strictly and
+`std/x509` reads a SubjectPublicKeyInfo and verifies with what it finds; what
+stage five adds to that module is the certificate around the key -- validity,
+names, extensions -- and the chain. `std/tls`'s `Config` has the seam it plugs
+into: a client trusts a pinned key today, and a chain when there is one to
+check.
 
-Three smaller things are left behind these stages:
+Smaller things left behind these stages:
 
 - **No 1.2-style RSA key transport and no RSA signing**, deliberately, per the
   decision above. If a signing key ever has a caller, it needs a constant-time
   `modexp` and the Chinese remainder theorem, and neither is written.
 - **A public exponent may be any size.** `modexp` costs one modular
   multiplication per exponent bit, so a certificate carrying a 2048-bit
-  exponent would cost two thousand of them rather than seventeen. That is a
-  policy question about certificates rather than about arithmetic, so it
-  belongs to stage five's parser rather than here -- but it is not checked
-  anywhere yet, and it should be.
-- **P-256's scalar multiplication is a bare ladder with no window.** Two point
-  operations per bit, where a four-bit window with a constant-time table scan
-  would be a quarter of the additions. An exchange costs about four
-  milliseconds, which is nothing beside a network round trip, so the window is
-  an optimisation waiting for a reason.
+  exponent would cost two thousand of them rather than seventeen. Stage five's
+  parser is where the bound goes, and it is still not checked anywhere.
+- **P-256's *secret* scalar multiplication is still a bare ladder.** Stage four
+  windowed the half of it that is public -- a verification is now one
+  interleaved double-and-add rather than two ladders -- and deliberately left
+  the other half alone: a windowed ladder can reach a step where the
+  accumulator equals the table entry being added, which `pt_add` cannot do, and
+  ruling that out needs complete formulas or a mask over an exception where the
+  Montgomery ladder rules it out by construction. Worth revisiting only
+  together with a complete addition formula.
+- **No client certificates, no resumption, no 0-RTT.** A CertificateRequest is
+  answered with an empty certificate list, which is what RFC 8446 requires of a
+  client that has none; a NewSessionTicket is read and dropped. Both are
+  features, not oversights: a resumption secret that is never used cannot be
+  used wrongly.
+- **A `Config` cannot restrict what is offered.** A client offers all three
+  cipher suites and both groups, always. A caller that wants to insist on one
+  has no way to say so, where a server does (`server_requiring`).
 
 And the decisions already taken about stages four and five:
 

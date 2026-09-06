@@ -460,6 +460,34 @@ extra `sin_len` byte out of this code entirely.
   `generalize_definition` subtracts every variable the pending constraints
   still mention. Dropping that makes `const add = fn (a, b) { return a + b; };`
   mean something different from the declaration spelling the same body.
+- **`return f(x)` unifies two error sets; `try f(x); return;` widens one.** A
+  tail call in a `!void` function makes the caller's set *equal* the callee's,
+  because the whole type unifies -- so a later `try` of something that raises
+  more is rejected with "this function cannot raise", pointing at the second
+  call rather than at the first. `try` alone contributes a subset edge, which
+  is what a caller of several fallible things wants. `std/tls`'s two message
+  dispatchers are written that way for exactly this reason, and the shape is
+  worth recognising: the diagnostic names the wrong line.
+- **A subtype does not coerce into a supertype inside an error union.**
+  `return Sub{ .. };` from a function returning `!Base` is a type error: the
+  widening to `Base` and the wrapping into `!` are each supported and are not
+  composed. `const key: Base = Sub{ .. }; return key;` is the spelling, and
+  `std/x509.parse_spki` uses it three times.
+- **An `if` whose arms both leave has no merge block.** Code generation creates
+  one per `if` and used to switch to it unconditionally; the function epilogue
+  then closes whatever block is open with a valueless `return`, which is right
+  "only for a `void` function -- inference rejects anything else". But
+  inference rejects a function that can *fall through*, and one whose arms both
+  return cannot: the merge was unreachable rather than void, and the epilogue
+  gave a `str`-returning function a `return` with no value. `lower.rs` now
+  switches to the merge only when an arm can reach it. A block that is created
+  and never switched to is never added to the layout, so the unused one costs
+  nothing.
+- **`std/x509` is below `std/tls`, and the arrow cannot be reversed.** A TLS
+  client verifies a CertificateVerify with a key out of a certificate, so one
+  module must name the other's types and W# has no re-export. `SigKey` and
+  `verify_signature` live where a public key comes from, and `std/tls` imports
+  them.
 - **The closure environment is dead after the prologue.** Captures are copied
   into declared locals before the first safepoint and `env` is never read
   again, so it is not a root and need not be. Re-reading it after a call would
@@ -472,6 +500,12 @@ nix-shell --run "cargo test --workspace"
 ```
 
 - Unit tests live next to the code they cover.
+- A **test hook** is a `pub` function that exists so a test can reach a
+  primitive a whole operation would hide, and it says so in its doc comment.
+  `curve25519.field_mul`, `cipher.aes_sub_byte` and `tls.client_replay` are the
+  three; the last one sends a ClientHello it was handed, because RFC 8448's
+  recorded handshakes cannot be replayed against a hello this library would
+  build.
 - `crates/wsharp-sema/tests/` holds inference and monomorphisation tests, which
   assert on rendered signatures (`fn(T) T`) — far more readable than matching
   nested enums.
@@ -502,6 +536,15 @@ nix-shell --run "cargo test --workspace"
   verifier that accepts too much passes every test written from the valid side.
   `node`'s `crypto` and `python3`'s `pow`/`hashlib` are the two available here;
   `openssl` is not installed.
+- **A protocol is tested three ways, because a transcript can only do two of
+  them.** RFC 8448 publishes whole TLS 1.3 handshakes, so the key schedule can
+  be checked one derivation at a time (`tls_schedule.ws`) and the client can be
+  driven with recorded bytes and its output compared to recorded bytes
+  (`tls_rfc8448.ws`). What that cannot reach is the bytes this library produces
+  *first* -- a recorded ClientHello is an input, so comparing it says nothing.
+  That is why there is a server: `tls_loopback.ws` runs both ends against each
+  other with no sockets at all, which is also the only way one thread can drive
+  a negotiation.
 - **A cryptographic case is checked against an independent implementation,
   not against memory.** Every primitive in `std/hash` and `std/cipher` has its
   published vectors -- FIPS 180-4, RFC 4231, RFC 5869, RFC 8439, FIPS 197, and

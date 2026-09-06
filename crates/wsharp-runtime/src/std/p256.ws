@@ -21,6 +21,7 @@
 const array = @import("std/array");
 const bytes = @import("std/bytes");
 const bignum = @import("std/bignum");
+const der = @import("std/der");
 
 // ---------------------------------------------------------------------------
 // The curve
@@ -448,4 +449,261 @@ pub fn ecdh(secret: []u8, peer: []u8) ![]u8 {
     const full = bytes.new(64);
     try pt_affine(c, full, 0, r, w);
     return bytes.slice(full, 0, 32);
+}
+
+// ---------------------------------------------------------------------------
+// ECDSA
+// ---------------------------------------------------------------------------
+//
+// Verification only, for the reason RSA is verification only: TLS 1.3 needs to
+// check the signature on a certificate and on a CertificateVerify, and nothing
+// in this tree needs to produce one. `std/curve25519` is where a signature is
+// made, because Ed25519 is the scheme this library can implement without a
+// generator and without a constant-time exponentiation it does not have.
+//
+// **Everything here is public**, and that changes what the code is allowed to
+// be. `r`, `s`, the message digest and the peer's key all travel in the clear,
+// so a branch on any of them leaks nothing -- which is what makes the two
+// things below legitimate that would not be in `ecdh`: an addition with real
+// cases in it, and an interleaved double-and-add that skips a zero digit.
+//
+// The scalars live modulo `n` rather than modulo `p`, so this needs a second
+// Montgomery setup. That is `std/bignum` again at eight limbs, which is the
+// third caller of one modular multiplication.
+
+/// The group of points, in the form scalar arithmetic wants it.
+const Group = struct {
+    /// Arithmetic modulo n. Named `m` because `fn` is a keyword.
+    m: bignum.Mont,
+    one: []u32,
+    /// n - 2, the exponent an inversion modulo n is.
+    nm2: []u32,
+};
+
+fn group() Group {
+    const m = bignum.mont(bignum.from_be(N, 0, 32, LIMBS));
+    const one = bignum.new(LIMBS);
+    bignum.mont_one(m, one);
+    const two = bignum.new(LIMBS);
+    two[0] = 2;
+    const nm2 = bignum.new(LIMBS);
+    bignum.sub(nm2, bignum.from_be(N, 0, 32, LIMBS), two);
+    return Group{ .m = m, .one = one, .nm2 = nm2 };
+}
+
+/// Everything one verification needs, allocated once.
+const Verify = struct {
+    w: Work,
+    /// `pt_add_any`'s six.
+    z1: []u32, z2: []u32, u1: []u32, u2: []u32, s1: []u32, s2: []u32,
+    /// Scalars modulo n: the two multipliers, and three temporaries.
+    m1: []u32, m2: []u32, n1: []u32, n2: []u32, n3: []u32,
+    /// The inversion modulo n, which cannot share `Work`'s because that one is
+    /// modulo p and is in use around it.
+    ia: []u32, ib: []u32,
+    /// The four combinations of the two points, and the accumulator.
+    t0: Point, t1: Point, t2: Point, t3: Point, acc: Point,
+};
+
+fn verify_work() Verify {
+    return Verify{
+        .w = work(),
+        .z1 = bignum.new(LIMBS), .z2 = bignum.new(LIMBS),
+        .u1 = bignum.new(LIMBS), .u2 = bignum.new(LIMBS),
+        .s1 = bignum.new(LIMBS), .s2 = bignum.new(LIMBS),
+        .m1 = bignum.new(LIMBS), .m2 = bignum.new(LIMBS),
+        .n1 = bignum.new(LIMBS), .n2 = bignum.new(LIMBS), .n3 = bignum.new(LIMBS),
+        .ia = bignum.new(LIMBS), .ib = bignum.new(LIMBS),
+        .t0 = point(), .t1 = point(), .t2 = point(), .t3 = point(),
+        .acc = point(),
+    };
+}
+
+fn pt_infinity(c: Curve, p: Point) void {
+    bignum.copy(p.x, c.one);
+    bignum.copy(p.y, c.one);
+    var i = 0;
+    while (i < LIMBS) : (i += 1) { p.z[i] = 0; }
+    return;
+}
+
+/// `r = p + q`, for any two points at all.
+///
+/// The three cases `pt_add` above cannot do are done here by looking, which is
+/// exactly what `pt_add`'s comment says a caller must not do with a secret --
+/// and every caller of this one has none. `r` may be `p`.
+fn pt_add_any(c: Curve, r: Point, p: Point, q: Point, v: Verify) void {
+    if (bignum.is_zero(p.z)) { pt_copy(r, q); return; }
+    if (bignum.is_zero(q.z)) { pt_copy(r, p); return; }
+    const m = c.fp;
+    bignum.mont_sqr(m, v.z1, p.z);
+    bignum.mont_sqr(m, v.z2, q.z);
+    bignum.mont_mul(m, v.u1, p.x, v.z2);
+    bignum.mont_mul(m, v.u2, q.x, v.z1);
+    bignum.mont_mul(m, v.s1, p.y, q.z);
+    bignum.mont_mul(m, v.s1, v.s1, v.z2);
+    bignum.mont_mul(m, v.s2, q.y, p.z);
+    bignum.mont_mul(m, v.s2, v.s2, v.z1);
+    if (bignum.cmp(v.u1, v.u2) == 0) {
+        // The same x. Either the same point, which wants the doubling, or a
+        // point and its negative, whose sum is the identity.
+        if (bignum.cmp(v.s1, v.s2) == 0) {
+            pt_double(c, r, p, v.w);
+        } else {
+            pt_infinity(c, r);
+        }
+        return;
+    }
+    pt_add(c, r, p, q, v.w);
+    return;
+}
+
+fn table_pick(d: i64, v: Verify) Point {
+    if (d == 1) { return v.t1; }
+    if (d == 2) { return v.t2; }
+    return v.t3;
+}
+
+/// `r = ka * pa + kb * pb`, by walking both scalars at once.
+///
+/// Shamir's trick: one doubling per bit for the pair rather than one each, and
+/// one addition from a table of the four combinations. That is 256 doublings
+/// and about 192 additions where two separate ladders would be 512 of each --
+/// the optimisation the roadmap left open, taken where it is free.
+///
+/// It is *not* taken on the secret path above, and that is a decision rather
+/// than an omission: a windowed ladder over a secret scalar can reach a step
+/// where the accumulator equals the table entry being added, and `pt_add`
+/// cannot do that case. Ruling it out needs either complete formulas or a mask
+/// over an exception, where the Montgomery ladder rules it out by construction
+/// -- and an ECDH costs four milliseconds against a network round trip.
+fn shamir(c: Curve, r: Point, ka: []u32, pa: Point, kb: []u32, pb: Point, v: Verify) void {
+    pt_infinity(c, v.t0);
+    pt_copy(v.t1, pa);
+    pt_copy(v.t2, pb);
+    pt_add_any(c, v.t3, pa, pb, v);
+    pt_infinity(c, r);
+    var i = 255;
+    while (i >= 0) {
+        pt_double(c, r, r, v.w);
+        const d = i64(bignum.bit(ka, i)) | (i64(bignum.bit(kb, i)) << 1);
+        if (d != 0) { pt_add_any(c, r, r, table_pick(d, v), v); }
+        i -= 1;
+    }
+    return;
+}
+
+/// `out = a^-1 mod n`, both in Montgomery form, by `a^(n-2)`.
+fn sc_inv(g: Group, out: []u32, a: []u32, v: Verify) void {
+    bignum.copy(v.ia, g.one);
+    bignum.copy(v.ib, a);
+    var i = 255;
+    while (i >= 0) {
+        bignum.mont_sqr(g.m, v.ia, v.ia);
+        if (bignum.bit(g.nm2, i) == 1) { bignum.mont_mul(g.m, v.ia, v.ia, v.ib); }
+        i -= 1;
+    }
+    bignum.copy(out, v.ia);
+    return;
+}
+
+/// `a mod n`, in place, for a value already known to be below `2n`.
+///
+/// Every caller has a value below `2^256`, and `n` is above `2^255`, so one
+/// conditional subtraction is the whole reduction.
+fn reduce_n(a: []u32, v: Verify) void {
+    const borrow = bignum.sub(v.n1, a, v.m2);
+    bignum.select(a, a, v.n1, 0 - borrow);
+    return;
+}
+
+/// `r` and `s` from a DER `SEQUENCE { INTEGER r, INTEGER s }`, as 64 big-endian
+/// bytes.
+///
+/// Strict, through `std/der`: a non-minimal integer, a negative one, an
+/// indefinite length or a single trailing byte are all refusals. A signature is
+/// a value a peer chose, and every extra encoding a verifier accepts is a
+/// second name for the same signature.
+fn ecdsa_split(sig: []u8) ![]u8 {
+    const r = der.reader(sig);
+    const seq = try der.read_seq(r);
+    try der.expect_end(r);
+    const rb = try der.read_uint_bytes(seq);
+    const sb = try der.read_uint_bytes(seq);
+    try der.expect_end(seq);
+    const rn = array.len(rb);
+    const sn = array.len(sb);
+    if (rn > 32 or sn > 32) { return error.BadSignature; }
+    const out = bytes.new(64);
+    bytes.copy(out, 32 - rn, rb, 0, rn);
+    bytes.copy(out, 64 - sn, sb, 0, sn);
+    return out;
+}
+
+/// Whether `sig` is an ECDSA signature over `digest` by the key `pubkey`.
+///
+/// `pubkey` is an uncompressed point, `digest` is the output of the hash the
+/// signature algorithm names, and `sig` is DER. `bool` rather than `!void` for
+/// `ed25519_verify`'s reason: there is one thing a caller does about a refusal
+/// and no information in which refusal it was.
+///
+/// **Nothing is done about malleability.** `(r, s)` and `(r, n - s)` are both
+/// signatures over the same message, which is a fact about ECDSA rather than
+/// about this code, and rejecting the high half would refuse signatures that
+/// every other verifier accepts. A protocol that needs a signature to be a
+/// unique name for something needs to say so itself.
+pub fn ecdsa_verify(pubkey: []u8, digest: []u8, sig: []u8) bool {
+    const c = curve();
+    const v = verify_work();
+    if (!valid_with(c, v.w, pubkey)) { return false; }
+
+    const rs = ecdsa_split(sig) catch return false;
+    // 0 < r < n and 0 < s < n. A zero either side makes the verification
+    // equation degenerate, and a value at or above n is a second encoding.
+    if (!below(rs, 0, N) or !below(rs, 32, N)) { return false; }
+    bignum.copy(v.m2, bignum.from_be(N, 0, 32, LIMBS));
+    const rr = bignum.from_be(rs, 0, 32, LIMBS);
+    const ss = bignum.from_be(rs, 32, 32, LIMBS);
+    if (bignum.is_zero(rr) or bignum.is_zero(ss)) { return false; }
+
+    // z is the leftmost 256 bits of the digest -- the whole of a SHA-256 one,
+    // the first half of a SHA-512 one -- taken as a number and reduced.
+    const zb = bytes.new(32);
+    const dn = array.len(digest);
+    if (dn >= 32) {
+        bytes.copy(zb, 0, digest, 0, 32);
+    } else {
+        bytes.copy(zb, 32 - dn, digest, 0, dn);
+    }
+    const zz = bignum.from_be(zb, 0, 32, LIMBS);
+    reduce_n(zz, v);
+
+    // u1 = z/s and u2 = r/s, both modulo n.
+    const g = group();
+    bignum.to_mont(g.m, v.n1, ss);
+    sc_inv(g, v.n2, v.n1, v);
+    bignum.to_mont(g.m, v.n3, zz);
+    bignum.mont_mul(g.m, v.n3, v.n3, v.n2);
+    bignum.from_mont(g.m, v.m1, v.n3);
+    bignum.to_mont(g.m, v.n3, rr);
+    bignum.mont_mul(g.m, v.n3, v.n3, v.n2);
+    bignum.from_mont(g.m, v.n3, v.n3);
+
+    // R = u1*G + u2*Q, and the signature is good when R's x is r modulo n.
+    const gp = point();
+    bignum.copy(gp.x, c.gx);
+    bignum.copy(gp.y, c.gy);
+    bignum.copy(gp.z, c.one);
+    const q = point();
+    bignum.to_mont(c.fp, q.x, bignum.from_be(pubkey, 1, 32, LIMBS));
+    bignum.to_mont(c.fp, q.y, bignum.from_be(pubkey, 33, 32, LIMBS));
+    bignum.copy(q.z, c.one);
+    shamir(c, v.acc, v.m1, gp, v.n3, q, v);
+    if (bignum.is_zero(v.acc.z)) { return false; }
+
+    const xy = bytes.new(64);
+    pt_affine(c, xy, 0, v.acc, v.w) catch return false;
+    const xn = bignum.from_be(xy, 0, 32, LIMBS);
+    reduce_n(xn, v);
+    return bignum.cmp(xn, rr) == 0;
 }

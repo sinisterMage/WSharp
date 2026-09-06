@@ -83,7 +83,8 @@ everywhere.** They are checked when written and inferred when not.
 | Bytes | `std/bytes` — `[]u8` as a buffer, the bridge to and from `str`, word accessors and hex |
 | Crypto | `std/hash` — SHA-2, HMAC, HKDF; `std/cipher` — ChaCha20-Poly1305 and AES-GCM; `std/crypto` — the system's generator |
 | Key agreement | `std/curve25519` — X25519; `std/p256` — ECDH on NIST P-256, with the key-share validation RFC 8446 requires |
-| Signatures | `std/rsa` — PKCS#1 v1.5 and PSS verification, over `std/bignum`'s Montgomery arithmetic |
+| Signatures | `std/rsa` — PKCS#1 v1.5 and PSS verification; `std/curve25519` — Ed25519, signing and verification; `std/p256` — ECDSA verification |
+| TLS | `std/tls` — TLS 1.3, client and server: the key schedule, the record layer, and ClientHello through Finished |
 | Structs | `const P = struct { x: i64 };`, `P{ .x = 1 }`, `p.x` |
 | Subtyping | `const Sub = struct : Base { };` — a subtype widens implicitly |
 | Singletons | a struct with no fields is also a value: its sole instance |
@@ -367,6 +368,9 @@ serving many connections from one worker, not for keeping the collector alive.
 | `std/curve25519` | `x25519` `x25519_base` — and the small-order check on the *output*, which is the one a list of bad encodings misses |
 | `std/p256` | `derive` `ecdh` `valid` — ECDH on secp256r1, with a Montgomery ladder over Jacobian points |
 | `std/rsa` | `public_key` `verify_pkcs1` `verify_pss` — verification only, since TLS 1.3 does no RSA key exchange. The encoded message is built and compared, never parsed |
+| `std/der` | a strict DER reader: `read_value`, `read_seq`, `read_uint`, `read_oid`, `read_bitstring`, `read_time` (item 10) |
+| `std/x509` | `SigKey` and its three subtypes, `parse_spki`, `verify_signature` (item 10) |
+| `std/tls` | TLS 1.3, both ends: `client`, `server`, `feed`, `pending`, and a blocking `Session` over a socket (item 10) |
 
 A **prelude** needs no import, because every module has it:
 
