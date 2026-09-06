@@ -35,6 +35,7 @@
 // expect: an even modulus refused
 // expect: a tiny modulus refused
 // expect: an even exponent refused
+// expect: an exponent above 2^32 refused
 const rsa = @import("std/rsa");
 const hash = @import("std/hash");
 const bytes = @import("std/bytes");
@@ -92,6 +93,9 @@ fn main() i64 {
     bad_key(flip(hex(N), 255), hex(E), "an even modulus refused");
     bad_key(bytes.new(32), hex(E), "a tiny modulus refused");
     bad_key(hex(N), bytes.new(3), "an even exponent refused");
+    // Not wrong, just expensive: `modexp` is one modular multiplication per
+    // exponent bit, so this is a peer deciding how much work we do.
+    bad_key(hex(N), hex("0100000000000001"), "an exponent above 2^32 refused");
     return 0;
 }
 

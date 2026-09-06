@@ -483,6 +483,19 @@ extra `sin_len` byte out of this code entirely.
   switches to the merge only when an arm can reach it. A block that is created
   and never switched to is never added to the layout, so the unused one costs
   nothing.
+- **A dispatched call has one type, so every overload must share its return
+  type -- error set included.** That is what stopped `https://` from being a
+  `TlsConn : Conn` subtype with `conn_read` and `conn_write` as overloads,
+  which is otherwise exactly the shape this language is for: reading through
+  TLS can raise everything a handshake can and reading a socket cannot, so the
+  two would have to write the same two-dozen-name set out twice. An optional
+  field and an `if` keep every error intact. The lattice is right when the
+  members agree about failure and wrong when they do not.
+- **A trust store is a bag; a chain is a structure.** A certificate in the
+  store this library cannot read is dropped and the rest are used; one *in a
+  chain* is a refusal. Answering both the same way either makes a machine with
+  one odd root unusable or makes a broken chain acceptable. `parse_all` and
+  `pem_certificates` take the first rule, `verify_chain` the second.
 - **`std/x509` is below `std/tls`, and the arrow cannot be reversed.** A TLS
   client verifies a CertificateVerify with a key out of a certificate, so one
   module must name the other's types and W# has no re-export. `SigKey` and

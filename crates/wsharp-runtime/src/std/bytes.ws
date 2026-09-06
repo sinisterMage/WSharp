@@ -359,6 +359,98 @@ pub fn from_hex(s: str) ![]u8 {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Base64
+// ---------------------------------------------------------------------------
+//
+// Here for one reason: a certificate store on a Unix machine is a file of PEM,
+// and PEM is base64 between two marker lines. Nothing else in the tree wants
+// it, and it would not be worth a module of its own.
+//
+// **Whitespace is skipped rather than refused**, which is the one place this
+// is deliberately lenient where `from_hex` above is strict -- a PEM body is
+// wrapped at 64 columns by definition, so a decoder that refused a newline
+// could not read the thing it exists to read.
+
+const B64 = []u8{
+    65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77,   // 'A'..'M'
+    78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,   // 'N'..'Z'
+    97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
+    110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122,
+    48, 49, 50, 51, 52, 53, 54, 55, 56, 57,               // '0'..'9'
+    43, 47,                                               // '+', '/'
+};
+
+/// `b` as base64, with no line breaks.
+pub fn to_base64(b: []u8) str {
+    const n = array.len(b);
+    const out = new(((n + 2) / 3) * 4);
+    var i = 0;
+    var o = 0;
+    while (i < n) : (i += 3) {
+        var v = i64(b[i]) << 16;
+        if (i + 1 < n) { v = v | (i64(b[i + 1]) << 8); }
+        if (i + 2 < n) { v = v | i64(b[i + 2]); }
+        out[o] = B64[(v >> 18) & 63];
+        out[o + 1] = B64[(v >> 12) & 63];
+        if (i + 1 < n) { out[o + 2] = B64[(v >> 6) & 63]; } else { out[o + 2] = 61; }
+        if (i + 2 < n) { out[o + 3] = B64[v & 63]; } else { out[o + 3] = 61; }
+        o += 4;
+    }
+    return to_str(out);
+}
+
+fn unbase64(c: i64) i64 {
+    if (c >= 65 and c <= 90) { return c - 65; }
+    if (c >= 97 and c <= 122) { return c - 71; }
+    if (c >= 48 and c <= 57) { return c + 4; }
+    if (c == 43) { return 62; }
+    if (c == 47) { return 63; }
+    return -1;
+}
+
+fn is_space(c: i64) bool {
+    return c == 32 or c == 9 or c == 10 or c == 13;
+}
+
+/// The bytes a base64 string spells, ignoring whitespace.
+///
+/// A character that is neither a digit of the alphabet, nor padding, nor
+/// whitespace is `error.BadFormat`; so is a length that cannot be a whole
+/// number of bytes.
+pub fn from_base64(s: str) ![]u8 {
+    const n = text.len(s);
+    const out = new((n / 4 + 1) * 3);
+    var acc = 0;
+    var bits = 0;
+    var o = 0;
+    var pad = 0;
+    var i = 0;
+    while (i < n) : (i += 1) {
+        const c = text.byte_at(s, i);
+        if (is_space(c)) { continue; }
+        if (c == 61) { pad += 1; continue; }
+        // Padding is the end: a digit after it is a second message pretending
+        // to be part of this one.
+        if (pad != 0) { return error.BadFormat; }
+        const d = unbase64(c);
+        if (d < 0) { return error.BadFormat; }
+        acc = (acc << 6) | d;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out[o] = u8((acc >> bits) & 0xff);
+            o += 1;
+        }
+    }
+    // Whatever is left over must be zero: those are the bits the padding
+    // stands for, and a non-zero remainder is an encoding of nothing.
+    if (bits >= 6) { return error.BadFormat; }
+    if ((acc & ((1 << bits) - 1)) != 0) { return error.BadFormat; }
+    if (pad > 2) { return error.BadFormat; }
+    return slice(out, 0, o);
+}
+
 fn nibble(c: i64) !i64 {
     if (c >= 48 and c <= 57) { return c - 48; }
     if (c >= 97 and c <= 102) { return c - 87; }

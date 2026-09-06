@@ -427,6 +427,15 @@ fn library() -> Vec<Builtin> {
             ptr: crate::crypto::ws_crypto_random as *const u8,
         },
         Builtin {
+            module: CRYPTO_MODULE,
+            name: "raw_system_roots",
+            params: &[],
+            // `NotSupported` is the ordinary answer on a system that keeps its
+            // anchors in a file, which `std/x509` then goes and reads.
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::Str, &["NotSupported", "IoFailed"]),
+            ptr: crate::crypto::ws_crypto_system_roots as *const u8,
+        },
+        Builtin {
             module: TIME_MODULE,
             name: "now",
             params: &[],

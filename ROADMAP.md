@@ -18,10 +18,11 @@ Session 10 delivered item 10's stages two and three, the asymmetric half:
 X25519 and P-256 for key agreement, a fixed-width bignum with Montgomery
 arithmetic, and RSA PKCS#1 v1.5 and PSS verification above it — all of it W#,
 with no compiler change at all, because a 32-bit limb is what makes the 64x64
-product item 9 reserved a place for unnecessary. Session 11 delivered stage
-four, the protocol: Ed25519 and ECDSA, a strict DER reader, the record layer
-and the handshake at both ends — replayed against RFC 8448's published traces
-byte for byte, and run against itself over every suite and both groups.
+product item 9 reserved a place for unnecessary. Session 11 finished it: stage four
+is the protocol — Ed25519 and ECDSA, a strict DER reader, the record layer and
+the handshake at both ends, replayed against RFC 8448's published traces byte
+for byte — and stage five is the certificate, so `http.get("https://…")` now
+returns a page.
 
 This file records what was built and why it was built that way, the limitations
 that were chosen rather than stumbled into, and — for the items still ahead —
@@ -831,16 +832,19 @@ readiness API is what lets one worker serve many connections.
 
 - **`kqueue` and IOCP**, per the decision above: an upgrade behind the existing
   `Poller`, wanted when a program has thousands of sockets rather than tens.
-- **No TLS**, so `https://` is `error.NotSupported` rather than a connection
-  that quietly speaks the wrong protocol. That is item 10, and item 9 comes
-  first because the ciphers cannot be written without it.
+- **TLS arrived in item 10** and turned `https://` from `error.NotSupported`
+  into a connection. It cost `std/http` a field on `Conn`, a branch in
+  `parse_url` and four call sites, which is what "a TLS connection is a
+  `Socket` by another name" was a bet on.
 - **No connection pooling.** The HTTP client opens a socket per request and
   sends `Connection: close`, which is the honest shape for a client with no
   pool. `Conn`, `send_request` and `read_response` are exposed so that a
   protocol wanting to reuse a socket can.
 - **A failed request leaks its socket.** W# has no `defer`, so a `try` that
-  leaves `http.request` early skips the `close` below it. The process closes
-  everything at exit, so this is a leak within one run rather than a leak.
+  leaves `http.request_with` early skips the `close` below it. The process
+  closes everything at exit, so this is a leak within one run rather than a
+  leak -- but a TLS connection is a much more expensive thing to leak than a
+  socket was, and this is the first place that shows.
 
 ---
 
@@ -990,20 +994,20 @@ Doing it turned up two things:
   argument's type.
 
 
-## 10. TLS 1.3, written in W# — **in progress: stages one to four are done**
+## 10. TLS 1.3, written in W# — **done**
 
 Item 8 left `https://` as `error.NotSupported` rather than a connection that
 quietly speaks the wrong protocol. Removing it is what this item is for -- and
 what the package manager needs before it can fetch anything from a host it did
 not already trust.
 
-It is also by a wide margin the largest item in the tree, so it is being built
-in stages rather than pretended into one commit. **Stage one is the byte
-plumbing and every symmetric primitive TLS 1.3 uses. Stages two and three are
-the asymmetric half: two curves for key agreement, and a bignum and RSA for
-verifying a certificate's signature. Stage four is the protocol itself: two
-more signature schemes, the record layer, and the handshake.** The stage after
-them is listed at the end.
+It was also by a wide margin the largest item in the tree, so it was built in
+stages rather than pretended into one commit. **Stage one is the byte plumbing
+and every symmetric primitive TLS 1.3 uses. Stages two and three are the
+asymmetric half: two curves for key agreement, and a bignum and RSA for
+verifying a certificate's signature. Stage four is the protocol: two more
+signature schemes, the record layer, and the handshake. Stage five is the
+certificate: X.509, a chain, three root stores, and `https://`.**
 
 ### Why in W# rather than in the runtime
 
@@ -1315,6 +1319,97 @@ recorded bytes is a client whose *own* bytes nothing has ever read.
   resumed 1.2 one to a middlebox. The record is not part of the transcript, and
   one that is not a single `0x01` is refused.
 
+### Stage five: certificates, a chain, three root stores, and `https://`
+
+Item 8 left one line in `std/http`: `https://` was `error.NotSupported`
+"rather than a connection that quietly speaks the wrong protocol". This is that
+line removed, and everything a client needs before removing it is honest --
+which is a certificate parser, a chain, and somewhere to get the anchors from.
+
+#### What was built
+
+| Piece | Where |
+|---|---|
+| The certificate around the key: validity, names, and the four extensions that change the answer | `std/x509.ws` |
+| Chain building, with `pathLenConstraint`, `basicConstraints` and `keyUsage` enforced | same |
+| `subjectAltName` matching, with one wildcard in the leftmost label and nowhere else | same |
+| PEM, and the candidate paths every Linux and BSD keeps a bundle at | same |
+| The platform stores: Security.framework on macOS, `CertOpenSystemStoreW` on Windows | `sys/{bsd,windows}.rs`, `crypto.rs` |
+| Base64, which is the whole of what PEM is | `std/bytes.ws` |
+| `https://`, as a field on `Conn` and four call sites | `std/http.ws` |
+| A bound on the RSA public exponent | `std/rsa.ws` |
+| Certificates minted for the tests, each wrong in one way | `tests/cases/x509_*.ws` |
+| A request over TLS to a server this library also wrote | `tests/cases/https_loopback.ws` |
+
+#### Decisions worth recording
+
+- **`subjectAltName`, and never the common name.** Every browser stopped
+  looking at the CN years ago and the reason is worth keeping: a CN is a
+  display string with no structure, so a certificate for
+  `CN=example.com, O=Some Company` and one issued to a company literally named
+  `example.com` are the same bytes to a naive reader. A `dNSName` says what it
+  is. One wildcard, covering the whole of the leftmost label and nothing else,
+  so `*.a.com` is not a certificate for `a.com` and not one for `c.b.a.com`.
+- **A name is compared as bytes.** RFC 5280 has rules about folding case in a
+  `PrintableString`, and no authority relies on them: an issuer name in a
+  certificate and the same authority's subject name in its own are the same
+  encoding, because one was copied from the other. Comparing encodings cannot
+  accidentally make two different names equal, which the folding rules can.
+- **An algorithm this library cannot verify is not a reason to refuse a
+  certificate.** It was at first, and that was wrong in a way the system store
+  made obvious: a *trust anchor's* own signature is never checked -- it is
+  trusted for being in the store, not for having signed itself -- so refusing
+  one for its signature algorithm drops authorities for a reason that never
+  applies to them. The scheme becomes zero instead, `verify_signature` refuses
+  it, and a chain that actually needs the signature still fails. That change
+  took the local store from 79 usable roots to 83.
+- **What is left out is 36 of them, and the reason is P-384.** Thirty-five of
+  this machine's 119 root certificates have `secp384r1` keys and one has
+  `secp521r1`, and `std/p256` is the only curve with point arithmetic behind
+  it. That is the single biggest limitation of this item: `https://` reaches
+  `www.google.com`, whose chain is a P-256 leaf under three RSA certificates,
+  and does not reach `example.com`, whose chain goes through two P-384
+  intermediates. It is also the cheapest thing left to fix -- the formulas are
+  the same, `a` is -3 on both curves, and the arithmetic is `std/bignum`'s
+  Montgomery multiplication at twelve limbs instead of eight, which is exactly
+  the payoff of not having written a Solinas reduction for P-256.
+- **A store is a bag, a chain is a structure.** A certificate in the store that
+  this library cannot read is dropped and the rest are used; a certificate *in
+  a chain* that it cannot read is a refusal. Those are different questions --
+  one fewer authority to trust against one connection to a peer whose identity
+  cannot be established -- and answering them the same way would either make a
+  container with an odd root unusable or make a broken chain acceptable.
+- **An unknown extension marked critical is a refusal.** That is what critical
+  means: the issuer saying "refuse this certificate rather than ignore me". It
+  is the one place this parser is strict about something it could shrug at, and
+  it is the historical shape of several real failures.
+- **The clock is read at the handshake, not kept in the configuration.** A
+  configuration holds the parsed trust store because parsing it is expensive; a
+  long-lived process holding a *time* would go on believing a certificate that
+  expired while it was running.
+- **A subtype and an overload set were tried for `Conn` first, and do not
+  work.** `TlsConn : Conn` with `conn_read` and `conn_write` as overloads is
+  what this language is for, and it is what `https://` looks like it should be.
+  It fails on a rule that is not going to change: **a dispatched call has one
+  type, so every overload must share it** -- and reading through TLS can raise
+  everything a handshake can, two dozen names, where reading a socket raises
+  ten. Making them agree means writing the whole set out twice and keeping two
+  copies in step, or catching inside and answering with one flattened error,
+  which throws away the reason a connection failed. An optional field and an
+  `if` keep every error intact, and the comment in the file says so rather than
+  leaving the next reader to rediscover it.
+- **The root store is the fourth arm-shaped problem, and its arms have less in
+  common than any before it.** macOS has a keychain and Windows a store API,
+  and both hand back a blob of length-prefixed DER that W# cuts up -- the
+  runtime touching bytes and W# building the objects, which is the boundary
+  rule this whole item is written to. Every Linux and BSD has a file instead,
+  at a path that differs by distribution, so the list of candidate paths lives
+  in W# where it can be read rather than compiled in three times.
+- **The RSA exponent is bounded at 2^32 + 1**, which is item 10's last deferred
+  item. It is not a correctness fix: `modexp` costs one modular multiplication
+  per exponent bit, so a certificate carrying a 2048-bit exponent is a peer
+  deciding how much work this machine does.
+
 ### What being wrong costs here, and how that is paid
 
 This is the first thing in the tree where being wrong is a security problem
@@ -1354,6 +1449,25 @@ cipher suites, both groups and a HelloRetryRequest, and `tls_socket.ws` does it
 once more over a real socket with the server on a worker of its own, which is
 also two threads blocking in `read(2)` inside the collector's safe region.
 
+**A certificate cannot be borrowed, so the fixtures are minted.** A real
+certificate expires and takes the test with it, and the interesting cases --
+expired, not yet valid, the wrong name, an intermediate that is not a
+certificate authority, a `pathLenConstraint` violated, an unknown critical
+extension -- do not exist in the wild to be borrowed anyway. So `x509_reject.ws`
+has thirteen certificates made for it, each wrong in exactly one way, written
+by a hand-rolled DER encoder in a node script because node cannot issue one.
+Every certificate it produces is handed straight back to node's
+`crypto.X509Certificate`, which is the independent check that what was written
+is what was meant. The chain checks pass a *fixed* time rather than the clock,
+so the case says the same thing whenever it is run.
+
+And once, at the end, a real one: `http.get("https://www.google.com/")`
+returning a 200 over a chain checked against this machine's own store is the
+only thing that proves the root store, the parser, the chain builder and the
+name check together. It is not a case -- the harness runs every example and a
+network-dependent one would make CI depend on the weather -- so it is a command
+in the README instead.
+
 **RSA has no published vector this library could use**, because the ones that
 exist are 1024-bit and SHA-1 and this only carries the three SHA-2 prefixes TLS
 1.3 allows. So its vectors were *made*, and made twice: a key from one
@@ -1368,28 +1482,40 @@ rejection is the historical failure.
 
 ### What is left
 
-One stage is left:
+`https://` works. `http.get("https://www.google.com/")` returns a 200 with
+90 KB of HTML, over a TLS 1.3 connection whose certificate chain was checked
+against this machine's own trust store. What is left is a list of things that
+were left on purpose, and one that was not:
 
-| Stage | Contents |
-|---|---|
-| 5 | X.509: DER parsing, validity and name checking, chain building; the root store on three platforms; `https://` |
-
-Half of it is already in place. `std/der` reads the encoding strictly and
-`std/x509` reads a SubjectPublicKeyInfo and verifies with what it finds; what
-stage five adds to that module is the certificate around the key -- validity,
-names, extensions -- and the chain. `std/tls`'s `Config` has the seam it plugs
-into: a client trusts a pinned key today, and a chain when there is one to
-check.
+- **No P-384, and it is the limitation that matters.** Thirty-six of this
+  machine's 119 root certificates have keys this library cannot use, and a
+  large share of the modern web chains through a P-384 intermediate --
+  `example.com` does. It is also the cheapest thing on this list to fix,
+  because `std/p256` was written against `std/bignum`'s generic Montgomery
+  multiplication rather than a fast reduction for one prime: the formulas are
+  the same, `a` is -3 on both curves, and what changes is a table of constants
+  and a limb count. Anyone picking this up should start here.
+- **Nothing checks revocation.** No OCSP, no CRL, no stapling. A certificate
+  that was issued and then withdrawn is still accepted until it expires, which
+  is a real hole and a large piece of work -- OCSP is another protocol and
+  stapling is another extension. Saying so is better than a half-check that
+  looks like one.
+- **No name constraints and no certificate policies.** Both are extensions a
+  chain can carry, and both are *critical* when they appear, so a certificate
+  carrying one is refused rather than misread. That is the safe direction and
+  it does mean a handful of authorities cannot be used.
+- **No ALPN.** `std/http` speaks HTTP/1.1 and nothing else, so there is nothing
+  to negotiate yet; a client that wanted HTTP/2 would need the extension and a
+  second protocol behind it.
 
 Smaller things left behind these stages:
 
 - **No 1.2-style RSA key transport and no RSA signing**, deliberately, per the
   decision above. If a signing key ever has a caller, it needs a constant-time
   `modexp` and the Chinese remainder theorem, and neither is written.
-- **A public exponent may be any size.** `modexp` costs one modular
-  multiplication per exponent bit, so a certificate carrying a 2048-bit
-  exponent would cost two thousand of them rather than seventeen. Stage five's
-  parser is where the bound goes, and it is still not checked anywhere.
+- **A public exponent is bounded at 2^32 + 1** -- done in stage five. `modexp`
+  costs one modular multiplication per exponent bit, so an unbounded one is a
+  peer deciding how much work this machine does.
 - **P-256's *secret* scalar multiplication is still a bare ladder.** Stage four
   windowed the half of it that is public -- a verification is now one
   interleaved double-and-add rather than two ladders -- and deliberately left
@@ -1407,14 +1533,14 @@ Smaller things left behind these stages:
   cipher suites and both groups, always. A caller that wants to insist on one
   has no way to say so, where a server does (`server_requiring`).
 
-And the decisions already taken about stages four and five:
+The decisions taken in advance about these two stages, and how they turned out:
 
 - **TLS 1.3 only.** No 1.2, no fallback, no downgrade dance. A client that
   cannot talk to a 1.2-only server fails loudly against a server that should be
   upgraded, and every hour spent on 1.2 is an hour spent on the version with the
   worse security story.
 - **The root store is a fourth arm-shaped problem**, and the exploration for
-  this stage narrowed it. Most Linux distributions ship a concatenated PEM
+  that stage predicted it correctly. Most Linux distributions ship a concatenated PEM
   bundle, so a list of candidate paths tried with the existing `io.exists` and
   `io.read_file` covers Linux with no new syscall at all; macOS ships no such
   file and needs Security.framework, and Windows' store is not a file path, so
@@ -1422,14 +1548,16 @@ And the decisions already taken about stages four and five:
   Mozilla's list instead would make the build reproducible and the trust
   decisions stale, and staleness in a trust store is the failure mode that
   matters.
-- **A TLS connection is a `Socket` by another name**, and `std/http` is already
-  shaped for it: every read and write in that module bottoms out in three calls
-  on `Conn.socket`, so `https://` is a change to `Conn` and `parse_url` rather
-  than a second client.
-- **The wall clock has no caller yet.** It went in with this stage because it is
-  one declaration per arm and because X.509 validity checking is the first thing
-  stage five needs; it is exposed as `std/time.now` and tested against a date
-  that has certainly passed.
+- **A TLS connection is a `Socket` by another name**, and that turned out to be
+  exactly right: `https://` is a field on `Conn`, a branch in `parse_url`, and
+  four call sites. The chunked decoder, the header parser and the status
+  mapping did not change at all. What it is *not* is a subtype and an overload
+  set, which is what the shape deserved and which the error sets forbid -- the
+  reason is above, in stage five's decisions.
+- **The wall clock now has its caller.** It went in with stage one against the
+  day X.509 validity checking would want it; `std/tls` reads it once per
+  handshake, at the moment the chain is checked rather than when the
+  configuration was built.
 
 ---
 

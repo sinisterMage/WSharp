@@ -60,8 +60,28 @@ fn main() i64 {
         b = a;
         a = head;
     }
+    // A trace begins on its own, but only when the collector is *idle*: a
+    // threshold crossed while one is still marking starts nothing, so on a
+    // busy machine the second trace can simply be skipped and this case
+    // measured how the machine was scheduled rather than what the collector
+    // does. Keep allocating until two have actually begun, and bound the loop
+    // so a collector that never traces fails the case rather than hanging the
+    // suite -- which is the rule `net_poller.ws` had to learn about readiness,
+    // and is the same rule.
+    var spins = 0;
+    while (gc_traces() < 2 and spins < 200) : (spins += 1) { churn(); }
+
     print_int(total);
     print_int(length(a));
     print_bool(gc_traces() >= 2);
     return 0;
+}
+
+/// Five thousand nodes, kept only long enough to have been allocated.
+fn churn() void {
+    var head: ?Node = null;
+    var i = 0;
+    while (i < 5000) : (i += 1) { head = Node{ .value = i, .next = head }; }
+    if (length(head) != 5000) { print("unreachable"); }
+    return;
 }

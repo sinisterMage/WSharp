@@ -141,6 +141,19 @@ pub(crate) fn exists(path: &[u8]) -> bool {
 /// return short -- `getrandom` caps a call at 32 MiB and gives back what it
 /// has when a signal arrives -- and because `EINTR` is handled once in this
 /// file for everything else too.
+/// The operating system's trust anchors, as length-prefixed DER certificates,
+/// or `None` where the system keeps them in a file instead.
+///
+/// The fourth arm-shaped problem, and the one with the least in common between
+/// its arms: macOS has a keychain, Windows has a store API, and every Linux and
+/// BSD has a file at a path that differs by distribution. So two arms answer
+/// here and the third answers `None`, and `std/x509` reads the file -- which is
+/// the right split, because a list of candidate paths is data and belongs
+/// where it can be read rather than compiled in three times.
+pub(crate) fn system_roots() -> Option<Vec<u8>> {
+    imp::system_roots()
+}
+
 pub(crate) fn random(buf: &mut [u8]) -> Result<(), Errno> {
     let mut filled = 0;
     while filled < buf.len() {

@@ -94,7 +94,9 @@ pub const PublicKey = struct {
 /// `INTEGER` writes a value whose top bit is set. What is not allowed is a
 /// modulus that is even or absurdly small, or an exponent that is even or one:
 /// each of those is a key no signature under it could mean anything, and
-/// finding out here is better than finding out in the arithmetic.
+/// finding out here is better than finding out in the arithmetic. An exponent
+/// above 2^32 + 1 is refused for a different reason -- it is not wrong, it is
+/// expensive, and how much work this machine does is not a peer's decision.
 pub fn public_key(n: []u8, e: []u8) !PublicKey {
     const limbs = (array.len(n) + 3) / 4;
     if (limbs == 0) { return error.BadKey; }
@@ -110,6 +112,12 @@ pub fn public_key(n: []u8, e: []u8) !PublicKey {
     if (bits < 512) { return error.BadKey; }
     if ((nn[0] & 1) == 0) { return error.BadKey; }
     if ((ee[0] & 1) == 0 or bignum.bit_len(ee) < 2) { return error.BadKey; }
+    // `modexp` costs one modular multiplication per exponent bit, so a
+    // certificate carrying a 2048-bit public exponent would cost two thousand
+    // of them where 65537 costs seventeen -- a peer choosing how much work
+    // this machine does. Thirty-three bits is 2^32 + 1, which is above every
+    // exponent anything real uses and far below where the cost matters.
+    if (bignum.bit_len(ee) > 33) { return error.BadKey; }
     return PublicKey{
         .m = bignum.mont(nn),
         .e = ee,

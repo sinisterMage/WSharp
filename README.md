@@ -84,7 +84,7 @@ everywhere.** They are checked when written and inferred when not.
 | Crypto | `std/hash` — SHA-2, HMAC, HKDF; `std/cipher` — ChaCha20-Poly1305 and AES-GCM; `std/crypto` — the system's generator |
 | Key agreement | `std/curve25519` — X25519; `std/p256` — ECDH on NIST P-256, with the key-share validation RFC 8446 requires |
 | Signatures | `std/rsa` — PKCS#1 v1.5 and PSS verification; `std/curve25519` — Ed25519, signing and verification; `std/p256` — ECDSA verification |
-| TLS | `std/tls` — TLS 1.3, client and server: the key schedule, the record layer, and ClientHello through Finished |
+| TLS | `std/tls` — TLS 1.3, client and server; `std/x509` — certificates and chains, so `http.get("https://…")` works |
 | Structs | `const P = struct { x: i64 };`, `P{ .x = 1 }`, `p.x` |
 | Subtyping | `const Sub = struct : Base { };` — a subtype widens implicitly |
 | Singletons | a struct with no fields is also a value: its sole instance |
@@ -268,6 +268,36 @@ Note that `.cargo/config.toml` sets `-Cforce-frame-pointers=yes`: the collector
 walks the frame-pointer chain out of the runtime to find its roots, and the
 chain has to be unbroken through the Rust frames as well as the generated ones.
 
+### Fetching something over TLS
+
+Every part of this is a `.ws` file — the hash, the cipher, the curve, the
+signature, the certificate parser and the handshake — and the trust anchors are
+the ones the machine already has.
+
+```zig
+const http = @import("std/http");
+const text = @import("std/str");
+
+fn main() i64 {
+    const answer = http.get("https://www.google.com/") catch return 1;
+    print_int(answer.code);
+    print_int(text.len(answer.body));
+    return 0;
+}
+```
+
+It is not in `examples/`, because the test suite runs every example and a
+network-dependent one would make CI depend on the weather. Save it and run it:
+
+```sh
+nix-shell --run "cargo run -p wsharp-cli -- run /tmp/fetch.ws"
+```
+
+The one thing to know before trying an arbitrary host: **there is no P-384**,
+so a chain that goes through a `secp384r1` intermediate cannot be verified.
+That covers a good deal of the modern web — `example.com` is one — and it is
+the first thing listed under what is left in [ROADMAP.md](ROADMAP.md).
+
 ## The compiler
 
 ```sh
@@ -357,7 +387,7 @@ serving many connections from one worker, not for keeping the collector alive.
 | `std/bits` | `rotl` `rotr` — rotation, generic over `Integer`, one instruction on both targets |
 | `std/io` | `read_file` `read_line` `write_file` `exists` — the fallible ones name their errors, e.g. `!{NotFound, PermissionDenied, IoFailed}str` |
 | `std/net` | TCP: `Socket` `Listener` and `connect` `listen` `accept` `read` `write` `write_all` `read_exactly` `read_all` `set_nonblocking` `close`. UDP: `Datagrams` `Peer` `Datagram` and `udp` `send_to` `receive` `reply`. Readiness: `Poller` `Event` and `poller` `watch` `wait`. IPv4 or IPv6, with the family the resolver's choice |
-| `std/http` | the 27 HTTP status types, materialised on first mention, plus an HTTP/1.1 client and server: `get` `post` `request` `read_request` `respond` `header` `status_of` |
+| `std/http` | the 27 HTTP status types, materialised on first mention, plus an HTTP/1.1 client and server: `get` `post` `request` `read_request` `respond` `header` `status_of`; and since item 10, `https://` over `std/tls` |
 | `std/broker` | `Topic[M]` `Consumer[M]` and `topic` `publish` `subscribe` `next` `commit` `seek` `len` |
 | `std/bytes` | `[]u8` as a buffer, and the bridge to and from `str`: `new` `of` `to_str` `slice` `concat` `copy` `fill` `xor` `equal`, the big- and little-endian word accessors, `to_hex` `from_hex` |
 | `std/hash` | SHA-256, SHA-384 and SHA-512, one-shot and incremental, plus `hmac` `hkdf_extract` `hkdf_expand` — written once over a `Hash` value that says a block size, a digest size and how to hash |
@@ -369,7 +399,7 @@ serving many connections from one worker, not for keeping the collector alive.
 | `std/p256` | `derive` `ecdh` `valid` — ECDH on secp256r1, with a Montgomery ladder over Jacobian points |
 | `std/rsa` | `public_key` `verify_pkcs1` `verify_pss` — verification only, since TLS 1.3 does no RSA key exchange. The encoded message is built and compared, never parsed |
 | `std/der` | a strict DER reader: `read_value`, `read_seq`, `read_uint`, `read_oid`, `read_bitstring`, `read_time` (item 10) |
-| `std/x509` | `SigKey` and its three subtypes, `parse_spki`, `verify_signature` (item 10) |
+| `std/x509` | `SigKey` and its three subtypes, `parse_spki`, `verify_signature`; certificates, `matches_host`, `verify_chain`, `pem_certificates`, `system_roots` (item 10) |
 | `std/tls` | TLS 1.3, both ends: `client`, `server`, `feed`, `pending`, and a blocking `Session` over a socket (item 10) |
 
 A **prelude** needs no import, because every module has it:
@@ -480,9 +510,12 @@ Sessions are numbered by the original feature list:
       they are used at. `i64` was the right default and the wrong only choice
       the moment a program computed on bytes; ChaCha20's quarter round is now a
       test case rather than a thing the language could not say.
-- [ ] **10.** TLS 1.3, written in W#, with certificate chains verified against
+- [x] **10.** TLS 1.3, written in W#, with certificate chains verified against
       the platform's own root store — which is what turns `https://` from
-      `error.NotSupported` into a connection.
+      `error.NotSupported` into a connection. Every hash, cipher, curve,
+      signature scheme and X.509 structure is a `.ws` file; the whole client
+      and server are replayed against RFC 8448's published traces byte for
+      byte. `http.get("https://www.google.com/")` returns a page.
 - [ ] **11.** Package management, in a tool called **ingot**: git spoken rather
       than shelled out to, a content-addressed store, and a resolver that says
       *why* a version was ruled out rather than that it was.

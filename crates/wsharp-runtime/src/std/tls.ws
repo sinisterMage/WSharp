@@ -35,6 +35,8 @@ const curve = @import("std/curve25519");
 const p256 = @import("std/p256");
 const x509 = @import("std/x509");
 const net = @import("std/net");
+const list = @import("std/list");
+const time = @import("std/time");
 
 // ---------------------------------------------------------------------------
 // The registry
@@ -281,10 +283,21 @@ pub const Config = struct {
     host: str,
     /// A key that is trusted outright, or null.
     pinned: ?x509.SigKey,
+    /// The trust anchors a chain must reach, or null.
+    roots: ?list.List[x509.Cert],
 };
 
+/// A configuration that trusts nothing, and so completes no handshake.
+///
+/// Useful only as a starting point; `pinned_config` and `roots_config` are the
+/// two that can actually finish.
 pub fn client_config(host: str) Config {
-    return Config{ .host = host, .pinned = null };
+    return Config{ .host = host, .pinned = null, .roots = null };
+}
+
+/// A configuration that checks the peer's chain against a set of anchors.
+pub fn roots_config(host: str, roots: list.List[x509.Cert]) Config {
+    return Config{ .host = host, .pinned = null, .roots = roots };
 }
 
 /// A configuration that trusts exactly one key, whatever certificate arrives.
@@ -292,7 +305,7 @@ pub fn client_config(host: str) Config {
 /// Honest about what it is: this checks that the peer holds the private half
 /// of a key the caller already knows, which is key pinning and not a chain.
 pub fn pinned_config(host: str, key: x509.SigKey) Config {
-    return Config{ .host = host, .pinned = key };
+    return Config{ .host = host, .pinned = key, .roots = null };
 }
 
 /// What a server needs.
@@ -1091,13 +1104,14 @@ fn client_certificate(c: Conn, body: []u8) !void {
     // Every entry is read, so that a malformed one behind a well-formed leaf
     // is still a malformed message.
     var first = bytes.new(0);
+    var rest: list.List[[]u8] = list.new();
     var n = 0;
     while (!done(certs)) {
         const dn = try get_u24(certs);
         const cert = try get_bytes(certs, dn);
         const en = try get_u16(certs);
         const skip = try get_sub(certs, en);
-        if (n == 0) { first = cert; }
+        if (n == 0) { first = cert; } else { list.push(rest, cert); }
         n += 1;
     }
 
@@ -1105,6 +1119,14 @@ fn client_certificate(c: Conn, body: []u8) !void {
         // Key pinning: the chain is not consulted at all, and the connection
         // is exactly as trustworthy as the caller's belief about that key.
         c.peer_key = k;
+        return;
+    }
+    if (c.cfg.roots) |roots| {
+        // The clock is read here rather than kept in the config, so that a
+        // long-lived program does not go on believing a certificate that
+        // expired while it was running.
+        c.peer_key = try x509.verify_chain(first, list.to_array(rest), roots,
+                                           c.cfg.host, time.now());
         return;
     }
     fail(c, AL_BAD_CERTIFICATE);
@@ -1567,7 +1589,7 @@ pub fn client_replay(cfg: Config, hello: []u8, group: i64, secret: []u8) !Conn {
 
 /// A server waiting for a ClientHello.
 pub fn server(scfg: ServerConfig) Conn {
-    const c = new_conn(ROLE_SERVER, Config{ .host = "", .pinned = null });
+    const c = new_conn(ROLE_SERVER, Config{ .host = "", .pinned = null, .roots = null });
     c.scfg = scfg;
     c.state = ST_WAIT_CH;
     return c;

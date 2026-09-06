@@ -578,3 +578,72 @@ impl Poller {
         Ok(out)
     }
 }
+
+/// The trust anchors, as a blob of length-prefixed DER certificates.
+///
+/// macOS keeps them in a keychain rather than in a file, so this is the one
+/// place in the family that has an answer. Security.framework hands back a
+/// `CFArray` of `SecCertificateRef`, and `SecCertificateCopyData` turns each
+/// into the DER this library reads.
+///
+/// The FreeBSDs go through the file path list in `std/x509` like Linux, so
+/// they answer `None`.
+#[cfg(target_os = "macos")]
+pub(crate) fn system_roots() -> Option<Vec<u8>> {
+    // Opaque pointers, all of them: nothing here reads a field of a Core
+    // Foundation object, which is what makes declaring them by hand safe.
+    type CFTypeRef = *const core::ffi::c_void;
+    type CFArrayRef = CFTypeRef;
+    type CFDataRef = CFTypeRef;
+    type CFIndex = isize;
+    type OSStatus = i32;
+
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecTrustCopyAnchorCertificates(certs: *mut CFArrayRef) -> OSStatus;
+        fn SecCertificateCopyData(cert: CFTypeRef) -> CFDataRef;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFArrayGetCount(array: CFArrayRef) -> CFIndex;
+        fn CFArrayGetValueAtIndex(array: CFArrayRef, index: CFIndex) -> CFTypeRef;
+        fn CFDataGetLength(data: CFDataRef) -> CFIndex;
+        fn CFDataGetBytePtr(data: CFDataRef) -> *const u8;
+        fn CFRelease(object: CFTypeRef);
+    }
+
+    let mut anchors: CFArrayRef = core::ptr::null();
+    // Copy semantics: this owns the array and every certificate in it, and
+    // releases both below.
+    if unsafe { SecTrustCopyAnchorCertificates(&mut anchors) } != 0 || anchors.is_null() {
+        return None;
+    }
+    let count = unsafe { CFArrayGetCount(anchors) };
+    let mut out = Vec::new();
+    for i in 0..count {
+        let cert = unsafe { CFArrayGetValueAtIndex(anchors, i) };
+        if cert.is_null() {
+            continue;
+        }
+        let data = unsafe { SecCertificateCopyData(cert) };
+        if data.is_null() {
+            continue;
+        }
+        let len = unsafe { CFDataGetLength(data) };
+        let ptr = unsafe { CFDataGetBytePtr(data) };
+        if len > 0 && !ptr.is_null() {
+            let der = unsafe { core::slice::from_raw_parts(ptr, len as usize) };
+            out.extend_from_slice(&(der.len() as u32).to_be_bytes());
+            out.extend_from_slice(der);
+        }
+        unsafe { CFRelease(data) };
+    }
+    unsafe { CFRelease(anchors) };
+    if out.is_empty() { None } else { Some(out) }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn system_roots() -> Option<Vec<u8>> {
+    None
+}

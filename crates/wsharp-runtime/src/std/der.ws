@@ -270,6 +270,34 @@ pub fn read_bitstring(r: Reader) ![]u8 {
     return bytes.slice(v.buf, v.from + 1, v.to);
 }
 
+/// A BIT STRING that need not be a whole number of bytes: the bytes, and how
+/// many bits of the last one are padding.
+///
+/// `read_bitstring` above is the strict form and is what a key or a signature
+/// wants, because both are byte strings. A `keyUsage` is not: it is nine named
+/// bits, so almost every one in the world has unused bits and the strict form
+/// would refuse the lot.
+pub const Bits = struct { bytes: []u8, unused: i64 };
+
+pub fn read_bits(r: Reader) !Bits {
+    const v = try read_value(r);
+    if (v.tag != BIT_STRING) { return error.BadFormat; }
+    if (v.to == v.from) { return error.BadFormat; }
+    const unused = i64(v.buf[v.from]);
+    if (unused > 7) { return error.BadFormat; }
+    // No bits at all, but a count of how many are missing, is not a number.
+    if (unused != 0 and v.to == v.from + 1) { return error.BadFormat; }
+    return Bits{ .bytes = bytes.slice(v.buf, v.from + 1, v.to), .unused = unused };
+}
+
+/// Bit `i` of a BIT STRING, counted from the most significant bit of the first
+/// byte, which is how X.509 numbers the bits of a `keyUsage`.
+pub fn bit_set(b: Bits, i: i64) bool {
+    const total = array.len(b.bytes) * 8 - b.unused;
+    if (i < 0 or i >= total) { return false; }
+    return ((b.bytes[i / 8] >> u8(7 - (i % 8))) & 1) == 1;
+}
+
 pub fn read_octets(r: Reader) ![]u8 {
     const v = try read_value(r);
     if (v.tag != OCTET_STRING) { return error.BadFormat; }

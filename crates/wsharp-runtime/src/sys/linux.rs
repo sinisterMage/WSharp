@@ -611,3 +611,14 @@ impl Drop for Poller {
         close(self.epfd as Fd);
     }
 }
+
+/// The trust anchors, as a blob of length-prefixed DER certificates.
+///
+/// `None` here, and that is the whole of the Linux arm: there is no system
+/// call and no library that answers this question. Every distribution ships a
+/// concatenated PEM bundle instead, at one of a handful of paths, and
+/// `std/x509` tries them with `io.exists` and `io.read_file` -- which is why
+/// this platform needed no new syscall at all.
+pub(crate) fn system_roots() -> Option<Vec<u8>> {
+    None
+}

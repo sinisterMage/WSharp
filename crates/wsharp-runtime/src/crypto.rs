@@ -57,3 +57,32 @@ pub extern "C" fn ws_time_now() -> i64 {
     unsafe { crate::gc::checkpoint() };
     sys::wall_clock_secs()
 }
+
+/// The operating system's trust anchors, as a blob of length-prefixed DER
+/// certificates.
+///
+/// A `str` for [`ws_crypto_random`]'s reason: a builtin may not allocate an
+/// array, and a `str` is the one byte-shaped object the runtime can make. The
+/// length prefixes are what let `std/x509` cut it back up -- the runtime hands
+/// over bytes and W# builds the objects, which is the boundary rule this whole
+/// item is written to.
+///
+/// `error.NotSupported` where the system keeps its anchors in a file instead,
+/// which is every Linux and every BSD but macOS. That is not a failure: it is
+/// the answer that sends `std/x509` to its list of candidate paths.
+///
+/// Inside a safe region, because a keychain or a certificate store is a
+/// database and reading one is not instant.
+///
+/// # Safety
+/// Called from JIT-compiled code across an FFI boundary; `out` must point at
+/// storage laid out as a [`FallibleStr`].
+pub unsafe extern "C" fn ws_crypto_system_roots(out: *mut FallibleStr) {
+    unsafe { crate::gc::checkpoint() };
+    let roots = crate::worker::blocking(sys::system_roots);
+    let result = match roots {
+        Some(blob) => FallibleStr::ok(crate::strings::alloc_str(&blob)),
+        None => FallibleStr::err(crate::builtins::ERROR_NOT_SUPPORTED),
+    };
+    unsafe { out.write(result) };
+}

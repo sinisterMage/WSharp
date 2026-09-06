@@ -8,6 +8,10 @@
 const net = @import("std/net");
 const text = @import("std/str");
 const list = @import("std/list");
+const tls = @import("std/tls");
+const x509 = @import("std/x509");
+const bytes = @import("std/bytes");
+const array = @import("std/array");
 
 /// One header. Names are compared lowercased, because the wire does not agree
 /// about their case and nothing should have to care.
@@ -102,10 +106,66 @@ pub const Response = struct {
 /// the line arrived in -- a socket cannot be read back into. This is that
 /// somewhere, and it is why every read below goes through a `Conn` rather than
 /// through the socket directly.
-pub const Conn = struct { socket: net.Socket, buffered: str };
+pub const Conn = struct {
+    socket: net.Socket,
+    buffered: str,
+    /// The TLS session in front of the socket, or null for `http://`.
+    session: ?tls.Session,
+};
 
 pub fn connection(s: net.Socket) Conn {
-    return Conn{ .socket = s, .buffered = "" };
+    return Conn{ .socket = s, .buffered = "", .session = null };
+}
+
+pub fn tls_connection(s: tls.Session) Conn {
+    return Conn{ .socket = s.socket, .buffered = "", .session = s };
+}
+
+// A field and an `if`, where a subtype and an overload set would read better.
+//
+// The lattice is what this language is for and it was the first thing tried
+// here: `TlsConn : Conn`, with `conn_read` and `conn_write` as overloads, so
+// that the four lines below that touch a socket became two functions and
+// nothing else in the module changed. It does not work, and the reason is
+// worth writing down. **A dispatched call has one type, so every overload must
+// share it** -- and these two do not: reading through TLS can raise everything
+// a handshake can, which is two dozen names, where reading a socket raises ten.
+// Making them agree means writing that whole set out twice, on both overloads,
+// and keeping the two copies in step for ever; or catching inside and
+// answering with one flattened error, which throws away the reason a
+// connection failed. Neither is worth the shape.
+
+/// Read from whatever kind of connection this is.
+fn conn_read(c: Conn, max: i64) !str {
+    if (c.session) |s| {
+        const buf = bytes.new(max);
+        const n = try tls.read(s, buf, 0, max);
+        return bytes.slice_str(buf, 0, n);
+    }
+    const chunk = try net.read(c.socket, max);
+    return chunk;
+}
+
+fn conn_write(c: Conn, data: str) !void {
+    if (c.session) |s| {
+        const b = bytes.of(data);
+        try tls.write_all(s, b, 0, array.len(b));
+        return;
+    }
+    try net.write_all(c.socket, data);
+    return;
+}
+
+/// Close a connection, telling the peer first where there is a way to.
+pub fn close(c: Conn) void {
+    if (c.session) |s| {
+        // A close_notify is what distinguishes a finished response from a
+        // truncated one, so it goes even though the socket is about to.
+        tls.close_session(s);
+        return;
+    }
+    net.close(c.socket);
+    return;
 }
 
 /// The value of a header, matched without regard to case; null when absent.
@@ -123,7 +183,7 @@ pub fn header(headers: list.List[Header], name: str) ?str {
 fn read_line(c: Conn) !str {
     var at = text.find(c.buffered, "\r\n");
     while (at < 0) {
-        const chunk = try net.read(c.socket, 4096);
+        const chunk = try conn_read(c, 4096);
         if (text.len(chunk) == 0) { return error.EndOfFile; }
         c.buffered = text.concat(c.buffered, chunk);
         at = text.find(c.buffered, "\r\n");
@@ -136,7 +196,7 @@ fn read_line(c: Conn) !str {
 /// Exactly `n` bytes of body.
 fn read_body(c: Conn, n: i64) !str {
     while (text.len(c.buffered) < n) {
-        const chunk = try net.read(c.socket, n - text.len(c.buffered));
+        const chunk = try conn_read(c, n - text.len(c.buffered));
         if (text.len(chunk) == 0) { return error.EndOfFile; }
         c.buffered = text.concat(c.buffered, chunk);
     }
@@ -224,19 +284,20 @@ fn read_payload(c: Conn, headers: list.List[Header]) !str {
 }
 
 /// Where a URL points.
-const Endpoint = struct { host: str, port: i64, path: str };
+const Endpoint = struct { host: str, port: i64, path: str, secure: bool };
 
-/// `http://host[:port][/path]`.
-///
-/// `https://` is `error.NotSupported` rather than a connection that quietly
-/// speaks the wrong protocol: there is no TLS client to hand the socket to yet,
-/// and a request that reached the server in plaintext would be worse than one
-/// that never left.
+/// `http://host[:port][/path]` or `https://` the same.
 fn parse_url(url: str) !Endpoint {
-    if (text.starts_with(url, "https://")) { return error.NotSupported; }
-    if (!text.starts_with(url, "http://")) { return error.BadFormat; }
+    var secure = false;
+    var skip = 7;
+    if (text.starts_with(url, "https://")) {
+        secure = true;
+        skip = 8;
+    } else {
+        if (!text.starts_with(url, "http://")) { return error.BadFormat; }
+    }
 
-    const rest = text.substr(url, 7, text.len(url));
+    const rest = text.substr(url, skip, text.len(url));
     var authority = rest;
     var path = "/";
     const slash = text.find(rest, "/");
@@ -248,12 +309,13 @@ fn parse_url(url: str) !Endpoint {
 
     var host = authority;
     var port = 80;
+    if (secure) { port = 443; }
     const colon = text.find(authority, ":");
     if (colon >= 0) {
         host = text.substr(authority, 0, colon);
         port = try text.parse_int(text.substr(authority, colon + 1, text.len(authority)));
     }
-    return Endpoint{ .host = host, .port = port, .path = path };
+    return Endpoint{ .host = host, .port = port, .path = path, .secure = secure };
 }
 
 /// Write a request line, headers and body onto a connection.
@@ -269,7 +331,7 @@ pub fn send_request(c: Conn, host: str, method: str, path: str, body: str) !void
     head = text.concat(head, "\r\nConnection: close\r\nContent-Length: ");
     head = text.concat(head, text.from_int(text.len(body)));
     head = text.concat(head, "\r\n\r\n");
-    try net.write_all(c.socket, text.concat(head, body));
+    try conn_write(c, text.concat(head, body));
     return;
 }
 
@@ -303,12 +365,40 @@ pub fn read_response(c: Conn) !Response {
 /// and the writer below.
 pub fn request(url: str, method: str, body: str) !Response {
     const where = try parse_url(url);
+    if (where.secure) {
+        // Reading and parsing the store costs about as much as the handshake
+        // does, and doing it per request is why `request_with` exists.
+        const roots = try x509.system_roots();
+        return try request_with(url, method, body,
+                                tls.roots_config(where.host, roots));
+    }
+    return try request_with(url, method, body, tls.client_config(""));
+}
+
+/// The same, against a TLS configuration the caller already has.
+///
+/// A program making more than one `https://` request wants this one: a
+/// `Config` holds the parsed trust store, and parsing it is the expensive half
+/// of a connection. The configuration's host is ignored -- the URL says which
+/// host this is, and a certificate checked against the wrong name is worse
+/// than none.
+pub fn request_with(url: str, method: str, body: str, cfg: tls.Config) !Response {
+    const where = try parse_url(url);
     const socket = try net.connect(where.host, where.port);
-    const c = connection(socket);
+    var c = connection(socket);
+    if (where.secure) {
+        const session = try tls.connect(socket, with_host(cfg, where.host));
+        c = tls_connection(session);
+    }
     try send_request(c, where.host, method, where.path, body);
     const answer = try read_response(c);
-    net.close(socket);
+    close(c);
     return answer;
+}
+
+/// The same configuration, aimed at this host.
+fn with_host(cfg: tls.Config, host: str) tls.Config {
+    return tls.Config{ .host = host, .pinned = cfg.pinned, .roots = cfg.roots };
 }
 
 pub fn get(url: str) !Response {
@@ -359,6 +449,6 @@ pub fn respond(c: Conn, code: i64, content_type: str, body: str) !void {
     head = text.concat(head, "\r\nContent-Length: ");
     head = text.concat(head, text.from_int(text.len(body)));
     head = text.concat(head, "\r\nConnection: close\r\n\r\n");
-    try net.write_all(c.socket, text.concat(head, body));
+    try conn_write(c, text.concat(head, body));
     return;
 }

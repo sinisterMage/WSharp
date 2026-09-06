@@ -739,3 +739,65 @@ impl Poller {
         Ok(out)
     }
 }
+
+/// The trust anchors, as a blob of length-prefixed DER certificates.
+///
+/// Windows' store is not a file path and not a directory: it is an API. The
+/// "ROOT" system store is the one holding the anchors a browser would trust,
+/// and `CertEnumCertificatesInStore` walks it, handing back a context whose
+/// `pbCertEncoded` is the DER this library reads.
+///
+/// A third library, after kernel32 and ws2_32 and bcrypt -- the same shape the
+/// generator needed.
+pub(crate) fn system_roots() -> Option<Vec<u8>> {
+    type HCERTSTORE = *mut c_void;
+
+    /// Only the first three fields are read, but the whole layout has to be
+    /// right for the offsets to be: `pbCertEncoded` is at word one.
+    #[repr(C)]
+    struct CertContext {
+        encoding_type: DWORD,
+        encoded: *const u8,
+        encoded_len: DWORD,
+        info: *mut c_void,
+        store: HCERTSTORE,
+    }
+
+    #[link(name = "crypt32")]
+    unsafe extern "system" {
+        fn CertOpenSystemStoreW(provider: usize, subsystem: *const u16) -> HCERTSTORE;
+        fn CertEnumCertificatesInStore(
+            store: HCERTSTORE,
+            previous: *const CertContext,
+        ) -> *const CertContext;
+        fn CertCloseStore(store: HCERTSTORE, flags: DWORD) -> BOOL;
+    }
+
+    // "ROOT", as UTF-16 with its terminator.
+    let name: [u16; 5] = [b'R' as u16, b'O' as u16, b'O' as u16, b'T' as u16, 0];
+    let store = unsafe { CertOpenSystemStoreW(0, name.as_ptr()) };
+    if store.is_null() {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut context: *const CertContext = core::ptr::null();
+    loop {
+        // Each call frees the context it was given, so the previous pointer
+        // must not be touched afterwards.
+        context = unsafe { CertEnumCertificatesInStore(store, context) };
+        if context.is_null() {
+            break;
+        }
+        let der = unsafe {
+            let c = &*context;
+            if c.encoded.is_null() || c.encoded_len == 0 {
+                continue;
+            }
+            core::slice::from_raw_parts(c.encoded, c.encoded_len as usize)
+        };
+        out.extend_from_slice(&(der.len() as u32).to_be_bytes());
+        out.extend_from_slice(der);
+    }
+    unsafe { CertCloseStore(store, 0) };
+    if out.is_empty() { None } else { Some(out) }
+}
