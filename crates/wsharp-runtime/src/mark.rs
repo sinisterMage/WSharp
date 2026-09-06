@@ -72,8 +72,8 @@ use crate::evacuate;
 use crate::gc::{self, with_buffers};
 use crate::header::{claim_mark, flip_mark_parity, is_marked, type_id_of};
 use crate::heap::{self, is_collectable};
-use crate::worker::Worker;
 use crate::types;
+use crate::worker::Worker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

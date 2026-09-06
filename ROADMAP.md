@@ -7,7 +7,9 @@ and the module system — everything the original feature list asked for.
 Session 6 closed what item 5 had left open: a growable array, and `fn` literals
 that generalise. Session 7 delivered item 8: the operating system declared by
 hand on three platform arms, a safe region that lets a thread block without
-stalling its collector, and `std/net` and `std/http` above them.
+stalling its collector, and `std/net` and `std/http` above them. Session 8
+delivered item 9: eight more integer types, the bit operators, and literals
+that take the type they are used at — which is what makes item 10 writable.
 
 This file records what was built and why it was built that way, the limitations
 that were chosen rather than stumbled into, and — for the items still ahead —
@@ -821,74 +823,139 @@ readiness API is what lets one worker serve many connections.
 
 ---
 
-## 9. Sized and unsigned integers, and bitwise operators — **next**
+## 9. Sized and unsigned integers, and bitwise operators — **done**
 
-W# has one integer type. `i64` is the right default and the wrong *only* choice
-the moment a program computes on bytes rather than merely moving them: SHA-256
-is defined on 32-bit words that wrap, ChaCha20 on 32-bit add, xor and rotate,
-X25519 on the limbs of a much wider number. None of that can be written here
-today, which is why this comes before TLS rather than beside it.
+`i64` is the right default and was the wrong *only* choice the moment a program
+computed on bytes rather than merely moving them. SHA-256 is addition modulo
+2^32, ChaCha20 is 32-bit add, xor and rotate; neither could be written here.
+`tests/cases/chacha_quarter.ws` is now RFC 8439's quarter-round test vector, in
+W#, and it is the shortest statement of what this item was for.
 
-It is not only crypto, and item 8 met it twice while being built. `std/net.wait`
-decodes a readiness bitmask with `bits % 2 == 1` and `bits >= 2` because there
-is no `&`. `std/http.parse_hex` exists because a chunk header is base 16 and
-`str.parse_int` is decimal. Both are arithmetic standing in for bit work.
+### What was built
 
-### What it needs
+| Piece | Where |
+|---|---|
+| `i8` `i16` `i32` `i64` `u8` `u16` `u32` `u64`, as one parameterised constructor rather than eight variants | `wsharp-sema/src/ty.rs` — `IntTy`, `TyCon::Int` |
+| `& \| ^ << >> ~` and their compound forms, at Zig's relative precedence | `wsharp-syntax/src/{token,lexer,parser,ast}.rs` |
+| `>>` arithmetic on a signed type and logical on an unsigned one; the four ordering comparisons and both divisions likewise | `wsharp-codegen/src/lower.rs` — `NumKind`, `binary`, `checked_div` |
+| `comptime_int`: a literal takes the type it is used at and defaults to `i64` | `infer.rs` — `Constraint::IntLiteral`, `int_literal`, `default_int_ty` |
+| Scalars packed at their natural size and alignment, through one `place` | `wsharp-sema/src/layout.rs` — `size_of`, `align_of`, `place` |
+| `u32(x)`, `i64(x)`, `f64(n)` — conversions written, never inferred | `infer.rs` — `infer_convert`; `lower.rs` — `convert` |
+| `Integer` beside `Number`, and abstract types ordered by their member sets | `wsharp-runtime/src/builtins.rs` — `abstract_types`; `ty.rs` — `is_sub_ty` |
+| `std/bits` — `rotl` and `rotr`, generic over `Integer`, lowered inline | `builtins.rs` — `BuiltinTy::IntVar`; `lower.rs` — the `BITS_MODULE` arm |
+| `print_uint` and `str.from_uint`, for the half of `u64` an `i64` cannot hold | `builtins.rs`, `strings.rs` |
 
-- **The types.** `u8`, `u16`, `u32`, `u64` beside `i8`, `i16`, `i32` and the
-  `i64` that already exists. Not `usize`: this language has no pointer
-  arithmetic to size, and a type whose width depends on the target is a type
-  whose overflow depends on the target.
-- **Unsigned arithmetic wraps; signed arithmetic still traps.** SHA-256 *is*
-  addition modulo 2^32, so a checked `+` would make it unwritable. A signed
-  overflow is a bug in every program that is not doing this, and it keeps the
-  panic it has.
-- **`& | ^ << >> ~`**, and a rotate. Rotate is not a C operator, is one
-  instruction on both targets, and is what every one of these algorithms is
-  written in terms of -- so it is a builtin (`bits.rotl(x, n)`) rather than a
-  shift-shift-or pattern the code generator has to recognise and would
-  sometimes miss.
-- **`>>` differs by signedness**: logical on an unsigned type, arithmetic on a
-  signed one. That difference is most of the reason the two kinds are worth
-  distinguishing.
-- **A literal has to stop being an `i64`.** "Integer literals are always `i64`"
-  is a smaller follow-up today; it becomes load-bearing here, because `0xff`
-  has to be a `u8` in one place and a `u32` in another. Either a `comptime_int`
-  that takes the type it is used at, or suffixes, and the first is much nicer
-  to write.
+### Decisions worth recording
 
-### Decisions worth recording in advance
-
+- **Unsigned arithmetic wraps, and so does signed.** The wrapping is the point
+  for unsigned — SHA-256 *is* addition modulo 2^32, so a checked `+` would make
+  it unwritable — and for signed it is what the language already did: only
+  division ever panicked here, and it still does. What changed is that the
+  check is now per width and is skipped entirely for unsigned division, which
+  cannot overflow. The panic no longer says `i64::MIN`, because an `i32` can
+  reach it too.
+- **A literal stopped being an `i64` without suffixes.** An integer literal
+  gets a fresh type variable and a constraint, so `0xff` is a `u8` in one place
+  and a `u32` in another. Three things then had to settle it early, and each is
+  a place where "an integer literal" is not an answer: an overloaded call
+  chooses *by* argument type; a coercion into a `?i64` must wrap the literal
+  rather than let it become one; and a literal beside an equally undecided
+  operand would otherwise merge with it into a variable that nothing pins until
+  the end of the binding group. All three default it exactly as the language
+  always did, so no program that compiled before means anything different now.
+- **A literal too large for an `i64` defaults to `u64`.** The lexer's bound
+  moved from `i64::MAX` to `u64::MAX` for the same reason: a literal has no
+  type yet, and a 64-bit mask should not have to name its type to be written
+  down at all.
+- **A minus sign on a literal is part of the literal.** Without that, `-128` is
+  the negation of `128` and does not fit an `i8` — the one value each signed
+  type has that its positive twin does not would be unwritable. It also retires
+  the `- 1` dance `panic_div_overflow.ws` had to document.
+- **Unary `-` requires a signed type.** `-x` on a `u8` is not an error the
+  machine reports; it is 256 - x. Rejecting it is what keeps the widened
+  `Number` honest, and it is the same rule that already rejected `%` there.
+- **`Number` lists every numeric type, and `Integer` was added beside it.**
+  That is what makes `math.min` one function rather than nine. The price is
+  stated rather than hidden: a body annotated `Number` must work for *every*
+  member, so it may not use `%` and may not negate. `Integer` is what such a
+  body claims instead. Abstract types are now ordered by their member sets
+  rather than by identity — `Integer ⊑ Number` because every type it lists is
+  one `Number` lists too — which is one line in `is_sub_ty` and gives
+  specificity everything it needs. Two abstract types with identical members
+  would be mutually more specific, so a test asserts the table is a strict
+  lattice.
+- **Rotation is a builtin, and an inline one.** It is one instruction on both
+  targets and is what every one of these algorithms is spelled in, so leaving
+  the code generator to recognise a shift-shift-or pattern would mean sometimes
+  missing it. It cannot be an `extern "C"` function either, because a Rust one
+  cannot be generic over the width — so `BuiltinTy::IntVar` gives it a type
+  constrained to `Integer` and `Trans::call` lowers it inline, exactly as
+  `array.new` already was.
+- **The shift amount is masked to the operand's width.** Not a choice so much
+  as a discovery: Cranelift documents it for `ishl`/`ushr`/`sshr`, and its
+  constant folding and both backends do it for `rotl`/`rotr` as well. `x << 64`
+  on a `u64` is `x`, not undefined, and a case pins it.
 - **Conversions are written, never inferred.** A silent widening is how a
-  32-bit hash becomes a 64-bit one that is right for a while. `u32(x)` truncates
-  and says so.
-- **`Number` has to say what it means.** The abstract type lists `i64` and
-  `f64` today, and it is what `math.min` is generic over. Listing all eleven
-  numeric types makes `min` work everywhere and makes every *other* constrained
-  generic over `Number` have to work for `u8` too. This is a real decision, not
-  a table edit, and it should be made before the types land rather than after
-  something depends on the answer.
-- **The collector does not care.** These are scalars: no header, no reference,
-  no barrier. `layout.rs` and `repr.rs` have to agree about their sizes, which
-  is the invariant a test already checks.
-- **Dispatch does not care either.** A scalar's type is always statically
-  known, so no runtime test is ever emitted for one -- exactly as item 4 found
-  for the abstract types it added.
+  32-bit hash becomes a 64-bit one that is right for a while. `u32(x)`
+  truncates and says so; a float-to-integer conversion saturates rather than
+  trapping, so it is total — a value too large clamps and a NaN is zero.
+- **Cranelift is stricter than its own documentation.** Two things cost time
+  and are worth writing down: `iconst` demands a *zero-extended* immediate, so
+  `iconst.i32 -1` is a verifier error and a negative literal has to arrive
+  masked; and `uextend`/`ireduce` are strictly wider/narrower despite
+  `uextend`'s doc claiming same-width is a no-op, so a conversion between two
+  types of the same width must emit nothing at all rather than ask for one.
 
-### What it costs
+### What packing changed, and what it uncovered
 
-Eight new types is eight more rows in every table that enumerates them, and
-every one of `unify`, `layout::place`, `repr::slot_types` and the arithmetic
-lowering grows a case. The interesting risk is not that, though: it is that
-inference currently has exactly one integer type and therefore never has to
-*choose* one. The moment a literal can be any of eight, every place a type
-variable is defaulted needs an answer, and getting that wrong is a program that
-compiles and computes something else.
+A scalar now occupies its natural size at its natural alignment, so `[]u8` has
+a stride of one — without which every buffer in item 10 would be eight times
+too large — and a struct of bytes costs bytes. A *tagged* value keeps a whole
+word per slot, because slot `i` of a value living at `base + i*8` is what three
+separate pieces of code depend on: the stride `load_at` and `store_slots` walk,
+and the division `repr::pointer_slots` uses to turn a byte offset back into a
+slot index. Two tests state that invariant rather than leaving it in a comment.
 
----
+Alignment is not cosmetic here. Every load and store through these offsets uses
+Cranelift's `trusted` memory flags, whose `aligned` bit lets the instruction
+"trap or return a wrong result if the effective address is misaligned" — so
+packing without aligning would have made that flag a lie.
 
-## 10. TLS 1.3, written in W# — **after 9**
+Doing it turned up two things:
+
+- **`layout::place` was not the single definition CLAUDE.md claimed.** Four
+  more hand-rolled `offset += size_of(...)` loops existed: struct fields in
+  `infer.rs`, and three separate copies for closure captures — the layout
+  registered with the runtime, the prologue that reads captures out, and the
+  constructor that writes them in. Those three had to agree byte for byte and
+  did so only by being written the same way three times. All four now call
+  `place`, so the agreement is structural.
+- **The worker argument buffer was reading uninitialised memory.** A value
+  narrower than a word writes only part of one, and `rpc::pack` reads whole
+  words and sends them to another thread. That was already true of `bool` and
+  of every option tag; it was simply never exercised, because no test passed
+  such a value to a worker. `tests/cases/narrow_worker.ws` is that test, and
+  the buffer is zeroed before anything is written to it.
+
+### What is left
+
+- **`math.abs` and `math.sign` are still `i64`/`f64` overloads.** They cannot
+  become one generic over `Number`, and the reason changed: it used to be that
+  an integer literal was an `i64`, which `comptime_int` has retired; it is now
+  that negation is meaningless on an unsigned type. A narrow signed value needs
+  a conversion.
+- **An array index is still an `i64`.** Every literal index works, and `i64(i)`
+  covers the rest.
+- **No `u128`, and no `usize`.** The second is deliberate — this language has
+  no pointer arithmetic to size, and a type whose overload depends on the
+  target is a type whose overflow does.
+- **An overload set distinguished only by integer width needs the conversion
+  written at the call.** A literal argument settles to its default before the
+  overload is chosen, because which overload is meant is a question about the
+  argument's type.
+
+
+## 10. TLS 1.3, written in W# — **next**
 
 Item 8 left `https://` as `error.NotSupported` rather than a connection that
 quietly speaks the wrong protocol. This is what removes it -- and what the
@@ -905,6 +972,9 @@ to try. The handshake and X.509 have to be W# regardless -- both build object
 graphs, and item 6's rule sends those to `.ws` files.
 
 ### What it needs
+
+Item 9 landed the arithmetic this needs: 32-bit words that wrap, `& | ^ << >>`,
+and `bits.rotl`. What follows is the rest.
 
 | Piece | Notes |
 |---|---|
@@ -963,7 +1033,19 @@ check, not after.
 ## 11. Package management — **after 10**
 
 Item 6 left one line: *"No package management. An import is a relative path or
-a library one; there is nothing that fetches anything."* This is that.
+a library one; there is nothing that fetches anything."* This is that, and it
+has a name: **ingot**.
+
+### The name
+
+C#'s package manager is NuGet, which sounds like *nugget*; in Minecraft nine
+gold nuggets craft one ingot. Item **9** is where the name was coined, which is
+the whole joke and the reason it is written down here rather than decided later
+under time pressure. `ingot` is the *tool*; `wsharp` stays the compiler, so
+`wsharp run` keeps meaning what it means and `ingot install` is a different
+program with a different job. That separation is worth having on purpose: one
+of them must work on a machine with no network and no store, and the other is
+the thing that fills the store.
 
 ### The shape, and where it comes from
 
@@ -972,9 +1054,9 @@ client for Julia's package ecosystem, for the parts that are about *being a
 package manager* rather than about Julia:
 
 - **Resolving, installing and building are separate verbs.** Nothing compiles
-  because something else was fetched. `wsharp add` records an intent, `resolve`
-  chooses versions, `install` makes the store satisfy the lockfile, and
-  `build` is a thing you asked for.
+  because something else was fetched. `ingot add` records an
+  intent, `resolve` chooses versions, `install` makes the store satisfy the
+  lockfile, and `build` is a thing you asked for.
 - **`verify` answers with its exit status** -- ready, needs installing, needs
   resolving, broken -- so a CI script can ask without parsing anything.
 - **Output is tab-separated**, so a shell can cut it up.
@@ -1059,14 +1141,18 @@ These are deliberate limitations, each with a clear fix:
 - **Field access needs a known type.** Structs are nominal with no row
   polymorphism, so `fn getx(p) { return p.x; }` cannot be inferred and asks for
   an annotation instead.
-- **`==` is limited to `i64`, `f64`, `bool` and `str`.** Structs still need a
-  decision about identity versus structural equality.
-- **Integer literals are always `i64`.** No `comptime_int` coercion, so `1.0`
-  must be written where an `f64` is wanted. Item 9 makes this load-bearing:
-  `0xff` has to be a `u8` in one place and a `u32` in another.
+- **`==` is limited to the integer types, `f64`, `bool` and `str`.** Structs
+  still need a decision about identity versus structural equality.
+- **An integer literal is never an `f64`.** Item 9 made a literal take the
+  integer type it is used at, but not a float one: `1.0` must still be written
+  where an `f64` is wanted. The diagnostic now says so in those words rather
+  than reporting a bare mismatch.
 - **`%` is integer-only.** Cranelift has no float remainder, and a float `%`
   is rejected by inference rather than emulated.
-- **No sized integer types**, no unsigned types, no bitwise operators. Now
-  item 9 rather than a follow-up: crypto cannot be written without them.
+- **`math.abs` and `math.sign` are `i64`/`f64` overloads**, so a narrow signed
+  value needs a conversion. One generic over `Number` is not available: the
+  abstract type includes the unsigned types, and negation is meaningless there.
+- **An array index is an `i64`.** Every literal index works without saying so,
+  and `i64(i)` covers the rest.
 - **x86-64 and aarch64 only.** The collector reads the frame pointer with
   inline assembly; other architectures get a `compile_error!`.

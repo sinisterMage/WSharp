@@ -124,6 +124,13 @@ pub extern "C" fn ws_str_from_int(value: i64) -> *mut u8 {
     alloc_str(value.to_string().as_bytes())
 }
 
+/// The unsigned twin of [`ws_str_from_int`], for the half of `u64`'s range an
+/// `i64` cannot hold.
+pub extern "C" fn ws_str_from_uint(value: u64) -> *mut u8 {
+    unsafe { crate::gc::checkpoint() };
+    alloc_str(value.to_string().as_bytes())
+}
+
 pub extern "C" fn ws_str_from_float(value: f64) -> *mut u8 {
     unsafe { crate::gc::checkpoint() };
     alloc_str(format!("{value}").as_bytes())

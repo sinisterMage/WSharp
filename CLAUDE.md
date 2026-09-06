@@ -50,6 +50,10 @@ Things in this version that differ from older tutorials, each of which cost time
 | Referencing data | `symbol_value`, not `global_value`. |
 | `icmp_imm` / `iadd_imm` | Deprecated; use the `_s` / `_u` variants that say how the immediate is extended. |
 | `FunctionBuilder::finalize` | **Must** be called per function, and takes a `TargetFrontendConfig`. It is what releases the shared `FunctionBuilderContext`; skip it and the *next* `FunctionBuilder::new` fails an assert with no hint about the real cause. |
+| `iconst` | The immediate must be **zero-extended** into the controlling type. `iconst.i32 -1` is a verifier error, doc comments about signedness notwithstanding -- so a negative literal arrives masked (`IntTy::mask`). The `_imm_u` / `_imm_s` builders mask for you; the bare `iconst` does not. |
+| `uextend` / `ireduce` | Strictly **wider** / **narrower**, despite `uextend`'s doc saying same-width is a no-op. Converting between two types of the same width must emit *nothing*; asking for the identity is a verifier error. |
+| `ishl` / `ushr` / `sshr` / `rotl` / `rotr` | The shift or rotate amount is **masked to the operand's width**, so `x << 64` on a `u64` is `x`. Documented for the shifts; for the rotates it is established by `isle_prelude.rs`'s constant folding and both backends' lowering rather than by the doc comment. |
+| `sdiv` / `udiv` | Both trap, and a trap in a JIT with no signal handler is a bare SIGILL. The hand-rolled checks in `checked_div` are what turn those into panics that say something. `srem` defines `MIN % -1` as 0, and unsigned division cannot overflow at all. |
 
 ## The operating system
 
@@ -92,10 +96,61 @@ extra `sin_len` byte out of this code entirely.
   every type in a reachable function, *including intermediate expression types*,
   and reports what it cannot resolve. `repr::slot_types` panics on a leftover
   variable on purpose: it means that pass has a hole.
-- **Value layout has one definition.** `wsharp-sema/src/layout.rs` decides slot
-  counts and pointer offsets. Inference uses it to place struct fields, code
-  generation to shape registers. They must agree; a test in
+- **Value layout has one definition, and it is `layout::place`.** Everything
+  laid out end to end goes through it: a struct's fields (`infer.rs`), an
+  instantiation of a generic struct (`lower::struct_shape`), and a closure's
+  captures -- which needs it in three places at once, the layout registered
+  with the runtime, the prologue that reads captures out of `env`, and the
+  constructor that writes them in (`lower::capture_offsets`). Those three used
+  to be three hand-written loops that agreed only by being written the same
+  way; a disagreement is not a crash but a field read from the wrong place, and
+  the collector reading a scalar as a reference. `slot_count` and
+  `repr::slot_types` must agree too, and a test in
   `wsharp-codegen/src/repr.rs` checks that they do.
+- **A scalar packs; a tagged value does not.** A scalar occupies its natural
+  size at its natural alignment -- which is what makes `[]u8` a byte array
+  rather than one eight times too large -- while a `?T` or `!T` keeps a whole
+  machine word per slot. That second half is load-bearing: **slot `i` of a
+  value lives at `base + i * SLOT_SIZE`**, and three separate things depend on
+  exactly that -- the stride `load_at` and `store_slots` walk with, and the
+  division `repr::pointer_slots` uses to turn a byte offset back into a slot
+  index. Two tests in `layout.rs` state it rather than leaving it in a comment.
+- **Packing means aligning, and that is not cosmetic.** Every load and store
+  through these offsets uses `MemFlagsData::trusted()`, whose `aligned` bit
+  lets the instruction "trap or return a wrong result if the effective address
+  is misaligned". A field placed at its own alignment is what keeps that flag
+  honest. `layout::align_of` gives `void` an alignment of 1 rather than 0,
+  because `place` rounds by it.
+- **A subtype starts from its parent's *unaligned* `field_end`.** Aligning
+  there would move every subtype's fields and break "a subtype's fields are its
+  supertype's, followed by its own". Only the total size is rounded up.
+- **Signedness lives in the W# type, never in `ir::Type`.** Cranelift has
+  `I8`/`I16`/`I32`/`I64` and nothing else, so `i32` and `u32` are the same
+  machine type; it is the *instruction* that differs. `lower::NumKind` carries
+  the answer, and five things ask it: `>>` (`sshr` against `ushr`), `/` and `%`
+  (`sdiv`/`srem` against `udiv`/`urem`, and whether the overflow check is
+  emitted at all), and the four ordering comparisons.
+- **`+`, `-` and `*` wrap; only division panics.** For an unsigned type the
+  wrapping is the definition -- SHA-256 *is* addition modulo 2^32 -- and for a
+  signed one it is what the language has always done here. The division checks
+  are per width, and the unsigned overflow branch is not emitted, because there
+  is no pair of unsigned values whose quotient does not fit.
+- **An integer literal is a `comptime_int`, and three places settle it early.**
+  It gets a fresh variable and a `Constraint::IntLiteral`, so `0xff` is a `u8`
+  here and a `u32` there. But "an integer literal" is not an answer to *which
+  overload*, and a variable that survives to the end of a binding group is one
+  some coercion elsewhere can bind to something stranger than a number. So a
+  literal settles to its default at an overloaded call (`dispatched_call`),
+  when coerced to anything that is not an integer type (`coerce` -- which is
+  what makes it *wrap* into a `?i64` rather than become one), and when it sits
+  beside an equally undecided operand (`settle_literal_operand`). That last one
+  must not fire when an abstract type owns the other side: that is a
+  constrained generic, and settling it decides for the caller.
+- **The worker argument buffer is zeroed before it is written.** A value
+  narrower than a machine word writes only part of one, and `rpc::pack` reads
+  whole words and sends them to another thread. This was already true of `bool`
+  and of every option tag and was simply never exercised; `narrow_worker.ws` is
+  the case that would have caught it.
 - **A builtin may read and write bytes; anything that moves a *reference* from
   one object into another is written in W#.** This is why `std/array`,
   `std/str.split`, `std/net` and `std/http` are `.ws` files compiled with the
@@ -117,6 +172,15 @@ extra `sin_len` byte out of this code entirely.
   the write barrier is emitted, and where heap pointers are declared as roots.
   Bypassing any of them loses objects or corrupts them, and the failure is
   neither immediate nor reproducible. Run `--gc-stress` if you touch them.
+- **`Number` includes the unsigned types, so a generic over it may not
+  negate.** Nor may it use `%`: the abstract type lists every numeric type
+  including `f64`, and a body annotated with it must work for *every* member,
+  because the caller picks. `Integer` is what such a body claims instead.
+  Abstract types are ordered by their member sets rather than by identity
+  (`ty.rs::is_sub_ty`), which is what makes `Integer` the more specific of the
+  two -- and which means two abstract types with *identical* members would be
+  mutually more specific and silently lose an ambiguity error. A test asserts
+  the table is a strict lattice.
 - **A subtype's fields are its supertype's, followed by its own.** That is what
   lets a field read compiled against a supertype run unchanged on any subtype,
   with no adjustment and no vtable. `collect_structs` lays types out in lattice
@@ -380,6 +444,10 @@ nix-shell --run "cargo test --workspace"
   every `.ws` directly in `tests/cases`, and a file with no `main` is not a
   case; `read_dir` does not recurse, so a subdirectory is where an imported
   module goes.
+- **A case that prints a narrow integer converts it.** `print_int` takes an
+  `i64`, so a `u8` is written `print_int(i64(x))`; `print_uint` exists for the
+  half of `u64`'s range an `i64` cannot hold. Conversions are written and never
+  inferred, which is the same rule the language gives its users.
 - **The whole case suite runs a second time under `--gc-stress`**, which
   collects at every allocation and checks every root the stack maps describe.
   This is the collector's main defence, because rooting is spread over every

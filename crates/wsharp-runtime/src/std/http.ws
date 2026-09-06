@@ -179,7 +179,7 @@ fn parse_hex(s: str) !i64 {
         if (b >= 97 and b <= 102) { digit = b - 87; }
         if (b >= 65 and b <= 70) { digit = b - 55; }
         if (digit < 0) { return error.BadFormat; }
-        value = value * 16 + digit;
+        value = (value << 4) | digit;
     }
     return value;
 }

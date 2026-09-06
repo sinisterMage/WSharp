@@ -32,9 +32,124 @@ pub enum Type {
     Con(TyCon, Vec<Type>),
 }
 
+/// A sized integer type: how many bits, and whether the top one is a sign.
+///
+/// One parameterised constructor rather than eight variants, because every
+/// table that enumerates the scalars would otherwise grow eight rows instead
+/// of one. Signedness lives here rather than in Cranelift's `ir::Type`, which
+/// has only `I8`/`I16`/`I32`/`I64`: it is the *operator* that is signed or
+/// not, so `>>`, `/`, `%` and the four ordering comparisons each ask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct IntTy {
+    pub signed: bool,
+    /// 8, 16, 32 or 64. Not a target-dependent width: a type whose overflow
+    /// depends on the machine is a type whose bugs do.
+    pub bits: u8,
+}
+
+impl IntTy {
+    pub const I8: IntTy = IntTy {
+        signed: true,
+        bits: 8,
+    };
+    pub const I16: IntTy = IntTy {
+        signed: true,
+        bits: 16,
+    };
+    pub const I32: IntTy = IntTy {
+        signed: true,
+        bits: 32,
+    };
+    pub const I64: IntTy = IntTy {
+        signed: true,
+        bits: 64,
+    };
+    pub const U8: IntTy = IntTy {
+        signed: false,
+        bits: 8,
+    };
+    pub const U16: IntTy = IntTy {
+        signed: false,
+        bits: 16,
+    };
+    pub const U32: IntTy = IntTy {
+        signed: false,
+        bits: 32,
+    };
+    pub const U64: IntTy = IntTy {
+        signed: false,
+        bits: 64,
+    };
+
+    /// Every integer type, narrowest first, signed before unsigned. The order
+    /// is what `abstract_types`'s `Integer` row lists and what diagnostics
+    /// enumerate, so it is worth being deliberate about.
+    pub const ALL: [IntTy; 8] = [
+        IntTy::I8,
+        IntTy::I16,
+        IntTy::I32,
+        IntTy::I64,
+        IntTy::U8,
+        IntTy::U16,
+        IntTy::U32,
+        IntTy::U64,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match (self.signed, self.bits) {
+            (true, 8) => "i8",
+            (true, 16) => "i16",
+            (true, 32) => "i32",
+            (true, 64) => "i64",
+            (false, 8) => "u8",
+            (false, 16) => "u16",
+            (false, 32) => "u32",
+            (false, 64) => "u64",
+            _ => unreachable!("integer width {} is not one of 8, 16, 32, 64", self.bits),
+        }
+    }
+
+    /// The type spelled by this name, if it is an integer type at all.
+    pub fn from_name(name: &str) -> Option<IntTy> {
+        IntTy::ALL.into_iter().find(|t| t.name() == name)
+    }
+
+    /// The bytes one of these occupies, which is also its alignment.
+    pub fn size(self) -> u32 {
+        u32::from(self.bits) / 8
+    }
+
+    /// The range a literal of this type may name, as `i128` so that `u64`'s
+    /// top half and `i64`'s bottom one both fit in the same comparison.
+    pub fn range(self) -> (i128, i128) {
+        if self.signed {
+            let half = 1i128 << (self.bits - 1);
+            (-half, half - 1)
+        } else {
+            (0, (1i128 << self.bits) - 1)
+        }
+    }
+
+    pub fn contains(self, value: i128) -> bool {
+        let (lo, hi) = self.range();
+        (lo..=hi).contains(&value)
+    }
+
+    /// `value` reduced to this width, as the zero-extended pattern Cranelift's
+    /// `iconst` demands: the verifier rejects `iconst.i32 -1` outright, so a
+    /// negative literal has to arrive already masked.
+    pub fn mask(self, value: i128) -> i64 {
+        if self.bits == 64 {
+            value as i64
+        } else {
+            (value as i64) & ((1i64 << self.bits) - 1)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TyCon {
-    I64,
+    Int(IntTy),
     F64,
     Bool,
     Void,
@@ -78,14 +193,15 @@ pub enum TyCon {
 }
 
 impl Type {
-    pub const I64: Type = Type::Con(TyCon::I64, Vec::new());
-
     pub fn prim(con: TyCon) -> Type {
         Type::Con(con, Vec::new())
     }
 
+    pub fn int(t: IntTy) -> Type {
+        Type::prim(TyCon::Int(t))
+    }
     pub fn i64() -> Type {
-        Type::prim(TyCon::I64)
+        Type::int(IntTy::I64)
     }
     pub fn f64() -> Type {
         Type::prim(TyCon::F64)
@@ -157,7 +273,7 @@ impl Type {
                 let set = store.err_set(ids);
                 Type::err_union(Type::from_builtin_with(*inner, store, vars), set)
             }
-            B::Var(n) | B::Transferable(n) | B::Message(n) => {
+            B::Var(n) | B::Transferable(n) | B::Message(n) | B::IntVar(n) => {
                 vars.entry(n).or_insert_with(|| store.fresh()).clone()
             }
             simple => Type::from_builtin(simple),
@@ -177,10 +293,18 @@ impl Type {
             | B::ErrUnion(..)
             | B::Var(_)
             | B::Transferable(_)
-            | B::Message(_) => {
+            | B::Message(_)
+            | B::IntVar(_) => {
                 unreachable!("`{t:?}` needs a type store; use `from_builtin_with`")
             }
-            B::I64 => Type::i64(),
+            B::I8 => Type::int(IntTy::I8),
+            B::I16 => Type::int(IntTy::I16),
+            B::I32 => Type::int(IntTy::I32),
+            B::I64 => Type::int(IntTy::I64),
+            B::U8 => Type::int(IntTy::U8),
+            B::U16 => Type::int(IntTy::U16),
+            B::U32 => Type::int(IntTy::U32),
+            B::U64 => Type::int(IntTy::U64),
             B::F64 => Type::f64(),
             B::Bool => Type::bool(),
             B::Void => Type::void(),
@@ -197,7 +321,15 @@ impl Type {
     }
 
     pub fn is_numeric(&self) -> bool {
-        matches!(self, Type::Con(TyCon::I64 | TyCon::F64, _))
+        matches!(self, Type::Con(TyCon::Int(_) | TyCon::F64, _))
+    }
+
+    /// The integer type this is, if it is one at all.
+    pub fn as_int(&self) -> Option<IntTy> {
+        match self {
+            Type::Con(TyCon::Int(t), _) => Some(*t),
+            _ => None,
+        }
     }
 }
 
@@ -499,18 +631,6 @@ impl TypeStore {
         false
     }
 
-    /// Distance from `id` to a lattice root, used to order overloads by
-    /// specificity: a deeper type is the more specific one.
-    pub fn struct_depth(&self, id: StructId) -> u32 {
-        let mut depth = 0;
-        let mut cur = self.struct_parents[id as usize];
-        while let Some(parent) = cur {
-            depth += 1;
-            cur = self.struct_parents[parent as usize];
-        }
-        depth
-    }
-
     /// The subtype relation lifted to whole types. Structs have the declared
     /// lattice and abstract types have the table's; everything else is
     /// subtyping-by-equality, which keeps `?T`, `!T` and `fn` invariant and so
@@ -518,9 +638,11 @@ impl TypeStore {
     ///
     /// This is the only place the lattice reaches past structs. An abstract
     /// type is above exactly the concrete types it lists, which is what lets
-    /// specificity order `i64` under `Number` -- and it is a flat extension:
-    /// the table has no nesting, so two abstract types are related only when
-    /// they are the same one.
+    /// specificity order `i64` under `Number`. Two abstract types are ordered
+    /// by their member sets rather than by any declared nesting: `Integer` is
+    /// below `Number` because every type it lists is one `Number` lists too.
+    /// That is what makes `fn f(x: Integer)` win over `fn f(x: Number)`, with
+    /// no runtime test either way -- a scalar's type is always known.
     pub fn is_sub_ty(&mut self, sub: &Type, sup: &Type) -> bool {
         match (self.resolve(sub), self.resolve(sup)) {
             // A generic struct stands outside the lattice, so its
@@ -529,7 +651,12 @@ impl TypeStore {
             (Type::Con(TyCon::Struct(a), aa), Type::Con(TyCon::Struct(b), ba)) => {
                 self.is_subtype(a, b) && self.args_agree(&aa, &ba)
             }
-            (Type::Con(TyCon::Abstract(a), _), Type::Con(TyCon::Abstract(b), _)) => a == b,
+            (Type::Con(TyCon::Abstract(a), _), Type::Con(TyCon::Abstract(b), _)) => {
+                a == b || {
+                    let (sub, sup) = (abstract_members(a), abstract_members(b));
+                    sub.iter().all(|m| sup.contains(m))
+                }
+            }
             (a, Type::Con(TyCon::Abstract(id), _)) => abstract_members(id).contains(&a),
             (a, b) => a == b,
         }
@@ -772,7 +899,7 @@ impl TypeStore {
         match self.resolve(ty) {
             Type::Var(v) => names.get(&v).cloned().unwrap_or_else(|| "_".into()),
             Type::Con(con, args) => match con {
-                TyCon::I64 => "i64".into(),
+                TyCon::Int(t) => t.name().into(),
                 TyCon::F64 => "f64".into(),
                 TyCon::Bool => "bool".into(),
                 TyCon::Void => "void".into(),
@@ -951,7 +1078,10 @@ mod tests {
         let point = s.declare_struct("Point");
         assert_eq!(s.show(&Type::optional(Type::i64())), "?i64");
         let empty = s.err_set(Vec::new());
-        assert_eq!(s.show(&Type::err_union(Type::strukt(point), empty)), "!Point");
+        assert_eq!(
+            s.show(&Type::err_union(Type::strukt(point), empty)),
+            "!Point"
+        );
         assert_eq!(
             s.show(&Type::func(vec![Type::str(), Type::bool()], Type::void())),
             "fn(str, bool) void"
@@ -1000,8 +1130,29 @@ mod tests {
         assert_eq!(s.generalize(&inner).vars.len(), 1);
     }
 
+    /// Two abstract types with the same members would each be a subtype of the
+    /// other, and `compare_specificity` would then order them by declaration
+    /// rather than report the ambiguity it should. Nothing in the runtime's
+    /// table enforces that they differ, so this does.
     #[test]
-    fn an_abstract_type_is_above_the_types_it_lists() {
+    fn abstract_types_are_a_strict_lattice() {
+        let table = wsharp_runtime::builtins::abstract_types();
+        for (i, (a, _)) in table.iter().enumerate() {
+            for (j, (b, _)) in table.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let (ma, mb) = (abstract_members(i as u32), abstract_members(j as u32));
+                assert!(
+                    ma != mb,
+                    "abstract types `{a}` and `{b}` list the same members, so neither can be                      more specific than the other"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_abstract_type_with_fewer_members_is_the_more_specific() {
         let mut s = TypeStore::new();
         let number = lookup_abstract("Number").expect("`Number` is in the table");
         let num = Type::abstrakt(number);
@@ -1011,8 +1162,16 @@ mod tests {
         // Only downwards, and only for what the table lists.
         assert!(!s.is_sub_ty(&num, &Type::i64()));
         assert!(!s.is_sub_ty(&Type::str(), &num));
-        // Flat: an abstract type is comparable only with itself.
         assert!(s.is_sub_ty(&num, &num));
+        // `Integer` lists a subset of `Number`'s members, so it is the more
+        // specific of the two -- which is what an overload set needs to pick
+        // between `fn f(x: Integer)` and `fn f(x: Number)`.
+        let integer = lookup_abstract("Integer").expect("`Integer` is in the table");
+        let int = Type::abstrakt(integer);
+        assert!(s.is_sub_ty(&int, &num));
+        assert!(!s.is_sub_ty(&num, &int));
+        assert!(s.is_sub_ty(&Type::int(IntTy::U8), &int));
+        assert!(!s.is_sub_ty(&Type::f64(), &int));
         // And a variable is nothing's subtype until it is resolved.
         let v = s.fresh();
         assert!(!s.is_sub_ty(&v, &num));

@@ -46,13 +46,14 @@ The whole example is in [`examples/status.ws`](examples/status.ws).
 | Dispatch | multiple, always dynamic | multiple, static wherever inference pins the types |
 | Types | dynamic; annotations optional and advisory | Hindley-Milner; annotations optional and **checked** |
 | Generics | one method, specialised at run time | monomorphised at compile time; unreachable copies dropped |
-| Values | boxed by default | unboxed — `i64`, `f64`, `bool`, optionals and error unions live in registers |
+| Values | boxed by default | unboxed — the sized integers, `f64`, `bool`, optionals and error unions live in registers, and a `u8` costs a byte |
 | Errors | exceptions | `?T` optionals and `!T` error unions, Zig-style, with the error set inferred into the type |
 | Collector | generational, stop-the-world | reference counting with a coalescing barrier, a concurrent mark trace for cycles, and compaction |
 | Aimed at | arrays, notebooks, science | services, tools, systems |
 
 What Julia still does far better: a vast numerical ecosystem, a mature REPL and
-package manager, and a decade of tuning. W# is a young language with a small
+package manager (W#'s is item 11, and is called *ingot*), and a decade of
+tuning. W# is a young language with a small
 standard library. The table is a statement of design priorities, not a claim to
 have replaced anything.
 
@@ -64,14 +65,14 @@ everywhere.** They are checked when written and inferred when not.
 | | |
 |---|---|
 | Bindings | `const x = 1;` immutable, `var y: i64 = 2;` mutable |
-| Types | `i64` `f64` `bool` `void` `str`, `[]T` array, `?T` optional, `!T` error union, `fn(A) B` |
+| Types | `i8` `i16` `i32` `i64` `u8` `u16` `u32` `u64` `f64` `bool` `void` `str`, `[]T` array, `?T` optional, `!T` error union, `fn(A) B` |
 | Functions | `fn add(a, b) { return a + b; }`, `fn add(a: i64, b: i64) i64 { ... }` |
 | Overloads | several `fn`s may share a name; the call picks the most specific |
-| Abstract types | `Number` stands for `i64` and `f64`, so an overload can claim "any number" while another claims `i64` |
+| Abstract types | `Number` stands for every numeric type and `Integer` for the eight integer ones, so an overload can claim "any number" while another claims `i64` |
 | Control flow | `if (c) { } else { }`, `while (c) : (i += 1) { }`, `for (xs) \|x\| { }`, `break`, `continue` |
 | Expressions | `if (c) a else b`, `fn (a, b) { ... }` closures |
 | Closures | `const id = fn (x) { return x; };` generalises, may name itself, and `fn [T](a: []T) T` writes the parameters out |
-| Literals | `42`, `0xff`, `0b1010`, `0o17`, `1_000_000`, `2.5`, `"text"` with `\n \t \r \0 \\ \"` |
+| Literals | `42`, `0xff`, `0b1010`, `0o17`, `1_000_000`, `2.5`, `"text"` with `\n \t \r \0 \\ \"`; an integer literal takes the type it is used at and defaults to `i64` |
 | Arrays | `[]i64{ 1, 2, 3 }`, `a[i]`, `for (a) \|v, i\| { }`; an index out of range panics |
 | Growable | `std/list` — a backing array plus a count, so `push` is amortised constant time |
 | Iterating | `for (xs) \|x\|` over an array walks it by index; over anything else it calls `iter` and `next` from the module that declares its type |
@@ -85,7 +86,7 @@ everywhere.** They are checked when written and inferred when not.
 | Optionals | `null`, `a orelse b`, `a.?`, `if (a) \|v\| { }`, `while (a) \|v\| { }` |
 | Errors | `error.Name`, `try f()`, `f() catch 0`, `f() catch \|e\| ...`, `f() catch return false`, `f() catch { log(); 0 }` |
 | Error sets | `!i64` infers which errors; `!{NotFound, IoFailed}str` writes them down and is checked |
-| Operators | `+ - * /`, `%` (integers only), `== != < <= > >=` (non-chaining), `and or !` |
+| Operators | `+ - * /`, `%` and `& \| ^ << >> ~` (integers only), `== != < <= > >=` (non-chaining), `and or !`; `u32(x)` converts |
 
 `==` compares `str` by contents, so a string built at run time equals a literal.
 
@@ -123,13 +124,20 @@ type, so those types cannot themselves be inferred from the calls being
 resolved.
 
 Overloading is not limited to struct types. An **abstract type** stands for a
-set of concrete ones -- `Number` for `i64` and `f64` -- so a general case can
-be written alongside a specific one:
+set of concrete ones -- `Number` for every numeric type, `Integer` for the
+eight integer ones -- so a general case can be written alongside a specific
+one:
 
 ```zig
-fn show(x: i64)    str { return "an integer"; }
-fn show(x: Number) str { return "a number"; }   // catches f64
+fn show(x: i64)     str { return "an integer"; }
+fn show(x: Integer) str { return "some width of integer"; }
+fn show(x: Number)  str { return "a number"; }   // catches f64
 ```
+
+Abstract types are ordered by their member sets, so `Integer` is more specific
+than `Number` and wins wherever both apply. A body annotated `Number` must work
+for *every* type it lists, which is why it may not use `%` (no float form) or
+negate (no unsigned negatives) -- `Integer` is what such a body claims.
 
 An abstract type classifies values for dispatch and is never one itself: a
 parameter annotated with it is a *generic* parameter constrained to the
@@ -265,9 +273,11 @@ wsharp check <file.ws>    # type-check only
 The process exits with the low byte of `main`'s return value, as a C program
 does, so `return 256;` exits 0. A compile error exits 1. A failure the type
 system allows but the program must not perform — `.?` on a null optional, a
-failed `assert`, integer division by zero, `i64::MIN / -1`, an index outside an
-array, a call no overload matches — prints `W# panic: <reason>` to stderr and
-exits with status 101.
+failed `assert`, integer division by zero, a signed `MIN / -1`, an index
+outside an array, a call no overload matches — prints `W# panic: <reason>` to
+stderr and exits with status 101. Ordinary overflow is not one of them:
+`+`, `-` and `*` wrap, which for an unsigned type is the definition rather than
+a concession.
 
 `--emit` stops after a stage and prints it, which is the fastest way to see what
 the compiler is thinking:
@@ -339,6 +349,7 @@ serving many connections from one worker, not for keeping the collector alive.
 | `std/array` | `len` `new` `concat` `push` `slice` `repeat` |
 | `std/list` | `List[T]`, a growable array: `new` `with_capacity` `from` `len` `capacity` `get` `set` `push` `pop` `insert` `remove` `extend` `clear` `iter` `next` `to_array` |
 | `std/math` | `abs` `min` `max` `sign` `sqrt` `pow` `floor` `ceil` `round` `trunc` `ipow` |
+| `std/bits` | `rotl` `rotr` — rotation, generic over `Integer`, one instruction on both targets |
 | `std/io` | `read_file` `read_line` `write_file` `exists` — the fallible ones name their errors, e.g. `!{NotFound, PermissionDenied, IoFailed}str` |
 | `std/net` | TCP: `Socket` `Listener` and `connect` `listen` `accept` `read` `write` `write_all` `read_exactly` `read_all` `set_nonblocking` `close`. UDP: `Datagrams` `Peer` `Datagram` and `udp` `send_to` `receive` `reply`. Readiness: `Poller` `Event` and `poller` `watch` `wait`. IPv4 or IPv6, with the family the resolver's choice |
 | `std/http` | the 27 HTTP status types, materialised on first mention, plus an HTTP/1.1 client and server: `get` `post` `request` `read_request` `respond` `header` `status_of` |
@@ -348,7 +359,7 @@ A **prelude** needs no import, because every module has it:
 
 | | |
 |---|---|
-| `print(s: str)`, `print_int(i64)`, `print_float(f64)`, `print_bool(bool)` | write a line to stdout |
+| `print(s: str)`, `print_int(i64)`, `print_uint(u64)`, `print_float(f64)`, `print_bool(bool)` | write a line to stdout; a narrower value is written `print_int(i64(x))`, because conversions are written rather than inferred |
 | `assert(c: bool)` | panic if `c` is false |
 | `panic_index(i: i64, len: i64)` | the out-of-bounds panic, so a container written in W# reports a bad index exactly as `a[i]` does |
 | `gc_collect()` | one reference-counting collection |
@@ -447,16 +458,17 @@ Sessions are numbered by the original feature list:
       Linux, macOS/BSD and Windows arms, a readiness API, and a *safe region*
       that lets a thread block in a syscall while its collector walks the
       stack it left behind. `std/net` and `std/http` are on top of it.
-- [ ] **9.** Sized and unsigned integers, and bitwise operators. `i64` is the
-      right default and the wrong only choice the moment a program computes on
-      bytes: SHA-256 is addition modulo 2^32, and none of it can be written
-      here yet.
+- [x] **9.** Sized and unsigned integers, and bitwise operators — `i8` through
+      `u64`, `& | ^ << >> ~`, a rotate, and integer literals that take the type
+      they are used at. `i64` was the right default and the wrong only choice
+      the moment a program computed on bytes; ChaCha20's quarter round is now a
+      test case rather than a thing the language could not say.
 - [ ] **10.** TLS 1.3, written in W#, with certificate chains verified against
       the platform's own root store — which is what turns `https://` from
       `error.NotSupported` into a connection.
-- [ ] **11.** Package management: git spoken rather than shelled out to, a
-      content-addressed store, and a resolver that says *why* a version was
-      ruled out rather than that it was.
+- [ ] **11.** Package management, in a tool called **ingot**: git spoken rather
+      than shelled out to, a content-addressed store, and a resolver that says
+      *why* a version was ruled out rather than that it was.
 
 What is left, and where it plugs in, is in [ROADMAP.md](ROADMAP.md).
 Conventions and the invariants worth not breaking are in

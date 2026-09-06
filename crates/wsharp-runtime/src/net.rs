@@ -666,7 +666,7 @@ pub unsafe extern "C" fn ws_net_close_poller(poller: i64) {
 /// Not for tidiness -- the process is ending and the kernel would do it -- but
 /// so that a listener's port is released before the next test binds it.
 pub fn close_all() {
-    let entries = with_sockets(|table| std::mem::take(table));
+    let entries = with_sockets(std::mem::take);
     for entry in entries.into_iter().flatten() {
         sys::close_socket(entry.fd);
     }

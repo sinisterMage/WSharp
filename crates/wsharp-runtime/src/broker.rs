@@ -169,8 +169,8 @@ pub unsafe extern "C" fn ws_broker_poll(out: *mut MaybeMessage, consumer: i64) {
     let taken = with_broker(|b| {
         let c = b.consumers.get(consumer as usize)?;
         let t = b.topics.get(c.topic)?;
-        let at = (0..t.partitions.len())
-            .find(|&p| (c.position[p] as usize) < t.partitions[p].len())?;
+        let at =
+            (0..t.partitions.len()).find(|&p| (c.position[p] as usize) < t.partitions[p].len())?;
         let wire = t.partitions[at][c.position[at] as usize].clone();
         b.consumers[consumer as usize].position[at] += 1;
         Some(wire)

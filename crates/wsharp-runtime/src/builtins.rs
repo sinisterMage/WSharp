@@ -13,7 +13,14 @@ use crate::header::{AUX_OFFSET, HEADER_SIZE};
 /// stays a leaf crate that neither sema nor codegen has to be built before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinTy {
+    I8,
+    I16,
+    I32,
     I64,
+    U8,
+    U16,
+    U32,
+    U64,
     F64,
     Bool,
     Void,
@@ -43,6 +50,16 @@ pub enum BuiltinTy {
     /// the type and what makes the decoded value dispatchable on the other
     /// side. A scalar carries nothing.
     Message(u8),
+    /// A type variable that must be one of the integer types.
+    ///
+    /// Numbered as [`BuiltinTy::Var`] is, and the same variable; the type
+    /// checker additionally records a `Member` constraint on the abstract type
+    /// `Integer`, exactly as an `Integer`-annotated parameter would. What it
+    /// is *for* is a builtin the code generator lowers inline and so can
+    /// compile at any width -- `bits.rotl`, which is one instruction on both
+    /// targets and cannot be an `extern "C"` function because a Rust one
+    /// cannot be generic over the width.
+    IntVar(u8),
     /// A type variable, numbered within one signature: every `Var(0)` in a row
     /// is the same type, and each *use* of the builtin gets its own.
     ///
@@ -115,6 +132,17 @@ pub fn builtins() -> Vec<Builtin> {
             params: &[BuiltinTy::F64],
             ret: BuiltinTy::Void,
             ptr: ws_print_float as *const u8,
+        },
+        // `print_int` takes an `i64`, and a narrower value is written
+        // `print_int(i64(x))` -- conversions are written, never inferred. This
+        // is for the one value that cannot round-trip through an `i64`: a
+        // `u64` with its top bit set.
+        Builtin {
+            module: PRELUDE,
+            name: "print_uint",
+            params: &[BuiltinTy::U64],
+            ret: BuiltinTy::Void,
+            ptr: ws_print_uint as *const u8,
         },
         Builtin {
             module: PRELUDE,
@@ -294,6 +322,39 @@ fn library() -> Vec<Builtin> {
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, &["BadFormat"]),
             ptr: crate::strings::ws_str_parse_int as *const u8,
         },
+        // The other half of `from_int`, for the top half of a `u64`: an `i64`
+        // cannot hold it, so converting first would print a negative number.
+        Builtin {
+            module: STR_MODULE,
+            name: "from_uint",
+            params: &[BuiltinTy::U64],
+            ret: BuiltinTy::Str,
+            ptr: crate::strings::ws_str_from_uint as *const u8,
+        },
+        // Rotation, which every hash and stream cipher is written in terms of.
+        // A builtin rather than a shift-shift-or the code generator would have
+        // to recognise and would sometimes miss -- and lowered inline rather
+        // than called, because one machine instruction behind a call is not a
+        // rotate anybody wants, and because a Rust `extern "C"` cannot be
+        // generic over the width the way `IntVar` is.
+        //
+        // The pointers are never taken: `Trans::call` intercepts both by name,
+        // exactly as it does `array.new`. They name `ws_panic` so that the row
+        // is still a well-formed JIT symbol.
+        Builtin {
+            module: BITS_MODULE,
+            name: BITS_ROTL,
+            params: &[BuiltinTy::IntVar(0), BuiltinTy::IntVar(0)],
+            ret: BuiltinTy::IntVar(0),
+            ptr: ws_panic as *const u8,
+        },
+        Builtin {
+            module: BITS_MODULE,
+            name: BITS_ROTR,
+            params: &[BuiltinTy::IntVar(0), BuiltinTy::IntVar(0)],
+            ret: BuiltinTy::IntVar(0),
+            ptr: ws_panic as *const u8,
+        },
         Builtin {
             module: STR_MODULE,
             name: "to_lower",
@@ -361,7 +422,10 @@ fn library() -> Vec<Builtin> {
             module: IO_MODULE,
             name: "read_file",
             params: &[BuiltinTy::Str],
-            ret: BuiltinTy::ErrUnion(&BuiltinTy::Str, &["NotFound", "PermissionDenied", "IoFailed"]),
+            ret: BuiltinTy::ErrUnion(
+                &BuiltinTy::Str,
+                &["NotFound", "PermissionDenied", "IoFailed"],
+            ),
             ptr: crate::io::ws_io_read_file as *const u8,
         },
         Builtin {
@@ -760,6 +824,11 @@ pub const HTTP_MODULE: &str = "std/http";
 pub const BROKER_MODULE: &str = "std/broker";
 /// The standard library's sockets.
 pub const NET_MODULE: &str = "std/net";
+pub const BITS_MODULE: &str = "std/bits";
+/// The two rotates, which the code generator recognises by name and lowers
+/// inline rather than calling. See [`BuiltinTy::IntVar`].
+pub const BITS_ROTL: &str = "rotl";
+pub const BITS_ROTR: &str = "rotr";
 
 /// What any socket operation may raise.
 ///
@@ -846,7 +915,19 @@ pub fn std_module_paths() -> Vec<String> {
 /// A table for the same reason [`builtins`] and [`status_types`] are: sema reads
 /// it to seed the lattice, and adding a classifier is one row.
 pub fn abstract_types() -> &'static [(&'static str, &'static [BuiltinTy])] {
-    &[("Number", &[BuiltinTy::I64, BuiltinTy::F64])]
+    use BuiltinTy::*;
+    &[
+        // Every numeric type, which is what makes `math.min` one function
+        // rather than nine. The price is stated rather than hidden: a body
+        // annotated `Number` must work for *every* member, so it may not use
+        // `%` (no float form) and may not negate (no unsigned negatives).
+        ("Number", &[I8, I16, I32, I64, U8, U16, U32, U64, F64]),
+        // The integers alone, for a body that needs `%` or the bit operators
+        // and would otherwise have to be written eight times. Its members are
+        // a subset of `Number`'s, which is what makes it the more specific of
+        // the two when both could match -- see `TypeStore::is_sub_ty`.
+        ("Integer", &[I8, I16, I32, I64, U8, U16, U32, U64]),
+    ]
 }
 
 /// Runtime support routines that generated code calls but that are not
@@ -892,6 +973,13 @@ pub unsafe extern "C" fn ws_print_str(ptr: *const u8) {
 }
 
 pub extern "C" fn ws_print_int(value: i64) {
+    unsafe { crate::gc::checkpoint() };
+    println!("{value}");
+}
+
+/// The unsigned twin of [`ws_print_int`], for the half of `u64`'s range an
+/// `i64` cannot hold: `print_int(i64(x))` would show it as a negative number.
+pub extern "C" fn ws_print_uint(value: u64) {
     unsafe { crate::gc::checkpoint() };
     println!("{value}");
 }
@@ -1027,7 +1115,9 @@ pub extern "C" fn ws_panic(code: i64) {
         PANIC_ASSERT => "assertion failed".to_string(),
         PANIC_NO_METHOD => "no overload matched these argument types".to_string(),
         PANIC_DIVIDE_BY_ZERO => "integer division by zero".to_string(),
-        PANIC_DIVIDE_OVERFLOW => "integer overflow in division: i64::MIN / -1".to_string(),
+        // Not "i64::MIN" any more: the check is per width, so an `i32` can
+        // reach this too and naming one type would misdescribe the other.
+        PANIC_DIVIDE_OVERFLOW => "integer overflow in division: MIN / -1".to_string(),
         _ => format!("unknown failure (code {code})"),
     };
     report_and_exit(&reason)

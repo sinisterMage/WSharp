@@ -215,7 +215,10 @@ pub struct Expr {
 
 #[derive(Debug, Clone)]
 pub enum ExprKind {
-    Int(i64),
+    Int(i128),
+    /// `u32(x)`: a numeric conversion, written rather than inferred. The type
+    /// converted *to* is the expression's own type; this is what it came from.
+    Convert(Box<Expr>),
     Float(f64),
     Bool(bool),
     Str(StrId),
@@ -303,7 +306,10 @@ pub enum ExprKind {
         value: Option<Box<Expr>>,
     },
     /// `@spawn(m, args..)` -- start a worker, run `m.init(args..)` on it.
-    Spawn { service: ServiceId, args: Vec<Expr> },
+    Spawn {
+        service: ServiceId,
+        args: Vec<Expr>,
+    },
     /// `@join(w)`.
     Join(Box<Expr>),
     Orelse {

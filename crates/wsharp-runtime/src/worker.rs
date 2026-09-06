@@ -524,7 +524,10 @@ mod tests {
 
         let theirs = std::thread::spawn(|| {
             let there = Worker::current();
-            (there.id, crate::heap::ws_alloc(TYPE_ID_FIRST_USER, 32, 0) as usize)
+            (
+                there.id,
+                crate::heap::ws_alloc(TYPE_ID_FIRST_USER, 32, 0) as usize,
+            )
         })
         .join()
         .expect("the other thread finished");

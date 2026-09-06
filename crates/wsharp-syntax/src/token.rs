@@ -5,7 +5,7 @@ use crate::span::Span;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     // Literals.
-    Int(i64),
+    Int(i128),
     Float(f64),
     Str(Box<str>),
     Ident(Box<str>),
@@ -71,6 +71,21 @@ pub enum TokenKind {
     StarEq,
     SlashEq,
     PercentEq,
+
+    // Bitwise. `|` is `Pipe` above, because it is also capture syntax --
+    // `catch |e|`, `while (c) |v|`, `for (xs) |x|` -- and one token serves
+    // both: a capture is only ever looked for immediately after `catch` or
+    // after a header's `)`, where a binary operator cannot start.
+    Amp,
+    Caret,
+    Tilde,
+    Shl,
+    Shr,
+    AmpEq,
+    PipeEq,
+    CaretEq,
+    ShlEq,
+    ShrEq,
 
     Eof,
 }
@@ -144,6 +159,16 @@ impl TokenKind {
             TokenKind::StarEq => "*=",
             TokenKind::SlashEq => "/=",
             TokenKind::PercentEq => "%=",
+            TokenKind::Amp => "&",
+            TokenKind::Caret => "^",
+            TokenKind::Tilde => "~",
+            TokenKind::Shl => "<<",
+            TokenKind::Shr => ">>",
+            TokenKind::AmpEq => "&=",
+            TokenKind::PipeEq => "|=",
+            TokenKind::CaretEq => "^=",
+            TokenKind::ShlEq => "<<=",
+            TokenKind::ShrEq => ">>=",
             TokenKind::Eof => "<eof>",
             TokenKind::Int(_) | TokenKind::Float(_) | TokenKind::Str(_) | TokenKind::Ident(_) => {
                 unreachable!("value-carrying token has no fixed text")

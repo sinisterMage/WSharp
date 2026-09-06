@@ -26,7 +26,7 @@ use wsharp_runtime::header::{
 };
 use wsharp_sema::hir;
 use wsharp_sema::layout;
-use wsharp_sema::ty::{StructId, TyCon, Type, TypeStore};
+use wsharp_sema::ty::{IntTy, StructId, TyCon, Type, TypeStore};
 use wsharp_syntax::ast::{BinOp, UnOp};
 
 use crate::repr::{
@@ -85,17 +85,35 @@ pub struct Decls {
     pub join: FuncId,
 }
 
+/// Where a `fn` literal's captured values sit inside its closure object, and
+/// the offset just past the last of them.
+///
+/// Three places need this answer and must agree byte for byte: the layout
+/// registered with the runtime, the prologue that copies captures out of
+/// `env`, and the constructor that writes them in. Disagreement would not be a
+/// crash but a field read from the wrong place, and the collector reading a
+/// scalar as a reference. Going through [`layout::place`] -- the same function
+/// struct fields go through -- is what makes the agreement structural rather
+/// than three hand-written loops keeping step.
+pub fn capture_offsets(store: &mut TypeStore, func: &hir::FuncDef) -> (Vec<u32>, u32) {
+    let types: Vec<Type> = func
+        .captures
+        .iter()
+        .map(|c| func.locals[*c as usize].ty.clone())
+        .collect();
+    layout::place(store, &types, CLOSURE_CAPTURES_OFFSET)
+}
+
 /// The heap layout of the closure object for a `fn` literal: its total size,
 /// and the offsets of the captured values that are heap references.
 pub fn closure_layout(store: &mut TypeStore, func: &hir::FuncDef) -> (u32, Vec<u32>) {
-    let mut size = CLOSURE_CAPTURES_OFFSET;
+    let (offsets, end) = capture_offsets(store, func);
     let mut ptr_offsets = Vec::new();
-    for capture in &func.captures {
+    for (capture, at) in func.captures.iter().zip(&offsets) {
         let ty = func.locals[*capture as usize].ty.clone();
-        layout::ptr_offsets(store, &ty, size, &mut ptr_offsets);
-        size += layout::size_of(store, &ty);
+        layout::ptr_offsets(store, &ty, *at, &mut ptr_offsets);
     }
-    (align_up(size), ptr_offsets)
+    (align_up(end), ptr_offsets)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -188,9 +206,25 @@ fn returns_by_pointer(ty: BuiltinTy) -> bool {
 fn abi_slots(ty: BuiltinTy) -> SmallVec<[AbiParam; 2]> {
     match ty {
         BuiltinTy::Void => SmallVec::new(),
-        BuiltinTy::I64 | BuiltinTy::Var(_) | BuiltinTy::Transferable(_) => {
+        // `IntVar` is only ever a builtin the code generator lowers inline, so
+        // no call is emitted and this signature is never used -- but the row
+        // is still declared to the JIT, so it has to be well formed.
+        BuiltinTy::I64
+        | BuiltinTy::U64
+        | BuiltinTy::Var(_)
+        | BuiltinTy::Transferable(_)
+        | BuiltinTy::IntVar(_) => {
             smallvec![AbiParam::new(types::I64)]
         }
+        // C promotes a narrow integer argument, and which promotion it is
+        // depends on the sign -- the same reason `Bool` says `.uext()` below.
+        // Get this wrong and a `u8` of 200 arrives as -56.
+        BuiltinTy::I8 => smallvec![AbiParam::new(types::I8).sext()],
+        BuiltinTy::I16 => smallvec![AbiParam::new(types::I16).sext()],
+        BuiltinTy::I32 => smallvec![AbiParam::new(types::I32).sext()],
+        BuiltinTy::U8 => smallvec![AbiParam::new(types::I8).uext()],
+        BuiltinTy::U16 => smallvec![AbiParam::new(types::I16).uext()],
+        BuiltinTy::U32 => smallvec![AbiParam::new(types::I32).uext()],
         // A message is an object, so it crosses as the pointer it is.
         BuiltinTy::Message(_) => smallvec![AbiParam::new(PTR)],
         BuiltinTy::F64 => smallvec![AbiParam::new(types::F64)],
@@ -296,7 +330,10 @@ pub fn trampoline(
         }
         let ty = target.locals[*param as usize].ty.clone();
         for slot in repr::slot_types(store, &ty) {
-            call_args.push(b.ins().load(slot, flags, argv, at * layout::SLOT_SIZE as i32));
+            call_args.push(
+                b.ins()
+                    .load(slot, flags, argv, at * layout::SLOT_SIZE as i32),
+            );
             at += 1;
         }
     }
@@ -339,6 +376,22 @@ pub fn slot_kinds(store: &mut TypeStore, ty: &Type) -> Vec<wsharp_runtime::rpc::
             }
         })
         .collect()
+}
+
+/// Which family of instructions an operator lowers to.
+///
+/// Taken from the W# type rather than from the Cranelift one, because
+/// `ir::Type` has no notion of signedness: `i32` and `u32` are both `I32`, and
+/// it is `/`, `%`, `>>` and the four ordering comparisons that have to know
+/// which they are looking at.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NumKind {
+    Float,
+    Int(IntTy),
+    /// `bool` and an error tag. Only `==` and `!=` reach `binary` with one --
+    /// inference rejects every other operator on them -- and for those two,
+    /// width and signedness choose nothing.
+    Opaque,
 }
 
 struct Trans<'a, 'f> {
@@ -726,13 +779,12 @@ impl Trans<'_, '_> {
         }
 
         // Captured values are copied out of the closure environment on entry.
-        let mut offset = CLOSURE_CAPTURES_OFFSET;
-        for i in 0..self.func.captures.len() {
-            let local = self.func.captures[i];
+        let (offsets, _) = capture_offsets(self.store, self.func);
+        let captures: Vec<hir::LocalId> = self.func.captures.clone();
+        for (local, at) in captures.into_iter().zip(offsets) {
             let ty = self.local_ty(local);
-            let values = self.load_at(env, offset, &ty);
+            let values = self.load_at(env, at, &ty);
             self.def_local(local, &values);
-            offset += layout::size_of(self.store, &ty);
         }
 
         let body = &self.func.body;
@@ -943,7 +995,21 @@ impl Trans<'_, '_> {
             hir::ExprKind::Block { stmts, value } => self.value_block(&expr.ty, stmts, value),
             hir::ExprKind::Spawn { service, args } => self.spawn(&expr.ty, *service, args),
             hir::ExprKind::Join(worker) => self.join(worker),
-            hir::ExprKind::Int(v) => SmallVec::from_slice(&[self.b.ins().iconst(types::I64, *v)]),
+            hir::ExprKind::Int(v) => {
+                // The width comes from the expression's type rather than from
+                // `i64`: a literal is a `comptime_int` and takes the type its
+                // context asked for. The value is masked to that width because
+                // Cranelift's verifier wants a zero-extended immediate --
+                // `iconst.i32 -1` is rejected outright, doc comments about
+                // signedness notwithstanding.
+                let t = self
+                    .store
+                    .resolve(&expr.ty)
+                    .as_int()
+                    .expect("an integer literal is given an integer type by inference");
+                let value = self.b.ins().iconst(repr::clif_int(t), t.mask(*v));
+                SmallVec::from_slice(&[value])
+            }
             hir::ExprKind::Float(v) => SmallVec::from_slice(&[self.b.ins().f64const(*v)]),
             hir::ExprKind::Bool(v) => {
                 SmallVec::from_slice(&[self.b.ins().iconst(types::I8, i64::from(*v))])
@@ -994,6 +1060,13 @@ impl Trans<'_, '_> {
                 out
             }
 
+            hir::ExprKind::Convert(inner) => {
+                let value = self.expr(inner)[0];
+                let from = self.num_kind(&inner.ty);
+                let to = self.num_kind(&expr.ty);
+                SmallVec::from_slice(&[self.convert(value, from, to)])
+            }
+
             hir::ExprKind::Unary { op, expr: inner } => {
                 let value = self.expr(inner)[0];
                 let out = match op {
@@ -1001,9 +1074,13 @@ impl Trans<'_, '_> {
                         if self.b.func.dfg.value_type(value) == types::F64 {
                             self.b.ins().fneg(value)
                         } else {
+                            // Wrapping, and only ever on a signed type:
+                            // inference rejects `-x` on an unsigned one, where
+                            // the answer would be 2^n - x rather than an error.
                             self.b.ins().ineg(value)
                         }
                     }
+                    UnOp::BitNot => self.b.ins().bnot(value),
                     // `!b` is `b == 0`, which yields the I8 a W# bool is.
                     UnOp::Not => self
                         .b
@@ -1031,8 +1108,8 @@ impl Trans<'_, '_> {
                     };
                     return SmallVec::from_slice(&[result]);
                 }
-                let is_float = self.b.func.dfg.value_type(l) == types::F64;
-                SmallVec::from_slice(&[self.binary(*op, l, r, is_float)])
+                let kind = self.num_kind(&lhs.ty);
+                SmallVec::from_slice(&[self.binary(*op, l, r, kind)])
             }
 
             hir::ExprKind::Logical { op, lhs, rhs } => self.logical(*op, lhs, rhs),
@@ -1112,53 +1189,170 @@ impl Trans<'_, '_> {
         }
     }
 
-    fn binary(&mut self, op: BinOp, l: ir::Value, r: ir::Value, is_float: bool) -> ir::Value {
-        use ir::condcodes::{FloatCC, IntCC};
-        if is_float {
-            match op {
-                BinOp::Add => self.b.ins().fadd(l, r),
-                BinOp::Sub => self.b.ins().fsub(l, r),
-                BinOp::Mul => self.b.ins().fmul(l, r),
-                BinOp::Div => self.b.ins().fdiv(l, r),
-                // Cranelift has no float remainder; inference rejects `%` on
-                // floats before this point.
-                BinOp::Rem => unreachable!("`%` on floats is rejected by inference"),
-                BinOp::Eq => self.b.ins().fcmp(FloatCC::Equal, l, r),
-                BinOp::Ne => self.b.ins().fcmp(FloatCC::NotEqual, l, r),
-                BinOp::Lt => self.b.ins().fcmp(FloatCC::LessThan, l, r),
-                BinOp::Le => self.b.ins().fcmp(FloatCC::LessThanOrEqual, l, r),
-                BinOp::Gt => self.b.ins().fcmp(FloatCC::GreaterThan, l, r),
-                BinOp::Ge => self.b.ins().fcmp(FloatCC::GreaterThanOrEqual, l, r),
-                BinOp::And | BinOp::Or => unreachable!("logical operators are lowered separately"),
+    /// Which instruction family an operand type calls for.
+    fn num_kind(&mut self, ty: &Type) -> NumKind {
+        match self.store.resolve(ty) {
+            Type::Con(TyCon::F64, _) => NumKind::Float,
+            Type::Con(TyCon::Int(t), _) => NumKind::Int(t),
+            _ => NumKind::Opaque,
+        }
+    }
+
+    /// `u32(x)`: one numeric type into another, and every case written out.
+    ///
+    /// The same-width case has to be here rather than left to Cranelift:
+    /// `uextend` and `ireduce` are strictly *wider* and *narrower*
+    /// respectively, whatever `uextend`'s doc comment says about same-width
+    /// being a no-op, and asking for one is a verifier error rather than an
+    /// identity. Reinterpreting `i32` as `u32` is genuinely nothing to emit --
+    /// the bits are the bits, and only the operators applied to them differ.
+    fn convert(&mut self, value: ir::Value, from: NumKind, to: NumKind) -> ir::Value {
+        match (from, to) {
+            (NumKind::Int(a), NumKind::Int(b)) => match b.bits.cmp(&a.bits) {
+                std::cmp::Ordering::Less => self.b.ins().ireduce(repr::clif_int(b), value),
+                std::cmp::Ordering::Equal => value,
+                // The *source*'s signedness decides, because it is the source
+                // whose top bit either is a sign or is not. `u8(200)` widened
+                // to `i32` is 200; `i8(-56)` widened to `i32` is -56.
+                std::cmp::Ordering::Greater if a.signed => {
+                    self.b.ins().sextend(repr::clif_int(b), value)
+                }
+                std::cmp::Ordering::Greater => self.b.ins().uextend(repr::clif_int(b), value),
+            },
+            (NumKind::Int(a), NumKind::Float) => {
+                if a.signed {
+                    self.b.ins().fcvt_from_sint(types::F64, value)
+                } else {
+                    self.b.ins().fcvt_from_uint(types::F64, value)
+                }
             }
-        } else {
-            match op {
-                BinOp::Add => self.b.ins().iadd(l, r),
-                BinOp::Sub => self.b.ins().isub(l, r),
-                BinOp::Mul => self.b.ins().imul(l, r),
-                BinOp::Div | BinOp::Rem => self.checked_div(op, l, r),
-                BinOp::Eq => self.b.ins().icmp(IntCC::Equal, l, r),
-                BinOp::Ne => self.b.ins().icmp(IntCC::NotEqual, l, r),
-                BinOp::Lt => self.b.ins().icmp(IntCC::SignedLessThan, l, r),
-                BinOp::Le => self.b.ins().icmp(IntCC::SignedLessThanOrEqual, l, r),
-                BinOp::Gt => self.b.ins().icmp(IntCC::SignedGreaterThan, l, r),
-                BinOp::Ge => self.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, l, r),
-                BinOp::And | BinOp::Or => unreachable!("logical operators are lowered separately"),
+            // Saturating, which is what makes the conversion total: a float
+            // too large for the target clamps to its extreme and a NaN becomes
+            // zero, rather than trapping. The non-saturating forms trap, and a
+            // trap in a JIT with no signal handler is a SIGILL with no message.
+            (NumKind::Float, NumKind::Int(b)) => {
+                if b.signed {
+                    self.b.ins().fcvt_to_sint_sat(repr::clif_int(b), value)
+                } else {
+                    self.b.ins().fcvt_to_uint_sat(repr::clif_int(b), value)
+                }
+            }
+            (NumKind::Float, NumKind::Float) => value,
+            (NumKind::Opaque, _) | (_, NumKind::Opaque) => {
+                unreachable!("inference converts only between numeric types")
             }
         }
     }
 
+    fn binary(&mut self, op: BinOp, l: ir::Value, r: ir::Value, kind: NumKind) -> ir::Value {
+        use ir::condcodes::{FloatCC, IntCC};
+        let t = match kind {
+            NumKind::Int(t) => t,
+            NumKind::Opaque => {
+                return match op {
+                    BinOp::Eq => self.b.ins().icmp(IntCC::Equal, l, r),
+                    BinOp::Ne => self.b.ins().icmp(IntCC::NotEqual, l, r),
+                    other => unreachable!(
+                        "`{}` on a non-numeric type is rejected by inference",
+                        other.text()
+                    ),
+                };
+            }
+            NumKind::Float => {
+                return match op {
+                    BinOp::Add => self.b.ins().fadd(l, r),
+                    BinOp::Sub => self.b.ins().fsub(l, r),
+                    BinOp::Mul => self.b.ins().fmul(l, r),
+                    BinOp::Div => self.b.ins().fdiv(l, r),
+                    BinOp::Eq => self.b.ins().fcmp(FloatCC::Equal, l, r),
+                    BinOp::Ne => self.b.ins().fcmp(FloatCC::NotEqual, l, r),
+                    BinOp::Lt => self.b.ins().fcmp(FloatCC::LessThan, l, r),
+                    BinOp::Le => self.b.ins().fcmp(FloatCC::LessThanOrEqual, l, r),
+                    BinOp::Gt => self.b.ins().fcmp(FloatCC::GreaterThan, l, r),
+                    BinOp::Ge => self.b.ins().fcmp(FloatCC::GreaterThanOrEqual, l, r),
+                    // Cranelift has no float remainder; inference rejects `%`
+                    // on floats before this point.
+                    BinOp::Rem => unreachable!("`%` on floats is rejected by inference"),
+                    BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
+                        unreachable!("a bit operator on a float is rejected by inference")
+                    }
+                    BinOp::And | BinOp::Or => {
+                        unreachable!("logical operators are lowered separately")
+                    }
+                };
+            }
+        };
+        // Signed and unsigned differ in five of these, which is most of the
+        // reason the two kinds are worth distinguishing at all.
+        let (lt, le, gt, ge) = if t.signed {
+            (
+                IntCC::SignedLessThan,
+                IntCC::SignedLessThanOrEqual,
+                IntCC::SignedGreaterThan,
+                IntCC::SignedGreaterThanOrEqual,
+            )
+        } else {
+            (
+                IntCC::UnsignedLessThan,
+                IntCC::UnsignedLessThanOrEqual,
+                IntCC::UnsignedGreaterThan,
+                IntCC::UnsignedGreaterThanOrEqual,
+            )
+        };
+        match op {
+            // Wrapping, for both kinds. An unsigned overflow *is* the
+            // definition -- SHA-256 is addition modulo 2^32 -- and a signed
+            // one keeps the behaviour it has always had here: only division
+            // panics.
+            BinOp::Add => self.b.ins().iadd(l, r),
+            BinOp::Sub => self.b.ins().isub(l, r),
+            BinOp::Mul => self.b.ins().imul(l, r),
+            BinOp::Div | BinOp::Rem => self.checked_div(op, t, l, r),
+            BinOp::Eq => self.b.ins().icmp(IntCC::Equal, l, r),
+            BinOp::Ne => self.b.ins().icmp(IntCC::NotEqual, l, r),
+            BinOp::Lt => self.b.ins().icmp(lt, l, r),
+            BinOp::Le => self.b.ins().icmp(le, l, r),
+            BinOp::Gt => self.b.ins().icmp(gt, l, r),
+            BinOp::Ge => self.b.ins().icmp(ge, l, r),
+            BinOp::BitAnd => self.b.ins().band(l, r),
+            BinOp::BitOr => self.b.ins().bor(l, r),
+            BinOp::BitXor => self.b.ins().bxor(l, r),
+            // Cranelift masks the shift amount to the operand's width, so
+            // `x << 64` on a `u64` is `x << 0` rather than undefined. That is
+            // the rule the language adopts, because it is also what both
+            // targets do in hardware.
+            BinOp::Shl => self.b.ins().ishl(l, r),
+            // The one operator whose *instruction* depends on signedness
+            // rather than only its condition code: an arithmetic shift keeps
+            // the sign, a logical one shifts zeroes in.
+            BinOp::Shr => {
+                if t.signed {
+                    self.b.ins().sshr(l, r)
+                } else {
+                    self.b.ins().ushr(l, r)
+                }
+            }
+            BinOp::And | BinOp::Or => unreachable!("logical operators are lowered separately"),
+        }
+    }
+
     /// Integer `/` and `%`, with the two inputs the hardware cannot answer
-    /// turned into panics: a zero divisor, and `i64::MIN / -1`, whose result
-    /// does not fit. Cranelift's `sdiv` traps on both, but a trap is a SIGILL
-    /// with no message; a panic says what happened. `srem` defines
-    /// `i64::MIN % -1` as 0, so only `/` needs the second check.
-    fn checked_div(&mut self, op: BinOp, l: ir::Value, r: ir::Value) -> ir::Value {
+    /// turned into panics: a zero divisor, and `MIN / -1`, whose result does
+    /// not fit. Cranelift's `sdiv` traps on both, but a trap is a SIGILL with
+    /// no message; a panic says what happened. `srem` defines `MIN % -1` as 0,
+    /// so only `/` needs the second check.
+    ///
+    /// An *unsigned* division needs no overflow check at all -- there is no
+    /// pair of unsigned values whose quotient does not fit -- so the whole
+    /// second branch is skipped, and `MIN` is the minimum of this width rather
+    /// than of `i64`.
+    fn checked_div(&mut self, op: BinOp, t: IntTy, l: ir::Value, r: ir::Value) -> ir::Value {
         use ir::condcodes::IntCC;
         let ok = self.b.create_block();
+        let can_overflow = op == BinOp::Div && t.signed;
 
         let by_zero = self.b.create_block();
-        let nonzero = if op == BinOp::Div {
+        let nonzero = if can_overflow {
             self.b.create_block()
         } else {
             ok
@@ -1170,9 +1364,9 @@ impl Trans<'_, '_> {
         // `ws_panic` never returns; the jump only gives the block a terminator.
         self.jump_to(ok, NO_ARGS);
 
-        if op == BinOp::Div {
+        if can_overflow {
             self.switch(nonzero);
-            let is_min = self.b.ins().icmp_imm_s(IntCC::Equal, l, i64::MIN);
+            let is_min = self.b.ins().icmp_imm_s(IntCC::Equal, l, t.range().0 as i64);
             let is_neg_one = self.b.ins().icmp_imm_s(IntCC::Equal, r, -1);
             let overflows = self.b.ins().band(is_min, is_neg_one);
             let overflow = self.b.create_block();
@@ -1183,10 +1377,11 @@ impl Trans<'_, '_> {
         }
 
         self.switch(ok);
-        if op == BinOp::Div {
-            self.b.ins().sdiv(l, r)
-        } else {
-            self.b.ins().srem(l, r)
+        match (op, t.signed) {
+            (BinOp::Div, true) => self.b.ins().sdiv(l, r),
+            (BinOp::Div, false) => self.b.ins().udiv(l, r),
+            (_, true) => self.b.ins().srem(l, r),
+            (_, false) => self.b.ins().urem(l, r),
         }
     }
 
@@ -1298,12 +1493,25 @@ impl Trans<'_, '_> {
     /// How arguments and results cross to the runtime: only the call site knows
     /// what shape they are, and only generated code may build one, because a
     /// reference in it has to be a reference this heap agrees about.
+    ///
+    /// Zeroed first, and that is not tidiness. A slot narrower than a word --
+    /// a `bool`, an option tag, a `u8` -- stores only its own bytes, and
+    /// `rpc::pack` then reads the whole word and sends it to another thread.
+    /// Whatever the stack happened to hold would travel with it: undefined
+    /// behaviour on the reading side, and a message that differs run to run.
     fn word_buffer(&mut self, words: usize) -> (ir::StackSlot, ir::Value) {
+        let words = words.max(1);
         let slot = self.b.create_sized_stack_slot(ir::StackSlotData::new(
             ir::StackSlotKind::ExplicitSlot,
-            (words.max(1) as u32) * layout::SLOT_SIZE,
+            (words as u32) * layout::SLOT_SIZE,
             layout::SLOT_SIZE.trailing_zeros() as u8,
         ));
+        let zero = self.b.ins().iconst(types::I64, 0);
+        for at in 0..words {
+            self.b
+                .ins()
+                .stack_store(PTR, zero, slot, (at as u32 * layout::SLOT_SIZE) as i32);
+        }
         let addr = self.b.ins().stack_addr(PTR, slot, 0);
         (slot, addr)
     }
@@ -1345,7 +1553,9 @@ impl Trans<'_, '_> {
         let (slot, argv) = self.word_buffer(words);
         self.write_args(slot, args);
 
-        let fr = self.module.declare_func_in_func(self.decls.spawn, self.b.func);
+        let fr = self
+            .module
+            .declare_func_in_func(self.decls.spawn, self.b.func);
         let id = self.b.ins().iconst(types::I32, service as i64);
         let call = self.b.ins().call(fr, &[id, argv]);
         let handle = self.b.inst_results(call)[0];
@@ -1370,7 +1580,9 @@ impl Trans<'_, '_> {
     /// `@join(w)` -- `!void`, which is one tag and no payload.
     fn join(&mut self, worker: &hir::Expr) -> Slots {
         let handle = self.expr(worker)[0];
-        let fr = self.module.declare_func_in_func(self.decls.join, self.b.func);
+        let fr = self
+            .module
+            .declare_func_in_func(self.decls.join, self.b.func);
         let call = self.b.ins().call(fr, &[handle]);
         let wide = self.b.inst_results(call)[0];
         let tag = self.b.ins().ireduce(repr::ERROR_TAG, wide);
@@ -1536,6 +1748,31 @@ impl Trans<'_, '_> {
                 let ty = ty.clone();
                 let len = self.expr(&args[0])[0];
                 self.array_alloc(&ty, len)
+            }
+
+            // The rotates, lowered here rather than called for the reason
+            // `array.new` is: only this site knows the width, and one machine
+            // instruction behind a call is not the rotate anybody asked for.
+            hir::Callee::Builtin(id)
+                if {
+                    let builtins = wsharp_runtime::builtins();
+                    let b = &builtins[*id as usize];
+                    b.module == wsharp_runtime::builtins::BITS_MODULE
+                } =>
+            {
+                let builtins = wsharp_runtime::builtins();
+                let left = builtins[*id as usize].name == wsharp_runtime::builtins::BITS_ROTL;
+                let value = self.expr(&args[0])[0];
+                let amount = self.expr(&args[1])[0];
+                // Cranelift masks the amount to the operand's width, on both
+                // targets and in its own constant folding, so a rotate by the
+                // width is the identity rather than undefined.
+                let out = if left {
+                    self.b.ins().rotl(value, amount)
+                } else {
+                    self.b.ins().rotr(value, amount)
+                };
+                SmallVec::from_slice(&[out])
             }
 
             hir::Callee::Builtin(id) => {
@@ -1925,10 +2162,9 @@ impl Trans<'_, '_> {
             CLOSURE_CODE_OFFSET as i32,
         );
 
-        let mut offset = CLOSURE_CAPTURES_OFFSET;
-        for (ty, value) in types.iter().zip(&values) {
-            self.emit_store_field(ptr, offset, ty, value);
-            offset += layout::size_of(self.store, ty);
+        let (offsets, _) = capture_offsets(self.store, program.func(func));
+        for ((ty, value), at) in types.iter().zip(&values).zip(offsets) {
+            self.emit_store_field(ptr, at, ty, value);
         }
         SmallVec::from_slice(&[ptr])
     }

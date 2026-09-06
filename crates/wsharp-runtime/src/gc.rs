@@ -18,9 +18,9 @@ use crate::header::{
     type_id_of,
 };
 use crate::heap::{in_heap, is_collectable};
-use crate::worker::Worker;
 use crate::mark;
 use crate::types;
+use crate::worker::Worker;
 
 /// What the write barrier has recorded since the last collection.
 ///
@@ -406,7 +406,7 @@ pub fn report_if_asked() {
 /// Let a trace in flight finish or stand down, so that the numbers printed at
 /// exit describe a heap nothing is still working on.
 pub fn quiesce() {
-    crate::worker::for_each_worker(|w| mark::quiesce(w));
+    crate::worker::for_each_worker(mark::quiesce);
 }
 
 /// How often to collect: every this many objects allocated.

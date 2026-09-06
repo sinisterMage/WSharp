@@ -155,7 +155,10 @@ impl<'a> Lexer<'a> {
                         b',' => TokenKind::Comma,
                         b';' => TokenKind::Semi,
                         b':' => TokenKind::Colon,
-                        b'|' => TokenKind::Pipe,
+                        b'|' => self.maybe_eq(TokenKind::PipeEq, TokenKind::Pipe),
+                        b'&' => self.maybe_eq(TokenKind::AmpEq, TokenKind::Amp),
+                        b'^' => self.maybe_eq(TokenKind::CaretEq, TokenKind::Caret),
+                        b'~' => TokenKind::Tilde,
                         b'?' => TokenKind::Question,
                         b'@' => TokenKind::At,
                         b'.' => {
@@ -172,8 +175,24 @@ impl<'a> Lexer<'a> {
                         b'%' => self.maybe_eq(TokenKind::PercentEq, TokenKind::Percent),
                         b'=' => self.maybe_eq(TokenKind::EqEq, TokenKind::Eq),
                         b'!' => self.maybe_eq(TokenKind::BangEq, TokenKind::Bang),
-                        b'<' => self.maybe_eq(TokenKind::LtEq, TokenKind::Lt),
-                        b'>' => self.maybe_eq(TokenKind::GtEq, TokenKind::Gt),
+                        // Three characters deep, so the longer token has to
+                        // be tried first at each step: `<<=` before `<<`,
+                        // and `<<` before `<=`. `maybe_eq` only knows how to
+                        // look one character ahead.
+                        b'<' => self.shift_or(
+                            TokenKind::ShlEq,
+                            TokenKind::Shl,
+                            TokenKind::LtEq,
+                            TokenKind::Lt,
+                            b'<',
+                        ),
+                        b'>' => self.shift_or(
+                            TokenKind::ShrEq,
+                            TokenKind::Shr,
+                            TokenKind::GtEq,
+                            TokenKind::Gt,
+                            b'>',
+                        ),
                         _ => {
                             let span = Span::new(start, self.pos);
                             let ch = self.src[start..self.pos].chars().next().unwrap_or('?');
@@ -196,6 +215,26 @@ impl<'a> Lexer<'a> {
 
     fn maybe_eq(&mut self, with_eq: TokenKind, without: TokenKind) -> TokenKind {
         if self.eat(b'=') { with_eq } else { without }
+    }
+
+    /// `<`, `<<`, `<<=` and `<=` from one leading `<` -- and the same for `>`.
+    ///
+    /// The doubled form is checked first because it is longer; `<=` is only
+    /// reachable once the second `<` is ruled out, which is what keeps
+    /// comparison working unchanged.
+    fn shift_or(
+        &mut self,
+        shift_eq: TokenKind,
+        shift: TokenKind,
+        cmp_eq: TokenKind,
+        cmp: TokenKind,
+        doubled: u8,
+    ) -> TokenKind {
+        if self.eat(doubled) {
+            self.maybe_eq(shift_eq, shift)
+        } else {
+            self.maybe_eq(cmp_eq, cmp)
+        }
     }
 
     fn ident(&mut self, start: usize) -> Token {
@@ -296,13 +335,21 @@ impl<'a> Lexer<'a> {
                 }
             }
         } else {
-            match i64::from_str_radix(&cleaned, radix) {
-                Ok(v) => TokenKind::Int(v),
-                Err(_) => {
+            // Parsed as `i128` and bounded by `u64::MAX` rather than by
+            // `i64::MAX`, because a literal has no type yet: `0xFFFF_FFFF_FFFF_FFFF`
+            // is a perfectly good `u64` and only inference can know that.
+            // Whether the value fits the type it is *used* at is checked
+            // there, where the type is known.
+            //
+            // A literal is always non-negative here -- `-1` is unary minus
+            // applied to `1` -- so the upper bound is the only one.
+            match i128::from_str_radix(&cleaned, radix) {
+                Ok(v) if v <= u64::MAX as i128 => TokenKind::Int(v),
+                _ => {
                     self.diags.push(
                         Diagnostic::error(span, "integer literal out of range")
-                            .label("does not fit in i64")
-                            .help("W# integers are 64-bit signed"),
+                            .label("does not fit in 64 bits")
+                            .help("the widest integer types W# has are `i64` and `u64`"),
                     );
                     TokenKind::Int(0)
                 }
@@ -546,6 +593,42 @@ mod tests {
         let (_, diags) = lex("99999999999999999999");
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("out of range"));
+    }
+
+    /// The bound is `u64::MAX`, not `i64::MAX`: a literal has no type yet, and
+    /// `0xFFFF_FFFF_FFFF_FFFF` is a perfectly good `u64`. Whether the value
+    /// fits the type it is *used* at is inference's question.
+    #[test]
+    fn a_literal_may_fill_a_u64() {
+        let (tokens, diags) = lex("0xFFFF_FFFF_FFFF_FFFF");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(tokens[0].kind, TokenKind::Int(u64::MAX as i128));
+
+        let (_, diags) = lex("18446744073709551616");
+        assert_eq!(diags.len(), 1, "one past `u64::MAX` is still out of range");
+    }
+
+    #[test]
+    fn bitwise_operators_lex_without_disturbing_comparison() {
+        let (tokens, diags) = lex("a & b | c ^ ~d << 1 >> 2 <= 3 >= 4 < 5 > 6");
+        assert!(diags.is_empty(), "{diags:?}");
+        let kinds: Vec<&TokenKind> = tokens.iter().map(|t| &t.kind).collect();
+        let text: Vec<String> = kinds
+            .iter()
+            .filter(|k| !matches!(k, TokenKind::Ident(_) | TokenKind::Int(_) | TokenKind::Eof))
+            .map(|k| k.text().to_string())
+            .collect();
+        assert_eq!(text, ["&", "|", "^", "~", "<<", ">>", "<=", ">=", "<", ">"]);
+
+        let (tokens, diags) = lex("a &= b |= c ^= d <<= e >>= f");
+        assert!(diags.is_empty(), "{diags:?}");
+        let text: Vec<String> = tokens
+            .iter()
+            .map(|t| &t.kind)
+            .filter(|k| !matches!(k, TokenKind::Ident(_) | TokenKind::Eof))
+            .map(|k| k.text().to_string())
+            .collect();
+        assert_eq!(text, ["&=", "|=", "^=", "<<=", ">>="]);
     }
 
     #[test]

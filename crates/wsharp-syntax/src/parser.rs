@@ -7,9 +7,13 @@
 //!   and
 //!   == != < <= > >=      (non-associative)
 //!   orelse  catch
+//!   |
+//!   ^
+//!   &
+//!   << >>
 //!   + -
 //!   * / %
-//!   - ! try              (prefix)
+//!   - ! ~ try            (prefix)
 //!   f()  .field  .?      (postfix)
 //! ```
 //!
@@ -685,6 +689,11 @@ impl Parser {
             TokenKind::StarEq => Some(BinOp::Mul),
             TokenKind::SlashEq => Some(BinOp::Div),
             TokenKind::PercentEq => Some(BinOp::Rem),
+            TokenKind::AmpEq => Some(BinOp::BitAnd),
+            TokenKind::PipeEq => Some(BinOp::BitOr),
+            TokenKind::CaretEq => Some(BinOp::BitXor),
+            TokenKind::ShlEq => Some(BinOp::Shl),
+            TokenKind::ShrEq => Some(BinOp::Shr),
             _ => {
                 self.expect(TokenKind::Semi)?;
                 return Some(Stmt::Expr(target));
@@ -776,6 +785,11 @@ impl Parser {
                 TokenKind::StarEq => Some(Some(BinOp::Mul)),
                 TokenKind::SlashEq => Some(Some(BinOp::Div)),
                 TokenKind::PercentEq => Some(Some(BinOp::Rem)),
+                TokenKind::AmpEq => Some(Some(BinOp::BitAnd)),
+                TokenKind::PipeEq => Some(Some(BinOp::BitOr)),
+                TokenKind::CaretEq => Some(Some(BinOp::BitXor)),
+                TokenKind::ShlEq => Some(Some(BinOp::Shl)),
+                TokenKind::ShrEq => Some(Some(BinOp::Shr)),
                 _ => None,
             };
             let stmt = match stmt {
@@ -941,7 +955,7 @@ impl Parser {
     /// `orelse` and `catch`, which bind tighter than comparison (as in Zig).
     fn catch_expr(&mut self) -> Option<Expr> {
         self.scoped(|p| {
-            let mut lhs = p.add_expr()?;
+            let mut lhs = p.bitor_expr()?;
             loop {
                 match p.peek() {
                     TokenKind::Orelse => {
@@ -970,6 +984,97 @@ impl Parser {
                     }
                     _ => return Some(lhs),
                 }
+            }
+        })
+    }
+
+    /// `|`, `^` and `&`, loosest first, which is C's ordering -- and, unlike
+    /// C's, looser than comparison, so `flags & MASK == MASK` means what it
+    /// reads as instead of `flags & (MASK == MASK)`. Zig groups all three at
+    /// one level; three levels say the same thing and read better.
+    ///
+    /// The `|` here is the same token a capture uses. There is no ambiguity:
+    /// a capture is only looked for straight after `catch` or after the `)`
+    /// closing a `while`/`for`/`if` header, and neither is a place a binary
+    /// operator could appear.
+    fn bitor_expr(&mut self) -> Option<Expr> {
+        self.scoped(|p| {
+            let mut lhs = p.bitxor_expr()?;
+            while matches!(p.peek(), TokenKind::Pipe) {
+                p.enter("expression")?;
+                p.bump();
+                let rhs = p.bitxor_expr()?;
+                let span = lhs.span().to(rhs.span());
+                lhs = Expr::Binary {
+                    op: BinOp::BitOr,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    span,
+                };
+            }
+            Some(lhs)
+        })
+    }
+
+    fn bitxor_expr(&mut self) -> Option<Expr> {
+        self.scoped(|p| {
+            let mut lhs = p.bitand_expr()?;
+            while matches!(p.peek(), TokenKind::Caret) {
+                p.enter("expression")?;
+                p.bump();
+                let rhs = p.bitand_expr()?;
+                let span = lhs.span().to(rhs.span());
+                lhs = Expr::Binary {
+                    op: BinOp::BitXor,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    span,
+                };
+            }
+            Some(lhs)
+        })
+    }
+
+    fn bitand_expr(&mut self) -> Option<Expr> {
+        self.scoped(|p| {
+            let mut lhs = p.shift_expr()?;
+            while matches!(p.peek(), TokenKind::Amp) {
+                p.enter("expression")?;
+                p.bump();
+                let rhs = p.shift_expr()?;
+                let span = lhs.span().to(rhs.span());
+                lhs = Expr::Binary {
+                    op: BinOp::BitAnd,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    span,
+                };
+            }
+            Some(lhs)
+        })
+    }
+
+    /// `<<` and `>>`, tighter than `&` and looser than `+` -- C's ordering and
+    /// Zig's alike, so `a << 2 + 1` shifts by three.
+    fn shift_expr(&mut self) -> Option<Expr> {
+        self.scoped(|p| {
+            let mut lhs = p.add_expr()?;
+            loop {
+                let op = match p.peek() {
+                    TokenKind::Shl => BinOp::Shl,
+                    TokenKind::Shr => BinOp::Shr,
+                    _ => return Some(lhs),
+                };
+                p.enter("expression")?;
+                p.bump();
+                let rhs = p.add_expr()?;
+                let span = lhs.span().to(rhs.span());
+                lhs = Expr::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    span,
+                };
             }
         })
     }
@@ -1042,6 +1147,15 @@ impl Parser {
                     expr: Box::new(expr),
                 })
             }
+            TokenKind::Tilde => {
+                self.bump();
+                let expr = self.unary_operand()?;
+                Some(Expr::Unary {
+                    op: UnOp::BitNot,
+                    span: start.to(expr.span()),
+                    expr: Box::new(expr),
+                })
+            }
             TokenKind::Try => {
                 self.bump();
                 let expr = self.unary_operand()?;
@@ -1089,7 +1203,11 @@ impl Parser {
                     span,
                 })
             }
-            _ => self.add_expr(),
+            // The bitwise level rather than `add_expr`: `|`, `^` and `&` bind
+            // tighter than `catch`, so `f() catch 0 | 2` is `f() catch (0|2)`.
+            // The `|` a capture uses was already consumed by `opt_capture`
+            // before this is reached, so there is nothing to be ambiguous with.
+            _ => self.bitor_expr(),
         }
     }
 

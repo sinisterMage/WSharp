@@ -26,9 +26,9 @@ use wsharp_syntax::diag::Label;
 use wsharp_syntax::span::{Ident, Span};
 
 use crate::hir::{self, UNRESOLVED};
-use crate::ty::{ServiceId, 
-    AbstractId, Scheme, StructId, TyCon, Type, TypeStore, TypeVarId, UnifyError, abstract_members,
-    abstract_name, lookup_abstract,
+use crate::ty::{
+    AbstractId, IntTy, Scheme, ServiceId, StructId, TyCon, Type, TypeStore, TypeVarId, UnifyError,
+    abstract_members, abstract_name, lookup_abstract,
 };
 
 pub struct Analysis {
@@ -168,15 +168,24 @@ struct Candidate {
 /// A constraint that could not be decided where it was met, because the type
 /// involved was still a variable. Solved at the end of the binding group.
 enum Constraint {
-    /// Must end up `i64` or `f64`; defaults to `i64` if still unconstrained.
+    /// Must end up a number the operator can work on; defaults to `i64` if
+    /// still unconstrained, which is the one type that satisfies every
+    /// [`Need`].
     Numeric {
         ty: Type,
         span: Span,
         op: &'static str,
-        /// `f64` is not enough: `%` has no float form, because Cranelift has
-        /// no float remainder and the language does not define one.
-        integers_only: bool,
+        need: Need,
     },
+    /// An integer literal: `ty` must end up an integer type wide enough to
+    /// hold `value`, and defaults to `i64` if nothing else pins it.
+    ///
+    /// This is what makes a literal a `comptime_int` rather than an `i64` --
+    /// `0xff` is a `u8` in one place and a `u32` in another, with no suffix on
+    /// either. It is deliberately a constraint and not a decision at the
+    /// literal: the type comes from the context, and the context is what the
+    /// rest of the binding group works out.
+    IntLiteral { ty: Type, value: i128, span: Span },
     /// Must be a type `==` can compare.
     Equatable { ty: Type, span: Span },
     /// Must be one of the concrete types an abstract type lists.
@@ -244,6 +253,55 @@ enum Constraint {
     },
 }
 
+/// What an operator asks of the type it is applied to.
+///
+/// One question with three answers rather than three constraints, because the
+/// answer is needed in exactly the same two places -- a concrete type, and
+/// every member of an abstract one -- and only the predicate differs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Need {
+    /// `+ - * /` and the ordering comparisons: any number at all.
+    Number,
+    /// `% & | ^ << >>` and `~`. `f64` is not enough: `%` has no float form,
+    /// because Cranelift has no float remainder and the language does not
+    /// define one, and a bit pattern is not a thing to ask a float for.
+    Integer,
+    /// Unary `-`. Every signed integer and `f64`, and no unsigned type: `-x`
+    /// on a `u8` is not an error the machine reports, it is 256 - x, which is
+    /// exactly the kind of wrong that survives to production.
+    Signed,
+}
+
+impl Need {
+    fn met_by(self, ty: &Type) -> bool {
+        match self {
+            Need::Number => ty.is_numeric(),
+            Need::Integer => ty.as_int().is_some(),
+            Need::Signed => match ty {
+                Type::Con(TyCon::F64, _) => true,
+                _ => ty.as_int().is_some_and(|t| t.signed),
+            },
+        }
+    }
+
+    /// How the requirement is named in a diagnostic, with its article.
+    fn article(self) -> &'static str {
+        match self {
+            Need::Number => "a number",
+            Need::Integer => "an integer",
+            Need::Signed => "a signed number",
+        }
+    }
+
+    fn help(self) -> &'static str {
+        match self {
+            Need::Number => "arithmetic works on the integer types and on `f64`",
+            Need::Integer => "the bit operators and `%` work on the integer types",
+            Need::Signed => "an unsigned type has no negatives; `~x + 1` is the wrapping form",
+        }
+    }
+}
+
 impl Constraint {
     /// Every type this constraint still has an opinion about.
     ///
@@ -254,6 +312,7 @@ impl Constraint {
     fn types(&self) -> [&Type; 2] {
         match self {
             Constraint::Numeric { ty, .. }
+            | Constraint::IntLiteral { ty, .. }
             | Constraint::Equatable { ty, .. }
             | Constraint::Member { ty, .. } => [ty, ty],
             Constraint::Transferable { ty, .. } => [ty, ty],
@@ -270,6 +329,29 @@ impl Constraint {
 // answered where it is met -- but `try_unify` binds whichever side is still a
 // variable, so by the time anything asks "is this a subtype?" both sides are
 // already concrete and the lattice answers immediately. See `coerce`.
+
+/// The type a conversion spelled `name(x)` produces, if `name` is one of the
+/// numeric types. `bool` and `str` are absent on purpose: there is no
+/// arithmetic meaning to give either.
+/// What an integer literal becomes when nothing asks for a particular type.
+///
+/// `i64`, as every literal used to be -- except for a value too large to be
+/// one, which takes `u64` instead. A literal that names a 64-bit mask should
+/// not have to say `u64` twice to be written down at all.
+fn default_int_ty(value: i128) -> Type {
+    if IntTy::I64.contains(value) {
+        Type::i64()
+    } else {
+        Type::int(IntTy::U64)
+    }
+}
+
+fn numeric_type_named(name: &str) -> Option<Type> {
+    match name {
+        "f64" => Some(Type::f64()),
+        other => IntTy::from_name(other).map(Type::int),
+    }
+}
 
 /// What a name bound inside a function body means.
 ///
@@ -784,7 +866,7 @@ impl<'a> Inferencer<'a> {
             // A subtype's fields are its supertype's followed by its own, so
             // the two layouts agree on every inherited field. `order` is a
             // preorder walk, so the parent is already laid out.
-            let (mut fields, mut offset) = match self.structs[id as usize].parent {
+            let (mut fields, offset) = match self.structs[id as usize].parent {
                 Some(parent) => {
                     let parent = &self.structs[parent as usize];
                     (parent.fields.clone(), parent.field_end)
@@ -828,27 +910,42 @@ impl<'a> Inferencer<'a> {
                 // they are left unresolved and recomputed per instantiation.
                 // `UNRESOLVED` rather than zero: a zero offset would quietly
                 // write over the header instead of failing where it is wrong.
-                let width = if is_generic {
-                    0
-                } else {
-                    crate::layout::size_of(&mut self.store, &ty)
-                };
                 fields.push(hir::FieldDef {
                     name: field.name.to_string(),
                     ty,
-                    offset: if is_generic { UNRESOLVED } else { offset },
+                    offset: UNRESOLVED,
                     span: field.span,
                 });
-                offset += width;
             }
             if is_generic {
                 self.type_scopes.pop();
             }
+
+            // The fields this struct adds go through `layout::place`, the same
+            // function code generation uses for an instantiation of a generic
+            // one -- which is what stops the two from ever disagreeing, and
+            // what gives a narrow field its own alignment rather than a word.
+            // The inherited ones keep the offsets the parent gave them, and
+            // `offset` is the parent's *unaligned* `field_end`: aligning there
+            // would move every subtype's fields.
+            let field_end = if is_generic {
+                UNRESOLVED
+            } else {
+                let own: Vec<Type> = fields[inherited as usize..]
+                    .iter()
+                    .map(|f| f.ty.clone())
+                    .collect();
+                let (offsets, end) = crate::layout::place(&mut self.store, &own, offset);
+                for (f, at) in fields[inherited as usize..].iter_mut().zip(offsets) {
+                    f.offset = at;
+                }
+                end
+            };
             let strukt = &mut self.structs[id as usize];
             strukt.fields = fields;
             strukt.inherited = inherited;
-            strukt.field_end = if is_generic { UNRESOLVED } else { offset };
-            strukt.size = if is_generic { 0 } else { align_up(offset) };
+            strukt.field_end = field_end;
+            strukt.size = if is_generic { 0 } else { align_up(field_end) };
         }
         self.current = 0;
     }
@@ -1264,7 +1361,7 @@ impl<'a> Inferencer<'a> {
     fn check_generic_names(&mut self, generics: &[Ident]) {
         for (i, g) in generics.iter().enumerate() {
             let name = g.as_str();
-            if matches!(name, "i64" | "f64" | "bool" | "void" | "str") {
+            if IntTy::from_name(name).is_some() || matches!(name, "f64" | "bool" | "void" | "str") {
                 self.error(g.span, format!("`{name}` is a primitive type"))
                     .help = Some("a type parameter needs a name of its own, such as `T`".into());
             } else if self.struct_named(name).is_some() {
@@ -1330,7 +1427,22 @@ impl<'a> Inferencer<'a> {
     fn declare_const(&mut self, decl: &ast::ConstDecl) {
         let (ty, kind) =
             match &decl.value {
-                ast::Expr::Int(v, _) => (Type::i64(), hir::ExprKind::Int(*v)),
+                // A top-level `const` needs no constraint: whatever annotation
+                // it has is right here, so the literal's type is knowable now
+                // rather than at the end of a binding group. An annotation
+                // that is not an integer type falls through to `i64` and is
+                // reported by the `expect` below, as it always was.
+                ast::Expr::Int(v, _) => {
+                    let ty = match &decl.ty {
+                        Some(ast::TypeExpr::Named(id)) => IntTy::from_name(id.as_str()),
+                        _ => None,
+                    }
+                    .map_or_else(|| default_int_ty(*v), Type::int);
+                    if let Some(t) = ty.as_int() {
+                        self.check_literal_fits(t, *v, decl.value.span());
+                    }
+                    (ty, hir::ExprKind::Int(*v))
+                }
                 ast::Expr::Float(v, _) => (Type::f64(), hir::ExprKind::Float(*v)),
                 ast::Expr::Bool(v, _) => (Type::bool(), hir::ExprKind::Bool(*v)),
                 ast::Expr::Str(s, _) => {
@@ -1403,8 +1515,10 @@ impl<'a> Inferencer<'a> {
                 if let Some(ty) = self.lookup_type_param(id.as_str()) {
                     return ty;
                 }
+                if let Some(t) = IntTy::from_name(id.as_str()) {
+                    return Type::int(t);
+                }
                 match id.as_str() {
-                    "i64" => Type::i64(),
                     "f64" => Type::f64(),
                     "bool" => Type::bool(),
                     "void" => Type::void(),
@@ -1476,8 +1590,10 @@ impl<'a> Inferencer<'a> {
                 // variable the solver fills in with what the body raises.
                 let set = match errors {
                     Some(names) => {
-                        let ids: Vec<hir::ErrorId> =
-                            names.iter().map(|n| self.intern_error(n.as_str())).collect();
+                        let ids: Vec<hir::ErrorId> = names
+                            .iter()
+                            .map(|n| self.intern_error(n.as_str()))
+                            .collect();
                         self.store.err_set(ids)
                     }
                     None => self.store.fresh_err_set(),
@@ -2239,7 +2355,7 @@ impl<'a> Inferencer<'a> {
             .add_local("[array]", arr_ty.clone(), false, span);
         let index_local = self.frame().add_local("[index]", Type::i64(), true, span);
 
-        let int = |v: i64| hir::Expr {
+        let int = |v: i128| hir::Expr {
             kind: hir::ExprKind::Int(v),
             ty: Type::i64(),
             span,
@@ -2389,7 +2505,9 @@ impl<'a> Inferencer<'a> {
         // The scope holding the hidden locals, so the user's body cannot see
         // them and a nested `for` gets its own.
         self.frame().scopes.push(Vec::new());
-        let iter_local = self.frame().add_local("[iter]", iter_ty.clone(), false, span);
+        let iter_local = self
+            .frame()
+            .add_local("[iter]", iter_ty.clone(), false, span);
         let index_local = for_stmt
             .index
             .as_ref()
@@ -2417,8 +2535,7 @@ impl<'a> Inferencer<'a> {
             let shown = self.store.show(&cond_ty);
             self.error(at, format!("`next` must return an optional, not `{shown}`"))
                 .help = Some(
-                "a `for` stops when `next` produces null, so it needs somewhere to put that"
-                    .into(),
+                "a `for` stops when `next` produces null, so it needs somewhere to put that".into(),
             );
             hir::Expr {
                 kind: hir::ExprKind::Null,
@@ -2537,7 +2654,8 @@ impl<'a> Inferencer<'a> {
         let Some(GlobalRef::Func(ids)) = self.globals.get(&format!("{path}.init")).cloned() else {
             // Named as the program wrote it: the key is an absolute file path,
             // which says nothing a reader of this line wants to know.
-            self.error(span, format!("`{written}` is not a service")).help = Some(
+            self.error(span, format!("`{written}` is not a service"))
+                .help = Some(
                 "a service is a module with an `init` that makes its state, and functions \
                  taking that state as their first parameter"
                     .into(),
@@ -2549,13 +2667,14 @@ impl<'a> Inferencer<'a> {
                 .help = Some("a worker runs one `init`, so there must be exactly one".into());
             return None;
         };
-        let Some((init_params, state)) = self.func_signature(init) else {
-            return None;
-        };
+        let (init_params, state) = self.func_signature(init)?;
         if !matches!(self.store.resolve(&state), Type::Con(TyCon::Struct(_), _)) {
             let shown = self.store.show(&state);
-            self.error(span, format!("a service's state must be a struct, not `{shown}`"))
-                .help = Some(
+            self.error(
+                span,
+                format!("a service's state must be a struct, not `{shown}`"),
+            )
+            .help = Some(
                 "the worker holds it for as long as it lives, and holding it is what a \
                  struct is for"
                     .into(),
@@ -2673,8 +2792,8 @@ impl<'a> Inferencer<'a> {
         let mut hir_args: Vec<hir::Expr> = args.iter().map(|a| self.infer_expr(a)).collect();
         let Some(service) = service else {
             if self.module_path_of(module).is_none() {
-                self.error(module.span(), "`@spawn` takes a module")
-                    .help = Some("as in `@spawn(counter, 0)`, where `counter` was imported".into());
+                self.error(module.span(), "`@spawn` takes a module").help =
+                    Some("as in `@spawn(counter, 0)`, where `counter` was imported".into());
             }
             let ty = self.store.fresh();
             return hir::Expr {
@@ -2724,9 +2843,15 @@ impl<'a> Inferencer<'a> {
     /// `@join(w)`.
     fn infer_join(&mut self, worker: &'a ast::Expr, span: Span) -> hir::Expr {
         let worker = self.infer_expr(worker);
-        if !matches!(self.store.resolve(&worker.ty), Type::Con(TyCon::Worker(_), _)) {
+        if !matches!(
+            self.store.resolve(&worker.ty),
+            Type::Con(TyCon::Worker(_), _)
+        ) {
             let shown = self.store.show(&worker.ty);
-            self.error(worker.span, format!("`@join` takes a worker, not `{shown}`"));
+            self.error(
+                worker.span,
+                format!("`@join` takes a worker, not `{shown}`"),
+            );
         }
         let died = self.intern_error(wsharp_runtime::builtins::WORKER_DIED);
         let set = self.store.err_set([died]);
@@ -2862,7 +2987,8 @@ impl<'a> Inferencer<'a> {
             }
             return Some(ids);
         }
-        self.error(span, format!("`{shown}` cannot be iterated")).help = Some(format!(
+        self.error(span, format!("`{shown}` cannot be iterated"))
+            .help = Some(format!(
             "a `for` over a struct calls `iter` and `next` from the module that declares it; \
              `{shown}` has no `{name}`"
         ));
@@ -3101,7 +3227,23 @@ impl<'a> Inferencer<'a> {
             ast::Expr::Block { stmts, value, .. } => self.infer_value_block(stmts, value, span),
             ast::Expr::Spawn { module, args, .. } => self.infer_spawn(module, args, span),
             ast::Expr::Join { worker, .. } => self.infer_join(worker, span),
-            ast::Expr::Int(v, _) => self.lit(hir::ExprKind::Int(*v), Type::i64(), span),
+            ast::Expr::Int(v, _) => self.int_literal(*v, span),
+            // A minus sign directly on a literal is part of the literal, not
+            // an operator applied to one. Without this `-128` would be the
+            // negation of `128`, which does not fit an `i8` -- so the one
+            // value an `i8` has that its positive twin does not would be
+            // unwritable, and `i64`'s would still need the `- 1` dance
+            // `panic_div_overflow.ws` documents.
+            ast::Expr::Unary {
+                op: UnOp::Neg,
+                expr: inner,
+                ..
+            } if matches!(**inner, ast::Expr::Int(..)) => {
+                let ast::Expr::Int(v, _) = **inner else {
+                    unreachable!("guarded above")
+                };
+                self.int_literal(-v, span)
+            }
             ast::Expr::Float(v, _) => self.lit(hir::ExprKind::Float(*v), Type::f64(), span),
             ast::Expr::Bool(v, _) => self.lit(hir::ExprKind::Bool(*v), Type::bool(), span),
             ast::Expr::Str(s, _) => {
@@ -3143,7 +3285,16 @@ impl<'a> Inferencer<'a> {
                             ty: inner.ty.clone(),
                             span,
                             op: "-",
-                            integers_only: false,
+                            need: Need::Signed,
+                        });
+                        inner.ty.clone()
+                    }
+                    UnOp::BitNot => {
+                        self.constraints.push(Constraint::Numeric {
+                            ty: inner.ty.clone(),
+                            span,
+                            op: "~",
+                            need: Need::Integer,
                         });
                         inner.ty.clone()
                     }
@@ -3327,9 +3478,9 @@ impl<'a> Inferencer<'a> {
                 self.frame().scopes.push(Vec::new());
                 let error_ty = Type::error(caught);
                 let capture_local = capture.as_ref().map(|name| {
-                    let local =
-                        self.frame()
-                            .add_local(name.as_str(), error_ty, false, name.span);
+                    let local = self
+                        .frame()
+                        .add_local(name.as_str(), error_ty, false, name.span);
                     self.frame().bind_local(name.as_str(), local);
                     local
                 });
@@ -3850,6 +4001,33 @@ impl<'a> Inferencer<'a> {
             .map(|t| Type::from_builtin_with(*t, &mut self.store, &mut vars))
             .collect();
         let ret = Type::from_builtin_with(b.ret, &mut self.store, &mut vars);
+        // A signature may say that one of its variables has to be an integer.
+        // The runtime's own type enum cannot name an abstract type, so the row
+        // says `IntVar` and this turns it into the same `Member` constraint an
+        // `Integer`-annotated parameter would produce -- so the demand travels
+        // from the table to each use exactly as an abstract type's does.
+        for (i, t) in b.params.iter().chain(std::iter::once(&b.ret)).enumerate() {
+            let wsharp_runtime::BuiltinTy::IntVar(n) = t else {
+                continue;
+            };
+            // The first position that names the variable is enough: one
+            // variable, one constraint, however many positions mention it.
+            if i > 0 && b.params[..i].contains(t) {
+                continue;
+            }
+            if let Some(ty) = vars.get(n)
+                && let Some(id) = lookup_abstract("Integer")
+            {
+                self.constraints.push(Constraint::Member {
+                    ty: ty.clone(),
+                    id,
+                    span,
+                });
+                if let Some(func) = self.current_fn {
+                    self.fn_member_vars[func as usize].push((ty.clone(), id, span));
+                }
+            }
+        }
         // A signature may say that one of its variables has to be copyable to
         // another worker's heap. The runtime's own small type enum cannot ask
         // that question, so it names the variable and this records it.
@@ -3916,6 +4094,16 @@ impl<'a> Inferencer<'a> {
             }
             _ => (lhs, rhs),
         };
+        // An integer literal takes its type from the other operand -- but only
+        // when the other operand has one. Two undecided sides would merge into
+        // a single variable that nothing pins until the end of the binding
+        // group, and a variable that survives that long is one some coercion
+        // elsewhere can bind to something stranger than a number: `n < 0`
+        // followed by `return n;` in a function returning `!i64` would make
+        // `n` an error union. So a literal beside an undecided operand takes
+        // its default here, exactly as it did when every literal was an `i64`.
+        self.settle_literal_operand(&lhs, &rhs);
+        self.settle_literal_operand(&rhs, &lhs);
         self.expect(&rhs.ty, &lhs.ty, rhs.span, "the right operand");
         let ty = if op.is_comparison() {
             if op.is_ordering() {
@@ -3923,7 +4111,7 @@ impl<'a> Inferencer<'a> {
                     ty: lhs.ty.clone(),
                     span,
                     op: op.text(),
-                    integers_only: false,
+                    need: Need::Number,
                 });
             } else {
                 self.constraints.push(Constraint::Equatable {
@@ -3933,12 +4121,17 @@ impl<'a> Inferencer<'a> {
             }
             Type::bool()
         } else {
-            // `%=` comes through here too, as `x = x % e`, so it is covered.
+            // `%=` comes through here too, as `x = x % e`, and so does every
+            // other compound assignment, so they are all covered.
             self.constraints.push(Constraint::Numeric {
                 ty: lhs.ty.clone(),
                 span,
                 op: op.text(),
-                integers_only: op == BinOp::Rem,
+                need: if op == BinOp::Rem || op.is_bitwise() {
+                    Need::Integer
+                } else {
+                    Need::Number
+                },
             });
             lhs.ty.clone()
         };
@@ -3950,6 +4143,52 @@ impl<'a> Inferencer<'a> {
                 rhs: Box::new(rhs),
             },
             ty,
+            span,
+        }
+    }
+
+    /// `u32(x)` and friends: one argument, a numeric type in, a numeric type
+    /// out, and nothing implicit anywhere.
+    fn infer_convert(
+        &mut self,
+        to: Type,
+        name: &Ident,
+        args: &'a [ast::Expr],
+        span: Span,
+    ) -> hir::Expr {
+        if args.len() != 1 {
+            let n = args.len();
+            self.error(span, format!("`{name}` converts one value, not {n}"))
+                .help = Some(format!("write `{name}(x)` to convert `x` to `{name}`"));
+        }
+        let mut value = match args.first() {
+            Some(arg) => self.infer_expr(arg),
+            None => self.lit(hir::ExprKind::Int(0), Type::i64(), span),
+        };
+        // A literal argument settles first: `u8(300)` should say that 300 does
+        // not fit an `i64` rather than silently making the literal a `u8` and
+        // converting it to itself.
+        let same = value.clone();
+        self.settle_literal_operand(&value, &same);
+        let from = self.store.resolve(&value.ty);
+        if !from.is_numeric() && !matches!(from, Type::Var(_)) {
+            let shown = self.store.show(&from);
+            self.error(
+                value.span,
+                format!("`{name}` converts a number, but this is `{shown}`"),
+            )
+            .help = Some("conversions go between the integer types and `f64`".into());
+            value.ty = to.clone();
+            return value;
+        }
+        // An unannotated argument would otherwise stay a variable for ever:
+        // nothing downstream of a conversion says anything about what went in.
+        if matches!(from, Type::Var(_)) {
+            self.expect(&value.ty, &Type::i64(), value.span, "the value converted");
+        }
+        hir::Expr {
+            kind: hir::ExprKind::Convert(Box::new(value)),
+            ty: to,
             span,
         }
     }
@@ -3967,6 +4206,22 @@ impl<'a> Inferencer<'a> {
             && let Some((local, service)) = self.worker_call_target(callee)
         {
             return self.infer_rpc_call(local, service, name, args, span);
+        }
+
+        // `u32(x)`, `i64(x)`, `f64(n)`: a conversion, spelled as a call on the
+        // type's own name. Conversions are written and never inferred -- a
+        // silent widening is how a 32-bit hash quietly becomes a 64-bit one
+        // that is right for a while -- so this is the only way between two
+        // numeric types.
+        //
+        // Bindings are consulted first, so a program that already has a
+        // function or a local of one of these names keeps it.
+        if let ast::Expr::Ident(name) = callee
+            && let Some(to) = numeric_type_named(name.as_str())
+            && !self.lookup_binding_exists(name.as_str())
+            && !self.has_global(name.as_str())
+        {
+            return self.infer_convert(to, name, args, span);
         }
 
         // A `const` alias for a set resolves exactly as the name it aliases.
@@ -4121,6 +4376,21 @@ impl<'a> Inferencer<'a> {
         span: Span,
     ) -> hir::Expr {
         let arity = hir_args.len();
+        // Which overload is meant is a question about the argument *types*, so
+        // a literal that nothing has pinned yet has to have decided by now: it
+        // takes `i64`, its default. This is the one place a literal is forced
+        // early, and it is why `math.abs(-7)` still picks the `i64` overload
+        // rather than being unable to choose. The cost is that an overload set
+        // distinguished only by integer width needs `take(u8(200))` written
+        // out -- which is what "conversions are written, never inferred" asks
+        // for anyway.
+        for arg in &hir_args {
+            if let hir::ExprKind::Int(value) = arg.kind
+                && matches!(self.store.resolve(&arg.ty), Type::Var(_))
+            {
+                let _ = self.store.unify(&arg.ty, &default_int_ty(value));
+            }
+        }
         let arg_tys: Vec<Type> = hir_args.iter().map(|a| a.ty.clone()).collect();
 
         let mut cands: Vec<Candidate> = Vec::new();
@@ -4894,6 +5164,19 @@ impl<'a> Inferencer<'a> {
     /// work in a function declared `!i64`, and `return 1;` in one declared
     /// `?i64`.
     fn coerce(&mut self, expr: hir::Expr, target: &Type, what: &str) -> hir::Expr {
+        // An integer literal has no type of its own until something asks for
+        // one. If an integer type is what is being asked for, it simply
+        // becomes that -- which is what makes `0xff` a `u8` here and a `u32`
+        // there. Anything else and it settles for `i64` first, so that it is
+        // *wrapped* into a `?i64` rather than becoming one, and so that a
+        // literal where a `str` is wanted still reads "has type `i64`,
+        // expected `str`" rather than naming a variable nobody wrote.
+        if let hir::ExprKind::Int(value) = expr.kind
+            && matches!(self.store.resolve(&expr.ty), Type::Var(_))
+            && self.store.resolve(target).as_int().is_none()
+        {
+            let _ = self.store.unify(&expr.ty, &default_int_ty(value));
+        }
         let Err(direct) = self.store.try_unify_checked(&expr.ty, target) else {
             return expr;
         };
@@ -5034,7 +5317,10 @@ impl<'a> Inferencer<'a> {
         for constraint in constraints {
             match constraint {
                 Constraint::ErrorSetHas {
-                    set, errors, widens, ..
+                    set,
+                    errors,
+                    widens,
+                    ..
                 } => {
                     if !widens {
                         continue;
@@ -5103,7 +5389,7 @@ impl<'a> Inferencer<'a> {
         match &resolved {
             Type::Var(_) => None,
             Type::Con(con, args) => match con {
-                TyCon::I64
+                TyCon::Int(_)
                 | TyCon::F64
                 | TyCon::Bool
                 | TyCon::Void
@@ -5160,6 +5446,75 @@ impl<'a> Inferencer<'a> {
         format!("{{{}}}", names.join(", "))
     }
 
+    /// An integer literal: a fresh variable, plus the constraint that decides
+    /// what it becomes.
+    ///
+    /// The variable is what unification binds to whatever the context wants --
+    /// an annotation, a parameter, the other operand of `+`. The constraint is
+    /// what defaults it to `i64` when nothing does, and what checks the value
+    /// fits once something has.
+    /// Default `lit` to `i64` if it is an undecided integer literal sitting
+    /// beside an operand that is undecided too. See the call site.
+    fn settle_literal_operand(&mut self, lit: &hir::Expr, other: &hir::Expr) {
+        if let hir::ExprKind::Int(value) = lit.kind
+            && matches!(self.store.resolve(&lit.ty), Type::Var(_))
+            && matches!(self.store.resolve(&other.ty), Type::Var(_))
+            // ...but never when an abstract type owns the other side. That is
+            // a constrained generic, and settling the literal would settle it
+            // too: `fn odd(n: Number) { return n % 2; }` would quietly become
+            // an `i64` function and stop reporting that `Number` includes an
+            // `f64` the `%` cannot serve.
+            && !self.is_member_constrained(&other.ty)
+        {
+            let _ = self.store.unify(&lit.ty, &default_int_ty(value));
+        }
+    }
+
+    /// Whether an abstract type already holds this type to a set of members.
+    ///
+    /// Read off the pending constraints rather than kept in a set beside them,
+    /// because unification merges variables and a set would have to be told.
+    /// There are only ever a handful of these -- one per abstract-annotated
+    /// parameter and one per use of such a function.
+    fn is_member_constrained(&mut self, ty: &Type) -> bool {
+        let Type::Var(v) = self.store.resolve(ty) else {
+            return false;
+        };
+        let members: Vec<Type> = self
+            .constraints
+            .iter()
+            .filter_map(|c| match c {
+                Constraint::Member { ty, .. } => Some(ty.clone()),
+                _ => None,
+            })
+            .collect();
+        members
+            .into_iter()
+            .any(|m| matches!(self.store.resolve(&m), Type::Var(other) if other == v))
+    }
+
+    fn int_literal(&mut self, value: i128, span: Span) -> hir::Expr {
+        let ty = self.store.fresh();
+        self.constraints.push(Constraint::IntLiteral {
+            ty: ty.clone(),
+            value,
+            span,
+        });
+        self.lit(hir::ExprKind::Int(value), ty, span)
+    }
+
+    /// Report a literal that its type cannot hold. Shared by the constraint
+    /// solver and by top-level `const`, which knows the answer sooner.
+    fn check_literal_fits(&mut self, t: IntTy, value: i128, span: Span) {
+        if t.contains(value) {
+            return;
+        }
+        let (lo, hi) = t.range();
+        let name = t.name();
+        self.error(span, format!("`{value}` does not fit in `{name}`"))
+            .help = Some(format!("`{name}` holds {lo} to {hi}"));
+    }
+
     fn solve_constraints(&mut self) {
         let constraints = std::mem::take(&mut self.constraints);
         // Which variables an abstract type already holds to a set of concrete
@@ -5172,7 +5527,40 @@ impl<'a> Inferencer<'a> {
             if let Constraint::Member { ty, id, .. } = constraint
                 && let Type::Var(v) = self.store.resolve(ty)
             {
-                constrained.insert(v, *id);
+                // Abstract types overlap now that `Integer` sits inside
+                // `Number`, so a variable can carry both. Keep the tighter
+                // one: it is the one whose members every question below has
+                // to hold for, and last-write-wins would answer some of them
+                // against a set the annotation never promised.
+                match constrained.entry(v) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        if abstract_members(*id).len() < abstract_members(*e.get()).len() {
+                            e.insert(*id);
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(*id);
+                    }
+                }
+            }
+        }
+
+        // An integer literal that nothing has pinned takes `i64`, and takes it
+        // here rather than at the end. Everything below asks questions a type
+        // variable cannot answer -- which overload, what is being indexed, is
+        // this comparable -- and "an integer literal" is not a type. Anything
+        // that was going to decide the literal's type has already done so:
+        // inference of the whole binding group is over by the time this runs.
+        //
+        // A variable an abstract type owns is left alone, for the reason the
+        // `Numeric` arm leaves it alone: that is a constrained generic, and
+        // defaulting it would decide for the caller.
+        for constraint in &constraints {
+            if let Constraint::IntLiteral { ty, value, .. } = constraint
+                && let Type::Var(v) = self.store.resolve(ty)
+                && !constrained.contains_key(&v)
+            {
+                let _ = self.store.unify(ty, &default_int_ty(*value));
             }
         }
 
@@ -5262,43 +5650,70 @@ impl<'a> Inferencer<'a> {
                          does not cover"
                     ));
                 }
-                Constraint::Numeric {
-                    ty,
-                    span,
-                    op,
-                    integers_only,
-                } => {
+                Constraint::Numeric { ty, span, op, need } => {
                     let resolved = self.store.resolve(&ty);
                     if let Type::Var(v) = resolved
                         && let Some(&abstract_id) = constrained.get(&v)
                     {
-                        self.check_members_support(abstract_id, span, op, integers_only);
+                        self.check_members_support(abstract_id, span, op, need);
                         continue;
                     }
                     match resolved {
-                        // Unconstrained by anything else: default to i64.
+                        // Unconstrained by anything else: default to `i64`,
+                        // the one type that meets every `Need`. This is the
+                        // only place an integer type is chosen rather than
+                        // written, which is why there is exactly one default
+                        // and not one per width.
                         Type::Var(_) => {
                             let _ = self.store.unify(&ty, &Type::i64());
                         }
-                        Type::Con(TyCon::F64, _) if integers_only => {
-                            self.error(
-                                span,
-                                format!("`{op}` needs an integer, but this is `f64`"),
-                            )
-                            .help = Some(format!(
-                                "`{op}` works on `i64`; use `f64` subtraction and truncation \
-                                 for a float remainder"
-                            ));
-                        }
-                        t if t.is_numeric() => {}
+                        t if need.met_by(&t) => {}
                         t => {
                             let shown = self.store.show(&t);
+                            let article = need.article();
                             self.error(
                                 span,
-                                format!("`{op}` needs a number, but this is `{shown}`"),
+                                format!("`{op}` needs {article}, but this is `{shown}`"),
                             )
-                            .help = Some("arithmetic works on `i64` and `f64`".into());
+                            .help = Some(need.help().into());
                         }
+                    }
+                }
+                Constraint::IntLiteral { ty, value, span } => {
+                    // The type is settled by now: either the context bound it
+                    // during inference, or the pass above defaulted it.
+                    // What is left is whether the value fits.
+                    match self.store.resolve(&ty) {
+                        Type::Var(v) => {
+                            // A variable an abstract type owns: a constrained
+                            // generic the caller will instantiate. The literal
+                            // has to fit *every* integer the annotation lists,
+                            // for the reason `%` on a `Number` has to work for
+                            // every member -- the caller picks, not the body.
+                            if let Some(&id) = constrained.get(&v) {
+                                for member in abstract_members(id) {
+                                    if let Some(t) = member.as_int() {
+                                        self.check_literal_fits(t, value, span);
+                                    }
+                                }
+                            }
+                        }
+                        ref other => match other.as_int() {
+                            Some(t) => self.check_literal_fits(t, value, span),
+                            None => {
+                                let shown = self.store.show(other);
+                                self.error(
+                                    span,
+                                    format!(
+                                        "`{value}` is an integer literal, but this is `{shown}`"
+                                    ),
+                                )
+                                .help = Some(
+                                    "an integer literal takes the type it is used at, and there                                      is no integer type here -- write `1.0` rather than `1` for                                      an `f64`"
+                                        .into(),
+                                );
+                            }
+                        },
                     }
                 }
                 Constraint::Equatable { ty, span } => {
@@ -5322,7 +5737,7 @@ impl<'a> Inferencer<'a> {
                         // `catch |e|` binds worth having now that its set says
                         // what it can be.
                         Type::Con(
-                            TyCon::I64 | TyCon::F64 | TyCon::Bool | TyCon::Str | TyCon::Error,
+                            TyCon::Int(_) | TyCon::F64 | TyCon::Bool | TyCon::Str | TyCon::Error,
                             _,
                         ) => {}
                         t => {
@@ -5439,43 +5854,32 @@ impl<'a> Inferencer<'a> {
     ///
     /// The question is decidable without knowing which member it will be: the
     /// operator has to work for *every* one of them, because the caller picks.
-    fn check_members_support(
-        &mut self,
-        id: AbstractId,
-        span: Span,
-        op: &'static str,
-        integers_only: bool,
-    ) {
+    fn check_members_support(&mut self, id: AbstractId, span: Span, op: &'static str, need: Need) {
         let name = abstract_name(id);
         for member in abstract_members(id) {
-            let bad = if integers_only {
-                member != Type::i64()
-            } else {
-                !member.is_numeric()
-            };
-            if bad {
-                let shown = self.store.show(&member);
-                let article = if integers_only {
-                    "an integer"
-                } else {
-                    "a number"
-                };
-                self.error(
-                    span,
-                    format!("`{op}` needs {article}, but `{name}` includes `{shown}`"),
-                )
-                .help = Some(format!(
-                    "a parameter annotated `{name}` must work for every type `{name}` lists"
-                ));
-                return;
+            if need.met_by(&member) {
+                continue;
             }
+            let shown = self.store.show(&member);
+            let article = need.article();
+            self.error(
+                span,
+                format!("`{op}` needs {article}, but `{name}` includes `{shown}`"),
+            )
+            .help = Some(format!(
+                "a parameter annotated `{name}` must work for every type `{name}` lists"
+            ));
+            return;
         }
     }
 
     fn check_members_equatable(&mut self, id: AbstractId, span: Span) {
         let name = abstract_name(id);
         for member in abstract_members(id) {
-            if !matches!(member, Type::Con(TyCon::I64 | TyCon::F64 | TyCon::Bool, _)) {
+            if !matches!(
+                member,
+                Type::Con(TyCon::Int(_) | TyCon::F64 | TyCon::Bool, _)
+            ) {
                 let shown = self.store.show(&member);
                 self.error(
                     span,
@@ -5483,7 +5887,8 @@ impl<'a> Inferencer<'a> {
                         "`{shown}` values cannot be compared with `==`, and `{name}` includes one"
                     ),
                 )
-                .help = Some("only `i64`, `f64` and `bool` can be compared so far".into());
+                .help =
+                    Some("only the integer types, `f64` and `bool` can be compared so far".into());
                 return;
             }
         }
@@ -5595,7 +6000,7 @@ impl<'a> Inferencer<'a> {
                 params.is_empty()
                     && matches!(
                         self.store.resolve(ret),
-                        Type::Con(TyCon::I64 | TyCon::Void, _)
+                        Type::Con(TyCon::Int(IntTy::I64) | TyCon::Void, _)
                     )
             }
             None => false,
@@ -6033,7 +6438,8 @@ fn patch_targs_expr(expr: &mut hir::Expr, targs_for: &HashMap<hir::FuncId, Vec<T
                 patch_targs_expr(c, targs_for);
             }
         }
-        hir::ExprKind::Unary { expr, .. }
+        hir::ExprKind::Convert(expr)
+        | hir::ExprKind::Unary { expr, .. }
         | hir::ExprKind::Some(expr)
         | hir::ExprKind::Ok(expr)
         | hir::ExprKind::Try(expr)
@@ -6159,7 +6565,8 @@ fn fixup_expr(expr: &mut hir::Expr, structs: &[hir::StructDef], store: &mut Type
             fixup_expr(obj, structs, store);
             resolve_field(&obj.ty, name, structs, store, strukt, index);
         }
-        hir::ExprKind::Unary { expr, .. }
+        hir::ExprKind::Convert(expr)
+        | hir::ExprKind::Unary { expr, .. }
         | hir::ExprKind::Some(expr)
         | hir::ExprKind::Ok(expr)
         | hir::ExprKind::Try(expr)

@@ -6,7 +6,14 @@
 
 use crate::ty::{TyCon, Type, TypeStore};
 
-/// Every value slot is one machine word.
+/// Every value *slot* is one machine word.
+///
+/// A slot is a machine value, not a byte count: slot `i` of a value lives at
+/// `base + i * SLOT_SIZE`, and three things depend on exactly that -- the
+/// stride `load_at` and `store_slots` walk with, and the division
+/// `repr::pointer_slots` uses to turn a byte offset back into a slot index.
+/// Scalars pack (see [`size_of`]); a tagged value keeps a whole word per slot
+/// so that the invariant survives.
 pub const SLOT_SIZE: u32 = 8;
 
 /// How many slots a value of this type occupies.
@@ -24,8 +31,42 @@ pub fn slot_count(store: &mut TypeStore, ty: &Type) -> u32 {
 }
 
 /// Bytes a value of this type occupies in memory.
+///
+/// A scalar takes its natural width, so `[]u8` is a byte array rather than one
+/// eight times too large and a struct of bytes costs bytes. A *tagged* value
+/// keeps one whole word per slot instead, and deliberately: the tight packing
+/// would give `?u8` a size of nine with an alignment of eight, and then
+/// `[]?u8`'s stride would not be a multiple of its alignment. It would also
+/// break the rule [`SLOT_SIZE`] states.
 pub fn size_of(store: &mut TypeStore, ty: &Type) -> u32 {
-    slot_count(store, ty) * SLOT_SIZE
+    match store.resolve(ty) {
+        Type::Con(TyCon::Void, _) => 0,
+        Type::Con(TyCon::Int(t), _) => t.size(),
+        Type::Con(TyCon::Bool, _) => 1,
+        // An error is its tag, which is 32 bits wide (`repr::ERROR_TAG`).
+        Type::Con(TyCon::Error, _) => 4,
+        // Tagged: a word per slot, per the note above.
+        ty @ Type::Con(TyCon::Optional | TyCon::ErrUnion, _) => slot_count(store, &ty) * SLOT_SIZE,
+        _ => SLOT_SIZE,
+    }
+}
+
+/// The alignment a value of this type must be placed at.
+///
+/// Not cosmetic. Every load and store through [`crate::layout`]'s offsets uses
+/// Cranelift's `trusted` memory flags, whose `aligned` bit lets the instruction
+/// "trap or return a wrong result if the effective address is misaligned" --
+/// so packing without aligning turns that flag into a lie.
+pub fn align_of(store: &mut TypeStore, ty: &Type) -> u32 {
+    match store.resolve(ty) {
+        // One, not zero: `place` rounds by this, and rounding by zero divides.
+        Type::Con(TyCon::Void, _) => 1,
+        Type::Con(TyCon::Int(t), _) => t.size(),
+        Type::Con(TyCon::Bool, _) => 1,
+        Type::Con(TyCon::Error, _) => 4,
+        // A tagged value leads with a word-wide slot, so it aligns like one.
+        _ => SLOT_SIZE,
+    }
 }
 
 /// Whether a value of this type is a pointer to a heap object, and so something
@@ -48,6 +89,7 @@ pub fn place(store: &mut TypeStore, types: &[Type], start: u32) -> (Vec<u32>, u3
     let mut offsets = Vec::with_capacity(types.len());
     let mut offset = start;
     for ty in types {
+        offset = offset.next_multiple_of(align_of(store, ty));
         offsets.push(offset);
         offset += size_of(store, ty);
     }
@@ -93,7 +135,7 @@ pub fn ptr_offsets(store: &mut TypeStore, ty: &Type, base: u32, out: &mut Vec<u3
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ty::Type;
+    use crate::ty::{IntTy, Type};
 
     #[test]
     fn scalars_take_one_slot_and_void_takes_none() {
@@ -118,6 +160,93 @@ mod tests {
         );
         // An optional with no payload is just a tag.
         assert_eq!(slot_count(&mut s, &Type::optional(Type::void())), 1);
+    }
+
+    /// The rule [`SLOT_SIZE`]'s note states, checked rather than asserted in
+    /// prose: slot `i` of a value lives at `base + i * SLOT_SIZE`, so a value
+    /// must be big enough to hold its last slot there. `load_at`,
+    /// `store_slots` and `repr::pointer_slots` all depend on it.
+    #[test]
+    fn a_value_is_big_enough_for_its_last_slot() {
+        let mut s = TypeStore::new();
+        let empty = s.err_set(Vec::new());
+        let cases = vec![
+            Type::int(IntTy::I8),
+            Type::int(IntTy::U8),
+            Type::int(IntTy::I32),
+            Type::int(IntTy::U64),
+            Type::f64(),
+            Type::bool(),
+            Type::str(),
+            Type::optional(Type::int(IntTy::U8)),
+            Type::optional(Type::str()),
+            Type::optional(Type::optional(Type::i64())),
+            Type::err_union(Type::int(IntTy::U8), empty),
+        ];
+        for ty in cases {
+            let slots = slot_count(&mut s, &ty);
+            let size = size_of(&mut s, &ty);
+            assert!(
+                size >= (slots.saturating_sub(1)) * SLOT_SIZE,
+                "{ty:?}: {slots} slots do not fit in {size} bytes"
+            );
+        }
+    }
+
+    /// What keeps `HEADER_SIZE + i * stride` aligned for every element: the
+    /// stride is a whole number of the element's alignment. An array whose
+    /// elements were 9 bytes at an alignment of 8 would misalign every one
+    /// after the first, and the loads through it claim to be aligned.
+    #[test]
+    fn an_element_stride_is_a_multiple_of_its_alignment() {
+        let mut s = TypeStore::new();
+        let point = s.declare_struct("Point");
+        let cases = vec![
+            Type::int(IntTy::U8),
+            Type::int(IntTy::I16),
+            Type::int(IntTy::U32),
+            Type::i64(),
+            Type::f64(),
+            Type::bool(),
+            Type::str(),
+            Type::strukt(point),
+            Type::optional(Type::int(IntTy::U8)),
+            Type::optional(Type::str()),
+        ];
+        for ty in cases {
+            let (stride, _) = elem_layout(&mut s, &ty);
+            let align = align_of(&mut s, &ty);
+            assert_eq!(stride % align, 0, "{ty:?}: stride {stride}, align {align}");
+        }
+    }
+
+    #[test]
+    fn scalars_pack_and_tagged_values_do_not() {
+        let mut s = TypeStore::new();
+        assert_eq!(size_of(&mut s, &Type::int(IntTy::U8)), 1);
+        assert_eq!(size_of(&mut s, &Type::int(IntTy::I16)), 2);
+        assert_eq!(size_of(&mut s, &Type::int(IntTy::U32)), 4);
+        assert_eq!(size_of(&mut s, &Type::i64()), 8);
+        assert_eq!(size_of(&mut s, &Type::bool()), 1);
+        assert_eq!(size_of(&mut s, &Type::str()), 8);
+        // A tag plus a payload, a word each, whatever the payload is.
+        assert_eq!(size_of(&mut s, &Type::optional(Type::int(IntTy::U8))), 16);
+    }
+
+    /// Fields are placed at their own alignment, and a run of narrow ones
+    /// costs what it says rather than a word each.
+    #[test]
+    fn place_aligns_each_field() {
+        let mut s = TypeStore::new();
+        let fields = vec![
+            Type::int(IntTy::U8),
+            Type::int(IntTy::U8),
+            Type::int(IntTy::I32),
+            Type::str(),
+        ];
+        let (offsets, end) = place(&mut s, &fields, 16);
+        assert_eq!(offsets, vec![16, 17, 20, 24]);
+        assert_eq!(end, 32);
     }
 
     #[test]

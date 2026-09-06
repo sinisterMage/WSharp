@@ -385,7 +385,8 @@ impl Mono<'_> {
                 }
             }
             hir::ExprKind::Field { obj, .. } => self.rewrite_expr(obj, subst),
-            hir::ExprKind::Unary { expr, .. }
+            hir::ExprKind::Convert(expr)
+            | hir::ExprKind::Unary { expr, .. }
             | hir::ExprKind::Some(expr)
             | hir::ExprKind::Ok(expr)
             | hir::ExprKind::Try(expr)

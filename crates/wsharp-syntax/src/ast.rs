@@ -265,7 +265,7 @@ pub struct FieldInit {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
-    Int(i64, Span),
+    Int(i128, Span),
     Float(f64, Span),
     Bool(bool, Span),
     Str(Box<str>, Span),
@@ -360,7 +360,10 @@ pub enum Expr {
         span: Span,
     },
     /// `@join(w)` -- wait for a worker to finish and shut it down.
-    Join { worker: Box<Expr>, span: Span },
+    Join {
+        worker: Box<Expr>,
+        span: Span,
+    },
     Import {
         path: Box<str>,
         span: Span,
@@ -407,6 +410,10 @@ impl Expr {
 pub enum UnOp {
     Neg,
     Not,
+    /// `~x`: every bit flipped. Spelled `~` rather than reusing `!`, which is
+    /// boolean negation and stays that way -- `!x` on a number is a type
+    /// error, not a bit pattern.
+    BitNot,
 }
 
 impl UnOp {
@@ -414,6 +421,7 @@ impl UnOp {
         match self {
             UnOp::Neg => "-",
             UnOp::Not => "!",
+            UnOp::BitNot => "~",
         }
     }
 }
@@ -433,6 +441,11 @@ pub enum BinOp {
     Ge,
     And,
     Or,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
 }
 
 impl BinOp {
@@ -451,6 +464,11 @@ impl BinOp {
             BinOp::Ge => ">=",
             BinOp::And => "and",
             BinOp::Or => "or",
+            BinOp::BitAnd => "&",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
         }
     }
 
@@ -478,5 +496,15 @@ impl BinOp {
 
     pub fn is_logical(self) -> bool {
         matches!(self, BinOp::And | BinOp::Or)
+    }
+
+    /// The bit operators. Like arithmetic they take two operands of the same
+    /// type and produce it, but they demand an *integer* one: there is no
+    /// meaning to give `1.5 & 2.0` that anybody would want.
+    pub fn is_bitwise(self) -> bool {
+        matches!(
+            self,
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
+        )
     }
 }

@@ -121,7 +121,11 @@ pub unsafe fn encode(root: *mut u8) -> Wire {
         let body_len = size.saturating_sub(HEADER_SIZE) as usize;
         let mut body = vec![0u8; body_len];
         unsafe {
-            std::ptr::copy_nonoverlapping(obj.add(HEADER_SIZE as usize), body.as_mut_ptr(), body_len)
+            std::ptr::copy_nonoverlapping(
+                obj.add(HEADER_SIZE as usize),
+                body.as_mut_ptr(),
+                body_len,
+            )
         };
 
         // Every reference becomes an index. Collected first so that `intern`
@@ -288,7 +292,11 @@ mod tests {
         unsafe {
             let copy_b = (copy.add(16) as *const *mut u8).read();
             assert_ne!(copy_b, b, "the copy is in this heap, not the original's");
-            assert_eq!((copy_b.add(16) as *const *mut u8).read(), copy, "cycle kept");
+            assert_eq!(
+                (copy_b.add(16) as *const *mut u8).read(),
+                copy,
+                "cycle kept"
+            );
             assert_eq!(
                 (copy.add(24) as *const *mut u8).read(),
                 copy_b,

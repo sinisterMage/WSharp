@@ -61,7 +61,10 @@ fn spawn_and_join_are_builtin_forms() {
         body("const w = @spawn(counter, 1, \"x\");"),
         "(const w (spawn counter 1 \"x\"))"
     );
-    assert_eq!(body("const w = @spawn(counter);"), "(const w (spawn counter))");
+    assert_eq!(
+        body("const w = @spawn(counter);"),
+        "(const w (spawn counter))"
+    );
     assert_eq!(body("const n = @join(w);"), "(const n (join w))");
 }
 
@@ -138,6 +141,64 @@ fn arithmetic_precedence() {
     assert_eq!(body("const x = (1 + 2) * 3;"), "(const x (* (+ 1 2) 3))");
     assert_eq!(body("const x = 1 - 2 - 3;"), "(const x (- (- 1 2) 3))");
     assert_eq!(body("const x = -a * b;"), "(const x (* (- a) b))");
+}
+
+/// The four levels item 9 slotted in, in Zig's relative order: bitwise looser
+/// than shifts, shifts looser than `+`, comparison looser than all of them.
+/// That last one is C's ordering inverted, and deliberately: `flags & M == M`
+/// means what it reads as rather than `flags & (M == M)`.
+#[test]
+fn bitwise_precedence_puts_comparison_outermost() {
+    assert_eq!(
+        body("const x = a | b ^ c & d;"),
+        "(const x (| a (^ b (& c d))))"
+    );
+    assert_eq!(
+        body("const x = a & b == c;"),
+        "(const x (== (& a b) c))",
+        "unlike C, `&` binds tighter than `==`"
+    );
+    assert_eq!(
+        body("const x = a & b << 2 + 1;"),
+        "(const x (& a (<< b (+ 2 1))))"
+    );
+    assert_eq!(body("const x = a << 1 << 2;"), "(const x (<< (<< a 1) 2))");
+    assert_eq!(body("const x = ~a & b;"), "(const x (& (~ a) b))");
+    assert_eq!(
+        body("const x = a and b | c;"),
+        "(const x (and a (| b c)))",
+        "`and` stays the loosest of all"
+    );
+}
+
+/// `|` is also capture syntax. A capture is only ever looked for straight
+/// after `catch` or after a header's `)`, so the operator is unambiguous
+/// everywhere else -- including inside a condition and as a `catch`
+/// alternative, which binds tighter than the `catch` itself.
+#[test]
+fn a_bitwise_or_is_not_mistaken_for_a_capture() {
+    assert_eq!(
+        body("const x = f() catch 0 | 2;"),
+        "(const x (catch (call f) (| 0 2)))"
+    );
+    assert_eq!(
+        body("const x = f() catch |e| e | 1;"),
+        "(const x (catch |e| (call f) (| e 1)))"
+    );
+    assert_eq!(
+        body("while (a | b) { }"),
+        "(while (| a b)\n  (block))",
+        "a `|` inside a header is an operator"
+    );
+}
+
+#[test]
+fn compound_assignment_covers_the_bit_operators() {
+    assert_eq!(body("x &= 1;"), "(assign& x 1)");
+    assert_eq!(body("x |= 1;"), "(assign| x 1)");
+    assert_eq!(body("x ^= 1;"), "(assign^ x 1)");
+    assert_eq!(body("x <<= 1;"), "(assign<< x 1)");
+    assert_eq!(body("x >>= 1;"), "(assign>> x 1)");
 }
 
 #[test]

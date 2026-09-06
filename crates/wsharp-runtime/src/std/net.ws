@@ -256,13 +256,12 @@ pub fn wait(p: Poller, timeout_ms: i64) !list.List[Event] {
     var i = 0;
     while (i < found) : (i += 1) {
         const handle = try raw_ready_socket(p.handle, i);
-        // 1 is readable and 2 is writable. Tested with arithmetic because W#
-        // has no bitwise operators yet.
+        // 1 is readable and 2 is writable.
         const bits = try raw_ready_events(p.handle, i);
         list.push(out, Event{
             .socket = Socket{ .handle = handle },
-            .readable = bits % 2 == 1,
-            .writable = bits >= 2,
+            .readable = bits & 1 == 1,
+            .writable = bits & 2 == 2,
         });
     }
     return out;

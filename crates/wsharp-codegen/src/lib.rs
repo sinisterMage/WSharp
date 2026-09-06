@@ -244,19 +244,10 @@ fn define_trampolines(
 ) -> Result<Vec<Trampoline>, CodegenError> {
     let mut out = Vec::new();
     for (sid, service) in program.services.iter().enumerate() {
-        let mut wanted: Vec<(Option<usize>, String, hir::FuncId, bool)> = vec![(
-            None,
-            format!("service{sid}$init"),
-            service.init,
-            false,
-        )];
+        let mut wanted: Vec<(Option<usize>, String, hir::FuncId, bool)> =
+            vec![(None, format!("service{sid}$init"), service.init, false)];
         for (m, method) in service.methods.iter().enumerate() {
-            wanted.push((
-                Some(m),
-                format!("service{sid}$m{m}"),
-                method.func,
-                true,
-            ));
+            wanted.push((Some(m), format!("service{sid}$m{m}"), method.func, true));
         }
 
         for (method, name, target_id, takes_state) in wanted {
@@ -270,7 +261,15 @@ fn define_trampolines(
             ctx.func.name = ir::UserFuncName::user(0, clif_id.as_u32());
             {
                 let builder = FunctionBuilder::new(&mut ctx.func, fb_ctx);
-                lower::trampoline(builder, module, store, decls, target, target_id, takes_state);
+                lower::trampoline(
+                    builder,
+                    module,
+                    store,
+                    decls,
+                    target,
+                    target_id,
+                    takes_state,
+                );
             }
             module
                 .define_function(clif_id, ctx)
@@ -598,7 +597,8 @@ fn types_in_expr(expr: &hir::Expr, out: &mut Vec<Type>) {
             }
         }
         hir::ExprKind::Join(worker) => types_in_expr(worker, out),
-        hir::ExprKind::Unary { expr, .. }
+        hir::ExprKind::Convert(expr)
+        | hir::ExprKind::Unary { expr, .. }
         | hir::ExprKind::Some(expr)
         | hir::ExprKind::Ok(expr)
         | hir::ExprKind::Try(expr)
@@ -782,7 +782,9 @@ fn declare_all(
     // its arguments as a buffer of machine words, because only the call site
     // knows what shape they are and only generated code may build one.
     let mut spawn_sig = ir::Signature::new(call_conv);
-    spawn_sig.params.push(ir::AbiParam::new(ir::types::I32).uext());
+    spawn_sig
+        .params
+        .push(ir::AbiParam::new(ir::types::I32).uext());
     spawn_sig.params.push(ir::AbiParam::new(repr::PTR));
     spawn_sig.returns.push(ir::AbiParam::new(ir::types::I64));
     let spawn = module
@@ -791,8 +793,12 @@ fn declare_all(
 
     let mut rpc_sig = ir::Signature::new(call_conv);
     rpc_sig.params.push(ir::AbiParam::new(ir::types::I64));
-    rpc_sig.params.push(ir::AbiParam::new(ir::types::I32).uext());
-    rpc_sig.params.push(ir::AbiParam::new(ir::types::I32).uext());
+    rpc_sig
+        .params
+        .push(ir::AbiParam::new(ir::types::I32).uext());
+    rpc_sig
+        .params
+        .push(ir::AbiParam::new(ir::types::I32).uext());
     rpc_sig.params.push(ir::AbiParam::new(repr::PTR));
     rpc_sig.params.push(ir::AbiParam::new(repr::PTR));
     rpc_sig.returns.push(ir::AbiParam::new(ir::types::I64));

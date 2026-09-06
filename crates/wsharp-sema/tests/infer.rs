@@ -125,6 +125,86 @@ fn an_unconstrained_numeric_operand_defaults_to_i64() {
     );
 }
 
+/// A literal is a `comptime_int`: it takes the type its context asks for, and
+/// falls back to `i64` when nothing does.
+#[test]
+fn an_integer_literal_takes_the_type_it_is_used_at() {
+    assert_eq!(sig("fn f(x: u8) { return x + 1; }", "f"), "fn(u8) u8");
+    assert_eq!(sig("fn f(x: u32) { return x & 0xff; }", "f"), "fn(u32) u32");
+    assert_eq!(sig("fn f(x: i16) { return x << 3; }", "f"), "fn(i16) i16");
+    // Nothing asks, so `i64` -- which is what every literal used to be.
+    assert_eq!(sig("fn f() { return 0xff; }", "f"), "fn() i64");
+    // ...except a value too large to be one, which takes `u64` instead. A
+    // 64-bit mask should not have to say `u64` to be written down at all.
+    assert_eq!(
+        sig("fn f() { return 0xFFFF_FFFF_FFFF_FFFF; }", "f"),
+        "fn() u64"
+    );
+}
+
+#[test]
+fn a_literal_that_does_not_fit_its_type_is_reported() {
+    assert_error("fn f() u8 { return 300; }", "`300` does not fit in `u8`");
+    assert_error(
+        "fn main() i64 { const x: i8 = 128; return 0; }",
+        "`128` does not fit in `i8`",
+    );
+    // The one value an `i8` has that its positive twin does not: a minus sign
+    // on a literal is part of the literal.
+    assert_eq!(sig("fn f() i8 { return -128; }", "f"), "fn() i8");
+    // A literal is an integer and stays one; there is no coercion to `f64`.
+    assert_error(
+        "fn f(x: f64) { return x + 1; }",
+        "`1` is an integer literal, but this is `f64`",
+    );
+}
+
+/// `Integer` lists a subset of `Number`'s members, so it is the more specific
+/// of the two and wins the overload. Nothing is tested at run time: a scalar's
+/// type is always statically known.
+#[test]
+fn integer_is_more_specific_than_number() {
+    let src = r#"
+        fn kind(x: Number)  str { return "number"; }
+        fn kind(x: Integer) str { return "integer"; }
+        fn main() i64 { print(kind(1)); print(kind(1.5)); return 0; }
+    "#;
+    assert_eq!(sig(src, "main"), "fn() i64");
+}
+
+/// The price of `Number` listing every numeric type, stated rather than
+/// hidden: a body annotated with it has to work for all of them.
+#[test]
+fn a_number_parameter_may_not_negate() {
+    assert_error(
+        "fn f(x: Number) { return -x; }",
+        "`-` needs a signed number, but `Number` includes `u8`",
+    );
+    // And on a concrete unsigned type, for the same reason.
+    assert_error(
+        "fn f(x: u8) { return -x; }",
+        "`-` needs a signed number, but this is `u8`",
+    );
+    // `Integer` is what a body needing `%` claims instead of `Number`.
+    assert_eq!(
+        sig("fn f(x: Integer) { return x % 2; }", "f"),
+        "fn(Integer) Integer"
+    );
+}
+
+#[test]
+fn mixed_integer_widths_do_not_promote() {
+    assert_error(
+        "fn f(a: u8, b: u32) { return a + b; }",
+        "type mismatch: the right operand has type `u32`, expected `u8`",
+    );
+    // Written, never inferred.
+    assert_eq!(
+        sig("fn f(a: u8, b: u32) u32 { return u32(a) + b; }", "f"),
+        "fn(u8, u32) u32"
+    );
+}
+
 #[test]
 fn comparisons_produce_bool() {
     assert_eq!(
@@ -890,7 +970,8 @@ fn an_abstract_parameter_accepts_only_its_members() {
     // And on its own, where the constraint is checked at the use site.
     assert_error(
         "fn f(x: Number) str { return \"n\"; } fn main() i64 { print(f(\"nope\")); return 0; }",
-        "`Number` accepts `i64` and `f64`, but this is `str`",
+        "`Number` accepts `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64` and `f64`, but this \
+         is `str`",
     );
 }
 
