@@ -393,6 +393,16 @@ nix-shell --run "cargo test --workspace"
   into the backlog without anyone having called `accept`, so one thread can be
   both ends and no case can deadlock in CI. `net::close_all` runs at exit so a
   listener's port is released before the next case wants it.
+- **A readiness case must not assume one wait reports everything.** `poll` and
+  `epoll` are allowed to report a *subset* of what is ready, and the platforms
+  differ in what they report and when: Linux completes a loopback write inside
+  the syscall, so both ends of a pair are ready at once, while macOS hands
+  loopback delivery to the kernel and a wait issued straight afterwards may see
+  one or neither. `net_poller.ws` asserted that one wait saw both, passed
+  everywhere, and then failed on macOS under `--gc-stress` alone, which shifted
+  the timing enough to expose it. Loop until each socket has actually been
+  served, which is the shape a real server has anyway, and bound the loop so a
+  poller that reports nothing fails the case rather than hanging the suite.
 - **The safe region has a test that would pass without it.** A trace that
   finishes while its mutator is parked proves nothing if the mutator happened
   to park *after* the trace was over, so `served_pauses` is counted and
