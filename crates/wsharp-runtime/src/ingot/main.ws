@@ -243,7 +243,7 @@ fn write_manifest(f: fault.Fault, m: manifest.Manifest) void {
 /// manifest to change -- rather than being folded into one of ours.
 fn resolve(f: fault.Fault) i64 {
     const m = read_here(f) orelse return FAILED;
-    const outcome = plan.resolve(f, m);
+    const outcome = plan.resolve(f, plan.network(), m);
     const lock = outcome.lock orelse {
         if (text.len(outcome.report) > 0) { print(outcome.report); }
         return FAILED;
@@ -278,14 +278,12 @@ fn install(f: fault.Fault) i64 {
         fault.fail(f, "cannot work out where the store is: neither WSHARP_HOME nor a home directory");
         return FAILED;
     };
+    const net = plan.network();
     var installed = 0;
     for (list.to_array(lock.packages)) |p| {
         const digest = digest_of(p.tree);
         if (store.check(h, digest) == store.READY) { continue; }
-        const dir = source_dir(p) orelse {
-            fault.fail(f, text.concat(text.concat("`", p.name), "` has a source ingot cannot fetch"));
-            return FAILED;
-        };
+        const dir = plan.source_dir(f, net, p.source) orelse return FAILED;
         const got = store.install(f, h, dir);
         if (!f.ok) { return FAILED; }
         if (!text.eq(got, digest)) {
@@ -339,7 +337,7 @@ fn verify(f: fault.Fault) i64 {
         // A path dependency that has been edited since it was resolved is
         // neither missing nor damaged: the store holds exactly what it was
         // told to. It is the *lockfile* that is out of date.
-        if (source_dir(p)) |dir| {
+        if (local_source(p)) |dir| {
             if (fs.is_dir(dir)) {
                 const now = store.tree_hash(f, dir);
                 if (f.ok and !text.eq(now, digest)) {
@@ -369,8 +367,11 @@ fn digest_of(tree: str) str {
     return text.substr(tree, at + 1, text.len(tree));
 }
 
-/// Where a locked package's source is, for the sources ingot can reach.
-fn source_dir(p: manifest.Locked) ?str {
+/// Where a locked package's source is *without fetching anything*.
+///
+/// `verify` uses this and `install` does not: asking whether a project is
+/// ready must not go to the network, and making it ready must be allowed to.
+fn local_source(p: manifest.Locked) ?str {
     if (text.starts_with(p.source, "path+")) {
         return text.substr(p.source, 5, text.len(p.source));
     }

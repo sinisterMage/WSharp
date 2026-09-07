@@ -66,6 +66,7 @@ pub fn prepare(f: fault.Fault, h: str) void {
     make(f, objects(h));
     make(f, scratch(h));
     make(f, environments(h));
+    make(f, fetches(h));
     return;
 }
 
@@ -225,6 +226,72 @@ fn settle(f: fault.Fault, staging: str, target: str) void {
     if (!fs.is_dir(target)) {
         fault.fail_at(f, target, "cannot be published into the store");
     }
+    return;
+}
+
+/// Write a list of files into the store, and answer with the digest.
+///
+/// What a fetch produces is a list of paths and contents rather than a
+/// directory, so this is the other door into `install`: build the tree under
+/// `tmp/`, then hand it over. The two share the atomic `rename` and the
+/// hashing, which is the point -- a git package and a path package are the
+/// same thing in the store and nothing downstream can tell them apart.
+pub fn install_files(f: fault.Fault, h: str, files: list.List[File]) str {
+    prepare(f, h);
+    if (!f.ok) { return ""; }
+    const staging = path.join(scratch(h), temporary());
+    fs.mkdir_all(staging) catch {
+        fault.fail_at(f, staging, "cannot be created");
+        return "";
+    };
+    for (list.to_array(files)) |file| {
+        const where = path.join(staging, file.path);
+        fs.mkdir_all(path.dirname(where)) catch {
+            fault.fail_at(f, path.dirname(where), "cannot be created");
+            fs.remove_tree(staging) catch ignore();
+            return "";
+        };
+        io.write_file(where, bytes.to_str(file.data)) catch {
+            fault.fail_at(f, where, "cannot be written");
+            fs.remove_tree(staging) catch ignore();
+            return "";
+        };
+    }
+    const digest = install(f, h, staging);
+    fs.remove_tree(staging) catch ignore();
+    return digest;
+}
+
+/// One file of a fetched tree.
+///
+/// Declared here rather than taken from `ingot/git`, so that the store does not
+/// depend on the transport: what it needs is a path and some bytes, and where
+/// they came from is not its business.
+pub const File = struct { path: str, data: []u8 };
+
+// ---------------------------------------------------------------------------
+// Remembering a fetch
+// ---------------------------------------------------------------------------
+//
+// A git revision names one tree for ever, so fetching one twice is wasted
+// work. `git/<hash of the source>` holds the digest that source resolved to,
+// which turns the second `resolve` of a project into no network at all.
+
+pub fn fetches(h: str) str { return path.join(h, "git"); }
+
+pub fn remembered(h: str, source: str) ?str {
+    const file = path.join(fetches(h), bytes.to_hex(hash.sha256(bytes.of(source))));
+    if (!io.exists(file)) { return null; }
+    const digest = text.trim(io.read_file(file) catch return null);
+    if (text.len(digest) != 64) { return null; }
+    return digest;
+}
+
+pub fn remember(f: fault.Fault, h: str, source: str, digest: str) void {
+    make(f, fetches(h));
+    if (!f.ok) { return; }
+    const file = path.join(fetches(h), bytes.to_hex(hash.sha256(bytes.of(source))));
+    io.write_file(file, digest) catch fault.fail_at(f, file, "cannot be written");
     return;
 }
 

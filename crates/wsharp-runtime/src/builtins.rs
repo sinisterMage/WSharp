@@ -1068,6 +1068,8 @@ pub const OS_MODULE: &str = "std/os";
 pub const PATH_MODULE: &str = "std/path";
 /// TOML 1.0.0, which is what a manifest and a lockfile are written in.
 pub const TOML_MODULE: &str = "std/toml";
+/// DEFLATE and the zlib wrapper, which a git packfile is made of.
+pub const INFLATE_MODULE: &str = "std/inflate";
 /// The two rotates, which the code generator recognises by name and lowers
 /// inline rather than calling. See [`BuiltinTy::IntVar`].
 pub const BITS_ROTL: &str = "rotl";
@@ -1110,6 +1112,7 @@ pub fn std_module_sources() -> &'static [(&'static str, &'static str)] {
         (BYTES_MODULE, include_str!("std/bytes.ws")),
         (CRYPTO_MODULE, include_str!("std/crypto.ws")),
         (HASH_MODULE, include_str!("std/hash.ws")),
+        (INFLATE_MODULE, include_str!("std/inflate.ws")),
         (CIPHER_MODULE, include_str!("std/cipher.ws")),
         (BIGNUM_MODULE, include_str!("std/bignum.ws")),
         (CURVE25519_MODULE, include_str!("std/curve25519.ws")),
@@ -1150,6 +1153,9 @@ pub fn ingot_module_sources() -> &'static [(&'static str, &'static str)] {
         (INGOT_MANIFEST_MODULE, include_str!("ingot/manifest.ws")),
         (INGOT_STORE_MODULE, include_str!("ingot/store.ws")),
         (INGOT_PLAN_MODULE, include_str!("ingot/plan.ws")),
+        (INGOT_PKTLINE_MODULE, include_str!("ingot/pktline.ws")),
+        (INGOT_PACKFILE_MODULE, include_str!("ingot/packfile.ws")),
+        (INGOT_GIT_MODULE, include_str!("ingot/git.ws")),
         (INGOT_MAIN_MODULE, include_str!("ingot/main.ws")),
     ]
 }
@@ -1160,6 +1166,9 @@ pub const INGOT_PUBGRUB_MODULE: &str = "ingot/pubgrub";
 pub const INGOT_MANIFEST_MODULE: &str = "ingot/manifest";
 pub const INGOT_STORE_MODULE: &str = "ingot/store";
 pub const INGOT_PLAN_MODULE: &str = "ingot/plan";
+pub const INGOT_PKTLINE_MODULE: &str = "ingot/pktline";
+pub const INGOT_PACKFILE_MODULE: &str = "ingot/packfile";
+pub const INGOT_GIT_MODULE: &str = "ingot/git";
 /// The verbs, and the module the `ingot` binary runs.
 pub const INGOT_MAIN_MODULE: &str = "ingot/main";
 

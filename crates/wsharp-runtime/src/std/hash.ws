@@ -239,6 +239,142 @@ pub fn sha256(data: []u8) []u8 {
 }
 
 // ---------------------------------------------------------------------------
+// SHA-1
+// ---------------------------------------------------------------------------
+//
+// Here because git names every object by one, and for no other reason. It is
+// **broken for signatures** -- a chosen-prefix collision has been public since
+// 2017 -- and nothing in `std/tls` or `std/x509` will use it. Git's use is not
+// a signature: an object id names content that is also checked by the transport
+// above it, and a package's own integrity is `ingot/store`'s SHA-256 tree hash
+// rather than anything git said. Saying that here is cheaper than being asked.
+//
+// FIPS 180-4 section 6.1, and the same shape as SHA-256 above: 64-byte blocks,
+// 80 rounds, five words of state.
+
+const H1 = []u32{
+    0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0,
+};
+
+pub const Sha1 = struct {
+    h: []u32,
+    w: []u32,
+    block: []u8,
+    used: i64,
+    length: u64,
+};
+
+pub fn sha1_init() Sha1 {
+    const h: []u32 = array.new(5);
+    var i = 0;
+    while (i < 5) : (i += 1) { h[i] = H1[i]; }
+    return Sha1{
+        .h = h,
+        // The message schedule lives in the state and is made once, for the
+        // reason every other primitive here does: a temporary inside the block
+        // loop is a collection per block under `--gc-stress`.
+        .w = array.new(80),
+        .block = bytes.new(64),
+        .used = 0,
+        .length = 0,
+    };
+}
+
+fn sha1_block(s: Sha1, data: []u8, at: i64) void {
+    const w = s.w;
+    var i = 0;
+    while (i < 16) : (i += 1) { w[i] = bytes.be32(data, at + i * 4); }
+    while (i < 80) : (i += 1) {
+        w[i] = bits.rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    }
+
+    var a = s.h[0];
+    var b = s.h[1];
+    var c = s.h[2];
+    var d = s.h[3];
+    var e = s.h[4];
+
+    i = 0;
+    while (i < 80) : (i += 1) {
+        var f = (b & c) | (~b & d);
+        var k: u32 = 0x5a827999;
+        if (i >= 60) {
+            f = b ^ c ^ d;
+            k = 0xca62c1d6;
+        } else {
+            if (i >= 40) {
+                f = (b & c) | (b & d) | (c & d);
+                k = 0x8f1bbcdc;
+            } else {
+                if (i >= 20) {
+                    f = b ^ c ^ d;
+                    k = 0x6ed9eba1;
+                }
+            }
+        }
+        const t = bits.rotl(a, 5) + f + e + k + w[i];
+        e = d;
+        d = c;
+        c = bits.rotl(b, 30);
+        b = a;
+        a = t;
+    }
+
+    s.h[0] += a;
+    s.h[1] += b;
+    s.h[2] += c;
+    s.h[3] += d;
+    s.h[4] += e;
+    return;
+}
+
+pub fn sha1_update(s: Sha1, data: []u8, at: i64, n: i64) void {
+    s.length += u64(n);
+    var taken = 0;
+    if (s.used > 0) {
+        var room = 64 - s.used;
+        if (room > n) { room = n; }
+        bytes.copy(s.block, s.used, data, at, room);
+        s.used += room;
+        taken = room;
+        if (s.used == 64) {
+            sha1_block(s, s.block, 0);
+            s.used = 0;
+        }
+    }
+    while (n - taken >= 64) {
+        sha1_block(s, data, at + taken);
+        taken += 64;
+    }
+    if (n - taken > 0) {
+        bytes.copy(s.block, 0, data, at + taken, n - taken);
+        s.used = n - taken;
+    }
+    return;
+}
+
+pub fn sha1_final(s: Sha1) []u8 {
+    const bit_length = s.length * 8;
+    const tail = bytes.new(72);
+    tail[0] = 0x80;
+    var pad = 64 - ((s.used + 9) % 64);
+    if (pad == 64) { pad = 0; }
+    bytes.put_be64(tail, 1 + pad, bit_length);
+    sha1_update(s, tail, 0, 1 + pad + 8);
+
+    const out = bytes.new(20);
+    var i = 0;
+    while (i < 5) : (i += 1) { bytes.put_be32(out, i * 4, s.h[i]); }
+    return out;
+}
+
+pub fn sha1(data: []u8) []u8 {
+    const s = sha1_init();
+    sha1_update(s, data, 0, array.len(data));
+    return sha1_final(s);
+}
+
+// ---------------------------------------------------------------------------
 // SHA-512, and SHA-384 above it
 // ---------------------------------------------------------------------------
 //

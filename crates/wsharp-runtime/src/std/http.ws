@@ -324,12 +324,28 @@ fn parse_url(url: str) !Endpoint {
 /// a test with both ends in one process, or a client reusing a socket -- can
 /// use it without opening another.
 pub fn send_request(c: Conn, host: str, method: str, path: str, body: str) !void {
+    var none: list.List[Header] = list.new();
+    try send_request_with(c, host, method, path, body, none);
+    return;
+}
+
+/// The same, with headers of this caller's own.
+///
+/// Wanted the moment a protocol rides on HTTP rather than merely using it:
+/// git's smart transport is chosen by a `Git-Protocol` header and its request
+/// bodies are identified by a `Content-Type` one, and neither is something a
+/// general client could have guessed.
+pub fn send_request_with(c: Conn, host: str, method: str, path: str, body: str,
+                         extra: list.List[Header]) !void {
     var head = text.concat(method, " ");
     head = text.concat(head, path);
     head = text.concat(head, " HTTP/1.1\r\nHost: ");
     head = text.concat(head, host);
     head = text.concat(head, "\r\nConnection: close\r\nContent-Length: ");
     head = text.concat(head, text.from_int(text.len(body)));
+    for (list.to_array(extra)) |h| {
+        head = text.concat(head, text.concat("\r\n", text.concat(h.name, text.concat(": ", h.value))));
+    }
     head = text.concat(head, "\r\n\r\n");
     try conn_write(c, text.concat(head, body));
     return;
@@ -383,6 +399,13 @@ pub fn request(url: str, method: str, body: str) !Response {
 /// host this is, and a certificate checked against the wrong name is worse
 /// than none.
 pub fn request_with(url: str, method: str, body: str, cfg: tls.Config) !Response {
+    var none: list.List[Header] = list.new();
+    return try request_headers(url, method, body, cfg, none);
+}
+
+/// The same again, with headers of this caller's own.
+pub fn request_headers(url: str, method: str, body: str, cfg: tls.Config,
+                       extra: list.List[Header]) !Response {
     const where = try parse_url(url);
     const socket = try net.connect(where.host, where.port);
     var c = connection(socket);
@@ -390,7 +413,7 @@ pub fn request_with(url: str, method: str, body: str, cfg: tls.Config) !Response
         const session = try tls.connect(socket, with_host(cfg, where.host));
         c = tls_connection(session);
     }
-    try send_request(c, where.host, method, where.path, body);
+    try send_request_with(c, where.host, method, where.path, body, extra);
     const answer = try read_response(c);
     close(c);
     return answer;

@@ -545,7 +545,9 @@ Sessions are numbered by the original feature list:
       versions, version *sets* as unions of intervals, and PubGrub — which
       answers a conflict with the derivation that caused it rather than with
       "unsatisfiable", and which found a real bug in the garbage collector on
-      its way in.
+      its way in. Stage four is git: SHA-1, zlib inflate, pkt-line framing and
+      a packfile with both kinds of delta resolved, all of it W#, replayed
+      against a conversation a real `git upload-pack` took part in.
 
 What is left, and where it plugs in, is in [ROADMAP.md](ROADMAP.md).
 Conventions and the invariants worth not breaking are in

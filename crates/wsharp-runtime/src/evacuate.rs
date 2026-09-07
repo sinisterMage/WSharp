@@ -24,7 +24,7 @@
 use crate::gc::with_buffers;
 use crate::header::{
     FLAG_DEAD, FLAG_IMMORTAL, flags_of_meta, forwarding_target, is_forwarded_meta, is_marked,
-    load_meta, test_flag, type_id_of,
+    load_meta, type_id_of,
 };
 
 use crate::heap;
@@ -137,6 +137,13 @@ unsafe fn fix_slot(slot: *mut *mut u8) {
 /// # Safety
 /// `obj` must be a live, un-forwarded object with a registered type.
 unsafe fn fix_fields(obj: *mut u8) {
+    // A forwarded header is an *address*, not a type id, so this test comes
+    // first: reading a type out of one gives a number that may name a real
+    // type, and the fields it then describes are a stranger's bytes. The copy
+    // is on this list too, and the copy is the one that needs fixing.
+    if is_forwarded_meta(unsafe { load_meta(obj) }) {
+        return;
+    }
     let Some(info) = types::info(unsafe { type_id_of(obj) }) else {
         return;
     };
@@ -216,8 +223,14 @@ pub(crate) unsafe fn fix_references(remembered: &[*mut *mut u8], scan: &[*mut u8
 /// As [`fix_references`].
 pub(crate) unsafe fn verify_nothing_scanned_is_dead(scan: &[*mut u8]) {
     for &obj in scan {
+        let meta = unsafe { load_meta(obj) };
+        // A forwarded object is not dead and has no flags to ask about: its
+        // header is where it went. `fix_fields` skips it for the same reason.
+        if is_forwarded_meta(meta) {
+            continue;
+        }
         assert!(
-            !unsafe { test_flag(obj, FLAG_DEAD) },
+            flags_of_meta(meta) & FLAG_DEAD == 0,
             "the evacuation pause was handed {obj:p}, which has been freed"
         );
     }

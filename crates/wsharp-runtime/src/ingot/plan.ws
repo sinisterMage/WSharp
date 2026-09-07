@@ -14,36 +14,78 @@
 const array = @import("std/array");
 const fault = @import("ingot/fault");
 const fs = @import("std/fs");
+const git = @import("ingot/git");
 const list = @import("std/list");
 const manifest = @import("ingot/manifest");
 const path = @import("std/path");
 const pubgrub = @import("ingot/pubgrub");
 const semver = @import("ingot/semver");
 const store = @import("ingot/store");
+const tls = @import("std/tls");
+const x509 = @import("std/x509");
 const text = @import("std/str");
 
 /// One package the search may choose, and where its files are.
 pub const Source = struct {
     name: str,
     version: semver.Version,
-    /// The directory it was read from, relative to the project.
+    /// The directory it was read from: relative to the project for a path
+    /// dependency, and inside the store for a fetched one.
     dir: str,
+    /// How the lockfile names where it came from.
+    origin: str,
     needs: list.List[pubgrub.Need],
     /// The same, by name, for the lockfile.
     deps: []str,
 };
+
+/// What a fetch needs to reach a remote, gathered once.
+///
+/// The trust store is the expensive half of an HTTPS connection and is parsed
+/// once here rather than per request, which is what `http.request_with` exists
+/// for. `ready` is false when there is no store to be had, and every git
+/// dependency then fails with that rather than with a handshake error.
+pub const Network = struct { cfg: tls.Config, ready: bool, tried: bool };
+
+/// A network nothing has needed yet.
+///
+/// Reading the machine's certificate store costs about as much as a handshake,
+/// so it is not done until a git dependency actually asks -- which means a
+/// project of path dependencies resolves without touching it, and a machine
+/// with no store can still use one.
+pub fn network() Network {
+    return Network{ .cfg = tls.client_config(""), .ready = false, .tried = false };
+}
+
+/// A network that will refuse, for a caller that must not reach one.
+pub fn offline() Network {
+    return Network{ .cfg = tls.client_config(""), .ready = false, .tried = true };
+}
+
+fn connect(f: fault.Fault, net: Network) bool {
+    if (net.tried) { return net.ready; }
+    net.tried = true;
+    const roots = x509.system_roots() catch {
+        fault.fail(f, "this machine has no certificate store, so nothing can be fetched");
+        return false;
+    };
+    net.cfg = tls.roots_config("", roots);
+    net.ready = true;
+    return true;
+}
 
 /// Every package reachable from `m` by following path dependencies.
 ///
 /// Breadth first, and a package reached twice by two routes is read once: two
 /// spellings of one directory are one package, and `path.normalise` is what
 /// makes them the same string.
-pub fn discover(f: fault.Fault, m: manifest.Manifest) ?list.List[Source] {
+pub fn discover(f: fault.Fault, net: Network, m: manifest.Manifest) ?list.List[Source] {
     var found: list.List[Source] = list.new();
     var dirs: list.List[str] = list.new();
     var queue: list.List[str] = list.new();
     var wanted: list.List[str] = list.new();
-    if (!enqueue(f, m, m.dir, queue, wanted)) { return null; }
+    var origins: list.List[str] = list.new();
+    if (!enqueue(f, net, m, m.dir, queue, wanted, origins)) { return null; }
     var at = 0;
     while (at < list.len(queue)) : (at += 1) {
         const dir = list.get(queue, at);
@@ -59,9 +101,9 @@ pub fn discover(f: fault.Fault, m: manifest.Manifest) ?list.List[Source] {
                 text.concat(dir, text.concat(", whose package is called ", sub.name))));
             return null;
         }
-        const source = describe(f, sub, dir) orelse return null;
+        const source = describe(f, sub, dir, list.get(origins, at)) orelse return null;
         list.push(found, source);
-        if (!enqueue(f, sub, dir, queue, wanted)) { return null; }
+        if (!enqueue(f, net, sub, dir, queue, wanted, origins)) { return null; }
     }
     return found;
 }
@@ -71,9 +113,18 @@ pub fn discover(f: fault.Fault, m: manifest.Manifest) ?list.List[Source] {
 /// A dependency written as a *version* is left alone here: something else in
 /// the graph may be the package it names, and this is not the place to decide
 /// -- `unsourced` asks afterwards, when the whole graph is known.
-fn enqueue(f: fault.Fault, m: manifest.Manifest, from: str,
-           queue: list.List[str], wanted: list.List[str]) bool {
+fn enqueue(f: fault.Fault, net: Network, m: manifest.Manifest, from: str,
+           queue: list.List[str], wanted: list.List[str], origins: list.List[str]) bool {
     for (list.to_array(m.deps)) |d| {
+        if (text.len(d.git) > 0) {
+            const dir = fetched(f, net, d) orelse return false;
+            if (!holds(queue, dir)) {
+                list.push(queue, dir);
+                list.push(wanted, d.name);
+                list.push(origins, source_name(d));
+            }
+            continue;
+        }
         if (text.len(d.dir) == 0) { continue; }
         const dir = path.normalise(path.join(from, d.dir));
         if (!fs.is_dir(dir)) {
@@ -81,9 +132,107 @@ fn enqueue(f: fault.Fault, m: manifest.Manifest, from: str,
                 text.concat(dir, ", which is not a directory")));
             return false;
         }
-        if (!holds(queue, dir)) { list.push(queue, dir); list.push(wanted, d.name); }
+        if (!holds(queue, dir)) {
+            list.push(queue, dir);
+            list.push(wanted, d.name);
+            list.push(origins, text.concat("path+", dir));
+        }
     }
     return true;
+}
+
+/// How a lockfile names a git dependency: the URL and the revision, which
+/// together name one tree for ever.
+fn source_name(d: manifest.Dep) str {
+    return text.concat("git+", text.concat(d.git, text.concat("#", d.rev)));
+}
+
+/// A git dependency's files, in the store, and where they are.
+///
+/// Fetching is what `resolve` has to do before it can even read the package's
+/// manifest, so it happens here rather than in `install` -- and it is
+/// remembered, because a revision names one tree for ever and the second
+/// `resolve` of a project should touch no network at all.
+fn fetched(f: fault.Fault, net: Network, d: manifest.Dep) ?str {
+    const home = store.home() catch {
+        fault.fail(f, "cannot work out where the store is");
+        return null;
+    };
+    const source = source_name(d);
+    if (store.remembered(home, source)) |digest| {
+        if (store.check(home, digest) == store.READY) { return store.entry(home, digest); }
+    }
+    if (text.len(d.rev) != 40) {
+        fault.fail(f, text.concat(text.concat("`", d.name),
+            "` needs a `rev` that is a full object id"));
+        return null;
+    }
+    if (!connect(f, net)) {
+        if (f.ok) {
+            fault.fail(f, text.concat(text.concat("`", d.name),
+                "` has not been fetched, and nothing here can fetch it"));
+        }
+        return null;
+    }
+    return pull(f, net, home, d.git, d.rev, source);
+}
+
+/// Fetch one revision into the store, and answer with where it landed.
+fn pull(f: fault.Fault, net: Network, home: str, url: str, rev: str, source: str) ?str {
+    const remote = git.Remote{ .url = url, .cfg = net.cfg };
+    const pack = git.fetch(f, remote, rev) orelse return null;
+    const files = git.files(f, pack, rev) orelse return null;
+    var carried: list.List[store.File] = list.new();
+    for (list.to_array(files)) |file| {
+        list.push(carried, store.File{ .path = file.path, .data = file.data });
+    }
+    const digest = store.install_files(f, home, carried);
+    if (!f.ok) { return null; }
+    store.remember(f, home, source, digest);
+    if (!f.ok) { return null; }
+    return store.entry(home, digest);
+}
+
+/// The directory a lockfile's `source` names, fetching it if it is a revision
+/// that is not in the store yet.
+///
+/// What `install` uses: a lockfile may name a git package on a machine that
+/// has never seen it, and the whole point of `install` is to make the store
+/// satisfy the lockfile.
+pub fn source_dir(f: fault.Fault, net: Network, source: str) ?str {
+    if (text.starts_with(source, "path+")) {
+        return text.substr(source, 5, text.len(source));
+    }
+    if (!text.starts_with(source, "git+")) {
+        fault.fail(f, text.concat("ingot does not know the source ", source));
+        return null;
+    }
+    const home = store.home() catch {
+        fault.fail(f, "cannot work out where the store is");
+        return null;
+    };
+    if (store.remembered(home, source)) |digest| {
+        if (store.check(home, digest) == store.READY) { return store.entry(home, digest); }
+    }
+    const rest = text.substr(source, 4, text.len(source));
+    const hash_at = last_hash(rest);
+    if (hash_at < 0) {
+        fault.fail(f, text.concat("this source names no revision: ", source));
+        return null;
+    }
+    if (!connect(f, net)) { return null; }
+    return pull(f, net, home, text.substr(rest, 0, hash_at),
+                text.substr(rest, hash_at + 1, text.len(rest)), source);
+}
+
+/// The last `#`, which is what separates a URL from a revision -- a URL may
+/// hold one of its own.
+fn last_hash(s: str) i64 {
+    var i = text.len(s) - 1;
+    while (i >= 0) : (i -= 1) {
+        if (text.byte_at(s, i) == 35) { return i; }
+    }
+    return -1;
 }
 
 /// The first package something asks for that nothing in the graph supplies.
@@ -112,7 +261,7 @@ fn supplied(root: Source, found: list.List[Source], name: str) bool {
 }
 
 /// A manifest as something the solver can choose.
-fn describe(f: fault.Fault, m: manifest.Manifest, dir: str) ?Source {
+fn describe(f: fault.Fault, m: manifest.Manifest, dir: str, origin: str) ?Source {
     const version = semver.parse(m.version) orelse {
         fault.fail_at(f, path.join(dir, manifest.MANIFEST_NAME),
             text.concat(text.concat("`", m.version), "` is not a version"));
@@ -125,7 +274,14 @@ fn describe(f: fault.Fault, m: manifest.Manifest, dir: str) ?Source {
         list.push(needs, pubgrub.Need{ .package = d.name, .range = range });
         names = array.push(names, d.name);
     }
-    return Source{ .name = m.name, .version = version, .dir = dir, .needs = needs, .deps = names };
+    return Source{
+        .name = m.name,
+        .version = version,
+        .dir = dir,
+        .origin = origin,
+        .needs = needs,
+        .deps = names,
+    };
 }
 
 /// What a dependency asks for.
@@ -173,9 +329,9 @@ pub fn provider(root: Source, found: list.List[Source]) pubgrub.Provider {
 pub const Plan = struct { lock: ?manifest.Lock, report: str };
 
 /// Choose versions for everything `m` needs, and hash what was chosen.
-pub fn resolve(f: fault.Fault, m: manifest.Manifest) Plan {
-    const found = discover(f, m) orelse return failed("");
-    const root = describe(f, m, m.dir) orelse return failed("");
+pub fn resolve(f: fault.Fault, net: Network, m: manifest.Manifest) Plan {
+    const found = discover(f, net, m) orelse return failed("");
+    const root = describe(f, m, m.dir, "root") orelse return failed("");
 
     if (unsourced(root, found)) |name| {
         fault.fail(f, text.concat(text.concat("`", name),
@@ -201,7 +357,7 @@ pub fn resolve(f: fault.Fault, m: manifest.Manifest) Plan {
         list.push(packages, manifest.Locked{
             .name = source.name,
             .version = semver.render(source.version),
-            .source = text.concat("path+", source.dir),
+            .source = source.origin,
             .tree = text.concat("sha256:", digest),
             .deps = source.deps,
         });

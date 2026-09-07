@@ -411,6 +411,14 @@ extra `sin_len` byte out of this code entirely.
   `--gc-stress` walks the whole heap afterwards to check. Anything that adds a
   place a heap pointer can be stored must be added to that list *and* to the
   verifier.
+- **The evacuation pause must test forwarding before reading a header.** This
+  is the same rule `evacuate::forward`, `heap::evacuate_block` and
+  `note_evacuated_blocks` already followed, and `evacuate::fix_fields` was the
+  one place that did not: a logged object in a block being emptied gets
+  forwarded while the program runs, and a forwarding header's low 32 bits are
+  part of an *address*, which can easily name a real type id. Scanning one then
+  walks a stranger's bytes with somebody else's layout. The copy is on the same
+  list, and the copy is what needs fixing.
 - **Counting's frees wait until the trace's *last* pause, not its second.**
   The evacuation pause reads two lists recorded during the mark -- the slots
   the marker saw pointing into a block being emptied, and the objects the trace
@@ -447,6 +455,25 @@ extra `sin_len` byte out of this code entirely.
   message. A new list operation that indexes `items` and forgets this hands
   back a spare slot -- a zero, or a null reference -- instead of reporting the
   mistake.
+- **A git object id is SHA-1 and a package's integrity is not.** `std/hash`
+  carries SHA-1 because git names every object by one; nothing in `std/tls` or
+  `std/x509` uses it, and a fetched tree's own key is `ingot/store`'s SHA-256.
+  Saying that in the module header is cheaper than being asked.
+- **`std/inflate` answers with a cursor, not with bytes.** A packfile is a
+  concatenation of zlib streams with nothing between them, so only the
+  decompressor knows where one ends. A `decompress(bytes) -> bytes` would be
+  the obvious shape and useless for the one caller there is. The Huffman tables
+  live in the reader and are built once, because a block that allocated would
+  be a collection per block under `--gc-stress`.
+- **A packfile has two varints and they are different.** A size is the ordinary
+  seven-bits-at-a-time little-endian form; an offset delta's backreference
+  accumulates `((n + 1) << 7) | next`, which makes each number's encoding
+  unique. Reading one with the other's loop gives a plausible wrong answer and
+  is the classic bug. A copy instruction with a size of zero means 65536.
+- **Git says no out of band.** `ERR <message>` is a plain pkt-line and can
+  arrive anywhere a line can, including before the side bands exist. A client
+  that only looked at band 3 reads a refusal as an unknown section and reports
+  an empty answer.
 - **A version set is intervals, not a predicate.** `ingot/semver`'s `Range` is
   a sorted, disjoint, non-adjacent list of intervals with inclusive or
   exclusive ends, because PubGrub takes *complements* constantly and a
@@ -648,9 +675,19 @@ nix-shell --run "cargo test --workspace"
   tool -- a verb reads a directory, writes two files and answers with an exit
   status -- so `crates/ingot/tests/verbs.rs` drives the built binary with
   `-C <dir>` and `WSHARP_HOME` pointed inside a temporary directory.
-- **A case cannot expect trailing whitespace.** `parse_expectations` trims each
-  header line, so a tab-separated row with an empty last field has to print
-  something -- `-` is what `ingot_manifest.ws` uses.
+- **A case cannot expect leading *or* trailing whitespace.**
+  `parse_expectations` trims each header line, so a tab-separated row with an
+  empty last field has to print something -- `-` is what `ingot_manifest.ws`
+  uses -- and an indented line cannot be expected at all, which is why
+  `packfile.ws` writes `- ` rather than two spaces.
+- **The git client is recorded against a real `git upload-pack`.** The requests
+  in `tests/cases/modules/gitfixture.ws` are the bytes `ingot/git` generates,
+  and the answers are what `git upload-pack --stateless-rpc` said when it was
+  handed them -- the same program `git http-backend` puts behind the HTTP
+  endpoint. That checks the half a recorded transcript cannot: whether a real
+  server *accepts* what this client sends. The packfiles in
+  `packfixture.ws` are what `git repack` wrote, one with offset deltas and one
+  with reference deltas, because only the first is common and both must work.
 - **A case that touches the filesystem builds its own directory and removes
   it.** `os.temp_dir()` says where, and the name carries `crypto.random` bytes,
   because the suite runs a second time under `--gc-stress` and the two runs may

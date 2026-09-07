@@ -366,11 +366,12 @@ A module system, and four modules behind it.
 | `std/os` | `args`, `get`, `home`, `temp_dir` (item 11) |
 | `std/path` | `join`, `dirname`, `basename`, `extension`, `is_absolute`, `normalise` (item 11) |
 | `std/toml` | TOML 1.0.0, read and written: `parse`, `write`, the `Value` lattice, `get`/`set`/`lookup` (item 11) |
+| `std/inflate` | DEFLATE and the zlib wrapper, as a cursor: `zlib`, `raw`, `adler32` (item 11) |
 | `std/http` | the 27 status types, moved out of the global namespace; since item 8, an HTTP/1.1 client and server over `std/net` |
 | `std/broker` | `Topic[M]`, `Consumer[M]` and `topic`, `publish`, `subscribe`, `next`, `commit`, `seek`, `len` |
 | `std/net` | `Socket`, `Listener`, `Poller`, `Event`, `Datagrams`, `Peer`, `Datagram` and `connect`, `listen`, `accept`, `read`, `write`, `write_all`, `read_exactly`, `read_all`, `set_nonblocking`, `poller`, `watch`, `wait`, `udp`, `send_to`, `receive`, `reply`, `close` (item 8); and since item 10, `read_into`, `write_bytes`, `write_all_bytes`, `read_exactly_into` over a `[]u8` |
 | `std/bytes` | `[]u8` as a buffer and the bridge to `str`: `new`, `of`, `to_str`, `slice`, `concat`, `copy`, `fill`, `xor`, `equal`, the big- and little-endian word accessors, `to_hex`, `from_hex` (item 10) |
-| `std/hash` | SHA-256, SHA-384, SHA-512 one-shot and incremental; `hmac`, `hkdf_extract`, `hkdf_expand` (item 10) |
+| `std/hash` | SHA-256, SHA-384, SHA-512 one-shot and incremental; `hmac`, `hkdf_extract`, `hkdf_expand` (item 10); SHA-1, for git's object ids (item 11) |
 | `std/cipher` | ChaCha20, Poly1305, ChaCha20-Poly1305; AES-128/256, GHASH, AES-GCM (item 10) |
 | `std/crypto` | `random` — the system's generator (item 10) |
 | `std/time` | `now` — seconds since the Unix epoch (item 10) |
@@ -1618,7 +1619,7 @@ having before the next exists.
 | One | `argv`, the environment, and a real filesystem | **done** |
 | Two | TOML, the manifest and lockfile, and the content-addressed store | **done** |
 | Three | Semantic versions, and a PubGrub resolver that explains itself | **done** |
-| Four | Git spoken rather than shelled out to: inflate, pkt-line, a packfile | to do |
+| Four | Git spoken rather than shelled out to: inflate, pkt-line, a packfile | **done** |
 | Five | The loader hook, and the re-export a package facade needs | to do |
 
 ### Stage one — the language can see the world — **done**
@@ -1946,6 +1947,123 @@ keeps logging. With the fix backed out, that case trips the assertion about two
 runs in five; with it, six runs in six are clean, and the case reports 21
 traces and a thousand objects moved, which is the number to look at.
 
+### Stage four — git, spoken rather than shelled out to — **done**
+
+| Piece | Where |
+|---|---|
+| SHA-1, because git names every object by one | `std/hash.ws` |
+| DEFLATE and the zlib wrapper, as a cursor | `std/inflate.ws` |
+| Headers of a caller's own on an HTTP request | `std/http.ws` — `send_request_with`, `request_headers` |
+| pkt-line framing and side bands | `ingot/pktline.ws` |
+| A packfile, with both delta kinds resolved | `ingot/packfile.ws` |
+| Smart HTTP v2: discovery, `ls-refs`, `fetch` | `ingot/git.ws` |
+| A fetched tree becoming a store entry | `ingot/store.ws` — `install_files`, `remember` |
+| A git dependency being resolved and installed | `ingot/plan.ws` |
+| A second bug in the collector | `evacuate.rs` |
+
+`ingot.toml` can now say `dep = { git = "https://…", rev = "…" }`, and
+`ingot resolve` fetches it, reads its manifest, folds it into the search, and
+records the tree's digest in the lockfile. Fetching happens at *resolve* rather
+than at install, because resolving needs the dependency's own manifest before
+it can choose anything -- and it is remembered under `~/.wsharp/git/`, since a
+revision names one tree for ever and the second resolve of a project should
+touch no network at all.
+
+#### The interface a packfile forces
+
+`std/inflate` answers with **how many input bytes it consumed**, not with a
+buffer. That is the whole shape of the module and it is not a preference: a
+packfile is a concatenation of zlib streams with nothing between them, so only
+the decompressor knows where one ends. A `decompress(bytes) -> bytes` would
+have been the obvious thing to write and useless for the one caller there is.
+
+The decoder is Mark Adler's `puff` in outline -- canonical Huffman from a table
+of counts and a table of symbols rather than from a tree -- and the tables live
+in the reader rather than in a block, because a block that allocated would be a
+collection per block under `--gc-stress`. It costs nothing measurable: the case
+runs in a fifth of a second under stress.
+
+There is no `crc32` and no gzip wrapper, for the reason `std/der` has no writer.
+
+#### Three places a packfile reader is wrong
+
+- **A packfile has two varints and they are different.** A size is the ordinary
+  seven-bits-at-a-time little-endian form. An offset delta's backreference
+  accumulates `((n + 1) << 7) | next`, which is what makes every number's
+  encoding unique. Reading one with the other's loop gives a plausible wrong
+  answer, and is the classic bug.
+- **A copy instruction with a size of zero means 65536.** Zero would be a copy
+  of nothing, which no encoder writes, so the value was given a use.
+- **A back reference whose distance is shorter than its length is how a run is
+  encoded**, so the copy is byte at a time and not a block move -- the bytes
+  being read are partly the bytes being written.
+
+#### `ERR` is not a side band
+
+Git says no out of band: `ERR <message>` is a plain pkt-line and can arrive
+anywhere a line can, including before the side bands exist to carry one. A
+client that only watched band 3 would read a refusal as an unknown section and
+report an empty answer. This was found by asking a real server for a commit it
+does not have, which is the only way it would have been found.
+
+#### Tested against a real server, without a network
+
+The rule item 10 set -- a protocol is tested three ways, because a transcript
+can only do two of them -- applies here with one improvement available. Git's
+HTTP endpoint is `git upload-pack --stateless-rpc` behind a thin proxy, and
+that command can be run directly. So:
+
+1. The **requests** in the fixture are the bytes this client generates.
+2. The **answers** are what `git upload-pack` said when it was handed them.
+
+That closes the gap a recorded transcript leaves. A recorded request is an
+input, so comparing against it says nothing about what the client would have
+written; here the recording was made *from* the client's own output, and the
+server's willingness to answer is the assertion. The case then checks that the
+client still writes those bytes, so a change to the request is a failure rather
+than a silent divergence.
+
+The packfiles are what `git repack` actually wrote -- one with offset deltas,
+one with reference deltas, both holding a chain of length two -- and what comes
+out is checked against the object ids git itself assigned. An id is a SHA-1
+over the whole object, so a delta applied one byte wrongly is a different id.
+
+What is **not** tested is a fetch over a real network, for the reason
+`http.get("https://…")` is not in `examples/`: CI would depend on the weather.
+
+#### And a second bug in the collector, in the same pause as the first
+
+Stage three found the evacuation pause reading objects that had been *freed*.
+This stage found it reading objects that had been **forwarded** -- and the two
+are different mistakes with the same symptom.
+
+`evacuate::fix_fields` read an object's type id and walked the fields that type
+describes. A logged object sitting in a block being emptied gets forwarded
+while the program runs, and a forwarded header is an *address*: its low
+thirty-two bits are part of a pointer, which can perfectly well name a real
+type id. The pause then walked a stranger's bytes with somebody else's layout.
+
+The rule was already written down -- *"a forwarded header is an address, not
+flags; anything that reads a flag, a count, a size or a type id from an object
+in a block being emptied must test forwarding first"* -- and named the three
+places that follow it. `fix_fields` was the fourth and did not. It now returns
+straight away: the copy is on the same list, and the copy is what needs fixing.
+
+The `--gc-stress` check added in stage three had the same bug, which is how
+this one was found: it read `FLAG_DEAD` out of a forwarded header and reported
+a freed object that was not one. A check that is wrong in the way the code is
+wrong is worth remembering as a failure mode of its own.
+
+#### What it costs
+
+`ingot` compiles its own W# on every invocation, and stage four roughly doubled
+what that is: `ingot/git` reaches `std/tls`, which reaches `std/x509`,
+`std/nistec`, `std/rsa` and the rest. A release build starts in about half a
+second and a debug build in three and a half. Lazy loading is what keeps that
+from being every *program's* problem, but `ingot`'s own verbs genuinely reach
+all of it, and the fix -- if it is worth one -- is caching a compiled program
+rather than loading less.
+
 ### The name
 
 C#'s package manager is NuGet, which sounds like *nugget*; in Minecraft nine
@@ -1984,11 +2102,10 @@ package manager* rather than about Julia:
 - ~~**A filesystem beyond four functions.**~~ Done in stage one. It turned out
   to need *less* than this asked for: not a stat, but the two questions a stat
   was wanted for.
-- **Git, spoken rather than shelled out to.** Smart-HTTP v2 over item 10's TLS:
-  pkt-line framing, ref discovery, want/have negotiation, and then a packfile,
-  which means zlib inflate and delta resolution. Inflate is a few hundred lines
-  and wants item 9's bit operations; delta resolution is where the surprises
-  are.
+- ~~**Git, spoken rather than shelled out to.**~~ Done in stage four. The
+  surprises were where this said they would be, and there were three of them:
+  two different varints, a copy size of zero meaning 65536, and `ERR` not being
+  a side band.
 - ~~**A manifest and a lockfile format**~~ Done in stage two, and the decision
   went the harder way: all of TOML 1.0, because a subset is a promise the file
   extension makes and the code does not keep.
