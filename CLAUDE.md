@@ -411,6 +411,18 @@ extra `sin_len` byte out of this code entirely.
   `--gc-stress` walks the whole heap afterwards to check. Anything that adds a
   place a heap pointer can be stored must be added to that list *and* to the
   verifier.
+- **Counting's frees wait until the trace's *last* pause, not its second.**
+  The evacuation pause reads two lists recorded during the mark -- the slots
+  the marker saw pointing into a block being emptied, and the objects the trace
+  touched afterwards -- so an object freed between the two pauses will have had
+  its space taken by something else by the time the second one gets there, and
+  the pause then walks a stranger's bytes with a dead object's layout. So
+  `finish_marking` arms `evacuating` *before* it calls `gc::collect`, and
+  `defer_frees` is `tracing() || evacuating()`. `fix_references` visiting
+  `deferred_dead` is what that was always written for. Under `--gc-stress`,
+  `verify_nothing_scanned_is_dead` says so out loud; `gc_evacuation_lists.ws`
+  is what gives it something to fire on, and needs a few hundred thousand
+  short-lived nodes to do it.
 - **Counting after the final pause never names an unmarked object.** Its
   buffers were drained in the pause and the nursery was filtered by mark, so
   the concurrent sweep, which frees exactly the unmarked, cannot free anything
@@ -435,6 +447,28 @@ extra `sin_len` byte out of this code entirely.
   message. A new list operation that indexes `items` and forgets this hands
   back a spare slot -- a zero, or a null reference -- instead of reporting the
   mistake.
+- **A version set is intervals, not a predicate.** `ingot/semver`'s `Range` is
+  a sorted, disjoint, non-adjacent list of intervals with inclusive or
+  exclusive ends, because PubGrub takes *complements* constantly and a
+  predicate cannot be complemented into something you can then ask for the best
+  version of. The ends carry inclusivity rather than being half-open because a
+  version has no successor: there are infinitely many pre-releases between
+  `1.0.0` and `1.0.1`. Touching intervals are run together by `normalise`, so
+  two spellings of one set are one set and equality is a walk.
+- **A PubGrub term is not its allowed set.** "foo is not in A" is satisfied by
+  foo being *absent*, which no set of versions says -- so `relates` has four
+  cases and not one piece of set arithmetic. Collapsing a negative term to its
+  complement makes `not foo any-version`, which is what every dependency starts
+  life as, look like a term that can never hold, and the solver then decides
+  nothing at all. Two more rules that are load-bearing rather than tidy: an
+  incompatibility **merges terms about the same package** (resolution routinely
+  produces `{not foo ^1.0.0, foo 2.0.0}`, which merged is the clause that
+  rules something out and unmerged is a search that never terminates), and the
+  difference taken during resolution is **satisfier ∖ term**, not the reverse.
+- **A pre-release is not a candidate unless it was asked for**, and that is a
+  policy in `pubgrub.choose` rather than a rule in the set algebra. The algebra
+  stays honest that `1.1.0-rc.1` really is below `1.1.0` and really is inside
+  `^1.0.0`; `semver.mentions_prerelease` is what the policy asks.
 - **`std/list` keeps a dead reference in its tail.** `pop` and `remove`
   decrement the count and leave the vacated slot alone, because
   `l.items[i] = null` only typechecks when `T` is an optional. The collector

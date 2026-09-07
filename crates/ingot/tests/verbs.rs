@@ -344,6 +344,56 @@ fn a_verb_that_cannot_be_carried_out_says_why() {
     project.expect(&app, &["nonsense"], FAILED);
 }
 
+/// Resolution goes through PubGrub even when there is nothing to choose, which
+/// is what makes a requirement on a path dependency *checked* rather than
+/// ignored -- and what makes two packages that disagree about a third say so.
+#[test]
+fn a_requirement_that_cannot_be_met_is_explained() {
+    let project = Project::new("conflict");
+    project.package("core", "1.0.0", "", "pub fn one() i64 { return 1; }\n");
+    project.package(
+        "util",
+        "0.3.0",
+        "core = { path = \"../core\" }\n",
+        "pub fn twice(n: i64) i64 { return n * 2; }\n",
+    );
+    let app = project.dir("app");
+    std::fs::create_dir_all(&app).expect("an app directory");
+    project.expect(&app, &["init", "myapp"], READY);
+    project.expect(&app, &["add", "util", "--path", "../util"], READY);
+    project.expect(&app, &["add", "core", "--path", "../core"], READY);
+    project.expect(&app, &["resolve"], READY);
+
+    // A package nothing in the graph supplies is refused by name rather than
+    // as the solver's honest but unhelpful "no versions match".
+    project.expect(&app, &["add", "elsewhere", "^2.0.0"], READY);
+    let out = project.run(&app, &["resolve"]);
+    assert_eq!(out.status.code(), Some(FAILED));
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        stdout.contains("cannot yet fetch"),
+        "a dependency with no source says so:\n{stdout}"
+    );
+    project.expect(&app, &["remove", "elsewhere"], READY);
+    project.expect(&app, &["resolve"], READY);
+
+    // But a *version requirement* on a package a path dependency does supply
+    // is checked, and failing it is a derivation rather than a shrug.
+    std::fs::write(
+        project.dir("util").join("ingot.toml"),
+        "[package]\nname = \"util\"\nversion = \"0.3.0\"\n\n[dependencies]\ncore = \"^2.0.0\"\n",
+    )
+    .expect("an edit");
+    let out = project.run(&app, &["resolve"]);
+    assert_eq!(out.status.code(), Some(FAILED));
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        stdout.contains("no versions of core match >=2.0.0 <3.0.0")
+            && stdout.contains("util 0.3.0 depends on core >=2.0.0 <3.0.0"),
+        "the solver explains itself:\n{stdout}"
+    );
+}
+
 /// `ingot run` is the one verb that is the compiler, and it passes the rest of
 /// the command line through untouched.
 #[test]

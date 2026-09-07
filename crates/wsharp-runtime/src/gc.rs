@@ -554,7 +554,11 @@ pub unsafe fn collect() -> Vec<*mut u8> {
     roots.dedup();
     let rooted = |p: *mut u8| roots.binary_search(&p).is_ok();
 
-    let defer_frees = mark::tracing();
+    // Frees wait while a trace is marking, and -- for the same reason one
+    // pause later -- while it is moving objects: `to_scan` and `remembered`
+    // name things the evacuation pause has still to read, and a freed object's
+    // space can be taken by another before it gets there.
+    let defer_frees = mark::tracing() || evacuating();
     let (logged, decrements, nursery, fresh, deferred) = with_buffers(|b| {
         let logged = std::mem::take(&mut b.logged);
         // Everything the barrier logged during a trace is an object whose

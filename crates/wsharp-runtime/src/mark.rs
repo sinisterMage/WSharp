@@ -326,8 +326,27 @@ unsafe fn finish_marking() {
     // choose.
     heap::retire_local_buffer();
 
-    // Settle the counts and free what counting found dead during the mark.
-    // This empties every buffer but the nursery.
+    // Arm the load barrier *before* the counting below rather than after, and
+    // for a reason that has nothing to do with the barrier: `evacuating` is
+    // also what keeps counting's frees deferred, and the evacuation pause has
+    // still to read `to_scan` and `remembered`. Both of those name objects and
+    // slots recorded during the mark; freeing one here would let its space be
+    // reused while objects move, and the pause would then walk a stranger's
+    // bytes with a dead object's layout. The deferral that began at the
+    // trace's start therefore runs one pause longer -- which is what
+    // `fix_references` visiting `deferred_dead` was always written for.
+    //
+    // From here until the blocks are released, every reference the program
+    // loads out of the heap goes through the load barrier, so this is also
+    // what establishes the invariant that barrier maintains: nothing the
+    // program holds is in a block that is being emptied.
+    if !cset.is_empty() {
+        gc::set_evacuating(me(), true);
+    }
+
+    // Settle the counts, and free what counting found dead during the mark
+    // unless there is an evacuation still to come. This empties every buffer
+    // but the nursery.
     unsafe { gc::collect() };
 
     if cset.is_empty() {
@@ -337,11 +356,7 @@ unsafe fn finish_marking() {
     }
 
     // Move everything the roots point at, before letting the program run
-    // again. From here until the blocks are released, every reference the
-    // program loads out of the heap goes through the load barrier, so this is
-    // what establishes the invariant that barrier maintains: nothing the
-    // program holds is in a block that is being emptied.
-    gc::set_evacuating(me(), true);
+    // again.
     let mut move_root = |slot: *mut *mut u8| {
         let value = unsafe { slot.read() };
         if heap::is_evacuating(value) {
@@ -392,6 +407,9 @@ unsafe fn finish_evacuation_on(w: &'static Worker) {
     let remembered = std::mem::take(&mut state().remembered);
     let to_scan = with_buffers(|b| std::mem::take(&mut b.to_scan));
 
+    if gc::stress() {
+        unsafe { evacuate::verify_nothing_scanned_is_dead(&to_scan) };
+    }
     unsafe { evacuate::fix_references(&remembered, &to_scan) };
     if gc::stress() {
         unsafe { evacuate::verify_no_stale_references() };

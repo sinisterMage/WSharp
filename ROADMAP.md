@@ -1617,7 +1617,7 @@ having before the next exists.
 |---|---|---|
 | One | `argv`, the environment, and a real filesystem | **done** |
 | Two | TOML, the manifest and lockfile, and the content-addressed store | **done** |
-| Three | Semantic versions, and a PubGrub resolver that explains itself | to do |
+| Three | Semantic versions, and a PubGrub resolver that explains itself | **done** |
 | Four | Git spoken rather than shelled out to: inflate, pkt-line, a packfile | to do |
 | Five | The loader hook, and the re-export a package facade needs | to do |
 
@@ -1834,6 +1834,118 @@ The consequence to remember is the other side of the same coin: **a library
 module nothing imports is never checked.** A new one needs a case that imports
 it, or it is not compiled at all.
 
+### Stage three — the resolver that explains itself — **done**
+
+| Piece | Where |
+|---|---|
+| Semantic versions, and sets of them as unions of intervals | `ingot/semver.ws` |
+| PubGrub: terms, incompatibilities, unit propagation, conflict resolution | `ingot/pubgrub.ws` |
+| The report: a walk of the derivation graph | same — `explain` |
+| The manifest graph, and the provider over it | `ingot/plan.ws` |
+| A bug in the collector that this was the first program to reach | `mark.rs`, `gc.rs` |
+
+`ingot resolve` now goes through the solver, so a version requirement is
+*checked* rather than ignored and a project that cannot be satisfied is told
+why:
+
+```
+Because no versions of core match >=2.0.0 <3.0.0 and util 0.3.0 depends on
+core >=2.0.0 <3.0.0, util 0.3.0 cannot be used.
+Because util 0.3.0 cannot be used and no versions of util match <0.3.0 or
+>0.3.0, util any version cannot be used.
+Because util any version cannot be used and myapp 0.1.0 depends on util any
+version, version solving failed.
+```
+
+#### Every resolution goes through the solver, even one with nothing to choose
+
+A path dependency offers exactly one version, so a project made only of them
+gives the search no decisions to make. It goes through PubGrub anyway, and that
+is the decision worth recording: a requirement on such a package still has to
+be *checked*, and two packages that want incompatible versions of a third still
+have to be told apart from two that agree. Running the trivial case through the
+same code is what makes the interesting case say something useful rather than
+something new.
+
+The one thing kept out of the solver's hands is a package nothing in the graph
+supplies. PubGrub's honest answer there is "no versions of X match ^1.0.0",
+which is true and says nothing about what to do; `plan.unsourced` says "ingot
+cannot yet fetch one" instead, which is the thing stage four will change.
+
+#### A version set is intervals, because complements are the operation
+
+`semver.Range` is a sorted, disjoint, non-adjacent list of intervals whose ends
+carry inclusivity. Both halves of that are forced:
+
+- **Intervals rather than a predicate**, because the solver takes *complements*
+  constantly -- `not foo ^1.0.0` is a term it derives and reasons about -- and
+  a predicate cannot be complemented into something you can then ask for the
+  best version of.
+- **Inclusive or exclusive ends rather than half-open**, because a half-open
+  representation needs a successor function and a version has none: there are
+  infinitely many pre-releases between `1.0.0` and `1.0.1`.
+
+Touching intervals are run together, so two spellings of one set are one set
+and equality is a walk rather than two subset tests.
+
+**A pre-release is not a candidate unless it was asked for**, and that is a
+policy in the solver rather than a rule in the algebra. The algebra stays
+honest that `1.1.0-rc.1` is below `1.1.0` and is inside `^1.0.0`; the solver
+asks whether the range it is choosing from *names* a pre-release, and skips
+them if not. Putting the rule in the set arithmetic instead is how other
+implementations end up with two kinds of range.
+
+#### Three bugs in the solver, each worth naming
+
+PubGrub is a short algorithm and every line of it is load-bearing. Three
+things written the obvious way did not work, and each failed in the same way:
+the search stopped learning and ran until it hit its own step limit.
+
+- **An incompatibility must merge terms about the same package.** Resolution
+  routinely produces a pair like `{not foo ^1.0.0, foo 2.0.0}`, which merged is
+  `{foo 2.0.0}` -- the clause that actually rules something out, and the one
+  the terminal test can recognise. Left unmerged, the two are asked about the
+  same package independently and nothing is learned.
+- **The difference taken during resolution is `satisfier ∖ term`**, not the
+  reverse. The satisfier is *why* the term held, so what it allowed beyond the
+  term is still open and has to be carried into the new clause.
+- **A term is not its allowed set.** This was the subtle one. Representing a
+  negative term as the complement of its range makes three of the four
+  relation cases fall out of set arithmetic, and breaks the fourth: "foo is not
+  in A" is satisfied by foo being *absent altogether*, which no set of versions
+  says. Under that representation `not foo any-version` -- which is what every
+  dependency starts life as -- allows the empty set and so looks like a term
+  that can never hold, and the solver decides nothing at all. `relates` has
+  four cases for that reason.
+
+#### And one in the collector, which this was the first program to reach
+
+The solver allocates far more, and far more short-lived object graphs, than
+anything else in the suite, and it found a real bug in the evacuation pause:
+an object it was handed to fix up had been **freed**, and its space taken by
+something else, so the pause walked a stranger's bytes with a dead object's
+layout. It showed up as a misaligned pointer dereference inside `header.rs`,
+which is a long way from the cause.
+
+The cause is a one-pause window. The evacuation pause reads two lists recorded
+during the *mark* -- the slots the marker saw pointing into a block being
+emptied, and the objects the trace touched afterwards. Counting's frees were
+deferred through the mark, as they must be, and then run at the pause that
+*finishes* marking -- which is one pause too early. `finish_marking` now arms
+`evacuating` before it settles the counts, and `defer_frees` asks
+`tracing() || evacuating()`, so the frees wait for the trace's last pause
+rather than its second. `fix_references` visiting `deferred_dead` is what that
+was always written for; the deferral had simply stopped reaching it.
+
+Under `--gc-stress` the pause now asserts that nothing it was handed has been
+freed, and `gc_evacuation_lists.ws` is what gives that assertion something to
+fire on. Reproducing it needs volume rather than cleverness: a few hundred
+thousand short-lived nodes, a handful of scattered survivors to make blocks
+sparse enough to evacuate, and a field overwritten on every pass so the barrier
+keeps logging. With the fix backed out, that case trips the assertion about two
+runs in five; with it, six runs in six are clean, and the case reports 21
+traces and a thousand objects moved, which is the number to look at.
+
 ### The name
 
 C#'s package manager is NuGet, which sounds like *nugget*; in Minecraft nine
@@ -1863,7 +1975,7 @@ package manager* rather than about Julia:
 - **A resolver that explains itself.** The thing Ajt is actually built around:
   a solver that tracks *why* each version was ruled out, so a conflict comes
   back as something to act on rather than as "unsatisfiable". PubGrub is the
-  algorithm; the traceable derivation is the point.
+  algorithm; the traceable derivation is the point. *Done in stage three.*
 
 ### What it needs, and what is missing today
 

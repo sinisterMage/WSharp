@@ -1145,15 +1145,21 @@ pub fn std_module_sources() -> &'static [(&'static str, &'static str)] {
 pub fn ingot_module_sources() -> &'static [(&'static str, &'static str)] {
     &[
         (INGOT_FAULT_MODULE, include_str!("ingot/fault.ws")),
+        (INGOT_SEMVER_MODULE, include_str!("ingot/semver.ws")),
+        (INGOT_PUBGRUB_MODULE, include_str!("ingot/pubgrub.ws")),
         (INGOT_MANIFEST_MODULE, include_str!("ingot/manifest.ws")),
         (INGOT_STORE_MODULE, include_str!("ingot/store.ws")),
+        (INGOT_PLAN_MODULE, include_str!("ingot/plan.ws")),
         (INGOT_MAIN_MODULE, include_str!("ingot/main.ws")),
     ]
 }
 
 pub const INGOT_FAULT_MODULE: &str = "ingot/fault";
+pub const INGOT_SEMVER_MODULE: &str = "ingot/semver";
+pub const INGOT_PUBGRUB_MODULE: &str = "ingot/pubgrub";
 pub const INGOT_MANIFEST_MODULE: &str = "ingot/manifest";
 pub const INGOT_STORE_MODULE: &str = "ingot/store";
+pub const INGOT_PLAN_MODULE: &str = "ingot/plan";
 /// The verbs, and the module the `ingot` binary runs.
 pub const INGOT_MAIN_MODULE: &str = "ingot/main";
 

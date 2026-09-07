@@ -541,7 +541,11 @@ Sessions are numbered by the original feature list:
       `struct stat` turned out not to be needed to do it. Stage two is in too:
       TOML 1.0 read and written in W#, a content-addressed store that can tell
       "not installed" from "damaged", and the tool itself — a W# program with
-      two hundred lines of Rust under it.
+      two hundred lines of Rust under it. Stage three is the resolver: semantic
+      versions, version *sets* as unions of intervals, and PubGrub — which
+      answers a conflict with the derivation that caused it rather than with
+      "unsatisfiable", and which found a real bug in the garbage collector on
+      its way in.
 
 What is left, and where it plugs in, is in [ROADMAP.md](ROADMAP.md).
 Conventions and the invariants worth not breaking are in

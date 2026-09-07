@@ -23,8 +23,8 @@
 
 use crate::gc::with_buffers;
 use crate::header::{
-    FLAG_IMMORTAL, flags_of_meta, forwarding_target, is_forwarded_meta, is_marked, load_meta,
-    type_id_of,
+    FLAG_DEAD, FLAG_IMMORTAL, flags_of_meta, forwarding_target, is_forwarded_meta, is_marked,
+    load_meta, test_flag, type_id_of,
 };
 
 use crate::heap;
@@ -200,6 +200,27 @@ pub(crate) unsafe fn fix_references(remembered: &[*mut *mut u8], scan: &[*mut u8
             }
         }
     });
+}
+
+/// Under `--gc-stress`: nothing this pause is about to read has been freed.
+///
+/// The list `fix_references` walks was recorded during the mark, and an entry
+/// freed in between will have had its space taken by something else by now --
+/// so the pause would read a stranger's bytes through a dead object's layout,
+/// and write a forwarding address into the middle of a live one. Counting's
+/// frees are deferred through the evacuation precisely so that cannot happen
+/// (`mark::finish_marking` arms `evacuating` before it settles the counts),
+/// and this is the check that says so out loud.
+///
+/// # Safety
+/// As [`fix_references`].
+pub(crate) unsafe fn verify_nothing_scanned_is_dead(scan: &[*mut u8]) {
+    for &obj in scan {
+        assert!(
+            !unsafe { test_flag(obj, FLAG_DEAD) },
+            "the evacuation pause was handed {obj:p}, which has been freed"
+        );
+    }
 }
 
 /// Walk the whole heap and abort if anything live still points into a block

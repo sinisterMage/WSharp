@@ -31,6 +31,7 @@ const list = @import("std/list");
 const manifest = @import("ingot/manifest");
 const os = @import("std/os");
 const path = @import("std/path");
+const plan = @import("ingot/plan");
 const store = @import("ingot/store");
 const text = @import("std/str");
 const toml = @import("std/toml");
@@ -235,88 +236,24 @@ fn write_manifest(f: fault.Fault, m: manifest.Manifest) void {
 // resolve
 // ---------------------------------------------------------------------------
 
-/// Walk the manifest's dependencies and write a lockfile.
+/// Choose versions for everything the manifest asks for, and write them down.
 ///
-/// Path dependencies only, so far: a version requirement needs a resolver and
-/// a git dependency needs a client, and those are the next two stages. What is
-/// here is the rest of the job -- following a graph, noticing that two paths
-/// asked for the same package, refusing when they disagree, and recording the
-/// hash of every tree so that `verify` can tell drift from damage.
+/// The work is `ingot/plan`; this is the verb. A failure that is the solver's
+/// is printed as the solver wrote it -- a derivation naming the line of the
+/// manifest to change -- rather than being folded into one of ours.
 fn resolve(f: fault.Fault) i64 {
     const m = read_here(f) orelse return FAILED;
-    var packages: list.List[manifest.Locked] = list.new();
-    var queue: list.List[manifest.Dep] = list.new();
-    var origins: list.List[str] = list.new();
-    for (list.to_array(m.deps)) |d| {
-        list.push(queue, d);
-        list.push(origins, m.dir);
-    }
-
-    var at = 0;
-    while (at < list.len(queue)) : (at += 1) {
-        const d = list.get(queue, at);
-        const from = list.get(origins, at);
-        if (text.len(d.dir) == 0) {
-            fault.fail(f, text.concat(text.concat("`", d.name),
-                "` is not a path dependency, and ingot cannot yet fetch one"));
-            return FAILED;
-        }
-        const dir = path.normalise(path.join(from, d.dir));
-        const found = resolve_path(f, d, dir) orelse return FAILED;
-        const already = seen(packages, d.name);
-        if (already) |old| {
-            if (!text.eq(old.source, found.source)) {
-                fault.fail(f, text.concat(text.concat(text.concat("`", d.name),
-                    "` is asked for from two places: "),
-                    text.concat(text.concat(old.source, " and "), found.source)));
-                return FAILED;
-            }
-            continue;
-        }
-        list.push(packages, found);
-        const sub = manifest.read(f, path.join(dir, manifest.MANIFEST_NAME)) orelse return FAILED;
-        for (list.to_array(sub.deps)) |child| {
-            list.push(queue, child);
-            list.push(origins, dir);
-        }
-    }
-
-    const lock = manifest.Lock{
-        .version = manifest.LOCK_VERSION,
-        .manifest = m.digest,
-        .packages = packages,
+    const outcome = plan.resolve(f, m);
+    const lock = outcome.lock orelse {
+        if (text.len(outcome.report) > 0) { print(outcome.report); }
+        return FAILED;
     };
     io.write_file(lock_path(), manifest.write_lock(lock)) catch {
         fault.fail_at(f, lock_path(), "cannot be written");
         return FAILED;
     };
-    print(row2("resolved", text.from_int(list.len(packages))));
+    print(row2("resolved", text.from_int(list.len(lock.packages))));
     return OK;
-}
-
-fn resolve_path(f: fault.Fault, d: manifest.Dep, dir: str) ?manifest.Locked {
-    if (!fs.is_dir(dir)) {
-        fault.fail(f, text.concat(text.concat(text.concat("`", d.name), "` points at "),
-            text.concat(dir, ", which is not a directory")));
-        return null;
-    }
-    const sub = manifest.read(f, path.join(dir, manifest.MANIFEST_NAME)) orelse return null;
-    if (!text.eq(sub.name, d.name)) {
-        fault.fail(f, text.concat(text.concat(text.concat("`", d.name), "` points at "),
-            text.concat(dir, text.concat(", whose package is called ", sub.name))));
-        return null;
-    }
-    const digest = store.tree_hash(f, dir);
-    if (!f.ok) { return null; }
-    var names = []str{};
-    for (list.to_array(sub.deps)) |child| { names = array.push(names, child.name); }
-    return manifest.Locked{
-        .name = sub.name,
-        .version = sub.version,
-        .source = text.concat("path+", dir),
-        .tree = text.concat("sha256:", digest),
-        .deps = names,
-    };
 }
 
 fn seen(packages: list.List[manifest.Locked], name: str) ?manifest.Locked {
