@@ -1905,6 +1905,28 @@ impl<M: Module> Trans<'_, '_, M> {
                 {
                     *first = self.b.ins().ireduce(tag, *first);
                 }
+                // **A `bool` crossing the FFI boundary is trustworthy in its
+                // low bit and nowhere else.** The signature says `I8.uext()`,
+                // which is a promise about the *callee*, and Rust does not make
+                // it: `bool` comes back in the low byte with whatever was
+                // already in the rest of the register. Cranelift is entitled to
+                // believe the promise, so a comparison against the whole value
+                // can see rubbish that a test of the byte does not.
+                //
+                // That asymmetry is exactly how this was found. `if (is_dir(p))`
+                // behaved and `if (!is_dir(p))` did not, so `mkdir_all` skipped
+                // the `mkdir` for a directory that was not there, reported
+                // success, and left the caller to fail two calls later. It
+                // showed only on Windows, because that is where the leftover
+                // bits happened to be non-zero.
+                //
+                // One `and` puts it right for every caller at once, which is
+                // worth more than fixing the one loop that noticed.
+                if matches!(ret, BuiltinTy::Bool)
+                    && let Some(first) = out.first_mut()
+                {
+                    *first = self.b.ins().band_imm_u(*first, 1);
+                }
                 out
             }
 
