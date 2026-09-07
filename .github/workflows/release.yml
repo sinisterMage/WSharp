@@ -53,9 +53,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
-      # One target's failure must not cancel the other three. Windows is the
-      # least exercised of the four and is expected to need work; the Linux and
-      # macOS tarballs should still reach the release while it does.
+      # One target's failure must not cancel the others: a macOS runner having a
+      # bad day should not cost the Linux tarball.
       fail-fast: false
       matrix:
         include:
@@ -67,7 +66,6 @@ jobs:
             archive: libwsharp_start.a
             cc: cc
             sha: sha256sum
-            skip: ""
           - os: macos-latest
             triple: aarch64-apple-darwin
             exe: ""
@@ -77,7 +75,6 @@ jobs:
             # `<hex>  <name>` line, which is what matters: whatever reads it
             # should not have to know which machine wrote it.
             sha: shasum -a 256
-            skip: ""
           # `macos-13` was the Intel image and was retired in December 2025;
           # a job asking for it is never claimed and queues until it times out.
           # `macos-15-intel` is the replacement label, and is itself scheduled
@@ -89,42 +86,16 @@ jobs:
             archive: libwsharp_start.a
             cc: cc
             sha: shasum -a 256
-            skip: ""
-          - os: windows-latest
-            triple: x86_64-pc-windows-msvc
-            exe: ".exe"
-            # MSVC's spelling. `crates/wsharp-cli/src/link.rs` looks for both.
-            archive: wsharp_start.lib
-            # `link.rs` drives the link with `$CC` and passes `-o`, which
-            # `cl.exe` does not understand. `windows-latest` ships LLVM, and
-            # clang takes a Unix-shaped command line while still producing an
-            # MSVC-ABI binary.
-            cc: clang
-            sha: sha256sum
-            # **The case suite's whole-archive passes are skipped here, and
-            # that is a real reduction in coverage rather than a tidy-up.**
-            #
-            # `every_case_*` runs 212 programs, twice, and the built pass links
-            # 212 *separate executables*. Linux does all of it in 67 seconds;
-            # this machine was 19 minutes in and unfinished, because every one
-            # of those links is a process spawn, a linker invocation and a
-            # virus scan of a newly written `.exe`.
-            #
-            # What is given up is small and what is kept is the part that is
-            # actually about this platform. Those cases test *language*
-            # semantics -- inference, dispatch, the collector -- which do not
-            # vary by operating system and which Linux and both macOS arms run
-            # in full on every tag. What only Windows can test is
-            # `sys/windows.rs`, and the tests that cover it still run. The one
-            # Windows-specific question the skipped cases would have answered
-            # -- can `wsharp build` link at all here -- is answered two steps
-            # below by `Bootstrap ingot`, which builds a real program and runs
-            # it.
-            #
-            # `--skip` matches on substring, so these two names cover five
-            # tests: the three `every_case_*` and the two whose names end in
-            # `built_program`.
-            skip: "--skip every_case --skip built_program"
+          # **There is no Windows arm, and that is a decision rather than an
+          # omission.** Everything needed to *build* there works -- the linker,
+          # the subsystem, the system libraries, the C runtime, all fixed and
+          # all kept below. What does not work is `fs.mkdir_all`, which reports
+          # success without creating a directory, so `ingot install` fails for
+          # any package with a `src/` -- which is every package.
+          #
+          # Shipping that would be shipping a toolchain whose package manager
+          # does not work, so it is not shipped. The fixes stay; the arm comes
+          # back when the last bug does.
     defaults:
       run:
         # Git Bash on Windows, so one script works on all four. Every `run:`
@@ -139,45 +110,6 @@ jobs:
         with:
           ref: ${{ env.TAG }}
 
-      # Git Bash ships a `link.exe` and it is not a linker.
-      #
-      # `C:\Program Files\Git\usr\bin\link.exe` is GNU coreutils `link`, which
-      # makes a hard link. Every `run:` here uses `shell: bash`, so that
-      # directory is on `PATH` -- and it comes *before* the MSVC tools. Anything
-      # that resolves the name `link.exe` rather than using an absolute path
-      # gets the wrong program and fails with `extra operand`, which reads like
-      # a linker error and is a coreutils usage message.
-      #
-      # rustc normally dodges this by finding MSVC itself and invoking it by
-      # absolute path. `clang` -- which is what `wsharp build` drives, and which
-      # is not told where anything is -- looks on `PATH`. Removing the impostor
-      # is what lets both find the real one, and this runner is thrown away
-      # afterwards.
-      #
-      # This has to happen *before* the step below, and the two are one fix
-      # rather than two. Each was tried alone and each failed differently:
-      #
-      #   - `msvc-dev-cmd` alone: setting `LIB` and `INCLUDE` convinces rustc
-      #     the environment is already configured, so it stops invoking MSVC by
-      #     its own absolute path and starts resolving `link.exe` from `PATH`
-      #     -- where it found coreutils. That broke `cargo build`, which had
-      #     been passing.
-      #   - removing it alone: `cargo build` recovered, and `clang` then failed
-      #     at the link with no `LIB` to find `libcmt.lib` in.
-      #
-      # Together they agree: the impostor is gone, so resolving `link.exe` from
-      # `PATH` finds the real one, and `LIB` is set for whoever needs it.
-      - name: Remove the `link.exe` that is not a linker
-        if: runner.os == 'Windows'
-        run: rm -f "/c/Program Files/Git/usr/bin/link.exe"
-
-      # What `wsharp build` needs and cannot arrange for itself: `link.rs`
-      # drives the link by running `$CC`, and a bare `clang` inherits only the
-      # environment. cargo never needed this because rustc finds MSVC itself.
-      - name: The MSVC environment, for the linker
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-
       # `rust-toolchain.toml` pins 1.95.0 and every hosted runner ships rustup,
       # so the pin honours itself on first use. No container: the image
       # `.forgejo/workflows/ci.yml` uses is in a private registry this cannot
@@ -187,16 +119,6 @@ jobs:
           rustc --version
           cargo --version
           "$CC" --version | head -1
-          # `wsharp build` links by running `$CC` itself, so whether that will
-          # work is worth printing *before* a build fails at the far end. On
-          # Windows an empty `LIB` is the whole answer to why a link failed.
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            echo "CC is at: $(command -v "$CC" || echo 'not on PATH')"
-            echo "LIB is: ${LIB:-<unset>}"
-            # Which `link.exe` wins is the whole Windows story; if this says
-            # anything under `Git`, the step above did not do its job.
-            echo "link resolves to: $(command -v link || echo 'nothing')"
-          fi
 
       # **Before the tests, and that order is load-bearing.** The case suite's
       # AOT pass shells out to `wsharp build`, which links against
@@ -209,47 +131,11 @@ jobs:
       - name: Build for the test suite
         run: cargo build --workspace --locked
 
-      # Ground truth for the Windows link, because three guesses have now been
-      # wrong. `wsharp build` reports what `clang` printed and nothing about how
-      # it was called, so this does the same link by hand with `-v` -- which is
-      # the invocation, the search paths and the linker's own error, none of
-      # which the wrapped form shows.
-      #
-      # `continue-on-error`, because this is a diagnostic and not a gate: it
-      # must not decide whether a release happens, and it has to run even when
-      # the step after it is going to fail.
-      - name: Why the linker is unhappy
-        if: runner.os == 'Windows'
-        continue-on-error: true
-        run: |
-          set -x
-          ls -l target/debug/*.lib || true
-          # Stop before linking, so there is an object to link by hand.
-          ./target/debug/wsharp.exe build --emit=obj examples/fib.ws -o fib.o || true
-          ls -l fib.o || true
-          # The same command `link.rs` builds, plus `-v`. Kept in step with it
-          # by hand: a diagnostic that links differently from the real thing
-          # answers a question nobody asked.
-          clang -v -Xlinker -subsystem:console \
-            -Xlinker -nodefaultlib:libcmt -Xlinker -defaultlib:msvcrt \
-            fib.o target/debug/wsharp_start.lib -o fib.exe \
-            -lkernel32 -lntdll -luserenv -lws2_32 -ldbghelp \
-            -lbcrypt -lcrypt32 -ladvapi32 2>&1 | tail -100 || true
-          # Whether the archive even holds the `main` a Windows entry point
-          # needs. `LNK1561` is "entry point must be defined", and the MSVC
-          # linker infers the entry from the *objects* it was handed rather than
-          # from a library -- so this says whether that is the story.
-          llvm-nm --defined-only target/debug/wsharp_start.lib 2>/dev/null \
-            | grep -iE " T _?main$| T _?mainCRTStartup$" | head || true
-
       # A tag that cannot pass its own tests is not a release. This repeats what
       # CI already did for the commit, which is the point: a tag can be pushed
       # at any commit, including one CI never saw.
-      #
-      # `matrix.skip` is empty everywhere except Windows, where it drops the
-      # whole-archive passes for the reason set out beside it in the matrix.
       - name: Test
-        run: cargo test --workspace --locked -- ${{ matrix.skip }}
+        run: cargo test --workspace --locked
 
       - name: Build
         run: cargo build --release --locked

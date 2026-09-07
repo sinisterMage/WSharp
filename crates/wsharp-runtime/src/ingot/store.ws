@@ -252,8 +252,7 @@ pub fn install_files(f: fault.Fault, h: str, files: list.List[File]) str {
             return "";
         };
         io.write_file(where, bytes.to_str(file.data)) catch {
-            fault.fail_at(f, where, why_unwritable(path.dirname(where), where,
-                                                   text.len(bytes.to_str(file.data))));
+            fault.fail_at(f, where, why_unwritable(path.dirname(where)));
             fs.remove_tree(staging) catch ignore();
             return "";
         };
@@ -327,16 +326,11 @@ pub fn copy_tree(f: fault.Fault, from: str, to: str) void {
     // write that cannot explain itself. Checked here rather than inside
     // `mkdir_all` so the message can say how far up the tree anything actually
     // exists, which is the fact that says *where* the creation stopped.
+    // A postcondition, because a `mkdir_all` that answers yes and makes nothing
+    // is the worst shape a failure can take: the caller carries on and fails
+    // somewhere else entirely, describing a symptom rather than the fault. This
+    // is where it happened.
     if (!fs.is_dir(to)) {
-        // Printed rather than carried in the fault. The last attempt built this
-        // as one long `concat` and the fault came out *empty* -- a second
-        // failure hiding the first, and not one to debug while debugging
-        // something else. Standard output is captured by the harness and shown
-        // beside the assertion, and nothing between here and there can swallow
-        // it.
-        print(text.concat("DIAG want:    ", to));
-        print(text.concat("DIAG deepest: ", deepest_existing(to)));
-        print(text.concat("DIAG walk:    ", walk_down(to)));
         fault.fail_at(f, to, "mkdir_all reported success and made nothing");
         return;
     }
@@ -357,59 +351,11 @@ pub fn copy_tree(f: fault.Fault, from: str, to: str) void {
             return;
         };
         io.write_file(dst, body) catch {
-            fault.fail_at(f, dst, text.concat(
-                why_unwritable(path.dirname(dst), dst, text.len(body)),
-                text.concat("; copied from ", src)));
+            fault.fail_at(f, dst, why_unwritable(path.dirname(dst)));
             return;
         };
     }
     return;
-}
-
-/// `std/fs.mkdir_all`'s walk, written out here so it can say which step lies.
-///
-/// The same components in the same order, one `mkdir` at a time, checking after
-/// each. Either it names the step that refuses or claims to succeed and does
-/// not -- or it gets to the end, which would say the fault is in how
-/// `mkdir_all` walks rather than in what it calls.
-fn walk_down(to: str) str {
-    const full = path.normalise(to);
-    const parts = text.split(full, "/");
-    var so_far = path.drive(full);
-    var i = 1;
-    if (text.len(so_far) == 0) {
-        so_far = "/";
-        i = 0;
-    }
-    while (i < array.len(parts)) : (i += 1) {
-        if (text.len(parts[i]) == 0) { continue; }
-        so_far = path.join(so_far, parts[i]);
-        if (fs.is_dir(so_far)) { continue; }
-        fs.mkdir(so_far) catch {
-            return text.concat("mkdir refused at ", so_far);
-        };
-        if (!fs.is_dir(so_far)) {
-            return text.concat("mkdir answered yes and made nothing at ", so_far);
-        }
-    }
-    return text.concat("this walk created everything, ending at ", so_far);
-}
-
-/// The deepest ancestor of `p` that is a directory, or a word saying none is.
-///
-/// Walks up rather than down, so the answer is the last place a creation got
-/// to. `(nothing)` means not even the root answered, which would say the path
-/// is not being understood at all rather than that a step failed.
-fn deepest_existing(p: str) str {
-    var at = path.normalise(p);
-    var guard = 0;
-    while (guard < 64) : (guard += 1) {
-        if (fs.is_dir(at)) { return at; }
-        const up = path.dirname(at);
-        if (text.eq(up, at)) { return "(nothing)"; }
-        at = up;
-    }
-    return "(gave up walking up)";
 }
 
 /// A name nothing else is using.
@@ -445,30 +391,14 @@ fn ignore() void { return; }
 /// directory is there, whether anything at all can be written into it, and
 /// whether something is already sitting at the name. Between them they say
 /// which of the three possible bugs it is, and each points at a different file.
-fn why_unwritable(dir: str, where: str, size: i64) str {
+fn why_unwritable(dir: str) str {
     if (!fs.is_dir(dir)) {
-        // `mkdir_all` normalises before it creates and every other call passes
-        // the path as it was built, so the two can disagree about what they are
-        // naming. If the normalised spelling is there and this one is not, the
-        // directory was made all right and nothing else can find it.
-        const flat = path.normalise(dir);
-        if (fs.is_dir(flat)) {
-            return text.concat(
-                text.concat("cannot be written -- the directory is there as ", flat),
-                text.concat(" but not as ", dir));
-        }
-        return text.concat(
-            text.concat("cannot be written -- there is no directory ", dir),
-            text.concat(" nor ", flat));
+        return text.concat("cannot be written -- there is no directory ", dir);
     }
     if (!takes_a_file(dir)) {
         return text.concat("cannot be written -- nothing can be written into ", dir);
     }
-    var already = "";
-    if (io.exists(where)) { already = ", and something is already at that name"; }
-    return text.concat(
-        text.concat("cannot be written -- its directory takes other files", already),
-        text.concat("; this one is ", text.concat(text.from_int(size), " bytes")));
+    return "cannot be written";
 }
 
 /// Whether *some* file can be created in `dir`, whatever happened to the one
