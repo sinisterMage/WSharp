@@ -329,8 +329,9 @@ pub fn copy_tree(f: fault.Fault, from: str, to: str) void {
     // exists, which is the fact that says *where* the creation stopped.
     if (!fs.is_dir(to)) {
         fault.fail_at(f, to, text.concat(
-            "mkdir_all reported success and made nothing; the deepest thing that exists is ",
-            deepest_existing(to)));
+            text.concat("mkdir_all reported success and made nothing; the deepest thing that exists is ",
+                deepest_existing(to)),
+            text.concat("; walking down by hand: ", walk_down(to))));
         return;
     }
     const names = fs.read_dir(from) catch {
@@ -357,6 +358,35 @@ pub fn copy_tree(f: fault.Fault, from: str, to: str) void {
         };
     }
     return;
+}
+
+/// `std/fs.mkdir_all`'s walk, written out here so it can say which step lies.
+///
+/// The same components in the same order, one `mkdir` at a time, checking after
+/// each. Either it names the step that refuses or claims to succeed and does
+/// not -- or it gets to the end, which would say the fault is in how
+/// `mkdir_all` walks rather than in what it calls.
+fn walk_down(to: str) str {
+    const full = path.normalise(to);
+    const parts = text.split(full, "/");
+    var so_far = path.drive(full);
+    var i = 1;
+    if (text.len(so_far) == 0) {
+        so_far = "/";
+        i = 0;
+    }
+    while (i < array.len(parts)) : (i += 1) {
+        if (text.len(parts[i]) == 0) { continue; }
+        so_far = path.join(so_far, parts[i]);
+        if (fs.is_dir(so_far)) { continue; }
+        fs.mkdir(so_far) catch {
+            return text.concat("mkdir refused at ", so_far);
+        };
+        if (!fs.is_dir(so_far)) {
+            return text.concat("mkdir answered yes and made nothing at ", so_far);
+        }
+    }
+    return text.concat("this walk created everything, ending at ", so_far);
 }
 
 /// The deepest ancestor of `p` that is a directory, or a word saying none is.
