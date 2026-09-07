@@ -209,6 +209,33 @@ jobs:
       - name: Build for the test suite
         run: cargo build --workspace --locked
 
+      # Ground truth for the Windows link, because three guesses have now been
+      # wrong. `wsharp build` reports what `clang` printed and nothing about how
+      # it was called, so this does the same link by hand with `-v` -- which is
+      # the invocation, the search paths and the linker's own error, none of
+      # which the wrapped form shows.
+      #
+      # `continue-on-error`, because this is a diagnostic and not a gate: it
+      # must not decide whether a release happens, and it has to run even when
+      # the step after it is going to fail.
+      - name: Why the linker is unhappy
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: |
+          set -x
+          ls -l target/debug/*.lib || true
+          # Stop before linking, so there is an object to link by hand.
+          ./target/debug/wsharp.exe build --emit=obj examples/fib.ws -o fib.o || true
+          ls -l fib.o || true
+          # The same command `link.rs` builds, plus `-v`.
+          clang -v fib.o target/debug/wsharp_start.lib -o fib.exe 2>&1 | tail -80 || true
+          # Whether the archive even holds the `main` a Windows entry point
+          # needs. `LNK1561` is "entry point must be defined", and the MSVC
+          # linker infers the entry from the *objects* it was handed rather than
+          # from a library -- so this says whether that is the story.
+          llvm-nm --defined-only target/debug/wsharp_start.lib 2>/dev/null \
+            | grep -iE " T _?main$| T _?mainCRTStartup$" | head || true
+
       # A tag that cannot pass its own tests is not a release. This repeats what
       # CI already did for the commit, which is the point: a tag can be pushed
       # at any commit, including one CI never saw.
