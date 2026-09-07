@@ -67,6 +67,7 @@ jobs:
             archive: libwsharp_start.a
             cc: cc
             sha: sha256sum
+            skip: ""
           - os: macos-latest
             triple: aarch64-apple-darwin
             exe: ""
@@ -76,6 +77,7 @@ jobs:
             # `<hex>  <name>` line, which is what matters: whatever reads it
             # should not have to know which machine wrote it.
             sha: shasum -a 256
+            skip: ""
           # `macos-13` was the Intel image and was retired in December 2025;
           # a job asking for it is never claimed and queues until it times out.
           # `macos-15-intel` is the replacement label, and is itself scheduled
@@ -87,6 +89,7 @@ jobs:
             archive: libwsharp_start.a
             cc: cc
             sha: shasum -a 256
+            skip: ""
           - os: windows-latest
             triple: x86_64-pc-windows-msvc
             exe: ".exe"
@@ -98,6 +101,30 @@ jobs:
             # MSVC-ABI binary.
             cc: clang
             sha: sha256sum
+            # **The case suite's whole-archive passes are skipped here, and
+            # that is a real reduction in coverage rather than a tidy-up.**
+            #
+            # `every_case_*` runs 212 programs, twice, and the built pass links
+            # 212 *separate executables*. Linux does all of it in 67 seconds;
+            # this machine was 19 minutes in and unfinished, because every one
+            # of those links is a process spawn, a linker invocation and a
+            # virus scan of a newly written `.exe`.
+            #
+            # What is given up is small and what is kept is the part that is
+            # actually about this platform. Those cases test *language*
+            # semantics -- inference, dispatch, the collector -- which do not
+            # vary by operating system and which Linux and both macOS arms run
+            # in full on every tag. What only Windows can test is
+            # `sys/windows.rs`, and the tests that cover it still run. The one
+            # Windows-specific question the skipped cases would have answered
+            # -- can `wsharp build` link at all here -- is answered two steps
+            # below by `Bootstrap ingot`, which builds a real program and runs
+            # it.
+            #
+            # `--skip` matches on substring, so these two names cover five
+            # tests: the three `every_case_*` and the two whose names end in
+            # `built_program`.
+            skip: "--skip every_case --skip built_program"
     defaults:
       run:
         # Git Bash on Windows, so one script works on all four. Every `run:`
@@ -112,6 +139,22 @@ jobs:
         with:
           ref: ${{ env.TAG }}
 
+      # What `wsharp build` needs on Windows and cannot arrange for itself.
+      #
+      # `link.rs` drives the link by running `$CC` directly. cargo can link
+      # here without any of this because rustc knows where the MSVC toolchain
+      # is and passes it along; a bare `clang` inherits only the environment,
+      # and without `LIB` and `INCLUDE` it cannot find `libcmt.lib` or
+      # `kernel32.lib` and the link fails at the far end of a build. This step
+      # exports the developer environment into the job so every step after it
+      # can link.
+      #
+      # Nothing on the other three arms needs an equivalent: `cc` on Linux and
+      # macOS finds its own sysroot.
+      - name: The MSVC environment, for the linker
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
       # `rust-toolchain.toml` pins 1.95.0 and every hosted runner ships rustup,
       # so the pin honours itself on first use. No container: the image
       # `.forgejo/workflows/ci.yml` uses is in a private registry this cannot
@@ -121,6 +164,13 @@ jobs:
           rustc --version
           cargo --version
           "$CC" --version | head -1
+          # `wsharp build` links by running `$CC` itself, so whether that will
+          # work is worth printing *before* a build fails at the far end. On
+          # Windows an empty `LIB` is the whole answer to why a link failed.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "CC is at: $(command -v "$CC" || echo 'not on PATH')"
+            echo "LIB is: ${LIB:-<unset>}"
+          fi
 
       # **Before the tests, and that order is load-bearing.** The case suite's
       # AOT pass shells out to `wsharp build`, which links against
@@ -136,8 +186,11 @@ jobs:
       # A tag that cannot pass its own tests is not a release. This repeats what
       # CI already did for the commit, which is the point: a tag can be pushed
       # at any commit, including one CI never saw.
+      #
+      # `matrix.skip` is empty everywhere except Windows, where it drops the
+      # whole-archive passes for the reason set out beside it in the matrix.
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked -- ${{ matrix.skip }}
 
       - name: Build
         run: cargo build --release --locked
