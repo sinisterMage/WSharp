@@ -339,7 +339,9 @@ pub fn copy_tree(f: fault.Fault, from: str, to: str) void {
             return;
         };
         io.write_file(dst, body) catch {
-            fault.fail_at(f, dst, "cannot be written");
+            fault.fail_at(f, dst, text.concat(
+                why_unwritable(path.dirname(dst), dst, text.len(body)),
+                text.concat("; copied from ", src)));
             return;
         };
     }
