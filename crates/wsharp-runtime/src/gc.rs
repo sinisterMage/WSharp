@@ -117,6 +117,7 @@ pub fn logged_objects() -> usize {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `obj` must point at a
 /// live heap object whose type is registered.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_log_object(obj: *mut u8) {
     // Exactly one caller wins the bit and does the snapshot.
     if !unsafe { set_flag(obj, FLAG_LOGGED) } {
@@ -178,13 +179,14 @@ type SmallSnapshot = Vec<*mut u8>;
 /// a computational loop interruptible at all -- Cranelift's only safepoints are
 /// calls, and a loop need not contain one. The collector thread sets it when
 /// marking is done and the trace needs the program stopped to finish.
-pub use crate::worker::poll_flag_address;
+pub use crate::worker::{POLL_FLAG_SYMBOL, poll_flag_address};
 pub(crate) use crate::worker::{clear_poll, request_safepoint};
 
 /// The slow path of the loop safepoint check.
 ///
 /// # Safety
 /// Called from generated code with the frame chain intact.
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_gc_poll() {
     if !crate::worker::poll_wanted() {
         return;
@@ -205,7 +207,7 @@ pub extern "C" fn ws_gc_poll() {
 /// One byte rather than a phase comparison because generated code tests it on
 /// a path that is taken on every field read: while it is zero the barrier
 /// costs a load, a test and a branch that falls through.
-pub use crate::worker::evacuating_flag_address;
+pub use crate::worker::{EVACUATING_FLAG_SYMBOL, evacuating_flag_address};
 pub(crate) use crate::worker::set_evacuating;
 
 /// Whether *this* worker is moving objects.
@@ -217,6 +219,10 @@ pub fn evacuating() -> bool {
 /// The one collector switch that stays process-wide: it is set once, before
 /// any code runs, and every worker wants the same answer.
 static STRESS: AtomicBool = AtomicBool::new(false);
+
+/// Whether [`STRESS`] has been decided yet, either by [`set_stress`] or by
+/// reading the environment.
+static STRESS_KNOWN: AtomicBool = AtomicBool::new(false);
 
 /// Add one worker's counter up across every worker there is.
 ///
@@ -247,11 +253,28 @@ pub fn roots_seen() -> usize {
     total(|w| w.stats.roots_seen.load(Ordering::Relaxed))
 }
 
+/// Say so explicitly, as `wsharp run --gc-stress` does.
+///
+/// Takes precedence over the environment, and is what the compiler calls
+/// before it compiles anything.
 pub fn set_stress(on: bool) {
     STRESS.store(on, Ordering::Relaxed);
+    STRESS_KNOWN.store(true, Ordering::Relaxed);
 }
 
+/// Whether to collect at every allocation.
+///
+/// A compiled program has no compiler in it to call [`set_stress`], so it says
+/// so the way it says everything else to the collector: `WSHARP_GC_STRESS=1`,
+/// beside `WSHARP_GC_STATS` and `WSHARP_GC_TRACE`. Read once, on the first
+/// question, which is before anything has been allocated -- so switching it on
+/// here decides exactly as much as setting it before compilation did.
 pub fn stress() -> bool {
+    if !STRESS_KNOWN.load(Ordering::Relaxed) {
+        // Racy only in that two threads may both read the variable and store
+        // the same answer, which is why this is not a `OnceLock`.
+        set_stress(env_flag("WSHARP_GC_STRESS"));
+    }
     STRESS.load(Ordering::Relaxed)
 }
 

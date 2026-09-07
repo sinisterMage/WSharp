@@ -48,6 +48,7 @@ pub struct MaybeStr {
 ///
 /// Infallible. A program always has a command line, and one with no arguments
 /// has an empty one, which is an empty blob rather than an error.
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_os_raw_args() -> *mut u8 {
     unsafe { crate::gc::checkpoint() };
     let empty: Vec<Vec<u8>> = Vec::new();
@@ -66,6 +67,7 @@ pub extern "C" fn ws_os_raw_args() -> *mut u8 {
 /// Called from JIT-compiled code across an FFI boundary; `name` must be null or
 /// point at a W# string object, and `out` must point at storage laid out as a
 /// [`MaybeStr`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_os_env(out: *mut MaybeStr, name: *const u8) {
     unsafe { crate::gc::checkpoint() };
     let name = unsafe { str_bytes(name) }.to_vec();
@@ -101,6 +103,7 @@ pub unsafe extern "C" fn ws_os_env(out: *mut MaybeStr, name: *const u8) {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `out` must point at
 /// storage laid out as a [`FallibleStr`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_os_cwd(out: *mut FallibleStr) {
     unsafe { crate::gc::checkpoint() };
     let result = match crate::worker::blocking(sys::cwd) {
@@ -108,4 +111,106 @@ pub unsafe extern "C" fn ws_os_cwd(out: *mut FallibleStr) {
         Err(e) => FallibleStr::err(sys::error_tag(e)),
     };
     unsafe { out.write(result) };
+}
+
+/// Change the process's working directory.
+///
+/// The only writable piece of process-wide state this runtime offers, and it
+/// exists for one caller: a tool told to work somewhere else, as `git -C` is.
+/// Such a tool does it once, before any verb runs. Doing it half way through a
+/// program would make every relative path in it depend on when it was reached,
+/// which is why W# has no `defer`-style scoping for this and should not.
+///
+/// # Safety
+/// Called from generated code across an FFI boundary; `dir` must be null or
+/// point at a W# string object.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_os_chdir(dir: *const u8) -> i64 {
+    unsafe { crate::gc::checkpoint() };
+    // Copied into plain bytes before the safe region, because a reference held
+    // in a Rust local is described by no stack map and the collector may run
+    // while this thread is parked.
+    let dir = unsafe { str_bytes(dir) }.to_vec();
+    match crate::worker::blocking(|| sys::chdir(&dir)) {
+        Ok(()) => 0,
+        Err(e) => sys::error_tag(e),
+    }
+}
+
+/// The path of the running executable.
+///
+/// What a program needs to find something installed beside it -- which is how
+/// `ingot` finds `wsharp`. Not `argv[0]`: that is whatever the caller passed
+/// to `exec`, and a program found through `PATH` gets a bare name back.
+///
+/// # Safety
+/// Called from generated code across an FFI boundary; `out` must point at
+/// storage laid out as a [`FallibleStr`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_os_self_exe(out: *mut FallibleStr) {
+    unsafe { crate::gc::checkpoint() };
+    let result = match crate::worker::blocking(sys::self_exe) {
+        Ok(path) => FallibleStr::ok(alloc_str(&path)),
+        Err(e) => FallibleStr::err(sys::error_tag(e)),
+    };
+    unsafe { out.write(result) };
+}
+
+/// Replace this process with another program.
+///
+/// Answers only on failure: there is no caller left to answer on success. That
+/// is why the return is `!void` and not `!i64` -- a status would be a promise
+/// this cannot keep.
+///
+/// `argv` arrives as one blob of four-byte big-endian lengths and their bytes,
+/// the same framing [`ws_os_raw_args`] answers with -- and for a reason that is
+/// the mirror of that one. A `[]str` holds *references*, and every reference
+/// generated code loads goes through the load barrier; a Rust function reaching
+/// into the array would be reading them by another route, with nothing to
+/// resolve one the collector has already moved. So `std/os.exec` packs the
+/// array in W#, where the barrier applies by construction, and this reads
+/// bytes -- which is all a builtin may ever do.
+///
+/// The arguments are what the new program sees *without* its own name: the
+/// name is `program`, and this writes it in front itself. So it lines up with
+/// `os.args()`, which has never included the name, rather than with the C
+/// convention it would otherwise inherit.
+///
+/// # Safety
+/// Called from generated code across an FFI boundary; `program` and `argv`
+/// must be null or point at W# string objects.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_os_exec(program: *const u8, argv: *const u8) -> i64 {
+    unsafe { crate::gc::checkpoint() };
+    let program = unsafe { str_bytes(program) }.to_vec();
+    let blob = unsafe { str_bytes(argv) }.to_vec();
+    // The name the new program sees as its own comes first, which is what a C
+    // `argv` means and what every shell does.
+    let mut owned: Vec<Vec<u8>> = vec![program.clone()];
+    owned.extend(unpack(&blob));
+    // Nothing on the heap is touched from here: every byte `exec` needs is
+    // already copied, which is what a safe region requires of its caller.
+    let e = crate::worker::blocking(|| sys::exec(&program, &owned));
+    sys::error_tag(e)
+}
+
+/// The inverse of [`crate::fs::length_prefixed`].
+///
+/// A length the blob cannot hold ends the walk rather than being reported: the
+/// blob was written by `std/os.pack` beside this file, so a malformed one is a
+/// bug here and not something a caller could act on. The same rule
+/// `std/os.unpack` states for the other direction.
+fn unpack(blob: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at + 4 <= blob.len() {
+        let size = u32::from_be_bytes(blob[at..at + 4].try_into().expect("four bytes")) as usize;
+        at += 4;
+        if at + size > blob.len() {
+            return out;
+        }
+        out.push(blob[at..at + size].to_vec());
+        at += size;
+    }
+    out
 }

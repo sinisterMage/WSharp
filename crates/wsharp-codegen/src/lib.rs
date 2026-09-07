@@ -1,4 +1,4 @@
-//! Cranelift JIT code generation for W#.
+//! Cranelift code generation for W#.
 //!
 //! Functions are declared in one pass and defined in a second, which is what
 //! makes recursion and mutual recursion work: every callee already has an id by
@@ -6,9 +6,18 @@
 //!
 //! This runs only on a monomorphised program, so every type it meets is
 //! concrete.
+//!
+//! There are two backends and one lowering. [`build`] is everything that does
+//! not care which: it declares, translates and defines every function into
+//! whatever [`Module`] it is handed, and hands back the tables the runtime will
+//! need. What differs is only how those tables reach the runtime -- the JIT
+//! writes them into this process ([`compile_jit`]), an object file carries them
+//! as data. Nothing below `build` may ask which backend it is in; that would be
+//! the first of two lowerings, and the second would drift.
 
 pub mod lower;
 pub mod repr;
+pub mod tables;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -19,6 +28,7 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, Linkage, Module};
+use cranelift_object::{ObjectBuilder, ObjectModule};
 use wsharp_runtime::TypeLayout;
 use wsharp_runtime::header::{FLAG_IMMORTAL, TYPE_ID_FIRST_USER, TYPE_ID_STR, align_up, meta_word};
 use wsharp_runtime::stackwalk::{FunctionCode, SafePoint};
@@ -85,24 +95,131 @@ impl Jit {
     }
 }
 
-/// Compile a monomorphised program, returning something that can be run.
-pub fn compile(
+/// Everything a compiled program needs beyond its code, pending the addresses
+/// only a finished module knows.
+///
+/// The three tables here are the collector's, and each is produced once and
+/// consumed twice: the JIT hands them straight to the runtime in this process,
+/// an object file carries them as data a startup pass reads back. Keeping them
+/// as plain values rather than registering them as they are computed is what
+/// lets one walk serve both.
+pub struct Built {
+    /// Which Cranelift function is which, and what each data object is.
+    pub decls: lower::Decls,
+    /// Every heap type in the program, with the layout the collector traces by.
+    pub layouts: Layouts,
+    /// Per compiled function, its length and its safepoints -- keyed by the
+    /// Cranelift id, because the address is not known until the module is done.
+    pub harvested: Vec<(cranelift_module::FuncId, HarvestedCode)>,
+    /// One entry per service function, naming the trampoline that unpacks it.
+    pub services: Vec<Trampoline>,
+    /// `main`, and whether it answers with a value.
+    pub entry: hir::FuncId,
+    pub entry_returns_value: bool,
+    /// Cranelift IR for every function, when it was asked for.
+    pub clif: String,
+}
+
+/// Declare, translate and define every function of `program` into `module`.
+///
+/// The half of code generation that does not care which backend it is feeding.
+/// It stops short of `finalize_definitions` because that is where the two
+/// diverge: the JIT finalizes to get addresses, the object backend does not
+/// finalize at all.
+pub fn build<M: Module>(
+    module: &mut M,
+    program: &hir::Program,
+    store: &mut TypeStore,
+    builtins: &[wsharp_runtime::Builtin],
+    emit_clif: bool,
+) -> Result<Built, CodegenError> {
+    let entry = program
+        .entry
+        .ok_or_else(|| CodegenError("this program has no `main` function to run".to_string()))?;
+
+    let call_conv = module.target_config().default_call_conv;
+    let layouts = collect_layouts(program, store);
+
+    let decls = declare_all(module, program, store, builtins, call_conv, &layouts)?;
+
+    let mut clif = String::new();
+    let mut ctx = module.make_context();
+    let mut fb_ctx = FunctionBuilderContext::new();
+    let mut harvested: Vec<(cranelift_module::FuncId, HarvestedCode)> =
+        Vec::with_capacity(program.funcs.len());
+
+    for (id, func) in program.funcs.iter().enumerate() {
+        let clif_id = decls.funcs[id];
+        ctx.func.signature = lower::signature_of(store, func, call_conv);
+        ctx.func.name = ir::UserFuncName::user(0, clif_id.as_u32());
+
+        {
+            let builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+            lower::translate(builder, module, program, store, &decls, func);
+        }
+
+        if emit_clif {
+            clif.push_str(&format!("; {} (#{id})\n{}\n", func.name, ctx.func));
+        }
+
+        module
+            .define_function(clif_id, &mut ctx)
+            .map_err(|e| err(&format!("could not compile `{}`", func.name), e))?;
+        // Harvest the stack maps before `clear_context` discards them. The
+        // address a function ends up at is not known here -- under the JIT not
+        // until the module is finalized, under an object file not until a
+        // linker has run -- so keep the Cranelift id and resolve it later.
+        harvested.push((clif_id, harvest_stack_maps(&ctx)));
+        module.clear_context(&mut ctx);
+    }
+
+    // One trampoline per service function, emitted after the functions they
+    // call so that every `FuncId` they need is declared.
+    let services = define_trampolines(
+        module,
+        program,
+        store,
+        &decls,
+        call_conv,
+        &mut ctx,
+        &mut fb_ctx,
+        &mut harvested,
+    )?;
+
+    let entry_returns_value = !lower::returns_nothing(store, &program.func(entry).ret);
+
+    Ok(Built {
+        decls,
+        layouts,
+        harvested,
+        services,
+        entry,
+        entry_returns_value,
+        clif,
+    })
+}
+
+/// Compile a monomorphised program into this process, returning something that
+/// can be run.
+pub fn compile_jit(
     program: &hir::Program,
     store: &mut TypeStore,
     opts: &Options,
     emit_clif: bool,
 ) -> Result<Jit, CodegenError> {
-    let entry = program
-        .entry
-        .ok_or_else(|| CodegenError("this program has no `main` function to run".to_string()))?;
-
-    wsharp_runtime::gc::set_stress(opts.gc_stress);
+    // Only when asked. Saying `set_stress(false)` would settle the question
+    // and so override `WSHARP_GC_STRESS`, which is the switch a compiled
+    // program has and which ought to mean the same thing under both backends.
+    if opts.gc_stress {
+        wsharp_runtime::gc::set_stress(true);
+    }
 
     let mut flags = settings::builder();
     // The JIT resolves calls through absolute addresses in the same process.
     flags
         .set("use_colocated_libcalls", "false")
         .map_err(|e| err("flag", e))?;
+    // Not a choice: `cranelift-jit` asserts this is off.
     flags.set("is_pic", "false").map_err(|e| err("flag", e))?;
     // The collector finds its roots by following the frame-pointer chain from
     // inside the runtime, so every generated frame must have one.
@@ -123,98 +240,145 @@ pub fn compile(
     for (name, ptr) in wsharp_runtime::runtime_symbols() {
         jit_builder.symbol(name, ptr);
     }
+    // The two flag bytes are imported *data*, and the JIT resolves an undefined
+    // data symbol through this same map -- so the barriers get an address here
+    // and a relocation in an object file, from one lowering.
+    jit_builder.symbol(
+        wsharp_runtime::gc::POLL_FLAG_SYMBOL,
+        wsharp_runtime::gc::poll_flag_address() as *const u8,
+    );
+    jit_builder.symbol(
+        wsharp_runtime::gc::EVACUATING_FLAG_SYMBOL,
+        wsharp_runtime::gc::evacuating_flag_address() as *const u8,
+    );
     let builtins = wsharp_runtime::builtins();
     for builtin in &builtins {
-        jit_builder.symbol(builtin.symbol(), builtin.ptr);
+        // The same name the object backend declares, so a mistake in one shows
+        // up in the other rather than in only the untested half.
+        if !builtin.is_inline() {
+            jit_builder.symbol(builtin.link, builtin.ptr);
+        }
     }
 
     let mut module = JITModule::new(jit_builder);
-    let call_conv = module.target_config().default_call_conv;
+    let built = build(&mut module, program, store, &builtins, emit_clif)?;
 
-    register_layouts(program, store);
-    let closure_type_ids = register_closure_layouts(program, store);
-    // Arrays and generic instantiations continue past the closures, which
-    // continue past the structs.
-    let array_base = TYPE_ID_FIRST_USER + program.structs.len() as u32 + program.funcs.len() as u32;
-    let instance_type_ids = register_instance_layouts(program, store, array_base);
     // Freeze the registry now that every type is in it: from here the collector
     // reads layouts with no lock, which is what makes tracing affordable.
-    wsharp_runtime::publish();
-
-    let decls = declare_all(
-        &mut module,
-        program,
-        store,
-        &builtins,
-        call_conv,
-        closure_type_ids,
-        instance_type_ids,
-    )?;
-
-    let mut clif = String::new();
-    let mut ctx = module.make_context();
-    let mut fb_ctx = FunctionBuilderContext::new();
-    let mut harvested: Vec<(cranelift_module::FuncId, HarvestedCode)> =
-        Vec::with_capacity(program.funcs.len());
-
-    for (id, func) in program.funcs.iter().enumerate() {
-        let clif_id = decls.funcs[id];
-        ctx.func.signature = lower::signature_of(store, func, call_conv);
-        ctx.func.name = ir::UserFuncName::user(0, clif_id.as_u32());
-
-        {
-            let builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
-            lower::translate(builder, &mut module, program, store, &decls, func);
-        }
-
-        if emit_clif {
-            clif.push_str(&format!("; {} (#{id})\n{}\n", func.name, ctx.func));
-        }
-
-        module
-            .define_function(clif_id, &mut ctx)
-            .map_err(|e| err(&format!("could not compile `{}`", func.name), e))?;
-        // Harvest the stack maps before `clear_context` discards them. Absolute
-        // addresses are not known until the module is finalized, so keep the
-        // Cranelift function id and resolve it below.
-        harvested.push((clif_id, harvest_stack_maps(&ctx)));
-        module.clear_context(&mut ctx);
-    }
-
-    // One trampoline per service function, emitted after the functions they
-    // call so that every `FuncId` they need is declared.
-    let services = define_trampolines(
-        &mut module,
-        program,
-        store,
-        &decls,
-        call_conv,
-        &mut ctx,
-        &mut fb_ctx,
-        &mut harvested,
-    )?;
+    built.layouts.publish();
 
     module
         .finalize_definitions()
         .map_err(|e| err("could not finalize the module", e))?;
 
-    register_stack_maps(&module, harvested);
-    register_services(&module, program, services);
+    register_stack_maps(&module, built.harvested);
+    register_services(&module, program, built.services);
 
-    let entry_func = program.func(entry);
-    let entry_returns_value = !lower::returns_nothing(store, &entry_func.ret);
-    let entry_ptr = module.get_finalized_function(decls.funcs[entry as usize]);
+    let entry_ptr = module.get_finalized_function(built.decls.funcs[built.entry as usize]);
 
     Ok(Jit {
         _module: module,
         entry: entry_ptr,
-        entry_returns_value,
-        clif,
+        entry_returns_value: built.entry_returns_value,
+        clif: built.clif,
+    })
+}
+
+/// The symbol a compiled program exports its `main` under, and what the
+/// startup shim in `wsharp-start` calls.
+pub const ENTRY_SYMBOL: &str = "ws_main";
+
+/// A compiled program as a relocatable object file, ready to be linked against
+/// the runtime.
+pub struct Object {
+    pub bytes: Vec<u8>,
+    /// Cranelift IR for every function, when it was asked for.
+    pub clif: String,
+}
+
+/// Compile a monomorphised program to an object file.
+///
+/// The same `build` the JIT uses, so the code is the code either way. What
+/// differs is what becomes of the three tables the runtime needs -- written
+/// here as data a startup pass reads, rather than handed over by calling into
+/// a runtime that happens to be in the same process.
+pub fn compile_object(
+    program: &hir::Program,
+    store: &mut TypeStore,
+    emit_clif: bool,
+) -> Result<Object, CodegenError> {
+    let mut flags = settings::builder();
+    // Calls resolve through the linker rather than through addresses in this
+    // process, which is the whole difference between the two backends.
+    flags
+        .set("use_colocated_libcalls", "false")
+        .map_err(|e| err("flag", e))?;
+    flags.set("is_pic", "true").map_err(|e| err("flag", e))?;
+    // As for the JIT, and for the same reason: the collector walks the
+    // frame-pointer chain out of a runtime function, and a generated frame
+    // without one breaks the walk at its first step.
+    flags
+        .set("preserve_frame_pointers", "true")
+        .map_err(|e| err("flag", e))?;
+    flags
+        .set("opt_level", "speed")
+        .map_err(|e| err("flag", e))?;
+
+    let isa_builder = cranelift_native::builder()
+        .map_err(|e| CodegenError(format!("unsupported host architecture: {e}")))?;
+    let isa = isa_builder
+        .finish(settings::Flags::new(flags))
+        .map_err(|e| err("could not configure the target", e))?;
+
+    let builder = ObjectBuilder::new(isa, "wsharp", cranelift_module::default_libcall_names())
+        .map_err(|e| err("could not configure the object writer", e))?;
+    let mut module = ObjectModule::new(builder);
+
+    let builtins = wsharp_runtime::builtins();
+    let mut built = build(&mut module, program, store, &builtins, emit_clif)?;
+
+    // `main`, wrapped so that the startup shim has one signature to call.
+    let call_conv = module.target_config().default_call_conv;
+    let sig = lower::entry_signature(call_conv);
+    let shim = module
+        .declare_function(ENTRY_SYMBOL, Linkage::Export, &sig)
+        .map_err(|e| err("could not declare the entry point", e))?;
+    let mut ctx = module.make_context();
+    let mut fb_ctx = FunctionBuilderContext::new();
+    ctx.func.signature = sig;
+    ctx.func.name = ir::UserFuncName::user(0, shim.as_u32());
+    {
+        let b = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+        lower::entry_shim(b, &mut module, &built.decls, built.entry, built.entry_returns_value);
+    }
+    module
+        .define_function(shim, &mut ctx)
+        .map_err(|e| err("could not compile the entry point", e))?;
+    // Described like every other generated function, so the range the root walk
+    // calls "generated code" has no hole at the outermost frame.
+    built.harvested.push((shim, harvest_stack_maps(&ctx)));
+    module.clear_context(&mut ctx);
+
+    tables::emit_all(
+        &mut module,
+        program,
+        &built.layouts.entries,
+        &built.harvested,
+        &built.services,
+    )?;
+
+    let bytes = module
+        .finish()
+        .emit()
+        .map_err(|e| err("could not write the object file", e))?;
+    Ok(Object {
+        bytes,
+        clif: built.clif,
     })
 }
 
 /// A trampoline, pending the address it will finally live at.
-struct Trampoline {
+pub struct Trampoline {
     clif_id: cranelift_module::FuncId,
     /// Which service, and which of its methods -- `None` for its `init`.
     service: usize,
@@ -232,8 +396,8 @@ struct Trampoline {
 /// `array.concat` taught -- so it is done in generated code, where all three
 /// apply by construction.
 #[allow(clippy::too_many_arguments)]
-fn define_trampolines(
-    module: &mut JITModule,
+fn define_trampolines<M: Module>(
+    module: &mut M,
     program: &hir::Program,
     store: &mut TypeStore,
     decls: &lower::Decls,
@@ -302,31 +466,54 @@ fn define_trampolines(
     Ok(out)
 }
 
+/// Sort the trampolines into `(service name, its init, its methods in order)`.
+///
+/// Shared by the two things that need the answer -- the JIT, which turns each
+/// into an address, and `tables::services`, which writes each as a relocation.
+/// One grouping, so a service cannot be numbered one way in this process and
+/// another way in an object file.
+pub(crate) fn group_trampolines<'a>(
+    program: &hir::Program,
+    found: &'a [Trampoline],
+) -> Vec<(String, &'a Trampoline, Vec<&'a Trampoline>)> {
+    let mut services: Vec<Vec<&Trampoline>> =
+        program.services.iter().map(|_| Vec::new()).collect();
+    for t in found {
+        services[t.service].push(t);
+    }
+    services
+        .into_iter()
+        .enumerate()
+        .map(|(sid, mut entries)| {
+            // `init` sorts before every method, and the methods keep the order
+            // they are declared in -- which is the order a call site numbers
+            // them by.
+            entries.sort_by_key(|t| t.method.map_or(0, |m| m + 1));
+            let init = entries.remove(0);
+            (program.services[sid].name.clone(), init, entries)
+        })
+        .collect()
+}
+
 /// Hand the runtime the finished addresses, so a worker can call into a
 /// service it was only ever given the number of.
 fn register_services(module: &JITModule, program: &hir::Program, found: Vec<Trampoline>) {
     use wsharp_runtime::rpc::{MethodCode, ServiceCode};
-    let mut services: Vec<Vec<Trampoline>> = program.services.iter().map(|_| Vec::new()).collect();
-    for t in found {
-        services[t.service].push(t);
-    }
     let mut out: Vec<&'static ServiceCode> = Vec::new();
-    for (sid, mut entries) in services.into_iter().enumerate() {
-        entries.sort_by_key(|t| t.method.map_or(0, |m| m + 1));
-        let init = entries.remove(0);
-        let methods: Vec<MethodCode> = entries
+    for (name, init, methods) in group_trampolines(program, &found) {
+        let methods: Vec<MethodCode> = methods
             .into_iter()
             .map(|t| MethodCode {
-                name: Box::leak(t.name.into_boxed_str()),
+                name: Box::leak(t.name.clone().into_boxed_str()),
                 call: module.get_finalized_function(t.clif_id),
-                args: Box::leak(t.args.into_boxed_slice()),
-                ret: Box::leak(t.ret.into_boxed_slice()),
+                args: Box::leak(t.args.clone().into_boxed_slice()),
+                ret: Box::leak(t.ret.clone().into_boxed_slice()),
             })
             .collect();
         out.push(Box::leak(Box::new(ServiceCode {
-            name: Box::leak(program.services[sid].name.clone().into_boxed_str()),
+            name: Box::leak(name.into_boxed_str()),
             init: module.get_finalized_function(init.clif_id),
-            init_args: Box::leak(init.args.into_boxed_slice()),
+            init_args: Box::leak(init.args.clone().into_boxed_slice()),
             methods: Box::leak(methods.into_boxed_slice()),
         })));
     }
@@ -334,7 +521,7 @@ fn register_services(module: &JITModule, program: &hir::Program, found: Vec<Tram
 }
 
 /// A function's code length and its safepoints, pending a base address.
-struct HarvestedCode {
+pub struct HarvestedCode {
     len: usize,
     safepoints: Vec<SafePoint>,
 }
@@ -384,12 +571,63 @@ fn register_stack_maps(
     wsharp_runtime::stackwalk::register_code(funcs);
 }
 
-/// Tell the runtime the shape of every struct, so the collector can trace
-/// instances without knowing anything about W# types.
-fn register_layouts(program: &hir::Program, store: &mut TypeStore) {
+/// The shape of every heap type in the program, so the collector can trace an
+/// instance without knowing anything about W# types.
+///
+/// Collected rather than registered, because there are two backends and the
+/// same walk feeds both: [`Layouts::publish`] hands these to the runtime in
+/// this process, and the object backend writes them out as data instead. A
+/// second walk would be a second numbering, and a type id is baked into
+/// generated code by `alloc_raw`.
+pub struct Layouts {
+    /// `(type id, layout)`, in the order the ids were assigned.
+    pub entries: Vec<(u32, TypeLayout)>,
+    /// Runtime type id per `hir::FuncId`.
+    closure_type_ids: Vec<u32>,
+    /// Runtime type id per array type and generic-struct instantiation, keyed
+    /// by the type as rendered by `TypeStore::show`.
+    instance_type_ids: HashMap<String, u32>,
+}
+
+impl Layouts {
+    /// Hand every layout to the runtime in this process, and freeze the table.
+    pub fn publish(&self) {
+        for (id, layout) in &self.entries {
+            wsharp_runtime::register_type(*id, layout.clone());
+        }
+        wsharp_runtime::publish();
+    }
+}
+
+/// Number and lay out every heap type the program can make.
+///
+/// The order is the numbering, and it is three blocks in a fixed sequence:
+/// structs from `TYPE_ID_FIRST_USER`, then one closure id per function, then
+/// arrays and generic-struct instantiations. Struct ids have to come first and
+/// contiguously, because dispatch tests a subtype by comparing against a range.
+fn collect_layouts(program: &hir::Program, store: &mut TypeStore) -> Layouts {
+    let mut entries = Vec::new();
+    struct_layouts(program, store, &mut entries);
+    let closure_type_ids = closure_layouts(program, store, &mut entries);
+    // Arrays and generic instantiations continue past the closures, which
+    // continue past the structs.
+    let array_base = TYPE_ID_FIRST_USER + program.structs.len() as u32 + program.funcs.len() as u32;
+    let instance_type_ids = instance_layouts(program, store, array_base, &mut entries);
+    Layouts {
+        entries,
+        closure_type_ids,
+        instance_type_ids,
+    }
+}
+
+fn struct_layouts(
+    program: &hir::Program,
+    store: &mut TypeStore,
+    out: &mut Vec<(u32, TypeLayout)>,
+) {
     for def in &program.structs {
         // A generic struct has no instances of its own; each instantiation is
-        // registered separately, with the offsets its arguments imply.
+        // laid out separately, with the offsets its arguments imply.
         if !def.params.is_empty() {
             continue;
         }
@@ -398,10 +636,10 @@ fn register_layouts(program: &hir::Program, store: &mut TypeStore) {
             let ty = field.ty.clone();
             layout::ptr_offsets(store, &ty, field.offset, &mut ptr_offsets);
         }
-        wsharp_runtime::register_type(
+        out.push((
             def.type_id,
             TypeLayout::fixed(def.name.clone(), def.size, ptr_offsets),
-        );
+        ));
     }
 }
 
@@ -440,10 +678,11 @@ pub(crate) fn instance_field_types(
 /// the lattice has been numbered; they take ids from above it, which is sound
 /// because a generic struct stands outside the lattice and so is never the
 /// subject of a range test.
-fn register_instance_layouts(
+fn instance_layouts(
     program: &hir::Program,
     store: &mut TypeStore,
     base: u32,
+    out: &mut Vec<(u32, TypeLayout)>,
 ) -> HashMap<String, u32> {
     let mut ids = HashMap::new();
     for ty in collect_instance_types(program, store) {
@@ -470,7 +709,7 @@ fn register_instance_layouts(
             }
             other => unreachable!("`{}` is not an instance type", store.show(&other)),
         };
-        wsharp_runtime::register_type(type_id, layout);
+        out.push((type_id, layout));
         ids.insert(key, type_id);
     }
     ids
@@ -680,7 +919,11 @@ fn types_in_expr(expr: &hir::Expr, out: &mut Vec<Type>) {
 /// id with no layout behind it, so the collector could neither size them nor
 /// copy them, and evacuating one truncated it to its header and lost the code
 /// pointer it existed to carry.
-fn register_closure_layouts(program: &hir::Program, store: &mut TypeStore) -> Vec<u32> {
+fn closure_layouts(
+    program: &hir::Program,
+    store: &mut TypeStore,
+    out: &mut Vec<(u32, TypeLayout)>,
+) -> Vec<u32> {
     // Struct ids run from TYPE_ID_FIRST_USER; closures continue past them, one
     // per function, so a function's id is its index.
     let base = TYPE_ID_FIRST_USER + program.structs.len() as u32;
@@ -689,23 +932,22 @@ fn register_closure_layouts(program: &hir::Program, store: &mut TypeStore) -> Ve
         let type_id = base + id as u32;
         let (size, ptr_offsets) = lower::closure_layout(store, func);
         let what = if func.is_closure { "closure" } else { "fn" };
-        wsharp_runtime::register_type(
+        out.push((
             type_id,
             TypeLayout::fixed(format!("{what} {}", func.name), size, ptr_offsets),
-        );
+        ));
         ids.push(type_id);
     }
     ids
 }
 
-fn declare_all(
-    module: &mut JITModule,
+fn declare_all<M: Module>(
+    module: &mut M,
     program: &hir::Program,
     store: &mut TypeStore,
     builtins: &[wsharp_runtime::Builtin],
     call_conv: CallConv,
-    closure_type_ids: Vec<u32>,
-    instance_type_ids: HashMap<String, u32>,
+    layouts: &Layouts,
 ) -> Result<lower::Decls, CodegenError> {
     // Monomorphisation produces several functions with the same source name, so
     // the linkage name carries the index too.
@@ -719,13 +961,21 @@ fn declare_all(
         funcs.push(clif_id);
     }
 
+    // Declared by their linker names rather than their W# ones, because
+    // `std/str.len` is a fine thing to write and a poor thing to link. A row
+    // the code generator lowers inline is not declared at all: it names no
+    // symbol, and declaring one would put a name nothing calls in the table.
     let mut builtin_ids = Vec::with_capacity(builtins.len());
     for builtin in builtins {
+        if builtin.is_inline() {
+            builtin_ids.push(None);
+            continue;
+        }
         let sig = lower::builtin_signature(builtin, call_conv);
         let id = module
-            .declare_function(&builtin.symbol(), Linkage::Import, &sig)
+            .declare_function(builtin.link, Linkage::Import, &sig)
             .map_err(|e| err(&format!("could not declare builtin `{}`", builtin.name), e))?;
-        builtin_ids.push(id);
+        builtin_ids.push(Some(id));
     }
 
     let mut alloc_sig = ir::Signature::new(call_conv);
@@ -777,6 +1027,28 @@ fn declare_all(
         .declare_function("ws_resolve", Linkage::Import, &resolve_sig)
         .map_err(|e| err("could not declare `ws_resolve`", e))?;
 
+    // The two bytes generated code reads directly: the poll flag at every loop
+    // back edge, and the evacuating flag in front of every reference loaded out
+    // of a heap object. Writable, because the collector writes them; not
+    // thread-local, because they mean "*some* worker", which is what lets one
+    // byte serve every thread.
+    let poll_flag = module
+        .declare_data(
+            wsharp_runtime::gc::POLL_FLAG_SYMBOL,
+            Linkage::Import,
+            true,
+            false,
+        )
+        .map_err(|e| err("could not declare the poll flag", e))?;
+    let evacuating_flag = module
+        .declare_data(
+            wsharp_runtime::gc::EVACUATING_FLAG_SYMBOL,
+            Linkage::Import,
+            true,
+            false,
+        )
+        .map_err(|e| err("could not declare the evacuating flag", e))?;
+
     // The loop safepoint: no arguments, no result, called only when the poll
     // byte says a collection is wanted.
     let gc_poll = module
@@ -823,7 +1095,7 @@ fn declare_all(
         .map_err(|e| err("could not declare `ws_join`", e))?;
 
     let strings = define_strings(module, program)?;
-    let arrays = define_arrays(module, program, store, &instance_type_ids)?;
+    let arrays = define_arrays(module, program, store, &layouts.instance_type_ids)?;
     let singletons = define_singletons(module, program)?;
 
     Ok(lower::Decls {
@@ -832,11 +1104,13 @@ fn declare_all(
         strings,
         arrays,
         singletons,
-        closure_type_ids,
-        instance_type_ids,
+        closure_type_ids: layouts.closure_type_ids.clone(),
+        instance_type_ids: layouts.instance_type_ids.clone(),
         alloc,
         panic,
         panic_index,
+        poll_flag,
+        evacuating_flag,
         log_object,
         gc_poll,
         resolve,
@@ -852,8 +1126,8 @@ fn declare_all(
 /// and mentioning it should not allocate. One static object per type, in the
 /// data section beside the string literals and immortal for the same reason:
 /// the collector must neither move nor free it.
-fn define_singletons(
-    module: &mut JITModule,
+fn define_singletons<M: Module>(
+    module: &mut M,
     program: &hir::Program,
 ) -> Result<Vec<Option<cranelift_module::DataId>>, CodegenError> {
     let mut ids = Vec::with_capacity(program.structs.len());
@@ -897,8 +1171,8 @@ fn define_singletons(
 /// The elements are scalars, which inference has already insisted on -- so
 /// nothing here holds a reference, and an object the collector never traces
 /// cannot hide one.
-fn define_arrays(
-    module: &mut JITModule,
+fn define_arrays<M: Module>(
+    module: &mut M,
     program: &hir::Program,
     store: &mut TypeStore,
     instance_type_ids: &HashMap<String, u32>,
@@ -952,8 +1226,8 @@ fn define_arrays(
 ///
 /// They carry the immortal flag: they live in the module's data section rather
 /// than the W# heap, so a collector must neither move nor free them.
-fn define_strings(
-    module: &mut JITModule,
+fn define_strings<M: Module>(
+    module: &mut M,
     program: &hir::Program,
 ) -> Result<Vec<cranelift_module::DataId>, CodegenError> {
     let mut ids = Vec::with_capacity(program.strings.len());

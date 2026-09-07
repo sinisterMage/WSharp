@@ -11,6 +11,7 @@ cranelift-frontend.workspace = true
 cranelift-jit.workspace = true
 cranelift-module.workspace = true
 cranelift-native.workspace = true
+cranelift-object.workspace = true
 smallvec.workspace = true
 wsharp-runtime.workspace = true
 wsharp-sema.workspace = true

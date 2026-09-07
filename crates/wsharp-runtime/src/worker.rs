@@ -20,13 +20,17 @@
 //!   it was handed. One worker's spaces have to be findable from the answer
 //!   even though only its owner will ever be allocating in them.
 //! - **The two flag words generated code reads**, for the poll and for
-//!   evacuation. Their addresses are compiled into the code as constants, so
-//!   they cannot be per-worker without teaching the barriers thread-local
-//!   access. They mean "*some* worker wants a pause" and "*some* worker is
-//!   moving" instead, and the slow path asks the current worker whether the
-//!   request is its own. The cost is a false slow path on an uninvolved
-//!   worker: correct, because both slow paths are idempotent, and rare,
-//!   because both flags are set only around a pause.
+//!   evacuation. Generated code names them as symbols, so they cannot be
+//!   per-worker without teaching the barriers thread-local access. They mean
+//!   "*some* worker wants a pause" and "*some* worker is moving" instead, and
+//!   the slow path asks the current worker whether the request is its own. The
+//!   cost is a false slow path on an uninvolved worker: correct, because both
+//!   slow paths are idempotent, and rare, because both flags are set only
+//!   around a pause.
+//!
+//! Those two bytes are the only runtime *state* a compiled program reaches by
+//! name rather than through a call, which is why they are exported and why
+//! [`POLL_FLAG_SYMBOL`] and [`EVACUATING_FLAG_SYMBOL`] are written down.
 
 use std::cell::{Cell, RefCell};
 use std::ptr;
@@ -440,20 +444,38 @@ pub(crate) unsafe fn walk_worker_roots(worker: &Worker, visit: impl FnMut(*mut *
 /// Two words rather than one because the byte is what generated code loads,
 /// and a byte cannot count past 255 -- while the count is what makes one
 /// worker finishing its pause not silence another's request.
+///
+/// The byte is exported, and that is not decoration. Generated code reads it
+/// directly, so it is the one piece of runtime *state* -- as against runtime
+/// *functions* -- that a compiled program names. Under the JIT the name is
+/// resolved to this address in this process; in an object file it is a
+/// relocation a linker fills in. Renaming it breaks the second and not the
+/// first, which is why the name is a constant both sides read.
 static POLL_COUNT: AtomicUsize = AtomicUsize::new(0);
-static POLL_FLAG: AtomicU8 = AtomicU8::new(0);
+#[unsafe(no_mangle)]
+pub static ws_gc_poll_flag: AtomicU8 = AtomicU8::new(0);
 
 /// The same pair for evacuation, read by the load barrier in front of every
 /// reference the program loads out of a heap object.
 static EVACUATING_COUNT: AtomicUsize = AtomicUsize::new(0);
-static EVACUATING_FLAG: AtomicU8 = AtomicU8::new(0);
+#[unsafe(no_mangle)]
+pub static ws_gc_evacuating_flag: AtomicU8 = AtomicU8::new(0);
+
+/// What generated code links the two flag bytes by.
+///
+/// Read by the code generator, which declares them as imported data, and by
+/// the JIT, which resolves that import to [`poll_flag_address`] and
+/// [`evacuating_flag_address`]. One spelling, so the two backends cannot
+/// disagree about it.
+pub const POLL_FLAG_SYMBOL: &str = "ws_gc_poll_flag";
+pub const EVACUATING_FLAG_SYMBOL: &str = "ws_gc_evacuating_flag";
 
 pub fn poll_flag_address() -> usize {
-    &POLL_FLAG as *const AtomicU8 as usize
+    &ws_gc_poll_flag as *const AtomicU8 as usize
 }
 
 pub fn evacuating_flag_address() -> usize {
-    &EVACUATING_FLAG as *const AtomicU8 as usize
+    &ws_gc_evacuating_flag as *const AtomicU8 as usize
 }
 
 /// Raise or lower one worker's contribution to a shared flag.
@@ -470,11 +492,11 @@ fn set_shared(flag: &AtomicU8, count: &AtomicUsize, own: &AtomicBool, on: bool) 
 }
 
 pub(crate) fn request_safepoint(worker: &Worker) {
-    set_shared(&POLL_FLAG, &POLL_COUNT, &worker.mark.wanted, true);
+    set_shared(&ws_gc_poll_flag, &POLL_COUNT, &worker.mark.wanted, true);
 }
 
 pub(crate) fn clear_poll(worker: &Worker) {
-    set_shared(&POLL_FLAG, &POLL_COUNT, &worker.mark.wanted, false);
+    set_shared(&ws_gc_poll_flag, &POLL_COUNT, &worker.mark.wanted, false);
 }
 
 /// Whether *this* worker was the one asking, clearing its request if so.
@@ -487,12 +509,12 @@ pub(crate) fn take_safepoint_request(worker: &Worker) -> bool {
 }
 
 pub(crate) fn poll_wanted() -> bool {
-    POLL_FLAG.load(Ordering::Acquire) != 0
+    ws_gc_poll_flag.load(Ordering::Acquire) != 0
 }
 
 pub(crate) fn set_evacuating(worker: &Worker, on: bool) {
     set_shared(
-        &EVACUATING_FLAG,
+        &ws_gc_evacuating_flag,
         &EVACUATING_COUNT,
         &worker.mark.evacuating,
         on,

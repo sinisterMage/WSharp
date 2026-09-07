@@ -53,6 +53,7 @@ pub fn alloc_str(bytes: &[u8]) -> *mut u8 {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; the string arguments
 /// must be null or point at W# string objects.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_str_len(s: *const u8) -> i64 {
     unsafe { crate::gc::checkpoint() };
     unsafe { str_bytes(s).len() as i64 }
@@ -61,6 +62,7 @@ pub unsafe extern "C" fn ws_str_len(s: *const u8) -> i64 {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; the string arguments
 /// must be null or point at W# string objects.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_str_concat(a: *const u8, b: *const u8) -> *mut u8 {
     unsafe { crate::gc::checkpoint() };
     // Copy both sides out before allocating: the allocation is a safepoint,
@@ -74,6 +76,7 @@ pub unsafe extern "C" fn ws_str_concat(a: *const u8, b: *const u8) -> *mut u8 {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; the string arguments
 /// must be null or point at W# string objects.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_str_eq(a: *const u8, b: *const u8) -> bool {
     unsafe { crate::gc::checkpoint() };
     unsafe { str_bytes(a) == str_bytes(b) }
@@ -87,6 +90,7 @@ pub unsafe extern "C" fn ws_str_eq(a: *const u8, b: *const u8) -> bool {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; the string arguments
 /// must be null or point at W# string objects.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_str_substr(s: *const u8, from: i64, to: i64) -> *mut u8 {
     unsafe { crate::gc::checkpoint() };
     let bytes = unsafe { str_bytes(s) };
@@ -101,6 +105,7 @@ pub unsafe extern "C" fn ws_str_substr(s: *const u8, from: i64, to: i64) -> *mut
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; the string arguments
 /// must be null or point at W# string objects.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_str_find(s: *const u8, needle: *const u8) -> i64 {
     unsafe { crate::gc::checkpoint() };
     let hay = unsafe { str_bytes(s) };
@@ -119,6 +124,7 @@ pub unsafe extern "C" fn ws_str_find(s: *const u8, needle: *const u8) -> i64 {
     -1
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_str_from_int(value: i64) -> *mut u8 {
     unsafe { crate::gc::checkpoint() };
     alloc_str(value.to_string().as_bytes())
@@ -126,11 +132,13 @@ pub extern "C" fn ws_str_from_int(value: i64) -> *mut u8 {
 
 /// The unsigned twin of [`ws_str_from_int`], for the half of `u64`'s range an
 /// `i64` cannot hold.
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_str_from_uint(value: u64) -> *mut u8 {
     unsafe { crate::gc::checkpoint() };
     alloc_str(value.to_string().as_bytes())
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_str_from_float(value: f64) -> *mut u8 {
     unsafe { crate::gc::checkpoint() };
     alloc_str(format!("{value}").as_bytes())
@@ -143,6 +151,7 @@ pub extern "C" fn ws_str_from_float(value: f64) -> *mut u8 {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `a` must be null or
 /// point at a W# array object.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_array_len(a: *const u8) -> i64 {
     unsafe { crate::gc::checkpoint() };
     if a.is_null() {
@@ -161,6 +170,7 @@ pub unsafe extern "C" fn ws_array_len(a: *const u8) -> i64 {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; the string argument
 /// must be null or point at a W# string object.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_str_byte_at(s: *const u8, i: i64) -> i64 {
     unsafe { crate::gc::checkpoint() };
     let bytes = unsafe { str_bytes(s) };
@@ -179,6 +189,7 @@ pub unsafe extern "C" fn ws_str_byte_at(s: *const u8, i: i64) -> i64 {
 ///
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_str_from_byte(b: i64) -> *mut u8 {
     unsafe { crate::gc::checkpoint() };
     alloc_str(&[(b.rem_euclid(256)) as u8])
@@ -194,6 +205,7 @@ pub unsafe extern "C" fn ws_str_from_byte(b: i64) -> *mut u8 {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `out` must point at
 /// storage laid out as a [`crate::io::FallibleI64`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_str_parse_int(out: *mut crate::io::FallibleI64, s: *const u8) {
     unsafe { crate::gc::checkpoint() };
     let bytes = unsafe { str_bytes(s) };
@@ -221,6 +233,7 @@ pub unsafe extern "C" fn ws_str_parse_int(out: *mut crate::io::FallibleI64, s: *
 /// Called from JIT-compiled code across an FFI boundary; `s` must be null or
 /// point at a W# string object, and `out` must point at storage laid out as a
 /// [`crate::io::FallibleF64`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_str_parse_float(out: *mut crate::io::FallibleF64, s: *const u8) {
     unsafe { crate::gc::checkpoint() };
     let bytes = unsafe { str_bytes(s) };
@@ -262,6 +275,7 @@ fn parse_decimal(bytes: &[u8]) -> Option<i64> {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; the string argument
 /// must be null or point at a W# string object.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_str_to_lower(s: *const u8) -> *mut u8 {
     unsafe { crate::gc::checkpoint() };
     let lowered: Vec<u8> = unsafe { str_bytes(s) }
@@ -276,6 +290,7 @@ pub unsafe extern "C" fn ws_str_to_lower(s: *const u8) -> *mut u8 {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; the string argument
 /// must be null or point at a W# string object.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_str_trim(s: *const u8) -> *mut u8 {
     unsafe { crate::gc::checkpoint() };
     let bytes = unsafe { str_bytes(s) };

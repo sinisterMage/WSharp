@@ -66,6 +66,43 @@ mod c {
         /// Answers with `buf` on success and null on failure, so the path's
         /// length has to be found by looking for the terminator.
         pub(super) fn getcwd(buf: *mut u8, size: usize) -> *mut u8;
+        pub(super) fn chdir(path: *const u8) -> c_int;
+        /// Replaces this process, so it answers only on failure. `argv` is
+        /// null-terminated and its first entry is the program's own name.
+        pub(super) fn execvp(file: *const u8, argv: *const *const u8) -> c_int;
+    }
+
+    /// How each system in this family answers "what am I?", which is the one
+    /// question here with a different shape on every one of them.
+    ///
+    /// macOS has a libc call for it. FreeBSD, DragonFly and NetBSD have a
+    /// `sysctl`, with *different* names for the node -- and NetBSD's is under
+    /// `KERN_PROC_ARGS` rather than `KERN_PROC`, with its arguments in another
+    /// order. OpenBSD has neither, on purpose: it does not keep the path.
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" {
+        /// Writes a terminated path, and answers -1 with `size` updated to
+        /// what it wanted when the buffer was too small. Note that `size` is
+        /// in *and* out, and that the path it gives is not resolved -- which
+        /// is fine here, since it is used to find a sibling file.
+        pub(super) fn _NSGetExecutablePath(buf: *mut u8, size: *mut u32) -> c_int;
+    }
+
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd"
+    ))]
+    unsafe extern "C" {
+        pub(super) fn sysctl(
+            name: *const c_int,
+            // `u_int`, which is `u32` on every system in this family.
+            namelen: u32,
+            old: *mut u8,
+            oldlen: *mut usize,
+            new: *const u8,
+            newlen: usize,
+        ) -> c_int;
     }
 
     // `opendir` and `readdir` are the *one* pair here whose symbol name is not
@@ -141,6 +178,10 @@ const ENOENT: c_int = 2;
 const EINTR: c_int = 4;
 pub(crate) const EIO: c_int = 5;
 const EACCES: c_int = 13;
+/// What a `sysctl` answers when the buffer it was given was too small. 12 here
+/// and 12 on Linux -- inside the range where the two numberings still agree.
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
+const ENOMEM: c_int = 12;
 const EEXIST: c_int = 17;
 const ENOTDIR: c_int = 20;
 const EISDIR: c_int = 21;
@@ -368,6 +409,111 @@ pub(crate) fn cwd(room: usize) -> Result<Option<Vec<u8>>, Errno> {
     }
     let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     buf.truncate(len);
+    Ok(Some(buf))
+}
+
+pub(crate) fn chdir(path: &[u8]) -> Result<(), Errno> {
+    let path = c_path(path)?;
+    if unsafe { c::chdir(path.as_ptr()) } < 0 {
+        return Err(errno());
+    }
+    Ok(())
+}
+
+/// Replace this process. Answers only on failure.
+pub(crate) fn exec(program: &[u8], argv: &[Vec<u8>]) -> Errno {
+    let Ok(program) = c_path(program) else {
+        return Errno(ENOENT);
+    };
+    // The terminated copies must outlive the vector of pointers into them.
+    let mut owned: Vec<Vec<u8>> = Vec::with_capacity(argv.len());
+    for arg in argv {
+        match c_path(arg) {
+            Ok(a) => owned.push(a),
+            Err(e) => return e,
+        }
+    }
+    let mut pointers: Vec<*const u8> = owned.iter().map(|a| a.as_ptr()).collect();
+    pointers.push(core::ptr::null());
+    unsafe { c::execvp(program.as_ptr(), pointers.as_ptr()) };
+    errno()
+}
+
+/// The first level of a `sysctl` name: `CTL_KERN`. The same on every system
+/// here, and the only part of the name that is.
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
+const CTL_KERN: c_int = 1;
+
+/// The running executable.
+///
+/// Four systems, three answers and one refusal -- which is the shape this
+/// layer takes everywhere, and why the arms are per system rather than one
+/// "BSD" guess.
+#[cfg(target_os = "macos")]
+pub(crate) fn self_exe(room: usize) -> Result<Option<Vec<u8>>, Errno> {
+    let mut buf = vec![0u8; room];
+    let mut size = room as u32;
+    // -1 means "not enough room", and `size` has been set to how much is
+    // wanted -- but the growing loop above will get there anyway, so the
+    // number is not read.
+    if unsafe { c::_NSGetExecutablePath(buf.as_mut_ptr(), &mut size) } != 0 {
+        return Ok(None);
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    buf.truncate(len);
+    Ok(Some(buf))
+}
+
+/// `KERN_PROC` then `KERN_PROC_PATHNAME`, with `-1` meaning "this process".
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+pub(crate) fn self_exe(room: usize) -> Result<Option<Vec<u8>>, Errno> {
+    const KERN_PROC: c_int = 14;
+    const KERN_PROC_PATHNAME: c_int = 12;
+    sysctl_path(&[CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1], room)
+}
+
+/// NetBSD keeps it under `KERN_PROC_ARGS`, and puts the pid before the node
+/// rather than after it -- so the name is a different shape as well as
+/// different numbers.
+#[cfg(target_os = "netbsd")]
+pub(crate) fn self_exe(room: usize) -> Result<Option<Vec<u8>>, Errno> {
+    const KERN_PROC_ARGS: c_int = 48;
+    const KERN_PROC_PATHNAME: c_int = 5;
+    sysctl_path(&[CTL_KERN, KERN_PROC_ARGS, -1, KERN_PROC_PATHNAME], room)
+}
+
+/// OpenBSD does not keep the path of a running program, so there is nothing to
+/// ask. Reported rather than approximated from `argv[0]`, which is whatever
+/// the caller passed to `exec` and is a bare name for anything found on
+/// `PATH`. A caller that wanted a guess can make one; this layer will not.
+#[cfg(target_os = "openbsd")]
+pub(crate) fn self_exe(_room: usize) -> Result<Option<Vec<u8>>, Errno> {
+    Err(Errno(ENOENT))
+}
+
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
+fn sysctl_path(name: &[c_int], room: usize) -> Result<Option<Vec<u8>>, Errno> {
+    let mut buf = vec![0u8; room];
+    let mut len = room;
+    let ok = unsafe {
+        c::sysctl(
+            name.as_ptr(),
+            name.len() as u32,
+            buf.as_mut_ptr(),
+            &mut len,
+            core::ptr::null(),
+            0,
+        )
+    };
+    if ok < 0 {
+        let e = errno();
+        // "Not enough room", which the caller answers by asking for more.
+        return if e.0 == ENOMEM { Ok(None) } else { Err(e) };
+    }
+    // The kernel writes a terminator and counts it; the path is what precedes.
+    buf.truncate(len);
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    buf.truncate(end);
     Ok(Some(buf))
 }
 

@@ -42,16 +42,30 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
+      # `ingot` is a W# program, so `cargo` does not produce it: `wsharp` does,
+      # from the `ingot/main` module compiled into it. This is the bootstrap,
+      # and it is also the first real use of `wsharp build` in anger -- a
+      # release that cannot compile the package manager is not a release.
+      - name: Bootstrap ingot
+        run: |
+          set -eu
+          ./target/release/wsharp build --module ingot/main -o target/release/ingot
+          ./target/release/ingot help > /dev/null
+
       # The standard library is `include_str!`'d into the binary
       # (`wsharp-runtime/src/builtins.rs`), so the archive needs no `std`
-      # directory beside it -- one executable is a complete installation.
+      # directory beside it. It does need `lib/`: an installation is one
+      # *directory* now rather than one executable, because a compiler that
+      # links needs something to link against, and `wsharp build` looks for
+      # `libwsharp_start.a` beside itself and under `../lib`.
       - name: Package
         run: |
           set -eu
           version="${GITHUB_REF_NAME#v}"
           stage="wsharp-${version}-x86_64-unknown-linux-gnu"
-          mkdir -p "dist/release/${stage}"
-          cp target/release/wsharp README.md LICENSE "dist/release/${stage}/"
+          mkdir -p "dist/release/${stage}/lib"
+          cp target/release/wsharp target/release/ingot README.md LICENSE "dist/release/${stage}/"
+          cp target/release/libwsharp_start.a "dist/release/${stage}/lib/"
           tar -czf "dist/release/${stage}.tar.gz" -C dist/release "${stage}"
           rm -r "dist/release/${stage}"
           cd dist/release

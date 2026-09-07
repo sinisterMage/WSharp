@@ -245,6 +245,7 @@ pub unsafe fn decode(wire: &Wire) -> *mut u8 {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `a` must be null or a
 /// live array.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_transfer_roundtrip(a: *mut u8) -> *mut u8 {
     unsafe { crate::gc::checkpoint() };
     // Encoded before anything is allocated: `a` is a Rust local that no stack

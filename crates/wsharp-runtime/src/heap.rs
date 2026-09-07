@@ -1087,6 +1087,7 @@ fn with_heap<R>(f: impl FnOnce(&mut Heap) -> R) -> R {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `size` must include
 /// [`HEADER_SIZE`] and match the registered layout for `type_id`.
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_alloc(type_id: TypeId, size: u64, aux: u64) -> *mut u8 {
     let size = align_up((size as u32).max(HEADER_SIZE)) as usize;
     let ptr = allocate(type_id, size);

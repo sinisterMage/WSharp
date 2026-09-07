@@ -329,9 +329,18 @@ typical store, and it is the last line under what is left in
 ## The compiler
 
 ```sh
-wsharp run   <file.ws>    # compile and run main; exits with main's return value
-wsharp check <file.ws>    # type-check only
+wsharp run   <file.ws>            # compile and run main; exits with main's return value
+wsharp check <file.ws>            # type-check only
+wsharp build <file.ws> -o <prog>  # compile to a native executable
 ```
+
+`run` compiles into memory and runs there, which is what you want while writing
+something. `build` writes a real program: the collector, the workers, TLS and
+the rest of the runtime are linked into it, and it needs no compiler on the
+machine that runs it. Linking is done by `$CC`, or `cc`, against a
+`libwsharp_start.a` that `wsharp` looks for beside itself and under `../lib` —
+so an installation is a directory rather than a single file. `--emit=obj`
+stops at the relocatable object, which is the half that needs no C compiler.
 
 Anything after the file is the program's, not the compiler's, and reaches it
 through `std/os`:
@@ -531,13 +540,20 @@ whole graph.
 
 `ingot` is written in W#, which was the point rather than a flourish: a
 resolver, a hash, a protocol and a file format is a broad enough program to find
-out what the language is actually missing.
+out what the language is actually missing. It is now written in W# *all the way
+out* — there is no Rust driver behind it, and `cargo build` does not produce it.
+`wsharp build --module ingot/main -o ingot` does, which makes the package
+manager the first real user of the compiler's own `build`. The three things its
+driver used to do are W#'s now: `-C` is `os.chdir`, its diagnostics go to
+stderr, and `ingot run` becomes `wsharp run` through `os.exec` rather than
+embedding a compiler a W# program cannot have.
 
 ## How it works
 
 ```
 source ──► wsharp-syntax ──► wsharp-sema ──► wsharp-codegen ──► native code
-           lex, parse         infer, mono      Cranelift JIT
+           lex, parse         infer, mono      Cranelift: JIT
+                                               or object file
                                   │
                             wsharp-runtime
                     heap, collector, header, builtins
@@ -547,10 +563,10 @@ source ──► wsharp-syntax ──► wsharp-sema ──► wsharp-codegen �
 |---|---|
 | `wsharp-syntax` | Lexer, recursive-descent parser with Pratt-style precedence, spans, diagnostic rendering |
 | `wsharp-sema` | Name resolution, Hindley-Milner inference, the subtype lattice, overload selection, typed HIR, monomorphisation, value layout |
-| `wsharp-codegen` | HIR to Cranelift IR, the dispatcher, the write barrier, stack-map harvesting, JIT module setup |
+| `wsharp-codegen` | HIR to Cranelift IR, the dispatcher, the write barrier, stack-map harvesting, and both backends — the JIT and the object writer, over one lowering |
 | `wsharp-runtime` | Object header, block/line heap, reference counting, the mark trace and its thread, evacuation, stack walker, type registry, builtins — a leaf crate with no dependencies at all |
-| `wsharp-cli` | The `wsharp` binary, the module loader, and the end-to-end test suite |
-| `ingot` | The `ingot` binary: two hundred lines of Rust over `ingot/main.ws` |
+| `wsharp-cli` | The `wsharp` binary, the module loader, the linker driver, and the end-to-end test suites |
+| `wsharp-start` | The `main` a compiled program starts in, and the archive it links against — `wsharp-runtime` bundled with a startup that installs the emitted tables |
 
 A few decisions worth knowing about:
 

@@ -63,6 +63,69 @@ pub fn cwd() !str {
     return raw_cwd();
 }
 
+/// Run `program` instead of this one, and never come back.
+///
+/// Answers only on failure -- on success there is nobody left to answer to,
+/// which is why the result is `!void` and not a status.
+///
+/// `args` is what the new program sees as *its* arguments, without its own
+/// name: the name is `program`, and the runtime writes it in front. So this
+/// composes with `args()` above rather than with C's convention.
+///
+/// Windows has no `exec`. Its arm runs the program, waits, and exits with its
+/// status -- the same thing from outside, except that the process id changes.
+///
+/// The array is packed here rather than read by the builtin, and that is the
+/// load barrier's rule rather than a convenience: a `[]str` holds references,
+/// every reference generated code loads goes through the barrier, and a Rust
+/// function reaching into the array would have no way to resolve one the
+/// collector had already moved. Packing in W# means the barrier applies by
+/// construction and the builtin is handed bytes, which is all it may touch.
+pub fn exec(program: str, args: []str) !void {
+    return raw_exec(program, pack(args));
+}
+
+/// Work from somewhere else, as `git -C` does.
+///
+/// Process-wide, and meant to be called once before anything else: a program
+/// that changed directory half way through would make every relative path in
+/// it depend on when it was reached.
+pub fn chdir(dir: str) !void {
+    return raw_chdir(dir);
+}
+
+/// The path of the running executable.
+///
+/// What a tool needs to find something installed beside it. Not `args()[0]` --
+/// there is no such thing here, because the name is never in the list, and it
+/// would be a bare word for anything found on `PATH` anyway.
+///
+/// Raises `NotFound` on OpenBSD, which does not keep the answer.
+pub fn self_exe() !str {
+    return raw_self_exe();
+}
+
+/// The inverse of `unpack`: four-byte big-endian lengths and their bytes.
+///
+/// Written here because `exec` needs it and because the runtime cannot build
+/// it: the same split, in the same direction, as everything else that crosses
+/// this boundary carrying a list of strings.
+pub fn pack(items: []str) str {
+    var total = 0;
+    const n = array.len(items);
+    var i = 0;
+    while (i < n) : (i += 1) {
+        total += 4 + text.len(items[i]);
+    }
+    const b = bytes.buf(total);
+    i = 0;
+    while (i < n) : (i += 1) {
+        bytes.put_u32(b, u32(text.len(items[i])));
+        bytes.put_str(b, items[i]);
+    }
+    return bytes.to_str(bytes.taken(b));
+}
+
 /// Where this system keeps files nobody intends to keep.
 ///
 /// `TMPDIR` is what macOS and the BSDs set, `TMP` and `TEMP` are what Windows

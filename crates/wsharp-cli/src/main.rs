@@ -8,15 +8,18 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use wsharp_cli::{Emit, Root, drive};
+use wsharp_cli::{Action, Emit, Root, drive};
 
 /// Printed after the option list, since the collector's switches are
 /// environment variables rather than flags: they are read by the runtime,
 /// which a compiled program reaches without going through this driver.
 const AFTER_HELP: &str = "\
 Environment:
-  WSHARP_GC_STATS=1  print collector statistics on exit
-  WSHARP_GC_TRACE=1  print every frame the root walk visits";
+  WSHARP_GC_STATS=1   print collector statistics on exit
+  WSHARP_GC_TRACE=1   print every frame the root walk visits
+  WSHARP_GC_STRESS=1  collect at every allocation; what `run --gc-stress`
+                      does, and the only way to ask a built program for it
+  WSHARP_RUNTIME_LIB  the runtime archive `build` links against";
 
 #[derive(Parser)]
 #[command(
@@ -60,18 +63,75 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Compile a program to a native executable.
+    ///
+    /// The result needs no compiler to run: the runtime and the collector are
+    /// linked into it. Linking is done by `$CC`, or `cc`.
+    Build {
+        /// The program to compile. Omit only when `--module` names one.
+        file: Option<PathBuf>,
+        /// Compile a library module instead of a file, as `ingot/main` is.
+        #[arg(long, conflicts_with = "file")]
+        module: Option<String>,
+        /// Where to write the executable.
+        #[arg(short, long)]
+        out: PathBuf,
+        /// Print an intermediate form instead of building.
+        ///
+        /// `--emit=obj` writes the relocatable object to `--out` and does not
+        /// link, which is the half of this that needs no C compiler.
+        #[arg(long, value_enum)]
+        emit: Option<Emit>,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let (path, emit, gc_stress, run, args) = match cli.command {
-        Command::Check { file, emit } => (file, emit, false, false, Vec::new()),
+
+    // `build` is the one subcommand that neither runs the program nor takes
+    // its arguments, and the one that can be rooted at a module rather than a
+    // file -- so it is handled on its own rather than folded into the tuple
+    // the other two share.
+    if let Command::Build {
+        file,
+        module,
+        out,
+        emit,
+    } = cli.command
+    {
+        let result = match (&file, &module) {
+            (Some(path), _) => drive(
+                Root::File(path),
+                emit,
+                false,
+                Action::Build { out: out.clone() },
+            ),
+            (None, Some(name)) => drive(
+                Root::Module(name),
+                emit,
+                false,
+                Action::Build { out: out.clone() },
+            ),
+            (None, None) => Err("`build` needs a file, or `--module`".to_string()),
+        };
+        return match result {
+            Ok(code) => code,
+            Err(message) => {
+                eprintln!("error: {message}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    let (path, emit, gc_stress, action, args) = match cli.command {
+        Command::Check { file, emit } => (file, emit, false, Action::Check, Vec::new()),
         Command::Run {
             file,
             emit,
             gc_stress,
             args,
-        } => (file, emit, gc_stress, true, args),
+        } => (file, emit, gc_stress, Action::Run, args),
+        Command::Build { .. } => unreachable!("handled above"),
     };
     // Published before anything is compiled, let alone run: `os.raw_args`
     // reads process-wide storage that is written once, in the same class as
@@ -85,7 +145,7 @@ fn main() -> ExitCode {
     }
     wsharp_runtime::os::set_args(args.into_iter().map(String::into_bytes).collect());
 
-    match drive(Root::File(&path), emit, gc_stress, run) {
+    match drive(Root::File(&path), emit, gc_stress, action) {
         Ok(code) => code,
         Err(message) => {
             eprintln!("error: {message}");

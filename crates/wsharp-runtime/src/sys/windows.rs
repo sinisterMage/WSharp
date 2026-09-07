@@ -65,7 +65,25 @@ unsafe extern "system" {
     fn FindClose(handle: HANDLE) -> BOOL;
     fn GetEnvironmentVariableW(name: *const u16, buf: *mut u16, size: DWORD) -> DWORD;
     fn GetCurrentDirectoryW(size: DWORD, buf: *mut u16) -> DWORD;
+    fn SetCurrentDirectoryW(path: *const u16) -> BOOL;
+    /// With a null module, the running executable's own path. Answers with
+    /// how much it wrote, and *truncates* when the buffer is too small --
+    /// which it reports by writing exactly `size` characters, the same way
+    /// `readlink` does on Linux.
+    fn GetModuleFileNameW(module: HANDLE, buf: *mut u16, size: DWORD) -> DWORD;
+    fn ExitProcess(code: DWORD) -> !;
+    /// The C runtime's, not Win32's. Windows has no `exec`, and this is the
+    /// nearest thing: it starts the program, waits for it, and answers with
+    /// its exit status. `_P_WAIT` is the mode; the vectors are terminated.
+    ///
+    /// Named with a leading underscore because that is the name the CRT
+    /// exports -- `spawnvp` without one is the deprecated alias.
+    #[link_name = "_wspawnvp"]
+    fn wspawnvp(mode: c_int, file: *const u16, argv: *const *const u16) -> isize;
 }
+
+/// `_wspawnvp`'s "run it and wait", which is how this arm spells `exec`.
+const P_WAIT: c_int = 0;
 
 /// What `GetFileAttributesExW` fills in at `GetFileExInfoStandard`.
 ///
@@ -527,6 +545,63 @@ pub(crate) fn cwd(_room: usize) -> Result<Option<Vec<u8>>, Errno> {
     }
     buf.truncate(written as usize);
     Ok(Some(narrow(&buf)))
+}
+
+pub(crate) fn chdir(path: &[u8]) -> Result<(), Errno> {
+    let path = wide_path(path)?;
+    if unsafe { SetCurrentDirectoryW(path.as_ptr()) } == 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// The running executable.
+///
+/// Truncation is reported by filling the buffer exactly, so that counts as
+/// "not enough room" and [`super::self_exe`] asks again -- the same shape the
+/// Linux arm's `readlink` has, for the same reason.
+pub(crate) fn self_exe(room: usize) -> Result<Option<Vec<u8>>, Errno> {
+    let mut buf = vec![0u16; room];
+    let written = unsafe { GetModuleFileNameW(core::ptr::null_mut(), buf.as_mut_ptr(), room as DWORD) };
+    if written == 0 {
+        return Err(last_error());
+    }
+    if written as usize >= room {
+        return Ok(None);
+    }
+    buf.truncate(written as usize);
+    Ok(Some(narrow(&buf)))
+}
+
+/// Run a program and become its exit status.
+///
+/// Windows has no `exec`: a process cannot replace itself. Waiting and then
+/// exiting with the child's status is observationally the same for a command
+/// line tool, and differs in two ways worth knowing -- the process id changes,
+/// and anything waiting on *this* process sees it exit normally rather than
+/// being replaced.
+///
+/// Answers only on failure, like the Unix arms, because the success path ends
+/// in [`ExitProcess`].
+pub(crate) fn exec(program: &[u8], argv: &[Vec<u8>]) -> Errno {
+    let Ok(program) = wide_path(program) else {
+        return Errno(ERROR_FILE_NOT_FOUND);
+    };
+    // The terminated copies must outlive the vector of pointers into them.
+    let mut owned: Vec<Vec<u16>> = Vec::with_capacity(argv.len());
+    for arg in argv {
+        match wide_path(arg) {
+            Ok(a) => owned.push(a),
+            Err(e) => return e,
+        }
+    }
+    let mut pointers: Vec<*const u16> = owned.iter().map(|a| a.as_ptr()).collect();
+    pointers.push(core::ptr::null());
+    let status = unsafe { wspawnvp(P_WAIT, program.as_ptr(), pointers.as_ptr()) };
+    if status < 0 {
+        return last_error();
+    }
+    unsafe { ExitProcess(status as DWORD) }
 }
 
 // ---------------------------------------------------------------------------

@@ -55,6 +55,36 @@ Things in this version that differ from older tutorials, each of which cost time
 | `ishl` / `ushr` / `sshr` / `rotl` / `rotr` | The shift or rotate amount is **masked to the operand's width**, so `x << 64` on a `u64` is `x`. Documented for the shifts; for the rotates it is established by `isle_prelude.rs`'s constant folding and both backends' lowering rather than by the doc comment. |
 | `sdiv` / `udiv` | Both trap, and a trap in a JIT with no signal handler is a bare SIGILL. The hand-rolled checks in `checked_div` are what turn those into panics that say something. `srem` defines `MIN % -1` as 0, and unsigned division cannot overflow at all. |
 
+## Two backends, one lowering
+
+`wsharp run` compiles into this process; `wsharp build` writes an object file
+and links it against `libwsharp_start.a` with `cc`. Both go through
+`codegen::build`, which is generic over `cranelift_module::Module` and is the
+*only* place either backend's code comes from. Nothing below it may ask which
+backend it is in -- that would be the first of two lowerings, and the second
+would drift.
+
+What actually differs is one flag and where the tables go:
+
+| | `compile_jit` | `compile_object` |
+|---|---|---|
+| `is_pic` | `false` — cranelift-jit **asserts** this | `true` |
+| Runtime symbols | resolved to addresses via `JITBuilder::symbol` | left to the linker |
+| Type registry, stack maps, services | `register_type`/`register_code`/`register_services`, in process | emitted as data, read at startup by `runtime::aot` |
+| Entry | `transmute` and call | a `ws_main` shim, called by `wsharp-start`'s `main` |
+
+Things that will bite:
+
+| Thing | Reality |
+|---|---|
+| A new runtime entry point | Needs `#[unsafe(no_mangle)]` *and* a `link:` in its `Builtin` row. Under the JIT a missing one is a symbol panic at compile time; under AOT it is a link error at the far end of a build. A test asserts every `link` is well formed and its own. |
+| A new absolute address in generated code | There must not be one. The two GC flag bytes are `Linkage::Import` data reached with `symbol_value`, because an `iconst` of an address works under the JIT and is a wild pointer in a built program. |
+| `Linkage::Import` data under `is_pic` | Emits `R_X86_64_GOTPCREL`, which the linker *relaxes* to a RIP-relative `lea` because the flag is in the same static link unit. That is what keeps the load barrier's fast path one `lea` and one byte load. Check it with `readelf -r` on the linked binary, not on the object: the object always shows the GOT form. |
+| The three emitted tables | Sequential little-endian streams, defined once in `wsharp-runtime/src/aot.rs` and written by `wsharp-codegen/src/tables.rs`. Only code addresses are relocations. Adding a field means the writer, the reader, and the round-trip tests -- which drive the *real* reader over the writer's bytes, so there is no second implementation to keep in step. |
+| `MAGIC`/`VERSION` in those tables | The only guard against a program built by one compiler and linked against another's runtime. Bump `VERSION` when the layout changes. |
+| `crates/wsharp-start` | Defines `main`, so it sets `test = false`: a test harness brings its own `main` and the linker refuses two. It must be built with `-Cforce-frame-pointers=yes` or the collector's root walk breaks at its first Rust frame. |
+| `cargo build` and `ingot` | Does not produce it any more. `ingot` is `wsharp build --module ingot/main -o ingot`, and `crates/wsharp-cli/tests/verbs.rs` bootstraps one to test against. |
+
 ## The operating system
 
 `crates/wsharp-runtime/src/sys/` declares it by hand: three arms named for what
@@ -681,7 +711,7 @@ extra `sin_len` byte out of this code entirely.
   undeclared dependency would work until something else stopped needing it. The
   owner of a file is the entry whose directory is the *longest* prefix of it:
   longest, because `WSHARP_HOME` may sit inside the project, which is where
-  `crates/ingot/tests/verbs.rs` puts it.
+  `crates/wsharp-cli/tests/verbs.rs` puts it.
 - **A package presents one file.** `Manifest.root` is the facade, and nothing
   outside can name any other file in the tree -- `@import("util/inside")` is
   not a spelling. What a package of several files shows is what its facade
@@ -691,6 +721,28 @@ extra `sin_len` byte out of this code entirely.
   into declared locals before the first safepoint and `env` is never read
   again, so it is not a root and need not be. Re-reading it after a call would
   be a use-after-move.
+- **Generated code names runtime state by symbol, never by address.** The two
+  flag bytes the barriers read -- `ws_gc_poll_flag` and
+  `ws_gc_evacuating_flag` -- are exported statics declared as imported data and
+  reached with `symbol_value`, exactly as a string literal is. They used to be
+  `iconst`s of `&POLL_FLAG`, which is correct in a JIT and meaningless in a
+  file some other process will load. They are the *only* runtime state a
+  compiled program reaches without a call, which is why their names are
+  constants both halves read rather than strings written twice.
+- **A builtin takes a list of strings as one blob, for the reason it answers
+  with one.** `os.exec` could have taken a `[]str` and read the elements in
+  Rust; that would be reading *references* by a route the load barrier does not
+  cover, and one the collector had already moved would be a stale pointer
+  handed to `execvp`. So `std/os.pack` builds the same four-byte big-endian
+  framing `raw_args` and `raw_read_dir` answer with, in W#, where the barrier
+  applies by construction -- and the builtin is left with bytes. The rule is
+  the one it always was, read in the other direction.
+- **`ingot` is a W# program, and `wsharp` is what compiles it.** Its Rust
+  driver is gone: `-C` is `os.chdir`, the verb list is `ingot/main.ws`'s, and
+  `ingot run` *becomes* `wsharp run` through `os.exec` rather than embedding a
+  compiler it cannot have. So `cargo build` no longer produces `ingot`, a
+  release bootstraps it, and the compiler is looked for beside the binary
+  before `PATH`.
 
 ## Testing
 
@@ -729,7 +781,8 @@ nix-shell --run "cargo test --workspace"
   `tests/cases/ingot_*.ws` reaches the store and the manifest reader directly
   and gets the `--gc-stress` pass for free. What a case cannot reach is the
   tool -- a verb reads a directory, writes two files and answers with an exit
-  status -- so `crates/ingot/tests/verbs.rs` drives the built binary with
+  status -- so `crates/wsharp-cli/tests/verbs.rs` builds one with `wsharp build
+  --module ingot/main` and drives it with
   `-C <dir>` and `WSHARP_HOME` pointed inside a temporary directory.
 - **A case cannot expect leading *or* trailing whitespace.**
   `parse_expectations` trims each header line, so a tab-separated row with an
@@ -790,6 +843,18 @@ nix-shell --run "cargo test --workspace"
   `i64`, so a `u8` is written `print_int(i64(x))`; `print_uint` exists for the
   half of `u64`'s range an `i64` cannot hold. Conversions are written and never
   inferred, which is the same rule the language gives its users.
+- **The whole case suite runs a third time, compiled.**
+  `every_case_behaves_the_same_built_as_run` builds each case with `wsharp
+  build` and runs the executable, holding it to the same header. That is the
+  only thing that exercises the object backend, the three tables as data, the
+  relocations a linker fills in, and the `main` in `wsharp-start` -- a JIT pass
+  reaches none of them. It costs one `cc` per case and about a minute.
+  `the_collector_survives_stress_in_a_built_program` then runs the `gc_*`
+  subset natively under `WSHARP_GC_STRESS=1`, because the stack maps are the
+  table where a serialisation mistake is silent rather than fatal.
+  `a_built_program_reports_the_collector_doing_its_work` reads the stats line
+  and insists the counts are non-zero, for the reason below: a stack-map table
+  that deserialised to nothing makes every root check pass vacuously.
 - **The whole case suite runs a second time under `--gc-stress`**, which
   collects at every allocation and checks every root the stack maps describe.
   This is the collector's main defence, because rooting is spread over every

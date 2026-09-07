@@ -4,6 +4,7 @@
 //! This is a leaf crate -- it depends on nothing else in the workspace, so both
 //! the type checker and the code generator can use it.
 
+pub mod aot;
 pub mod broker;
 pub mod builtins;
 pub mod bytes;

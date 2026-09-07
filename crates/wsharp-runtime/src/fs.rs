@@ -27,6 +27,7 @@ use crate::sys;
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `path` must be null or
 /// point at a W# string object.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_fs_mkdir(path: *const u8) -> i64 {
     unsafe { crate::gc::checkpoint() };
     let path = unsafe { str_bytes(path) }.to_vec();
@@ -41,6 +42,7 @@ pub unsafe extern "C" fn ws_fs_mkdir(path: *const u8) -> i64 {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `path` must be null or
 /// point at a W# string object.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_fs_rmdir(path: *const u8) -> i64 {
     unsafe { crate::gc::checkpoint() };
     let path = unsafe { str_bytes(path) }.to_vec();
@@ -55,6 +57,7 @@ pub unsafe extern "C" fn ws_fs_rmdir(path: *const u8) -> i64 {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `path` must be null or
 /// point at a W# string object.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_fs_remove(path: *const u8) -> i64 {
     unsafe { crate::gc::checkpoint() };
     let path = unsafe { str_bytes(path) }.to_vec();
@@ -69,6 +72,7 @@ pub unsafe extern "C" fn ws_fs_remove(path: *const u8) -> i64 {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; both arguments must be
 /// null or point at W# string objects.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_fs_rename(from: *const u8, to: *const u8) -> i64 {
     unsafe { crate::gc::checkpoint() };
     let from = unsafe { str_bytes(from) }.to_vec();
@@ -87,6 +91,7 @@ pub unsafe extern "C" fn ws_fs_rename(from: *const u8, to: *const u8) -> i64 {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `path` must be null or
 /// point at a W# string object.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_fs_is_dir(path: *const u8) -> bool {
     unsafe { crate::gc::checkpoint() };
     let path = unsafe { str_bytes(path) }.to_vec();
@@ -99,6 +104,7 @@ pub unsafe extern "C" fn ws_fs_is_dir(path: *const u8) -> bool {
 /// Called from JIT-compiled code across an FFI boundary; `path` must be null or
 /// point at a W# string object, and `out` must point at storage laid out as a
 /// [`FallibleI64`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_fs_size(out: *mut FallibleI64, path: *const u8) {
     unsafe { crate::gc::checkpoint() };
     let path = unsafe { str_bytes(path) }.to_vec();
@@ -125,6 +131,7 @@ pub unsafe extern "C" fn ws_fs_size(out: *mut FallibleI64, path: *const u8) {
 /// Called from JIT-compiled code across an FFI boundary; `path` must be null or
 /// point at a W# string object, and `out` must point at storage laid out as a
 /// [`FallibleStr`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_fs_raw_read_dir(out: *mut FallibleStr, path: *const u8) {
     unsafe { crate::gc::checkpoint() };
     let path = unsafe { str_bytes(path) }.to_vec();

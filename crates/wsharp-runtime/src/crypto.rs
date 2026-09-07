@@ -28,6 +28,7 @@ use crate::sys;
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `out` must point at
 /// storage laid out as a [`FallibleStr`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_crypto_random(out: *mut FallibleStr, n: i64) {
     unsafe { crate::gc::checkpoint() };
     let n = n.clamp(0, MAX_RANDOM) as usize;
@@ -53,6 +54,7 @@ const MAX_RANDOM: i64 = 1 << 20;
 /// to report that it did not. A clock that is simply wrong is not a failure
 /// this layer can detect, and a caller checking a certificate's validity is
 /// already the thing that decides whether the answer is believable.
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_time_now() -> i64 {
     unsafe { crate::gc::checkpoint() };
     sys::wall_clock_secs()
@@ -77,6 +79,7 @@ pub extern "C" fn ws_time_now() -> i64 {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `out` must point at
 /// storage laid out as a [`FallibleStr`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_crypto_system_roots(out: *mut FallibleStr) {
     unsafe { crate::gc::checkpoint() };
     let roots = crate::worker::blocking(sys::system_roots);

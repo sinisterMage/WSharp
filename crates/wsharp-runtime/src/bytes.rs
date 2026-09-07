@@ -55,6 +55,7 @@ pub(crate) fn check_span(at: i64, n: i64, len: i64) {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `b` must be null or
 /// point at a W# `[]u8`.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_bytes_to_str(b: *const u8, from: i64, to: i64) -> *mut u8 {
     unsafe { crate::gc::checkpoint() };
     let elems = unsafe { elements(b) };
@@ -72,6 +73,7 @@ pub unsafe extern "C" fn ws_bytes_to_str(b: *const u8, from: i64, to: i64) -> *m
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `dst` must be null or
 /// point at a W# `[]u8` and `src` null or a W# `str`.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_bytes_from_str(dst: *mut u8, at: i64, src: *const u8) {
     unsafe { crate::gc::checkpoint() };
     let src_len = unsafe { str_bytes(src) }.len() as i64;
@@ -95,6 +97,7 @@ pub unsafe extern "C" fn ws_bytes_from_str(dst: *mut u8, at: i64, src: *const u8
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; both must be null or
 /// point at a W# `[]u8`.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_bytes_copy(
     dst: *mut u8,
     dst_at: i64,
@@ -133,6 +136,7 @@ pub unsafe extern "C" fn ws_bytes_copy(
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; both must be null or
 /// point at a W# `[]u8`.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_bytes_equal(a: *const u8, b: *const u8) -> bool {
     unsafe { crate::gc::checkpoint() };
     let (a, b) = unsafe { (elements(a), elements(b)) };

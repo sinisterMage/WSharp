@@ -9,9 +9,50 @@
 //! Every project is built under a directory of its own with random bytes in its
 //! name, and `WSHARP_HOME` points at a store inside it -- so the tests neither
 //! see each other nor touch the developer's real store.
+//!
+//! # Where `ingot` comes from
+//!
+//! It is not a cargo binary any more. `ingot` is a W# program -- `ingot/main`,
+//! compiled into `wsharp` along with the rest of the library -- and it is built
+//! by `wsharp build --module ingot/main`, which is what [`ingot`] below does
+//! once for the whole file. That is also how a release is made, so these tests
+//! drive the same artefact a user gets rather than one made another way.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
+
+/// The `ingot` binary, built from W# on first use.
+///
+/// Once per test *binary* rather than per test, because building it is a
+/// compile and a link and every test here wants the same one.
+fn ingot() -> &'static Path {
+    static BUILT: OnceLock<PathBuf> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("ingot-build-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a directory to build in");
+        let exe = dir.join(format!("ingot{}", std::env::consts::EXE_SUFFIX));
+        let out = Command::new(env!("CARGO_BIN_EXE_wsharp"))
+            .arg("build")
+            .arg("--module")
+            .arg("ingot/main")
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .expect("wsharp runs");
+        assert!(
+            out.status.success(),
+            "could not build ingot from `ingot/main`:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Beside it, because `ingot run` looks for the compiler there first --
+        // and because that is the layout a release has.
+        let beside = dir.join(format!("wsharp{}", std::env::consts::EXE_SUFFIX));
+        let _ = std::fs::remove_file(&beside);
+        std::fs::copy(env!("CARGO_BIN_EXE_wsharp"), &beside).expect("a compiler beside it");
+        exe
+    })
+}
 
 /// What `ingot verify` answers with. Spelled out rather than imported: the test
 /// should see what a script sees.
@@ -79,12 +120,8 @@ impl Project {
     /// verb to build a project somebody else installed, because everything it
     /// needs is in the `ingot.env` beside the lockfile.
     ///
-    /// Found beside `ingot` rather than through `CARGO_BIN_EXE_wsharp`, which
-    /// cargo only defines for a binary of the crate the test is in.
     fn compile(&self, file: &Path) -> Output {
-        let mut wsharp = PathBuf::from(env!("CARGO_BIN_EXE_ingot"));
-        wsharp.set_file_name(format!("wsharp{}", std::env::consts::EXE_SUFFIX));
-        Command::new(wsharp)
+        Command::new(env!("CARGO_BIN_EXE_wsharp"))
             .env("WSHARP_HOME", self.store())
             .arg("run")
             .arg(file)
@@ -93,7 +130,7 @@ impl Project {
     }
 
     fn run(&self, dir: &Path, args: &[&str]) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ingot"));
+        let mut command = Command::new(ingot());
         command
             .env("WSHARP_HOME", self.store())
             .arg("-C")
@@ -339,8 +376,9 @@ fn a_verb_that_cannot_be_carried_out_says_why() {
     let out = project.run(&app, &["verify"]);
     assert_eq!(out.status.code(), Some(BROKEN));
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("ingot init"),
-        "the message says what to do"
+        String::from_utf8_lossy(&out.stderr).contains("ingot init"),
+        "the message says what to do, on the error stream:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 
     project.expect(&app, &["init", "myapp"], READY);
@@ -352,9 +390,9 @@ fn a_verb_that_cannot_be_carried_out_says_why() {
     let out = project.run(&app, &["resolve"]);
     assert_eq!(out.status.code(), Some(FAILED));
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("cannot yet fetch"),
-        "stdout was:\n{}",
-        String::from_utf8_lossy(&out.stdout)
+        String::from_utf8_lossy(&out.stderr).contains("cannot yet fetch"),
+        "stderr was:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
     project.expect(&app, &["remove", "acme/json"], READY);
     project.expect(&app, &["remove", "acme/json"], FAILED);
@@ -364,9 +402,9 @@ fn a_verb_that_cannot_be_carried_out_says_why() {
     let out = project.run(&app, &["resolve"]);
     assert_eq!(out.status.code(), Some(FAILED));
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("whose package is called core"),
-        "stdout was:\n{}",
-        String::from_utf8_lossy(&out.stdout)
+        String::from_utf8_lossy(&out.stderr).contains("whose package is called core"),
+        "stderr was:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 
     project.expect(&app, &["nonsense"], FAILED);
@@ -397,10 +435,10 @@ fn a_requirement_that_cannot_be_met_is_explained() {
     project.expect(&app, &["add", "elsewhere", "^2.0.0"], READY);
     let out = project.run(&app, &["resolve"]);
     assert_eq!(out.status.code(), Some(FAILED));
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
-        stdout.contains("cannot yet fetch"),
-        "a dependency with no source says so:\n{stdout}"
+        stderr.contains("cannot yet fetch"),
+        "a dependency with no source says so:\n{stderr}"
     );
     project.expect(&app, &["remove", "elsewhere"], READY);
     project.expect(&app, &["resolve"], READY);
@@ -414,11 +452,11 @@ fn a_requirement_that_cannot_be_met_is_explained() {
     .expect("an edit");
     let out = project.run(&app, &["resolve"]);
     assert_eq!(out.status.code(), Some(FAILED));
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
-        stdout.contains("no versions of core match >=2.0.0 <3.0.0")
-            && stdout.contains("util 0.3.0 depends on core >=2.0.0 <3.0.0"),
-        "the solver explains itself:\n{stdout}"
+        stderr.contains("no versions of core match >=2.0.0 <3.0.0")
+            && stderr.contains("util 0.3.0 depends on core >=2.0.0 <3.0.0"),
+        "the solver explains itself:\n{stderr}"
     );
 }
 

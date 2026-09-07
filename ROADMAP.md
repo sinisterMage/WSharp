@@ -2328,6 +2328,96 @@ are not polish here; they are the feature.
 
 ---
 
+## 12. Ahead-of-time compilation — **done**
+
+Every item before this produced a program that ran *inside the compiler*. That
+is the right shape for testing a language and the wrong one for using it: a
+user could not hand anybody a binary, every run paid for parsing, inference,
+monomorphisation and code generation, and a machine that ran a W# program
+needed the whole of Cranelift on it. `wsharp build` is the answer, and
+`ingot` -- which had a Rust driver for exactly this reason -- is what proves it.
+
+| Stage | What it is | State |
+|---|---|---|
+| One | One lowering, generic over `Module` | **done** |
+| Two | A linker name for every runtime entry point | **done** |
+| Three | The two collector flags as symbols rather than addresses | **done** |
+| Four | The type registry, the stack maps and the services as data | **done** |
+| Five | The object backend, the startup archive, and `wsharp build` | **done** |
+| Six | `ingot` without a Rust entrypoint | **done** |
+
+### What was actually in the way
+
+Not code generation. Cranelift emits an object file about as readily as it
+fills memory, and `cranelift-object` is the same `Module` trait `cranelift-jit`
+implements -- stage one is a type parameter and five signatures. What was in
+the way is everything the JIT never had to say out loud, because the compiler
+and the program were the same process:
+
+- **Nothing had a linker name.** There was not one `#[no_mangle]` in the
+  workspace. The JIT takes the *address* of each runtime function and invents
+  the string name on the spot, so `std/str.len` was a fine symbol -- it only
+  ever had to be a `HashMap` key. Ninety-five entry points needed real names,
+  and a `link:` beside each `ptr:` so the two backends cannot disagree.
+- **Two addresses were compiled into the code.** The poll flag and the
+  evacuating flag are read by generated code directly, and their addresses were
+  `iconst`s -- correct in a JIT, and a wild pointer in a file another process
+  will load. They are exported statics now, declared as imported data and
+  reached with `symbol_value`, exactly as a string literal is.
+- **Three tables were handed over by calling a function.** The type registry,
+  the stack maps and the service table were built as Rust values and pushed
+  into the runtime. A compiled program has no compiler to push them, so they
+  are written into its data section and read back by a startup pass. Only code
+  addresses are relocations; everything else is a count or a byte.
+
+### The one number worth checking
+
+`R_X86_64_GOTPCREL`. Declaring the flags as imported data under `is_pic=true`
+emits a GOT reference, which would put an extra dependent load in front of
+*every heap reference the program loads* -- the hottest path in the language.
+The linker relaxes it to a RIP-relative `lea`, because the flag is in the same
+static link unit, and the linked binary has no GOT relocation for it at all.
+Worth knowing that the check is on the executable and not on the object: the
+object always shows the GOT form.
+
+### What it costs
+
+An installation is a *directory* now. `wsharp build` links, so it needs a C
+compiler and something to link against -- `libwsharp_start.a`, which is
+`wsharp-runtime` bundled with the `main` a compiled program starts in. The
+standard library is still `include_str!`'d into the compiler, so the only thing
+that grew is a `lib/` beside the binary. A missing `cc` is a user-facing
+failure now rather than a build-time one, which is why it has a sentence of its
+own rather than an `os error 2`.
+
+Defining `main` in that archive means Rust's `lang_start` never runs. Panics,
+unwinding, backtraces, threads and stdout all survive it; the main thread's
+stack guard page does not, so a runaway recursion is a segfault rather than a
+message. It was a segfault under the JIT too.
+
+### Why `ingot` is the test
+
+Its Rust driver did three things a W# program could not: `-C`, `--gc-stress`,
+and `run`. Two were easy -- `os.chdir`, and a flag that only ever belonged to
+whatever was being run. The third was the interesting one, because `ingot run`
+compiles a program and a W# program has no compiler in it. Embedding one would
+have meant linking Cranelift into the package manager; the answer is that it
+*hands over*, replacing itself with `wsharp run` through a new `os.exec`. The
+user sees one process and one exit status either way.
+
+That made `os.exec` the first builtin to take a list of strings, and it takes
+one blob rather than a `[]str` for the mirror of the reason `os.raw_args`
+answers with one: reading references in Rust would bypass the load barrier, and
+one the collector had moved would be a stale pointer handed to `execvp`.
+
+The suite that proves all of this is the case suite, a third time: every one of
+the 209 cases is built to a native executable and held to the same header, and
+the `gc_*` subset runs again under `WSHARP_GC_STRESS=1`. A built `gc_moving.ws`
+reports the same 100 objects moved and the same 18 safepoints the JIT does,
+which is what says the stack maps survived being written to a file.
+
+---
+
 ## Smaller follow-ups
 
 These are deliberate limitations, each with a clear fix:

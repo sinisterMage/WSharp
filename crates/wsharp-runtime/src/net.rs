@@ -138,6 +138,7 @@ fn port_of(port: i64) -> Option<u16> {
 /// Called from JIT-compiled code across an FFI boundary; `host` must be null or
 /// point at a W# string object, and `out` at storage laid out as a
 /// [`FallibleI64`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_connect(out: *mut FallibleI64, host: *const u8, port: i64) {
     unsafe { crate::gc::checkpoint() };
     // Out of the heap before the safe region: nothing in there may touch it.
@@ -161,6 +162,7 @@ pub unsafe extern "C" fn ws_net_connect(out: *mut FallibleI64, host: *const u8, 
 ///
 /// # Safety
 /// As [`ws_net_connect`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_listen(
     out: *mut FallibleI64,
     host: *const u8,
@@ -188,6 +190,7 @@ pub unsafe extern "C" fn ws_net_listen(
 ///
 /// # Safety
 /// As [`ws_net_connect`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_accept(out: *mut FallibleI64, listener: i64) {
     unsafe { crate::gc::checkpoint() };
     let Some(fd) = lookup(listener, Kind::Listener) else {
@@ -207,6 +210,7 @@ pub unsafe extern "C" fn ws_net_accept(out: *mut FallibleI64, listener: i64) {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `out` must point at
 /// storage laid out as a [`crate::io::FallibleStr`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_read(out: *mut crate::io::FallibleStr, socket: i64, max: i64) {
     unsafe { crate::gc::checkpoint() };
     let Some(fd) = lookup(socket, Kind::Stream) else {
@@ -249,6 +253,7 @@ const MAX_READ: i64 = 1 << 20;
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `out` must point at
 /// storage laid out as a [`FallibleI64`] and `buf` must be null or a W# `[]u8`.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_read_into(
     out: *mut FallibleI64,
     socket: i64,
@@ -291,6 +296,7 @@ pub unsafe extern "C" fn ws_net_read_into(
 ///
 /// # Safety
 /// As [`ws_net_read_into`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_write_bytes(
     out: *mut FallibleI64,
     socket: i64,
@@ -319,6 +325,7 @@ pub unsafe extern "C" fn ws_net_write_bytes(
 ///
 /// # Safety
 /// As [`ws_net_connect`]; `bytes` must be null or a W# string object.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_write(out: *mut FallibleI64, socket: i64, bytes: *const u8) {
     unsafe { crate::gc::checkpoint() };
     let Some(fd) = lookup(socket, Kind::Stream) else {
@@ -338,6 +345,7 @@ pub unsafe extern "C" fn ws_net_write(out: *mut FallibleI64, socket: i64, bytes:
 ///
 /// # Safety
 /// As [`ws_net_connect`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_local_port(out: *mut FallibleI64, listener: i64) {
     unsafe { crate::gc::checkpoint() };
     let Some(fd) = lookup_any(listener) else {
@@ -359,6 +367,7 @@ pub unsafe extern "C" fn ws_net_local_port(out: *mut FallibleI64, listener: i64)
 ///
 /// # Safety
 /// As [`ws_net_connect`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_set_nonblocking(out: *mut FallibleI64, socket: i64, on: i8) {
     unsafe { crate::gc::checkpoint() };
     let Some(fd) = lookup_any(socket) else {
@@ -376,6 +385,7 @@ pub unsafe extern "C" fn ws_net_set_nonblocking(out: *mut FallibleI64, socket: i
 ///
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_close(socket: i64) {
     unsafe { crate::gc::checkpoint() };
     let taken = with_sockets(|table| {
@@ -399,6 +409,7 @@ pub unsafe extern "C" fn ws_net_close(socket: i64) {
 ///
 /// # Safety
 /// As [`ws_net_connect`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_udp(out: *mut FallibleI64, host: *const u8, port: i64) {
     unsafe { crate::gc::checkpoint() };
     let host = unsafe { str_bytes(host) }.to_vec();
@@ -420,6 +431,7 @@ pub unsafe extern "C" fn ws_net_udp(out: *mut FallibleI64, host: *const u8, port
 ///
 /// # Safety
 /// As [`ws_net_connect`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_send_to(
     out: *mut FallibleI64,
     socket: i64,
@@ -463,6 +475,7 @@ pub unsafe extern "C" fn ws_net_send_to(
 ///
 /// # Safety
 /// As [`ws_net_connect`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_send_peer(
     out: *mut FallibleI64,
     socket: i64,
@@ -492,6 +505,7 @@ pub unsafe extern "C" fn ws_net_send_peer(
 ///
 /// # Safety
 /// As [`ws_net_read`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_recv_from(out: *mut crate::io::FallibleStr, socket: i64, max: i64) {
     unsafe { crate::gc::checkpoint() };
     let Some(fd) = lookup(socket, Kind::Datagram) else {
@@ -520,6 +534,7 @@ pub unsafe extern "C" fn ws_net_recv_from(out: *mut crate::io::FallibleStr, sock
 ///
 /// # Safety
 /// As [`ws_net_connect`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_last_peer(out: *mut FallibleI64, socket: i64) {
     unsafe { crate::gc::checkpoint() };
     let peer = with_sockets(|table| {
@@ -579,6 +594,7 @@ fn with_watch<R>(handle: i64, f: impl FnOnce(&mut Watch) -> R) -> Option<R> {
 ///
 /// # Safety
 /// As [`ws_net_connect`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_poller(out: *mut FallibleI64) {
     unsafe { crate::gc::checkpoint() };
     let result = match sys::Poller::new() {
@@ -602,6 +618,7 @@ pub unsafe extern "C" fn ws_net_poller(out: *mut FallibleI64) {
 ///
 /// # Safety
 /// As [`ws_net_connect`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_watch(
     out: *mut FallibleI64,
     poller: i64,
@@ -633,6 +650,7 @@ pub unsafe extern "C" fn ws_net_watch(
 ///
 /// # Safety
 /// As [`ws_net_connect`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_forget(out: *mut FallibleI64, poller: i64, socket: i64) {
     unsafe { crate::gc::checkpoint() };
     let done = with_watch(poller, |watch| {
@@ -660,6 +678,7 @@ pub unsafe extern "C" fn ws_net_forget(out: *mut FallibleI64, poller: i64, socke
 ///
 /// # Safety
 /// As [`ws_net_connect`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_wait(out: *mut FallibleI64, poller: i64, timeout_ms: i64) {
     unsafe { crate::gc::checkpoint() };
     let timeout = timeout_ms.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
@@ -691,6 +710,7 @@ pub unsafe extern "C" fn ws_net_wait(out: *mut FallibleI64, poller: i64, timeout
 ///
 /// # Safety
 /// As [`ws_net_connect`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_ready_socket(out: *mut FallibleI64, poller: i64, index: i64) {
     unsafe { crate::gc::checkpoint() };
     let found = with_watch(poller, |watch| {
@@ -713,6 +733,7 @@ pub unsafe extern "C" fn ws_net_ready_socket(out: *mut FallibleI64, poller: i64,
 ///
 /// # Safety
 /// As [`ws_net_connect`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_ready_events(out: *mut FallibleI64, poller: i64, index: i64) {
     unsafe { crate::gc::checkpoint() };
     let found = with_watch(poller, |watch| {
@@ -732,6 +753,7 @@ pub unsafe extern "C" fn ws_net_ready_events(out: *mut FallibleI64, poller: i64,
 ///
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_close_poller(poller: i64) {
     unsafe { crate::gc::checkpoint() };
     with_pollers(|table| {

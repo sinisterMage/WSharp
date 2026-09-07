@@ -45,10 +45,37 @@ pub const BROKEN = 3;
 pub const FAILED = 4;
 
 fn main() i64 {
-    const args = os.args();
+    // `--gc-stress` belongs to whatever is being run rather than to a verb, so
+    // it is taken out wherever it appears and handed to `run` if that is where
+    // we end up. No verb of ours has an opinion about it.
+    const raw = os.args();
+    const stress = mentions(raw, "--gc-stress");
+    var args = without(raw, "--gc-stress");
+
+    // `-C <dir>` works from somewhere else, as `git -C` does. First position
+    // only, and handled here rather than in a verb because a process has one
+    // working directory: changing it half way through would be a thing every
+    // path in every verb had to know about.
+    if (array.len(args) >= 1 and text.eq(args[0], "-C")) {
+        if (array.len(args) < 2) {
+            print_err("ingot: `-C` needs a directory");
+            return FAILED;
+        }
+        os.chdir(args[1]) catch {
+            print_err(text.concat("ingot: cannot work in ", args[1]));
+            return FAILED;
+        };
+        args = array.slice(args, 2, array.len(args));
+    }
+
     if (array.len(args) == 0) { usage(); return FAILED; }
     const verb = args[0];
     const rest = array.slice(args, 1, array.len(args));
+
+    // The one verb that is the compiler, and so the one that is not ours to
+    // carry out: this binary is a W# program and has no compiler inside it.
+    // It becomes `wsharp run` instead, which is the same JIT by the same name.
+    if (text.eq(verb, "run")) { return run_program(rest, stress); }
 
     const f = fault.none();
     var code = FAILED;
@@ -67,10 +94,98 @@ fn main() i64 {
         fault.fail(f, text.concat(text.concat("no such verb: `", verb), "`"));
     }
     if (!f.ok) {
-        print(text.concat("ingot: ", f.message));
+        // The error stream, so that a shell redirecting a verb's output still
+        // sees why it got none. Every verb's *answer* is on stdout.
+        print_err(text.concat("ingot: ", f.message));
         if (code == OK) { code = FAILED; }
     }
     return code;
+}
+
+// ---------------------------------------------------------------------------
+// run, which is the compiler's
+// ---------------------------------------------------------------------------
+
+/// `ingot run <file.ws> [args]`, by becoming `wsharp run`.
+///
+/// This used to be a Rust driver's, and for a good reason: the binary embedded
+/// the compiler and a W# program has no way to ask for one. It still has no
+/// way, so the answer is not to embed it but to hand over -- `exec` replaces
+/// this process with the compiler, which JITs and runs the program exactly as
+/// it always did. The user sees one process and one exit status either way.
+///
+/// Answers only if `exec` fails, because on success there is nobody here to
+/// answer.
+fn run_program(rest: []str, stress: bool) i64 {
+    if (array.len(rest) == 0) {
+        print_err("ingot: `run` needs a file");
+        return FAILED;
+    }
+    // A leading `--` is this driver's punctuation, not the program's first
+    // argument -- the same rule `wsharp run` applies.
+    var forward = []str{ "run" };
+    if (stress) { forward = array.push(forward, "--gc-stress"); }
+    forward = array.concat(forward, rest);
+
+    const wsharp = compiler();
+    os.exec(wsharp, forward) catch {
+        print_err(text.concat("ingot: cannot run the compiler at ", wsharp));
+        return FAILED;
+    };
+    // `exec` does not come back, so reaching here is itself the failure.
+    return FAILED;
+}
+
+/// Where the compiler is.
+///
+/// Beside this binary if it is there, because that is how a release is laid
+/// out and it is the answer that keeps a checkout and an installation from
+/// disagreeing. Otherwise the bare name, which lets the system search `PATH`
+/// -- and which is also the answer on a system that cannot say where a running
+/// program lives.
+fn compiler() str {
+    const me = os.self_exe() catch "";
+    if (text.len(me) > 0) {
+        const dir = path.dirname(path.normalise(me));
+        // `.exe` on Windows, and nothing anywhere else. Asked by looking
+        // rather than by knowing the platform, which this language has no way
+        // to ask about and should not need to.
+        if (io.exists(path.join(dir, "wsharp.exe"))) {
+            return path.join(dir, "wsharp.exe");
+        }
+        if (io.exists(path.join(dir, "wsharp"))) {
+            return path.join(dir, "wsharp");
+        }
+    }
+    return "wsharp";
+}
+
+// ---------------------------------------------------------------------------
+// The command line, before a verb sees it
+// ---------------------------------------------------------------------------
+
+/// Whether `flag` appears anywhere in `args`.
+fn mentions(args: []str, flag: str) bool {
+    const n = array.len(args);
+    var i = 0;
+    while (i < n) : (i += 1) {
+        if (text.eq(args[i], flag)) { return true; }
+    }
+    return false;
+}
+
+/// `args` without any occurrence of `flag`.
+///
+/// Removed wherever it appears rather than only in front, because it is not a
+/// verb's argument and a user who writes it last means the same thing.
+fn without(args: []str, flag: str) []str {
+    const n = array.len(args);
+    var out = []str{};
+    var i = 0;
+    while (i < n) : (i += 1) {
+        if (!text.eq(args[i], flag)) { out = array.push(out, args[i]); }
+    }
+    return out;
 }
 
 fn usage() void {
@@ -90,8 +205,12 @@ fn usage() void {
     print("  run <file.ws> [args]     compile and run a program");
     print("");
     print("`-C <dir>` works from somewhere else. `--gc-stress` belongs to what");
-    print("is being run. Output is tab-separated, and WSHARP_HOME says where");
-    print("the store is.");
+    print("is being run, so `run` passes it on and nothing else reads it.");
+    print("Output is tab-separated, and WSHARP_HOME says where the store is.");
+    print("");
+    print("`run` hands over to `wsharp`, which is looked for beside this");
+    print("program and then on PATH: this binary is a W# program and the");
+    print("compiler is what compiles W#.");
     print("");
     print("`install` also writes ingot.env, which is how the compiler finds a");
     print("package's files. It holds absolute paths, so it is derived rather");
@@ -249,7 +368,11 @@ fn resolve(f: fault.Fault) i64 {
     const m = read_here(f) orelse return FAILED;
     const outcome = plan.resolve(f, plan.network(), m);
     const lock = outcome.lock orelse {
-        if (text.len(outcome.report) > 0) { print(outcome.report); }
+        // The solver's account of why, on the error stream with every other
+        // explanation of a failure. Stdout carries what a verb *achieved* --
+        // here, nothing -- and a script cutting up `resolved<TAB>n` should not
+        // have to tell that apart from a page of reasoning.
+        if (text.len(outcome.report) > 0) { print_err(outcome.report); }
         return FAILED;
     };
     io.write_file(lock_path(), manifest.write_lock(lock)) catch {

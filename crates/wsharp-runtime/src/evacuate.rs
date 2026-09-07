@@ -46,6 +46,7 @@ pub(crate) const EVACUATE_BELOW_LINES: u16 = (heap::LINES_PER_BLOCK / 4) as u16;
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `p` must be null or a
 /// reference the program holds.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_resolve(p: *mut u8) -> *mut u8 {
     if p.is_null() {
         return p;

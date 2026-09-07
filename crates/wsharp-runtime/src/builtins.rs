@@ -81,6 +81,14 @@ pub struct Builtin {
     pub module: &'static str,
     pub params: &'static [BuiltinTy],
     pub ret: BuiltinTy,
+    /// The linker name of the native implementation -- the Rust function's own,
+    /// which is why every one of them is `#[unsafe(no_mangle)]`.
+    ///
+    /// [`ptr`](Self::ptr) says the same thing to the JIT, which resolves in
+    /// this process and needs no name at all. An object file has only the name,
+    /// so both are written down and a test insists they agree. Not derivable
+    /// from `module` and `name`: the prelude's `print` is `ws_print_str`.
+    pub link: &'static str,
     /// Address of the native implementation, handed to the JIT as a symbol.
     pub ptr: *const u8,
 }
@@ -88,12 +96,27 @@ pub struct Builtin {
 /// The prelude: visible in every module without an import.
 pub const PRELUDE: &str = "";
 
+/// The [`link`](Builtin::link) of a builtin the code generator lowers inline.
+///
+/// Three rows are compiled at the call site rather than called -- `array.new`,
+/// which needs the element type, and the two rotates, which need the width --
+/// so no symbol of theirs is ever referenced. Saying that here rather than
+/// naming some unrelated function keeps a name nothing calls out of the symbol
+/// table, and lets [`Builtin::is_inline`] be the one place that knows.
+pub const INLINE: &str = "";
+
 impl Builtin {
-    /// The name the JIT knows this by.
+    /// Whether this is compiled at the call site rather than called.
+    pub fn is_inline(&self) -> bool {
+        self.link == INLINE
+    }
+
+    /// How this is written in W#, qualified by its module.
     ///
-    /// Qualified, because two modules may each have a `len` and the symbol
-    /// table has no notion of a module. The bare name is what W# source
-    /// writes; this is what the linker sees.
+    /// Qualified because two modules may each have a `len`. This is a name for
+    /// people -- diagnostics, and `--emit=types` -- and deliberately not the
+    /// one anything links by: `std/str.len` is a fine string and a poor symbol.
+    /// [`link`](Self::link) is what a linker sees.
     pub fn symbol(&self) -> String {
         if self.module == PRELUDE {
             self.name.to_string()
@@ -117,13 +140,28 @@ pub fn builtins() -> Vec<Builtin> {
             name: "print",
             params: &[BuiltinTy::Str],
             ret: BuiltinTy::Void,
+            link: "ws_print_str",
             ptr: ws_print_str as *const u8,
+        },
+        // The same, on the error stream. Every other `print*` writes stdout,
+        // which is what a program's *output* is; this is for what a program
+        // says about itself going wrong, so that a caller redirecting the one
+        // still sees the other. It is deliberately the only one: a diagnostic
+        // is a sentence, and a sentence is a `str`.
+        Builtin {
+            module: PRELUDE,
+            name: "print_err",
+            params: &[BuiltinTy::Str],
+            ret: BuiltinTy::Void,
+            link: "ws_print_err",
+            ptr: ws_print_err as *const u8,
         },
         Builtin {
             module: PRELUDE,
             name: "print_int",
             params: &[BuiltinTy::I64],
             ret: BuiltinTy::Void,
+            link: "ws_print_int",
             ptr: ws_print_int as *const u8,
         },
         Builtin {
@@ -131,6 +169,7 @@ pub fn builtins() -> Vec<Builtin> {
             name: "print_float",
             params: &[BuiltinTy::F64],
             ret: BuiltinTy::Void,
+            link: "ws_print_float",
             ptr: ws_print_float as *const u8,
         },
         // `print_int` takes an `i64`, and a narrower value is written
@@ -142,6 +181,7 @@ pub fn builtins() -> Vec<Builtin> {
             name: "print_uint",
             params: &[BuiltinTy::U64],
             ret: BuiltinTy::Void,
+            link: "ws_print_uint",
             ptr: ws_print_uint as *const u8,
         },
         Builtin {
@@ -149,6 +189,7 @@ pub fn builtins() -> Vec<Builtin> {
             name: "print_bool",
             params: &[BuiltinTy::Bool],
             ret: BuiltinTy::Void,
+            link: "ws_print_bool",
             ptr: ws_print_bool as *const u8,
         },
         Builtin {
@@ -156,6 +197,7 @@ pub fn builtins() -> Vec<Builtin> {
             name: "assert",
             params: &[BuiltinTy::Bool],
             ret: BuiltinTy::Void,
+            link: "ws_assert",
             ptr: ws_assert as *const u8,
         },
         // The out-of-bounds panic, exposed for the same reason the `gc_*`
@@ -172,6 +214,7 @@ pub fn builtins() -> Vec<Builtin> {
             name: "panic_index",
             params: &[BuiltinTy::I64, BuiltinTy::I64],
             ret: BuiltinTy::Void,
+            link: "ws_panic_index",
             ptr: ws_panic_index as *const u8,
         },
         // The collector, exposed so that a W# program can assert on it. Being
@@ -183,6 +226,7 @@ pub fn builtins() -> Vec<Builtin> {
             name: "gc_collect",
             params: &[],
             ret: BuiltinTy::Void,
+            link: "ws_gc_collect",
             ptr: ws_gc_collect as *const u8,
         },
         Builtin {
@@ -190,6 +234,7 @@ pub fn builtins() -> Vec<Builtin> {
             name: "gc_trace",
             params: &[],
             ret: BuiltinTy::Void,
+            link: "ws_gc_trace",
             ptr: ws_gc_trace as *const u8,
         },
         // The two halves of a trace, so a program can mutate the heap while
@@ -199,6 +244,7 @@ pub fn builtins() -> Vec<Builtin> {
             name: "gc_trace_start",
             params: &[],
             ret: BuiltinTy::Void,
+            link: "ws_gc_trace_start",
             ptr: ws_gc_trace_start as *const u8,
         },
         Builtin {
@@ -206,6 +252,7 @@ pub fn builtins() -> Vec<Builtin> {
             name: "gc_trace_finish",
             params: &[],
             ret: BuiltinTy::Void,
+            link: "ws_gc_trace_finish",
             ptr: ws_gc_trace_finish as *const u8,
         },
         Builtin {
@@ -213,6 +260,7 @@ pub fn builtins() -> Vec<Builtin> {
             name: "gc_traces",
             params: &[],
             ret: BuiltinTy::I64,
+            link: "ws_gc_traces",
             ptr: ws_gc_traces as *const u8,
         },
         Builtin {
@@ -220,6 +268,7 @@ pub fn builtins() -> Vec<Builtin> {
             name: "gc_live_objects",
             params: &[],
             ret: BuiltinTy::I64,
+            link: "ws_gc_live_objects",
             ptr: ws_gc_live_objects as *const u8,
         },
         Builtin {
@@ -227,6 +276,7 @@ pub fn builtins() -> Vec<Builtin> {
             name: "gc_live_bytes",
             params: &[],
             ret: BuiltinTy::I64,
+            link: "ws_gc_live_bytes",
             ptr: ws_gc_live_bytes as *const u8,
         },
         Builtin {
@@ -234,6 +284,7 @@ pub fn builtins() -> Vec<Builtin> {
             name: "gc_collections",
             params: &[],
             ret: BuiltinTy::I64,
+            link: "ws_gc_collections",
             ptr: ws_gc_collections as *const u8,
         },
     ];
@@ -260,6 +311,7 @@ fn library() -> Vec<Builtin> {
             name: "len",
             params: &[BuiltinTy::Str],
             ret: BuiltinTy::I64,
+            link: "ws_str_len",
             ptr: crate::strings::ws_str_len as *const u8,
         },
         Builtin {
@@ -267,6 +319,7 @@ fn library() -> Vec<Builtin> {
             name: "concat",
             params: &[BuiltinTy::Str, BuiltinTy::Str],
             ret: BuiltinTy::Str,
+            link: "ws_str_concat",
             ptr: crate::strings::ws_str_concat as *const u8,
         },
         Builtin {
@@ -274,6 +327,7 @@ fn library() -> Vec<Builtin> {
             name: "eq",
             params: &[BuiltinTy::Str, BuiltinTy::Str],
             ret: BuiltinTy::Bool,
+            link: "ws_str_eq",
             ptr: crate::strings::ws_str_eq as *const u8,
         },
         Builtin {
@@ -281,6 +335,7 @@ fn library() -> Vec<Builtin> {
             name: "substr",
             params: &[BuiltinTy::Str, BuiltinTy::I64, BuiltinTy::I64],
             ret: BuiltinTy::Str,
+            link: "ws_str_substr",
             ptr: crate::strings::ws_str_substr as *const u8,
         },
         Builtin {
@@ -288,6 +343,7 @@ fn library() -> Vec<Builtin> {
             name: "find",
             params: &[BuiltinTy::Str, BuiltinTy::Str],
             ret: BuiltinTy::I64,
+            link: "ws_str_find",
             ptr: crate::strings::ws_str_find as *const u8,
         },
         Builtin {
@@ -295,6 +351,7 @@ fn library() -> Vec<Builtin> {
             name: "from_int",
             params: &[BuiltinTy::I64],
             ret: BuiltinTy::Str,
+            link: "ws_str_from_int",
             ptr: crate::strings::ws_str_from_int as *const u8,
         },
         Builtin {
@@ -302,6 +359,7 @@ fn library() -> Vec<Builtin> {
             name: "from_float",
             params: &[BuiltinTy::F64],
             ret: BuiltinTy::Str,
+            link: "ws_str_from_float",
             ptr: crate::strings::ws_str_from_float as *const u8,
         },
         Builtin {
@@ -309,6 +367,7 @@ fn library() -> Vec<Builtin> {
             name: "byte_at",
             params: &[BuiltinTy::Str, BuiltinTy::I64],
             ret: BuiltinTy::I64,
+            link: "ws_str_byte_at",
             ptr: crate::strings::ws_str_byte_at as *const u8,
         },
         Builtin {
@@ -316,6 +375,7 @@ fn library() -> Vec<Builtin> {
             name: "from_byte",
             params: &[BuiltinTy::I64],
             ret: BuiltinTy::Str,
+            link: "ws_str_from_byte",
             ptr: crate::strings::ws_str_from_byte as *const u8,
         },
         Builtin {
@@ -323,6 +383,7 @@ fn library() -> Vec<Builtin> {
             name: "parse_int",
             params: &[BuiltinTy::Str],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, &["BadFormat"]),
+            link: "ws_str_parse_int",
             ptr: crate::strings::ws_str_parse_int as *const u8,
         },
         // The asymmetry `str.parse_int` had left: a number could be written
@@ -332,6 +393,7 @@ fn library() -> Vec<Builtin> {
             name: "parse_float",
             params: &[BuiltinTy::Str],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::F64, &["BadFormat"]),
+            link: "ws_str_parse_float",
             ptr: crate::strings::ws_str_parse_float as *const u8,
         },
         // The other half of `from_int`, for the top half of a `u64`: an `i64`
@@ -341,6 +403,7 @@ fn library() -> Vec<Builtin> {
             name: "from_uint",
             params: &[BuiltinTy::U64],
             ret: BuiltinTy::Str,
+            link: "ws_str_from_uint",
             ptr: crate::strings::ws_str_from_uint as *const u8,
         },
         // Rotation, which every hash and stream cipher is written in terms of.
@@ -351,13 +414,14 @@ fn library() -> Vec<Builtin> {
         // generic over the width the way `IntVar` is.
         //
         // The pointers are never taken: `Trans::call` intercepts both by name,
-        // exactly as it does `array.new`. They name `ws_panic` so that the row
-        // is still a well-formed JIT symbol.
+        // exactly as it does `array.new`. An empty `link` says so, and is what
+        // stops code generation declaring a symbol nothing will ever call.
         Builtin {
             module: BITS_MODULE,
             name: BITS_ROTL,
             params: &[BuiltinTy::IntVar(0), BuiltinTy::IntVar(0)],
             ret: BuiltinTy::IntVar(0),
+            link: INLINE,
             ptr: ws_panic as *const u8,
         },
         Builtin {
@@ -365,6 +429,7 @@ fn library() -> Vec<Builtin> {
             name: BITS_ROTR,
             params: &[BuiltinTy::IntVar(0), BuiltinTy::IntVar(0)],
             ret: BuiltinTy::IntVar(0),
+            link: INLINE,
             ptr: ws_panic as *const u8,
         },
         Builtin {
@@ -372,6 +437,7 @@ fn library() -> Vec<Builtin> {
             name: "to_lower",
             params: &[BuiltinTy::Str],
             ret: BuiltinTy::Str,
+            link: "ws_str_to_lower",
             ptr: crate::strings::ws_str_to_lower as *const u8,
         },
         Builtin {
@@ -379,6 +445,7 @@ fn library() -> Vec<Builtin> {
             name: "trim",
             params: &[BuiltinTy::Str],
             ret: BuiltinTy::Str,
+            link: "ws_str_trim",
             ptr: crate::strings::ws_str_trim as *const u8,
         },
         Builtin {
@@ -386,6 +453,7 @@ fn library() -> Vec<Builtin> {
             name: "len",
             params: &[ARRAY_OF_ELEM],
             ret: BuiltinTy::I64,
+            link: "ws_array_len",
             ptr: crate::strings::ws_array_len as *const u8,
         },
         // `std/bytes`. Each of these writes into an object the caller made:
@@ -397,6 +465,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_to_str",
             params: &[BYTES_OF_U8, BuiltinTy::I64, BuiltinTy::I64],
             ret: BuiltinTy::Str,
+            link: "ws_bytes_to_str",
             ptr: crate::bytes::ws_bytes_to_str as *const u8,
         },
         Builtin {
@@ -404,6 +473,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_from_str",
             params: &[BYTES_OF_U8, BuiltinTy::I64, BuiltinTy::Str],
             ret: BuiltinTy::Void,
+            link: "ws_bytes_from_str",
             ptr: crate::bytes::ws_bytes_from_str as *const u8,
         },
         Builtin {
@@ -417,6 +487,7 @@ fn library() -> Vec<Builtin> {
                 BuiltinTy::I64,
             ],
             ret: BuiltinTy::Void,
+            link: "ws_bytes_copy",
             ptr: crate::bytes::ws_bytes_copy as *const u8,
         },
         Builtin {
@@ -424,6 +495,7 @@ fn library() -> Vec<Builtin> {
             name: "equal",
             params: &[BYTES_OF_U8, BYTES_OF_U8],
             ret: BuiltinTy::Bool,
+            link: "ws_bytes_equal",
             ptr: crate::bytes::ws_bytes_equal as *const u8,
         },
         Builtin {
@@ -433,6 +505,7 @@ fn library() -> Vec<Builtin> {
             // The same set `std/io` raises, since this is the same kind of
             // failure: the system was asked for something and said no.
             ret: BuiltinTy::ErrUnion(&BuiltinTy::Str, &["PermissionDenied", "IoFailed"]),
+            link: "ws_crypto_random",
             ptr: crate::crypto::ws_crypto_random as *const u8,
         },
         Builtin {
@@ -442,6 +515,7 @@ fn library() -> Vec<Builtin> {
             // `NotSupported` is the ordinary answer on a system that keeps its
             // anchors in a file, which `std/x509` then goes and reads.
             ret: BuiltinTy::ErrUnion(&BuiltinTy::Str, &["NotSupported", "IoFailed"]),
+            link: "ws_crypto_system_roots",
             ptr: crate::crypto::ws_crypto_system_roots as *const u8,
         },
         Builtin {
@@ -449,6 +523,7 @@ fn library() -> Vec<Builtin> {
             name: "now",
             params: &[],
             ret: BuiltinTy::I64,
+            link: "ws_time_now",
             ptr: crate::crypto::ws_time_now as *const u8,
         },
         Builtin {
@@ -456,6 +531,7 @@ fn library() -> Vec<Builtin> {
             name: "sqrt",
             params: &[BuiltinTy::F64],
             ret: BuiltinTy::F64,
+            link: "ws_math_sqrt",
             ptr: ws_math_sqrt as *const u8,
         },
         Builtin {
@@ -463,6 +539,7 @@ fn library() -> Vec<Builtin> {
             name: "pow",
             params: &[BuiltinTy::F64, BuiltinTy::F64],
             ret: BuiltinTy::F64,
+            link: "ws_math_pow",
             ptr: ws_math_pow as *const u8,
         },
         Builtin {
@@ -470,6 +547,7 @@ fn library() -> Vec<Builtin> {
             name: "floor",
             params: &[BuiltinTy::F64],
             ret: BuiltinTy::F64,
+            link: "ws_math_floor",
             ptr: ws_math_floor as *const u8,
         },
         Builtin {
@@ -477,6 +555,7 @@ fn library() -> Vec<Builtin> {
             name: "ceil",
             params: &[BuiltinTy::F64],
             ret: BuiltinTy::F64,
+            link: "ws_math_ceil",
             ptr: ws_math_ceil as *const u8,
         },
         Builtin {
@@ -484,6 +563,7 @@ fn library() -> Vec<Builtin> {
             name: "round",
             params: &[BuiltinTy::F64],
             ret: BuiltinTy::F64,
+            link: "ws_math_round",
             ptr: ws_math_round as *const u8,
         },
         Builtin {
@@ -491,6 +571,7 @@ fn library() -> Vec<Builtin> {
             name: "trunc",
             params: &[BuiltinTy::F64],
             ret: BuiltinTy::F64,
+            link: "ws_math_trunc",
             ptr: ws_math_trunc as *const u8,
         },
         Builtin {
@@ -501,6 +582,7 @@ fn library() -> Vec<Builtin> {
                 &BuiltinTy::Str,
                 &["NotFound", "PermissionDenied", "IoFailed"],
             ),
+            link: "ws_io_read_file",
             ptr: crate::io::ws_io_read_file as *const u8,
         },
         Builtin {
@@ -508,6 +590,7 @@ fn library() -> Vec<Builtin> {
             name: "read_line",
             params: &[],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::Str, &["IoFailed", "EndOfFile"]),
+            link: "ws_io_read_line",
             ptr: crate::io::ws_io_read_line as *const u8,
         },
         Builtin {
@@ -518,6 +601,7 @@ fn library() -> Vec<Builtin> {
                 &BuiltinTy::Void,
                 &["NotFound", "PermissionDenied", "IoFailed"],
             ),
+            link: "ws_io_write_file",
             ptr: crate::io::ws_io_write_file as *const u8,
         },
         Builtin {
@@ -525,6 +609,7 @@ fn library() -> Vec<Builtin> {
             name: "exists",
             params: &[BuiltinTy::Str],
             ret: BuiltinTy::Bool,
+            link: "ws_io_exists",
             ptr: crate::io::ws_io_exists as *const u8,
         },
         // ---- std/fs: the rest of a filesystem ----
@@ -546,6 +631,7 @@ fn library() -> Vec<Builtin> {
                     "IoFailed",
                 ],
             ),
+            link: "ws_fs_mkdir",
             ptr: crate::fs::ws_fs_mkdir as *const u8,
         },
         Builtin {
@@ -562,6 +648,7 @@ fn library() -> Vec<Builtin> {
                     "IoFailed",
                 ],
             ),
+            link: "ws_fs_rmdir",
             ptr: crate::fs::ws_fs_rmdir as *const u8,
         },
         Builtin {
@@ -577,6 +664,7 @@ fn library() -> Vec<Builtin> {
                     "IoFailed",
                 ],
             ),
+            link: "ws_fs_remove",
             ptr: crate::fs::ws_fs_remove as *const u8,
         },
         Builtin {
@@ -594,6 +682,7 @@ fn library() -> Vec<Builtin> {
                     "IoFailed",
                 ],
             ),
+            link: "ws_fs_rename",
             ptr: crate::fs::ws_fs_rename as *const u8,
         },
         Builtin {
@@ -601,6 +690,7 @@ fn library() -> Vec<Builtin> {
             name: "is_dir",
             params: &[BuiltinTy::Str],
             ret: BuiltinTy::Bool,
+            link: "ws_fs_is_dir",
             ptr: crate::fs::ws_fs_is_dir as *const u8,
         },
         Builtin {
@@ -611,6 +701,7 @@ fn library() -> Vec<Builtin> {
                 &BuiltinTy::I64,
                 &["NotFound", "PermissionDenied", "IoFailed"],
             ),
+            link: "ws_fs_size",
             ptr: crate::fs::ws_fs_size as *const u8,
         },
         Builtin {
@@ -621,6 +712,7 @@ fn library() -> Vec<Builtin> {
                 &BuiltinTy::Str,
                 &["NotFound", "PermissionDenied", "NotADirectory", "IoFailed"],
             ),
+            link: "ws_fs_raw_read_dir",
             ptr: crate::fs::ws_fs_raw_read_dir as *const u8,
         },
         // ---- std/os: the process's own arguments and environment ----
@@ -629,6 +721,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_args",
             params: &[],
             ret: BuiltinTy::Str,
+            link: "ws_os_raw_args",
             ptr: crate::os::ws_os_raw_args as *const u8,
         },
         Builtin {
@@ -636,6 +729,7 @@ fn library() -> Vec<Builtin> {
             name: "env",
             params: &[BuiltinTy::Str],
             ret: BuiltinTy::Optional(&BuiltinTy::Str),
+            link: "ws_os_env",
             ptr: crate::os::ws_os_env as *const u8,
         },
         // Fallible where `env` is not: a variable that is unset is ordinary,
@@ -649,7 +743,52 @@ fn library() -> Vec<Builtin> {
                 &BuiltinTy::Str,
                 &["NotFound", "PermissionDenied", "IoFailed"],
             ),
+            link: "ws_os_cwd",
             ptr: crate::os::ws_os_cwd as *const u8,
+        },
+        // The process's working directory, changed. The only writable piece of
+        // process-wide state this runtime offers, and it has one caller: a tool
+        // told to work somewhere else, as `git -C` is, which does it once
+        // before any of its own verbs run.
+        Builtin {
+            module: OS_MODULE,
+            name: "raw_chdir",
+            params: &[BuiltinTy::Str],
+            ret: BuiltinTy::ErrUnion(
+                &BuiltinTy::Void,
+                &["NotFound", "PermissionDenied", "NotADirectory", "IoFailed"],
+            ),
+            link: "ws_os_chdir",
+            ptr: crate::os::ws_os_chdir as *const u8,
+        },
+        // What a program needs to find something installed beside it, which is
+        // how `ingot` finds `wsharp`. Not `argv[0]`: that is whatever the
+        // caller passed to `exec`, and a program found on `PATH` gets a bare
+        // name back. OpenBSD does not keep the answer and says `NotFound`.
+        Builtin {
+            module: OS_MODULE,
+            name: "raw_self_exe",
+            params: &[],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::Str, &["NotFound", "IoFailed"]),
+            link: "ws_os_self_exe",
+            ptr: crate::os::ws_os_self_exe as *const u8,
+        },
+        // Replace this process. Answers only on failure, which is why the
+        // result is `!void` and not `!i64`: a status would be a promise it
+        // cannot keep. The arguments arrive as one length-prefixed blob rather
+        // than a `[]str`, because reading an array of *references* in Rust
+        // would bypass the load barrier -- `std/os.exec` packs it in W#, where
+        // the barrier applies by construction.
+        Builtin {
+            module: OS_MODULE,
+            name: "raw_exec",
+            params: &[BuiltinTy::Str, BuiltinTy::Str],
+            ret: BuiltinTy::ErrUnion(
+                &BuiltinTy::Void,
+                &["NotFound", "PermissionDenied", "IoFailed"],
+            ),
+            link: "ws_os_exec",
+            ptr: crate::os::ws_os_exec as *const u8,
         },
         // Copy an array out of this worker's heap and build it again, which
         // is what sending it somewhere does. Exposed for the reason the `gc_*`
@@ -664,6 +803,7 @@ fn library() -> Vec<Builtin> {
             name: "gc_transfer",
             params: &[TRANSFERABLE_ARRAY],
             ret: TRANSFERABLE_ARRAY,
+            link: "ws_transfer_roundtrip",
             ptr: crate::transfer::ws_transfer_roundtrip as *const u8,
         },
         // The broker. Handles are numbers rather than objects: a topic and a
@@ -675,6 +815,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_topic",
             params: &[BuiltinTy::Str, BuiltinTy::I64],
             ret: BuiltinTy::I64,
+            link: "ws_broker_topic",
             ptr: crate::broker::ws_broker_topic as *const u8,
         },
         Builtin {
@@ -682,6 +823,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_publish",
             params: &[BuiltinTy::I64, BuiltinTy::Str, MESSAGE],
             ret: BuiltinTy::I64,
+            link: "ws_broker_publish",
             ptr: crate::broker::ws_broker_publish as *const u8,
         },
         Builtin {
@@ -689,6 +831,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_subscribe",
             params: &[BuiltinTy::I64, BuiltinTy::Str],
             ret: BuiltinTy::I64,
+            link: "ws_broker_subscribe",
             ptr: crate::broker::ws_broker_subscribe as *const u8,
         },
         Builtin {
@@ -696,6 +839,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_poll",
             params: &[BuiltinTy::I64],
             ret: BuiltinTy::Optional(&MESSAGE),
+            link: "ws_broker_poll",
             ptr: crate::broker::ws_broker_poll as *const u8,
         },
         Builtin {
@@ -703,6 +847,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_commit",
             params: &[BuiltinTy::I64],
             ret: BuiltinTy::Void,
+            link: "ws_broker_commit",
             ptr: crate::broker::ws_broker_commit as *const u8,
         },
         Builtin {
@@ -710,6 +855,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_seek",
             params: &[BuiltinTy::I64, BuiltinTy::I64, BuiltinTy::I64],
             ret: BuiltinTy::Void,
+            link: "ws_broker_seek",
             ptr: crate::broker::ws_broker_seek as *const u8,
         },
         Builtin {
@@ -717,6 +863,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_len",
             params: &[BuiltinTy::I64],
             ret: BuiltinTy::I64,
+            link: "ws_broker_len",
             ptr: crate::broker::ws_broker_len as *const u8,
         },
         Builtin {
@@ -724,6 +871,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_connect",
             params: &[BuiltinTy::Str, BuiltinTy::I64],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            link: "ws_net_connect",
             ptr: crate::net::ws_net_connect as *const u8,
         },
         Builtin {
@@ -731,6 +879,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_listen",
             params: &[BuiltinTy::Str, BuiltinTy::I64, BuiltinTy::I64],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            link: "ws_net_listen",
             ptr: crate::net::ws_net_listen as *const u8,
         },
         Builtin {
@@ -738,6 +887,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_accept",
             params: &[BuiltinTy::I64],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            link: "ws_net_accept",
             ptr: crate::net::ws_net_accept as *const u8,
         },
         Builtin {
@@ -745,6 +895,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_read",
             params: &[BuiltinTy::I64, BuiltinTy::I64],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::Str, NET_ERRORS),
+            link: "ws_net_read",
             ptr: crate::net::ws_net_read as *const u8,
         },
         Builtin {
@@ -752,6 +903,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_read_into",
             params: &[BuiltinTy::I64, BYTES_OF_U8, BuiltinTy::I64, BuiltinTy::I64],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            link: "ws_net_read_into",
             ptr: crate::net::ws_net_read_into as *const u8,
         },
         Builtin {
@@ -759,6 +911,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_write_bytes",
             params: &[BuiltinTy::I64, BYTES_OF_U8, BuiltinTy::I64, BuiltinTy::I64],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            link: "ws_net_write_bytes",
             ptr: crate::net::ws_net_write_bytes as *const u8,
         },
         Builtin {
@@ -766,6 +919,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_write",
             params: &[BuiltinTy::I64, BuiltinTy::Str],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            link: "ws_net_write",
             ptr: crate::net::ws_net_write as *const u8,
         },
         Builtin {
@@ -773,6 +927,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_local_port",
             params: &[BuiltinTy::I64],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            link: "ws_net_local_port",
             ptr: crate::net::ws_net_local_port as *const u8,
         },
         Builtin {
@@ -780,6 +935,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_set_nonblocking",
             params: &[BuiltinTy::I64, BuiltinTy::Bool],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            link: "ws_net_set_nonblocking",
             ptr: crate::net::ws_net_set_nonblocking as *const u8,
         },
         Builtin {
@@ -787,6 +943,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_close",
             params: &[BuiltinTy::I64],
             ret: BuiltinTy::Void,
+            link: "ws_net_close",
             ptr: crate::net::ws_net_close as *const u8,
         },
         Builtin {
@@ -794,6 +951,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_udp",
             params: &[BuiltinTy::Str, BuiltinTy::I64],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            link: "ws_net_udp",
             ptr: crate::net::ws_net_udp as *const u8,
         },
         Builtin {
@@ -806,6 +964,7 @@ fn library() -> Vec<Builtin> {
                 BuiltinTy::Str,
             ],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            link: "ws_net_send_to",
             ptr: crate::net::ws_net_send_to as *const u8,
         },
         Builtin {
@@ -813,6 +972,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_send_peer",
             params: &[BuiltinTy::I64, BuiltinTy::I64, BuiltinTy::Str],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            link: "ws_net_send_peer",
             ptr: crate::net::ws_net_send_peer as *const u8,
         },
         Builtin {
@@ -820,6 +980,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_recv_from",
             params: &[BuiltinTy::I64, BuiltinTy::I64],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::Str, NET_ERRORS),
+            link: "ws_net_recv_from",
             ptr: crate::net::ws_net_recv_from as *const u8,
         },
         Builtin {
@@ -827,6 +988,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_last_peer",
             params: &[BuiltinTy::I64],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            link: "ws_net_last_peer",
             ptr: crate::net::ws_net_last_peer as *const u8,
         },
         Builtin {
@@ -834,6 +996,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_poller",
             params: &[],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            link: "ws_net_poller",
             ptr: crate::net::ws_net_poller as *const u8,
         },
         Builtin {
@@ -846,6 +1009,7 @@ fn library() -> Vec<Builtin> {
                 BuiltinTy::Bool,
             ],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            link: "ws_net_watch",
             ptr: crate::net::ws_net_watch as *const u8,
         },
         Builtin {
@@ -853,6 +1017,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_forget",
             params: &[BuiltinTy::I64, BuiltinTy::I64],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            link: "ws_net_forget",
             ptr: crate::net::ws_net_forget as *const u8,
         },
         Builtin {
@@ -860,6 +1025,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_wait",
             params: &[BuiltinTy::I64, BuiltinTy::I64],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            link: "ws_net_wait",
             ptr: crate::net::ws_net_wait as *const u8,
         },
         Builtin {
@@ -867,6 +1033,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_ready_socket",
             params: &[BuiltinTy::I64, BuiltinTy::I64],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            link: "ws_net_ready_socket",
             ptr: crate::net::ws_net_ready_socket as *const u8,
         },
         Builtin {
@@ -874,6 +1041,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_ready_events",
             params: &[BuiltinTy::I64, BuiltinTy::I64],
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            link: "ws_net_ready_events",
             ptr: crate::net::ws_net_ready_events as *const u8,
         },
         Builtin {
@@ -881,6 +1049,7 @@ fn library() -> Vec<Builtin> {
             name: "raw_close_poller",
             params: &[BuiltinTy::I64],
             ret: BuiltinTy::Void,
+            link: "ws_net_close_poller",
             ptr: crate::net::ws_net_close_poller as *const u8,
         },
         Builtin {
@@ -889,8 +1058,9 @@ fn library() -> Vec<Builtin> {
             params: &[BuiltinTy::I64],
             ret: ARRAY_OF_ELEM,
             // Lowered inline: only the call site knows the element type, and
-            // so the stride and the type id to stamp. `ptr` is never used, and
-            // is the allocator only so the symbol table stays well formed.
+            // so the stride and the type id to stamp. Neither `ptr` nor a
+            // symbol is ever used; `INLINE` is what says so.
+            link: INLINE,
             ptr: crate::heap::ws_alloc as *const u8,
         },
     ]
@@ -1272,6 +1442,7 @@ pub fn runtime_symbols() -> Vec<(&'static str, *const u8)> {
 /// # Safety
 /// `ptr` must be null or point at a W# string object: a header whose aux word
 /// holds the byte length, followed by that many bytes of UTF-8.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_print_str(ptr: *const u8) {
     unsafe { crate::gc::checkpoint() };
     if ptr.is_null() {
@@ -1291,6 +1462,37 @@ pub unsafe extern "C" fn ws_print_str(ptr: *const u8) {
     }
 }
 
+/// [`ws_print_str`] on the error stream.
+///
+/// The one thing W# can say that is not part of a program's output. Until
+/// there was a package manager written in it, every diagnostic went to stdout
+/// -- which is fine for a program whose output nobody redirects and wrong for
+/// a tool, where the two streams are the difference between a result and a
+/// complaint about not having one.
+///
+/// # Safety
+/// As [`ws_print_str`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_print_err(ptr: *const u8) {
+    unsafe { crate::gc::checkpoint() };
+    if ptr.is_null() {
+        eprintln!();
+        return;
+    }
+    // SAFETY: `ptr` is a W# string object -- length in the aux word, bytes
+    // immediately after the header.
+    let text = unsafe {
+        let len = (ptr.add(AUX_OFFSET as usize) as *const u64).read() as usize;
+        let bytes = std::slice::from_raw_parts(ptr.add(HEADER_SIZE as usize), len);
+        std::str::from_utf8(bytes)
+    };
+    match text {
+        Ok(s) => eprintln!("{s}"),
+        Err(_) => eprintln!("<invalid utf-8 string>"),
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_print_int(value: i64) {
     unsafe { crate::gc::checkpoint() };
     println!("{value}");
@@ -1298,12 +1500,14 @@ pub extern "C" fn ws_print_int(value: i64) {
 
 /// The unsigned twin of [`ws_print_int`], for the half of `u64`'s range an
 /// `i64` cannot hold: `print_int(i64(x))` would show it as a negative number.
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_print_uint(value: u64) {
     unsafe { crate::gc::checkpoint() };
     println!("{value}");
 }
 
 /// Always shows a decimal point, so a float `1` is not mistaken for an integer.
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_print_float(value: f64) {
     unsafe { crate::gc::checkpoint() };
     if value.is_finite() && value.fract() == 0.0 {
@@ -1313,11 +1517,13 @@ pub extern "C" fn ws_print_float(value: f64) {
     }
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_print_bool(value: i8) {
     unsafe { crate::gc::checkpoint() };
     println!("{}", value != 0);
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_assert(cond: i8) {
     unsafe { crate::gc::checkpoint() };
     if cond == 0 {
@@ -1330,6 +1536,7 @@ pub extern "C" fn ws_assert(cond: i8) {
 /// Called directly from generated code, so the frame chain above is intact and
 /// the stack maps describe the caller's roots -- which is exactly what a
 /// collection needs.
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_gc_collect() {
     // Not while a trace is moving objects: see `gc::on_allocation`.
     if crate::gc::evacuating() {
@@ -1341,61 +1548,74 @@ pub extern "C" fn ws_gc_collect() {
 /// Run a whole mark trace, synchronously: begin it, wait for the collector
 /// thread to mark, finish it, wait for the sweep. What follows in the program
 /// sees a heap with every cycle reclaimed.
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_gc_trace() {
     unsafe { crate::mark::run_full_trace() };
 }
 
 /// Begin a trace and return while the collector thread marks.
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_gc_trace_start() {
     unsafe { crate::mark::trace_start() };
 }
 
 /// Wait for the trace in flight to be entirely over.
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_gc_trace_finish() {
     unsafe { crate::mark::trace_finish() };
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_gc_traces() -> i64 {
     crate::gc::traces() as i64
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_gc_live_objects() -> i64 {
     crate::heap::heap_stats().live_objects as i64
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_gc_live_bytes() -> i64 {
     crate::heap::heap_stats().live_bytes as i64
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_gc_collections() -> i64 {
     crate::gc::collections() as i64
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_math_sqrt(x: f64) -> f64 {
     unsafe { crate::gc::checkpoint() };
     x.sqrt()
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_math_pow(x: f64, y: f64) -> f64 {
     unsafe { crate::gc::checkpoint() };
     x.powf(y)
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_math_floor(x: f64) -> f64 {
     unsafe { crate::gc::checkpoint() };
     x.floor()
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_math_ceil(x: f64) -> f64 {
     unsafe { crate::gc::checkpoint() };
     x.ceil()
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_math_round(x: f64) -> f64 {
     unsafe { crate::gc::checkpoint() };
     x.round()
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_math_trunc(x: f64) -> f64 {
     unsafe { crate::gc::checkpoint() };
     x.trunc()
@@ -1424,10 +1644,12 @@ pub const PANIC_EXIT_STATUS: i32 = 101;
 /// A separate entry point rather than three arguments on [`ws_panic`] because
 /// every other panic site would then have to pass two zeroes, and the reason
 /// they are zero would need explaining at each one.
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_panic_index(index: i64, len: i64) -> ! {
     report_and_exit(&format!("index {index} out of bounds (len {len})"))
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn ws_panic(code: i64) {
     let reason = match code {
         PANIC_UNWRAP_NULL => "unwrapped a null optional".to_string(),
@@ -1542,5 +1764,41 @@ mod tests {
         let syms = runtime_symbols();
         assert!(syms.iter().any(|(n, _)| *n == "ws_alloc"));
         assert!(syms.iter().all(|(_, p)| !p.is_null()));
+    }
+
+    /// A `link` is what an object file relocates against, and a wrong one is a
+    /// link error at the far end of a build rather than anything here. These
+    /// are the properties code generation relies on, said out loud.
+    #[test]
+    fn every_link_name_is_well_formed_and_its_own() {
+        let all = builtins();
+        let mut seen: Vec<&str> = Vec::new();
+        for b in &all {
+            if b.is_inline() {
+                continue;
+            }
+            assert!(
+                b.link.starts_with("ws_")
+                    && b.link
+                        .bytes()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_'),
+                "`{}` links as `{}`, which is not a symbol Rust can export \
+                 with `#[unsafe(no_mangle)]`",
+                b.symbol(),
+                b.link
+            );
+            assert!(
+                !seen.contains(&b.link),
+                "`{}` links as `{}`, which another row already claims -- two \
+                 rows with one symbol are one function with two signatures",
+                b.symbol(),
+                b.link
+            );
+            seen.push(b.link);
+        }
+        // The three rows the code generator compiles at the call site, and
+        // nothing else, may decline to name a symbol.
+        let inline: Vec<String> = all.iter().filter(|b| b.is_inline()).map(|b| b.symbol()).collect();
+        assert_eq!(inline, ["std/bits.rotl", "std/bits.rotr", "std/array.new"]);
     }
 }

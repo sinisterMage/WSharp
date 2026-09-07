@@ -93,11 +93,25 @@ fn check_case_with(path: &Path, flags: &[&str]) -> Result<(), String> {
         .output()
         .map_err(|e| format!("could not run the compiler: {e}"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    verify(
+        &expected,
+        output.status.code().unwrap_or(-1),
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+}
 
+/// Hold one run of a case to its header, whichever way it was run.
+fn verify(
+    expected: &Expectations,
+    code: i32,
+    success: bool,
+    stdout: &str,
+    stderr: &str,
+) -> Result<(), String> {
     if !expected.errors.is_empty() {
-        if output.status.success() {
+        if success {
             return Err(format!(
                 "expected a compile error containing {:?}, but it ran",
                 expected.errors
@@ -113,7 +127,6 @@ fn check_case_with(path: &Path, flags: &[&str]) -> Result<(), String> {
         return Ok(());
     }
 
-    let code = output.status.code().unwrap_or(-1);
     match &expected.panic {
         Some(needle) => {
             if code != PANIC_EXIT_STATUS {
@@ -149,6 +162,71 @@ fn check_case_with(path: &Path, flags: &[&str]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Build a case into a native executable and run *that*.
+///
+/// The other passes exercise the JIT. This exercises everything the JIT does
+/// not: the object backend, the three tables written as data and read back at
+/// startup, the relocations a linker fills in, and the `main` in
+/// `wsharp-start`. A case that passes under `run` and fails here is a bug in
+/// exactly that seam.
+fn check_case_native(path: &Path, dir: &Path, env: &[(&str, &str)]) -> Result<(), String> {
+    let source = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let expected = parse_expectations(&source);
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let exe = dir.join(&*stem);
+
+    let built = Command::new(env!("CARGO_BIN_EXE_wsharp"))
+        .arg("build")
+        .arg(path)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .map_err(|e| format!("could not run the compiler: {e}"))?;
+
+    // A case that must not compile is answered here, and `build` has to say
+    // the same thing `run` would -- which it does by sharing the front end.
+    if !expected.errors.is_empty() || !built.status.success() {
+        return verify(
+            &expected,
+            built.status.code().unwrap_or(-1),
+            built.status.success(),
+            &String::from_utf8_lossy(&built.stdout),
+            &String::from_utf8_lossy(&built.stderr),
+        );
+    }
+
+    let mut command = Command::new(&exe);
+    command.args(&expected.args);
+    for (k, v) in env {
+        command.env(k, v);
+    }
+    let output = command
+        .output()
+        .map_err(|e| format!("could not run {}: {e}", exe.display()))?;
+    // Removed on success only, so a failure leaves something to run by hand.
+    let result = verify(
+        &expected,
+        output.status.code().unwrap_or(-1),
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    );
+    if result.is_ok() {
+        let _ = std::fs::remove_file(&exe);
+    }
+    result
+}
+
+/// Somewhere to put the executables this builds.
+///
+/// Carries the process id because the suite's passes may run at the same time
+/// as each other, and two of them building `fib` into one path would race.
+fn native_dir(what: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("wsharp-aot-{what}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("cannot make {}: {e}", dir.display()));
+    dir
 }
 
 fn case_files() -> Vec<PathBuf> {
@@ -243,6 +321,127 @@ fn every_case_survives_collecting_at_every_allocation() {
         "cases failed under --gc-stress:\n\n{}",
         failures.join("\n\n")
     );
+}
+
+/// The whole suite again, compiled to native executables.
+///
+/// Everything above runs the program inside the compiler, where the runtime is
+/// already there to be handed the type registry, the stack maps and the
+/// service table. A built program has none of that: the three tables travel as
+/// data, their code addresses are relocations, and a `main` in `wsharp-start`
+/// installs them before anything runs. None of that is exercised by a JIT pass,
+/// and a backend nothing exercises is one that does not work.
+#[test]
+fn every_case_behaves_the_same_built_as_run() {
+    let dir = native_dir("cases");
+    let mut failures = Vec::new();
+    for path in case_files() {
+        if let Err(message) = check_case_native(&path, &dir, &[]) {
+            failures.push(format!("--- {} ---\n{message}", path.display()));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "cases failed when built:\n\n{}",
+        failures.join("\n\n")
+    );
+}
+
+/// The collector's cases, built, and collecting at every allocation.
+///
+/// The stack maps are the table where a serialisation mistake is silent: the
+/// collector would read a root at the wrong stack offset and mark whatever
+/// happened to be there. Stress turns that from a rare corruption into an
+/// abort on the next allocation. Only the `gc_*` cases, because they are the
+/// ones that allocate hard enough to say anything and the whole suite twice
+/// over is a cost without a matching return.
+#[test]
+fn the_collector_survives_stress_in_a_built_program() {
+    let dir = native_dir("stress");
+    let cases: Vec<PathBuf> = case_files()
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("gc_"))
+        })
+        .collect();
+    assert!(!cases.is_empty(), "no `gc_*` cases found");
+
+    let mut failures = Vec::new();
+    for path in &cases {
+        if let Err(message) = check_case_native(path, &dir, &[("WSHARP_GC_STRESS", "1")]) {
+            failures.push(format!("--- {} ---\n{message}", path.display()));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} built `gc_*` cases failed under WSHARP_GC_STRESS:\n\n{}",
+        failures.len(),
+        cases.len(),
+        failures.join("\n\n")
+    );
+}
+
+/// A built program's collector must actually do something.
+///
+/// Checking that a case passes is not enough: a stack walk that found no roots
+/// at all would make every root check succeed for the wrong reason, and a
+/// stack-map table that deserialised to nothing looks exactly like that. So
+/// read the counts and insist they are not zero -- the same discipline the
+/// collector's own notes ask for.
+#[test]
+fn a_built_program_reports_the_collector_doing_its_work() {
+    let dir = native_dir("stats");
+    let exe = dir.join("gc_moving");
+    let built = Command::new(env!("CARGO_BIN_EXE_wsharp"))
+        .arg("build")
+        .arg(cases_dir().join("gc_moving.ws"))
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .expect("could not run the compiler");
+    assert!(
+        built.status.success(),
+        "could not build gc_moving.ws:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let output = Command::new(&exe)
+        .env("WSHARP_GC_STATS", "1")
+        .output()
+        .expect("could not run the built program");
+    let stats = String::from_utf8_lossy(&output.stderr);
+    let line = stats
+        .lines()
+        .find(|l| l.starts_with("W# gc:"))
+        .unwrap_or_else(|| panic!("no collector report; stderr was:\n{stats}"));
+
+    // A number followed by the words the report uses, so this reads the same
+    // way the line does.
+    let number_before = |what: &str| -> usize {
+        let at = line
+            .find(what)
+            .unwrap_or_else(|| panic!("no `{what}` in the report:\n{line}"));
+        line[..at]
+            .split_whitespace()
+            .next_back()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no number before `{what}` in:\n{line}"))
+    };
+
+    assert!(number_before("traces") > 0, "no trace ever started:\n{line}");
+    assert!(number_before("moved") > 0, "nothing was ever moved:\n{line}");
+    assert!(
+        number_before("roots seen") > 0,
+        "the stack walk found no roots at all, which would make every root \
+         check pass vacuously -- the stack maps most likely did not survive \
+         being written to the object file:\n{line}"
+    );
+    assert!(
+        number_before("safepoints") > 0,
+        "no safepoints are registered:\n{line}"
+    );
+    let _ = std::fs::remove_file(&exe);
 }
 
 #[test]

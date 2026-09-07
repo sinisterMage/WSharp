@@ -201,6 +201,49 @@ pub(crate) fn cwd() -> Result<Vec<u8>, Errno> {
     }
 }
 
+/// Change the process's working directory.
+///
+/// Process-wide state, and the only writable piece of it this layer exposes.
+/// One caller has a claim on it -- a tool told to work somewhere else, as
+/// `git -C` is -- and that caller does it once, before anything else runs.
+pub(crate) fn chdir(path: &[u8]) -> Result<(), Errno> {
+    imp::chdir(path)
+}
+
+/// The path of the running executable.
+///
+/// Every system has its own way to ask and none of them is a standard, which
+/// is why this is per-arm rather than an approximation from `argv[0]`: that
+/// is whatever the caller passed to `exec`, and a program found through `PATH`
+/// gets a bare name it cannot turn back into a path.
+///
+/// Grows its buffer for the same reason [`cwd`] does, and for one arm --
+/// OpenBSD -- there is no way to ask at all, which it says rather than guesses.
+pub(crate) fn self_exe() -> Result<Vec<u8>, Errno> {
+    let mut room = 512;
+    loop {
+        if let Some(path) = imp::self_exe(room)? {
+            return Ok(path);
+        }
+        room *= 2;
+    }
+}
+
+/// Replace this process with another program.
+///
+/// Answers only on failure: on success there is no longer a caller to answer
+/// to. `argv` is what the new program sees *including* its own name, which is
+/// the C convention and not `os.args()`'s -- the caller writes the name twice
+/// on purpose.
+///
+/// Windows has no `exec`, so its arm runs the program to completion and exits
+/// with its status. Observationally the same for a command line tool; the
+/// difference is that the process id changes, and that a `wait` on this
+/// process sees one exit rather than a replacement.
+pub(crate) fn exec(program: &[u8], argv: &[Vec<u8>]) -> Errno {
+    imp::exec(program, argv)
+}
+
 /// A NUL-terminated C string, copied out.
 ///
 /// Shared by the arms because all three read one out of a structure the

@@ -15,11 +15,17 @@ repository = "https://forgejo-hagc.srv1954822.hstgr.cloud/ofekbickel/WSharp"
 # --- when in doubt, read the extracted source under
 # ~/.cargo/registry/src/index.crates.io-*/cranelift-*-0.134.3/ rather than
 # guessing from memory.
+#
+# `cranelift-object` was the one that had to be fetched, when `wsharp build`
+# arrived. Everything under it was already cached, so it was a single crate and
+# the offline property is restored. It implements the same `Module` trait
+# `cranelift-jit` does, which is why there is one lowering and two backends.
 cranelift-codegen = "=0.134.3"
 cranelift-frontend = "=0.134.3"
 cranelift-jit = "=0.134.3"
 cranelift-module = "=0.134.3"
 cranelift-native = "=0.134.3"
+cranelift-object = "=0.134.3"
 
 clap = { version = "4", features = ["derive"] }
 smallvec = "1"

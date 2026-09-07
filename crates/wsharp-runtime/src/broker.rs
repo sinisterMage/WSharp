@@ -81,6 +81,7 @@ fn partition_of(key: &[u8], partitions: usize) -> usize {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `name` must be a live
 /// string object.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_broker_topic(name: *const u8, partitions: i64) -> i64 {
     unsafe { crate::gc::checkpoint() };
     let name = String::from_utf8_lossy(unsafe { crate::strings::str_bytes(name) }).into_owned();
@@ -103,6 +104,7 @@ pub unsafe extern "C" fn ws_broker_topic(name: *const u8, partitions: i64) -> i6
 /// # Safety
 /// `message` must be a live heap object; the type checker is what guarantees
 /// that, by refusing anything but an object as a topic's message type.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_broker_publish(topic: i64, key: *const u8, message: *mut u8) -> i64 {
     unsafe { crate::gc::checkpoint() };
     // Out of this worker's heap and into bytes before the lock is taken: the
@@ -123,6 +125,7 @@ pub unsafe extern "C" fn ws_broker_publish(topic: i64, key: *const u8, message: 
 ///
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_broker_subscribe(topic: i64, group: *const u8) -> i64 {
     unsafe { crate::gc::checkpoint() };
     let group = String::from_utf8_lossy(unsafe { crate::strings::str_bytes(group) }).into_owned();
@@ -161,6 +164,7 @@ pub struct MaybeMessage {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `out` must point at a
 /// slot of this shape.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_broker_poll(out: *mut MaybeMessage, consumer: i64) {
     unsafe { crate::gc::checkpoint() };
     // Copied out from under the lock before anything is decoded: decoding
@@ -195,6 +199,7 @@ pub unsafe extern "C" fn ws_broker_poll(out: *mut MaybeMessage, consumer: i64) {
 ///
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_broker_commit(consumer: i64) {
     unsafe { crate::gc::checkpoint() };
     with_broker(|b| {
@@ -213,6 +218,7 @@ pub unsafe extern "C" fn ws_broker_commit(consumer: i64) {
 ///
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_broker_seek(consumer: i64, partition: i64, offset: i64) {
     unsafe { crate::gc::checkpoint() };
     with_broker(|b| {
@@ -229,6 +235,7 @@ pub unsafe extern "C" fn ws_broker_seek(consumer: i64, partition: i64, offset: i
 ///
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_broker_len(topic: i64) -> i64 {
     unsafe { crate::gc::checkpoint() };
     with_broker(|b| match b.topics.get(topic as usize) {

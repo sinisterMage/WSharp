@@ -177,6 +177,7 @@ unsafe fn unpack(words: &[Word], pinned: &Pinned) -> Vec<u64> {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `argv` must match the
 /// service's `init_args`.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_spawn(service_id: u32, argv: *const u64) -> i64 {
     unsafe { crate::gc::checkpoint() };
     let Some(code) = service(service_id) else {
@@ -304,6 +305,7 @@ fn worker_main(code: &'static ServiceCode, args: Vec<Word>, handle: &'static Han
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; `argv` and `out` must
 /// match the method's slot kinds.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_rpc_call(
     worker: i64,
     service_id: u32,
@@ -360,6 +362,7 @@ pub unsafe extern "C" fn ws_rpc_call(
 ///
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_join(worker: i64) -> i64 {
     unsafe { crate::gc::checkpoint() };
     let Some(handle) = handle(worker) else {

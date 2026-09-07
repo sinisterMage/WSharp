@@ -5,12 +5,13 @@
 //! the files, check them, specialise, compile, run -- so it lives here rather
 //! than in either.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::ValueEnum;
 use wsharp_syntax::diag::{Diagnostic, Severity, SourceMap, render};
 
+pub mod link;
 pub mod load;
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -26,6 +27,19 @@ pub enum Emit {
     /// The generated Cranelift IR. Compiles the program to get it, so this
     /// works under `check` as well as `run`.
     Clif,
+    /// The relocatable object file, left unlinked. `build` only: it is the
+    /// half of `build` that does not need a C compiler.
+    Obj,
+}
+
+/// What to do once a program has been checked and specialised.
+pub enum Action {
+    /// Stop. `check`, and anything `--emit` answers on its own.
+    Check,
+    /// Compile into this process and run `main`.
+    Run,
+    /// Compile to a native executable.
+    Build { out: PathBuf },
 }
 
 /// What a program is rooted at: a file, or one of the library's own modules.
@@ -52,8 +66,9 @@ pub fn drive(
     root: Root<'_>,
     emit: Option<Emit>,
     gc_stress: bool,
-    run: bool,
+    action: Action,
 ) -> Result<ExitCode, String> {
+    let run = !matches!(action, Action::Check);
     // `--emit=tokens` is about one file, and has to work on one that does not
     // parse, so it does not go through the loader.
     if emit == Some(Emit::Tokens) {
@@ -134,9 +149,19 @@ pub fn drive(
     }
 
     // ---- code generation ----
-    let options = wsharp_codegen::Options { gc_stress };
     let want_clif = emit == Some(Emit::Clif);
-    let jit = wsharp_codegen::compile(&mono.program, &mut analysis.store, &options, want_clif)
+    if let Action::Build { out } = action {
+        let object = wsharp_codegen::compile_object(&mono.program, &mut analysis.store, want_clif)
+            .map_err(|e| e.to_string())?;
+        if want_clif {
+            print!("{}", object.clif);
+            return Ok(ExitCode::SUCCESS);
+        }
+        return finish_build(&object.bytes, &out, emit == Some(Emit::Obj));
+    }
+
+    let options = wsharp_codegen::Options { gc_stress };
+    let jit = wsharp_codegen::compile_jit(&mono.program, &mut analysis.store, &options, want_clif)
         .map_err(|e| e.to_string())?;
     if want_clif {
         print!("{}", jit.clif);
@@ -146,6 +171,28 @@ pub fn drive(
     let status = jit.run();
     // Same convention as a C program: the low byte of `main`'s result.
     Ok(ExitCode::from((status & 0xff) as u8))
+}
+
+/// Write the object out, and link it unless only the object was asked for.
+///
+/// The object goes beside the executable rather than in a temporary directory,
+/// so that a failed link leaves something to look at and `--emit=obj` and a
+/// full build put the file in the same place.
+fn finish_build(bytes: &[u8], out: &Path, object_only: bool) -> Result<ExitCode, String> {
+    let object = if object_only {
+        out.to_path_buf()
+    } else {
+        out.with_extension("o")
+    };
+    std::fs::write(&object, bytes)
+        .map_err(|e| format!("cannot write {}: {e}", object.display()))?;
+    if object_only {
+        return Ok(ExitCode::SUCCESS);
+    }
+    link::link(&object, out)?;
+    // The object has served its purpose. A failed link keeps it, above.
+    let _ = std::fs::remove_file(&object);
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Print diagnostics; returns true if any of them were errors.

@@ -1,0 +1,21 @@
+[package]
+name = "wsharp-start"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# A static archive, because this is what `wsharp build` hands to `cc`. Building
+# it as a staticlib is also what bundles `wsharp-runtime` into the same `.a`,
+# so a compiled program links against one file rather than a list.
+[lib]
+crate-type = ["staticlib"]
+# No test harness. This crate *defines* `main`, and a test binary brings its
+# own -- building one asks the linker to place two, which it refuses. There is
+# nothing here to unit-test in any case: what this archive does is checked by
+# building a program with it, which `wsharp-cli`'s case suite does.
+test = false
+doctest = false
+
+[dependencies]
+wsharp-runtime.workspace = true

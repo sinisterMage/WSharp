@@ -101,6 +101,7 @@ impl FallibleF64 {
 /// Called from JIT-compiled code across an FFI boundary; the string arguments
 /// must be null or point at W# string objects, and `out` must point at writable
 /// storage laid out as a [`FallibleStr`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_io_read_file(out: *mut FallibleStr, path: *const u8) {
     unsafe { crate::gc::checkpoint() };
     // Copy the path out before allocating *and* before blocking: an allocation
@@ -128,6 +129,7 @@ pub unsafe extern "C" fn ws_io_read_file(out: *mut FallibleStr, path: *const u8)
 ///
 /// # Safety
 /// `out` must point at writable storage laid out as a [`FallibleStr`].
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_io_read_line(out: *mut FallibleStr) {
     unsafe { crate::gc::checkpoint() };
     // The blocking call this whole mechanism exists for: a program waiting on a
@@ -147,6 +149,7 @@ pub unsafe extern "C" fn ws_io_read_line(out: *mut FallibleStr) {
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; the string arguments
 /// must be null or point at W# string objects.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_io_write_file(path: *const u8, contents: *const u8) -> i64 {
     unsafe { crate::gc::checkpoint() };
     let path = unsafe { str_bytes(path) }.to_vec();
@@ -161,6 +164,7 @@ pub unsafe extern "C" fn ws_io_write_file(path: *const u8, contents: *const u8) 
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; the string arguments
 /// must be null or point at W# string objects.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_io_exists(path: *const u8) -> bool {
     unsafe { crate::gc::checkpoint() };
     let path = unsafe { str_bytes(path) }.to_vec();

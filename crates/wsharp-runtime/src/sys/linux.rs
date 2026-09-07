@@ -60,6 +60,14 @@ mod c {
         /// Answers with `buf` on success and null on failure, so the path's
         /// length has to be found by looking for the terminator.
         pub(super) fn getcwd(buf: *mut u8, size: usize) -> *mut u8;
+        pub(super) fn chdir(path: *const u8) -> c_int;
+        /// Does **not** terminate what it writes, and truncates silently when
+        /// the buffer is too small -- which is why the caller has to notice
+        /// that the answer exactly filled it and ask again with more.
+        pub(super) fn readlink(path: *const u8, buf: *mut u8, size: usize) -> isize;
+        /// Replaces this process, so it answers only on failure. `argv` is
+        /// null-terminated and its first entry is the program's own name.
+        pub(super) fn execvp(file: *const u8, argv: *const *const u8) -> c_int;
         /// `errno` is a macro in C, and this is what it expands to.
         pub(super) fn __errno_location() -> *mut c_int;
         /// Bytes from the kernel's generator. glibc has exported this since
@@ -311,6 +319,55 @@ pub(crate) fn env(name: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     Some(unsafe { super::c_string(value) })
+}
+
+pub(crate) fn chdir(path: &[u8]) -> Result<(), Errno> {
+    let path = c_path(path)?;
+    if unsafe { c::chdir(path.as_ptr()) } < 0 {
+        return Err(errno());
+    }
+    Ok(())
+}
+
+/// The running executable, read out of `/proc`.
+///
+/// The kernel keeps the answer as a symbolic link, which is the one place on
+/// Linux that knows it -- `argv[0]` is whatever the caller passed to `exec`.
+/// A `readlink` that exactly fills the buffer may have truncated, so that
+/// counts as "not enough room" and [`super::self_exe`] asks again.
+pub(crate) fn self_exe(room: usize) -> Result<Option<Vec<u8>>, Errno> {
+    let mut buf = vec![0u8; room];
+    let n = unsafe { c::readlink(c"/proc/self/exe".as_ptr() as *const u8, buf.as_mut_ptr(), room) };
+    if n < 0 {
+        return Err(errno());
+    }
+    let n = n as usize;
+    if n == room {
+        return Ok(None);
+    }
+    buf.truncate(n);
+    Ok(Some(buf))
+}
+
+/// Replace this process. Answers only on failure.
+pub(crate) fn exec(program: &[u8], argv: &[Vec<u8>]) -> Errno {
+    let Ok(program) = c_path(program) else {
+        return Errno(ENOENT);
+    };
+    // Terminated copies first, and the vector of pointers into them second:
+    // the pointers must outlive nothing, but they must point at something that
+    // is still alive when `execvp` reads it.
+    let mut owned: Vec<Vec<u8>> = Vec::with_capacity(argv.len());
+    for arg in argv {
+        match c_path(arg) {
+            Ok(a) => owned.push(a),
+            Err(e) => return e,
+        }
+    }
+    let mut pointers: Vec<*const u8> = owned.iter().map(|a| a.as_ptr()).collect();
+    pointers.push(core::ptr::null());
+    unsafe { c::execvp(program.as_ptr(), pointers.as_ptr()) };
+    errno()
 }
 
 /// The working directory, or `None` when `room` bytes were not enough.

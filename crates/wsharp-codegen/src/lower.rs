@@ -13,7 +13,6 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, Variable};
-use cranelift_jit::JITModule;
 use cranelift_module::{DataId, FuncId, Module};
 use smallvec::{SmallVec, smallvec};
 use std::collections::HashMap;
@@ -51,8 +50,9 @@ const NO_ARGS: &[BlockArg] = &[];
 pub struct Decls {
     /// Indexed by `hir::FuncId`.
     pub funcs: Vec<FuncId>,
-    /// Indexed by `hir::BuiltinId`.
-    pub builtins: Vec<FuncId>,
+    /// Indexed by `hir::BuiltinId`. `None` for a builtin the code generator
+    /// lowers inline, which names no symbol and is never called.
+    pub builtins: Vec<Option<FuncId>>,
     /// Indexed by `hir::StrId`.
     pub strings: Vec<DataId>,
     /// Indexed by `hir::ArrayId`: a top-level `const` array, in the data
@@ -74,6 +74,14 @@ pub struct Decls {
     /// element stride, and an instantiation's is not known until
     /// monomorphisation has picked its arguments.
     pub instance_type_ids: HashMap<String, u32>,
+    /// The byte the loop safepoint tests, and the byte the load barrier tests.
+    ///
+    /// Imported data rather than an address baked in as a constant. The JIT
+    /// could do either -- it resolves to this process -- but an object file
+    /// can only do this, and one lowering that works for both is worth more
+    /// than a constant that is a relocation away from being the same thing.
+    pub poll_flag: DataId,
+    pub evacuating_flag: DataId,
     /// The write barrier's slow path.
     pub log_object: FuncId,
     /// The loop safepoint's slow path.
@@ -260,9 +268,14 @@ struct LoopCtx {
 }
 
 /// Lower one function's body into `builder`.
-pub fn translate(
+///
+/// Generic over the module because there are two backends and one lowering:
+/// the JIT resolves everything to addresses in this process, an object file
+/// leaves the same references for a linker. Nothing here may ask which it is --
+/// that would be the first of two lowerings, and the second would drift.
+pub fn translate<M: Module>(
     builder: FunctionBuilder<'_>,
-    module: &mut JITModule,
+    module: &mut M,
     program: &hir::Program,
     store: &mut TypeStore,
     decls: &Decls,
@@ -300,9 +313,9 @@ pub fn translate(
 /// `takes_state` says whether the first parameter comes as its own argument --
 /// a method's does, because the worker holds the state and the caller never
 /// sees it -- rather than out of the buffer.
-pub fn trampoline(
+pub fn trampoline<M: Module>(
     mut b: FunctionBuilder<'_>,
-    module: &mut JITModule,
+    module: &mut M,
     store: &mut TypeStore,
     decls: &Decls,
     target: &hir::FuncDef,
@@ -353,6 +366,45 @@ pub fn trampoline(
     b.finalize(frontend_config);
 }
 
+/// The signature the startup shim calls a compiled program's `main` through.
+///
+/// No environment pointer and always a result, which is the point: `main` may
+/// be `fn main() void` or `fn main() i64`, and the difference is W#'s business
+/// rather than the Rust half's. [`entry_shim`] absorbs both.
+pub fn entry_signature(call_conv: CallConv) -> Signature {
+    let mut sig = Signature::new(call_conv);
+    sig.returns.push(AbiParam::new(types::I64));
+    sig
+}
+
+/// Emit `ws_main`: the one symbol a compiled program exports for its own code.
+///
+/// It passes the null environment pointer every top-level W# function takes,
+/// and answers zero for a `main` that returns nothing -- so the startup shim
+/// has one signature to call and no question to ask.
+pub fn entry_shim<M: Module>(
+    mut b: FunctionBuilder<'_>,
+    module: &mut M,
+    decls: &Decls,
+    entry: hir::FuncId,
+    returns_value: bool,
+) {
+    let frontend_config = module.target_config();
+    let block = b.create_block();
+    b.switch_to_block(block);
+    let fr = module.declare_func_in_func(decls.funcs[entry as usize], b.func);
+    let null_env = b.ins().iconst(PTR, 0);
+    let call = b.ins().call(fr, &[null_env]);
+    let code = if returns_value {
+        b.inst_results(call)[0]
+    } else {
+        b.ins().iconst(types::I64, 0)
+    };
+    b.ins().return_(&[code]);
+    b.seal_all_blocks();
+    b.finalize(frontend_config);
+}
+
 /// The signature a trampoline has, seen from Rust.
 pub fn trampoline_signature(call_conv: CallConv, takes_state: bool) -> Signature {
     let mut sig = Signature::new(call_conv);
@@ -397,9 +449,9 @@ enum NumKind {
     Opaque,
 }
 
-struct Trans<'a, 'f> {
+struct Trans<'a, 'f, M: Module> {
     b: FunctionBuilder<'f>,
-    module: &'a mut JITModule,
+    module: &'a mut M,
     program: &'a hir::Program,
     store: &'a mut TypeStore,
     decls: &'a Decls,
@@ -412,7 +464,7 @@ struct Trans<'a, 'f> {
     terminated: bool,
 }
 
-impl Trans<'_, '_> {
+impl<M: Module> Trans<'_, '_, M> {
     // ---- small helpers --------------------------------------------------
 
     fn slots_of(&mut self, ty: &Type) -> SlotTypes {
@@ -542,15 +594,15 @@ impl Trans<'_, '_> {
     /// points at where the object lives now, never where it used to.
     ///
     /// The cost when nothing is moving -- which is nearly always -- is a load
-    /// of one byte, a test, and a branch that is not taken. The address of the
-    /// byte is baked in as a constant, sound for the same reason the poll
-    /// flag's is: the JIT resolves everything to absolute addresses in this
-    /// process.
+    /// of one byte, a test, and a branch that is not taken. The byte is named
+    /// as a symbol rather than baked in as an address, for the same reason the
+    /// poll flag is: this is the one lowering both backends use, and only one
+    /// of them may invent an address.
     fn emit_load_barrier(&mut self, value: ir::Value) -> ir::Value {
-        let addr = self
-            .b
-            .ins()
-            .iconst(PTR, wsharp_runtime::gc::evacuating_flag_address() as i64);
+        let flag = self
+            .module
+            .declare_data_in_func(self.decls.evacuating_flag, self.b.func);
+        let addr = self.b.ins().symbol_value(PTR, flag);
         let moving = self
             .b
             .ins()
@@ -666,15 +718,15 @@ impl Trans<'_, '_> {
     /// It would run to completion no matter how badly the heap needed
     /// collecting, and a collector thread waiting for it would wait for ever.
     ///
-    /// The check is a load of one byte and a not-taken branch. The byte's
-    /// address is baked in as a constant, which is sound here for the same
-    /// reason string literals are: the JIT resolves everything to absolute
-    /// addresses in this process (`is_pic` is off).
+    /// The check is a load of one byte and a not-taken branch. The byte is
+    /// named as a symbol and reached with `symbol_value`, exactly as a string
+    /// literal is -- so the JIT resolves it to an address in this process and
+    /// an object file leaves a relocation, from one instruction either way.
     fn emit_gc_poll(&mut self) {
-        let addr = self
-            .b
-            .ins()
-            .iconst(PTR, wsharp_runtime::gc::poll_flag_address() as i64);
+        let flag = self
+            .module
+            .declare_data_in_func(self.decls.poll_flag, self.b.func);
+        let addr = self.b.ins().symbol_value(PTR, flag);
         let requested = self
             .b
             .ins()
@@ -1798,9 +1850,16 @@ impl Trans<'_, '_> {
             }
 
             hir::Callee::Builtin(id) => {
-                let clif = self.decls.builtins[*id as usize];
-                let fr = self.module.declare_func_in_func(clif, self.b.func);
                 let builtins = wsharp_runtime::builtins();
+                // The inline-lowered rows are matched above, so anything
+                // reaching here is a builtin that really is a call.
+                let clif = self.decls.builtins[*id as usize].unwrap_or_else(|| {
+                    panic!(
+                        "`{}` is lowered inline, so it has no symbol to call",
+                        builtins[*id as usize].symbol()
+                    )
+                });
+                let fr = self.module.declare_func_in_func(clif, self.b.func);
                 let ret = builtins[*id as usize].ret;
 
                 let mut values = Vec::new();
@@ -2090,7 +2149,7 @@ impl Trans<'_, '_> {
             .iter()
             .position(|x| x.module == wsharp_runtime::builtins::STR_MODULE && x.name == "eq")
             .expect("`std/str.eq` is in the builtin table");
-        let clif = self.decls.builtins[id];
+        let clif = self.decls.builtins[id].expect("`std/str.eq` is a call, not lowered inline");
         let fr = self.module.declare_func_in_func(clif, self.b.func);
         let call = self.b.ins().call(fr, &[a, b]);
         self.b.inst_results(call)[0]
