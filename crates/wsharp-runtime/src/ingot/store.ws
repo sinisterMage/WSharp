@@ -252,7 +252,7 @@ pub fn install_files(f: fault.Fault, h: str, files: list.List[File]) str {
             return "";
         };
         io.write_file(where, bytes.to_str(file.data)) catch {
-            fault.fail_at(f, where, "cannot be written");
+            fault.fail_at(f, where, why_unwritable(path.dirname(where)));
             fs.remove_tree(staging) catch ignore();
             return "";
         };
@@ -359,6 +359,25 @@ fn temporary() str {
 /// failure being reported: a `catch` must produce a value or leave, and there
 /// is nothing here to say that the message already being carried does not.
 fn ignore() void { return; }
+
+/// Why a file could not be written, as far as this can tell from outside.
+///
+/// A W# error union carries a tag and no detail, so "cannot be written" is all
+/// the `catch` itself knows -- and that is the least useful sentence a package
+/// manager can end on. The one distinction worth drawing costs a `stat`: a
+/// write into a directory that is not there is a *different* fault from a write
+/// that was refused, and only the first points at the line above rather than at
+/// the filesystem.
+///
+/// It earns its place: this is what the message said on Windows when
+/// `mkdir_all` was starting absolute paths at `/` instead of at their drive,
+/// and "cannot be written" was not enough to say so.
+fn why_unwritable(dir: str) str {
+    if (!fs.is_dir(dir)) {
+        return text.concat("cannot be written -- there is no directory ", dir);
+    }
+    return "cannot be written";
+}
 
 // ---------------------------------------------------------------------------
 // Collecting
