@@ -4,7 +4,7 @@
 //! `@import`. Resolving that is file-system work, so it lives here rather than
 //! in the type checker, which is handed the finished set.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use wsharp_syntax::ast;
@@ -31,46 +31,57 @@ pub struct Program {
     pub diags: Vec<Diagnostic>,
 }
 
+/// The tables `@import` resolves a library path against.
+fn libraries() -> [&'static [(&'static str, &'static str)]; 2] {
+    [
+        wsharp_runtime::builtins::std_module_sources(),
+        wsharp_runtime::builtins::ingot_module_sources(),
+    ]
+}
+
 /// Read `root` and everything it imports.
 ///
 /// Errors that stop a file being read -- a missing file, a cycle -- are
 /// returned as diagnostics rather than aborting, so a program with two broken
 /// imports reports both.
 pub fn load(root: &Path) -> Result<Program, String> {
-    let mut loader = Loader {
-        map: SourceMap::new(),
-        modules: Vec::new(),
-        diags: Vec::new(),
-        files: HashMap::new(),
-        loading: Vec::new(),
-    };
+    let mut loader = Loader::new();
     let text = std::fs::read_to_string(root)
         .map_err(|e| format!("cannot read {}: {e}", root.display()))?;
     loader.add(root, "main".into(), text);
-    // The parts of the standard library written in W#. They are compiled with
-    // the program like any other module -- monomorphised per element type,
-    // and dropped entirely when nothing calls them.
-    for (path, source) in wsharp_runtime::builtins::std_module_sources() {
-        let base = loader.map.add(format!("<{path}>"), (*source).to_string());
-        let (ast, mut diags) = wsharp_syntax::parse_at(source, base);
-        loader.diags.append(&mut diags);
-        // A standard-library module's own imports are standard-library paths,
-        // which stand for themselves.
-        let imports = source_imports(&ast)
-            .into_iter()
-            .map(|(spec, _)| (spec.clone(), spec))
-            .collect();
-        loader.modules.push(Loaded {
-            path: (*path).to_string(),
-            ast,
-            imports,
-        });
-    }
-    Ok(Program {
-        modules: loader.modules,
-        map: loader.map,
-        diags: loader.diags,
-    })
+    loader.add_library(&libraries());
+    Ok(loader.finish())
+}
+
+/// The same, for a program whose root is a library module rather than a file.
+///
+/// `ingot` is a W# program that is compiled into the binary along with the rest
+/// of the library, so there is no file to name. Everything else is identical --
+/// the module's own imports are library paths, its name is its module path, and
+/// what it reaches is loaded exactly as it would be for a program on disk.
+pub fn load_library_module(root: &str) -> Result<Program, String> {
+    let source = libraries()
+        .iter()
+        .flat_map(|table| table.iter())
+        .find(|(path, _)| *path == root)
+        .map(|(_, source)| *source)
+        .ok_or_else(|| format!("there is no library module `{root}`"))?;
+
+    let mut loader = Loader::new();
+    let base = loader.map.add(format!("<{root}>"), source.to_string());
+    let (ast, mut diags) = wsharp_syntax::parse_at(source, base);
+    loader.diags.append(&mut diags);
+    let imports = source_imports(&ast)
+        .into_iter()
+        .map(|(spec, _)| (spec.clone(), spec))
+        .collect();
+    loader.modules.push(Loaded {
+        path: root.to_string(),
+        ast,
+        imports,
+    });
+    loader.add_library(&libraries());
+    Ok(loader.finish())
 }
 
 struct Loader {
@@ -84,7 +95,48 @@ struct Loader {
     loading: Vec<PathBuf>,
 }
 
+/// Whether an import specifier names a library module rather than a file
+/// beside the one that wrote it.
+///
+/// Two namespaces: `std`, and `ingot` for the package manager's own modules.
+/// A third rule -- a package, resolved through a lockfile -- is item 11's
+/// stage five, and goes in `Loader::follow` beside this one.
+fn is_library(spec: &str) -> bool {
+    wsharp_runtime::builtins::LIBRARY_ROOTS.iter().any(|root| {
+        spec == *root
+            || spec
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
+/// The namespace a library specifier is in, for `@import("std")`.
+fn library_root(spec: &str) -> Option<&'static str> {
+    wsharp_runtime::builtins::LIBRARY_ROOTS
+        .iter()
+        .copied()
+        .find(|root| spec == *root)
+}
+
 impl Loader {
+    fn new() -> Loader {
+        Loader {
+            map: SourceMap::new(),
+            modules: Vec::new(),
+            diags: Vec::new(),
+            files: HashMap::new(),
+            loading: Vec::new(),
+        }
+    }
+
+    fn finish(self) -> Program {
+        Program {
+            modules: self.modules,
+            map: self.map,
+            diags: self.diags,
+        }
+    }
+
     fn add(&mut self, file: &Path, module_path: String, text: String) {
         let base = self.map.add(file.display().to_string(), text.clone());
         let (ast, mut diags) = wsharp_syntax::parse_at(&text, base);
@@ -113,13 +165,94 @@ impl Loader {
         self.loading.pop();
     }
 
+    /// Add the parts of the standard library written in W# that this program
+    /// can actually reach.
+    ///
+    /// They are compiled with the program like any other module --
+    /// monomorphised per element type, and dropped entirely when nothing calls
+    /// them -- but they still have to be *parsed and inferred*, and that is
+    /// not free. Every module went in unconditionally while the library was
+    /// four files, which stopped being reasonable at twenty-odd: a ten-line
+    /// program spent more time inferring TLS and TOML than anything else.
+    ///
+    /// So a library module is read only when something imports it, following
+    /// each one's own imports in turn. `@import("std")` means all of them,
+    /// because a module path is a prefix and any of them can be walked into
+    /// from there.
+    ///
+    /// The order is the table's, so what a program is built from does not
+    /// depend on the order it happened to mention things in.
+    fn add_library(&mut self, tables: &[&'static [(&'static str, &'static str)]]) {
+        let sources: Vec<(&'static str, &'static str)> =
+            tables.iter().flat_map(|t| t.iter().copied()).collect();
+        let table: HashMap<&str, &str> = sources.iter().copied().collect();
+
+        let mut wanted: HashSet<&str> = HashSet::new();
+        let mut roots: HashSet<&'static str> = HashSet::new();
+        for module in &self.modules {
+            for spec in module.imports.values() {
+                if let Some(root) = library_root(spec) {
+                    roots.insert(root);
+                } else if let Some((path, _)) = table.get_key_value(spec.as_str()) {
+                    wanted.insert(path);
+                }
+            }
+        }
+        // A bare namespace is every module in it, because a module path is a
+        // prefix and any of them can be walked into from there.
+        for root in roots {
+            let prefix = format!("{root}/");
+            wanted.extend(table.keys().copied().filter(|p| p.starts_with(&prefix)));
+        }
+
+        // Parse each wanted module once, and follow what it imports. A library
+        // module's imports are library paths, which stand for themselves.
+        let mut parsed: HashMap<&str, (ast::Module, HashMap<String, String>)> = HashMap::new();
+        let mut queue: Vec<&str> = wanted.iter().copied().collect();
+        // A root that is itself a library module -- which is what `ingot` runs
+        // -- is already here, and reading it again would declare everything in
+        // it twice.
+        let already: HashSet<&str> = self.modules.iter().map(|m| m.path.as_str()).collect();
+        while let Some(path) = queue.pop() {
+            if parsed.contains_key(path) || already.contains(path) {
+                continue;
+            }
+            let Some(source) = table.get(path) else {
+                continue;
+            };
+            let base = self.map.add(format!("<{path}>"), (*source).to_string());
+            let (module, mut diags) = wsharp_syntax::parse_at(source, base);
+            self.diags.append(&mut diags);
+            let mut imports = HashMap::new();
+            for (spec, _) in source_imports(&module) {
+                if is_library(&spec)
+                    && let Some((next, _)) = table.get_key_value(spec.as_str())
+                {
+                    queue.push(next);
+                }
+                imports.insert(spec.clone(), spec);
+            }
+            parsed.insert(path, (module, imports));
+        }
+
+        for (path, _) in &sources {
+            if let Some((ast, imports)) = parsed.remove(*path) {
+                self.modules.push(Loaded {
+                    path: (*path).to_string(),
+                    ast,
+                    imports,
+                });
+            }
+        }
+    }
+
     /// Read one imported file and return the module path it is known by.
     ///
     /// `None` means the import failed and has been reported. A standard-library
     /// path resolves to itself: there is no file, and the type checker knows
     /// which ones exist.
     fn follow(&mut self, from: &Path, spec: &str, span: wsharp_syntax::Span) -> Option<String> {
-        if spec == "std" || spec.starts_with("std/") {
+        if is_library(spec) {
             return Some(spec.to_string());
         }
         let dir = from.parent().unwrap_or_else(|| Path::new("."));

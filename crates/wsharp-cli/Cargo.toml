@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "wsharp_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "wsharp"
 path = "src/main.rs"

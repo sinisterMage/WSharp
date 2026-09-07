@@ -365,6 +365,7 @@ A module system, and four modules behind it.
 | `std/fs` | `mkdir`, `rmdir`, `remove`, `rename`, `is_dir`, `size`, `read_dir`, `mkdir_all`, `remove_tree` (item 11) |
 | `std/os` | `args`, `get`, `home`, `temp_dir` (item 11) |
 | `std/path` | `join`, `dirname`, `basename`, `extension`, `is_absolute`, `normalise` (item 11) |
+| `std/toml` | TOML 1.0.0, read and written: `parse`, `write`, the `Value` lattice, `get`/`set`/`lookup` (item 11) |
 | `std/http` | the 27 status types, moved out of the global namespace; since item 8, an HTTP/1.1 client and server over `std/net` |
 | `std/broker` | `Topic[M]`, `Consumer[M]` and `topic`, `publish`, `subscribe`, `next`, `commit`, `seek`, `len` |
 | `std/net` | `Socket`, `Listener`, `Poller`, `Event`, `Datagrams`, `Peer`, `Datagram` and `connect`, `listen`, `accept`, `read`, `write`, `write_all`, `read_exactly`, `read_all`, `set_nonblocking`, `poller`, `watch`, `wait`, `udp`, `send_to`, `receive`, `reply`, `close` (item 8); and since item 10, `read_into`, `write_bytes`, `write_all_bytes`, `read_exactly_into` over a `[]u8` |
@@ -1615,7 +1616,7 @@ having before the next exists.
 | Stage | What it is | State |
 |---|---|---|
 | One | `argv`, the environment, and a real filesystem | **done** |
-| Two | TOML, the manifest and lockfile, and the content-addressed store | to do |
+| Two | TOML, the manifest and lockfile, and the content-addressed store | **done** |
 | Three | Semantic versions, and a PubGrub resolver that explains itself | to do |
 | Four | Git spoken rather than shelled out to: inflate, pkt-line, a packfile | to do |
 | Five | The loader hook, and the re-export a package facade needs | to do |
@@ -1684,6 +1685,155 @@ the first thing this item has found that the language cannot say, and it is
 noted rather than fixed: the store publishes by `rename` precisely so that two
 processes racing is not a case anything has to get right.
 
+### Stage two — TOML, the store, and the tool — **done**
+
+| Piece | Where |
+|---|---|
+| TOML 1.0.0, read and written | `std/toml.ws` |
+| `str.parse_float`, the asymmetry `str.parse_int` had left | `strings.rs` |
+| `ingot.toml` and `ingot.lock` | `ingot/manifest.ws` |
+| The content-addressed store: the tree hash, an atomic install, `check`, `gc` | `ingot/store.ws` |
+| One failure, with something to read on it | `ingot/fault.ws` |
+| The verbs | `ingot/main.ws` |
+| The tool: two hundred lines of Rust over them | `crates/ingot/` |
+| A library module is read only if something imports it | `wsharp-cli/src/load.rs` — `add_library` |
+
+`ingot init`, `add`, `remove`, `resolve`, `install`, `verify`, `list`, `why`,
+`gc`, `store` and `run` all work, against path dependencies. A registry
+dependency needs stage three and a git one needs stage four; both are refused
+by name rather than as "unsatisfiable".
+
+#### TOML, whole, because a subset is a promise the extension makes
+
+The manifest format was the one thing this item said to decide deliberately
+rather than by accident, and the decision went the harder way: **all of TOML
+1.0**, not a line-oriented format of our own and not a subset. A reader that
+takes three quarters of the grammar answers "syntax error" on a file every
+other tool in the world reads, and the person holding it has no way to tell
+which quarter they landed in.
+
+So: dotted keys, all four string forms including the triple-quoted ones with
+their line-ending backslash and their `\uXXXX`, integers in four bases with
+underscores, floats with exponents, `inf` and `nan`, the four date and time
+forms, arrays, inline tables, `[table]`, `[[array of tables]]`, and the
+redefinition rules that are the part nobody expects to be hard. There is a
+writer too, which `std/der` decided against on the grounds that nothing needed
+one; something needs one here, and a lockfile written by a hand-rolled emitter
+and read by a real parser is a bug that waits for the one entry with a
+quotation mark in it. The round trip is the test.
+
+Two things about writing it in W# are worth recording.
+
+**A value is a lattice.** The language has no sum types, and what it has
+instead is nominal subtyping with multiple dispatch — so `Value` is an empty
+supertype, each shape is a subtype carrying its payload, and `as_int` is an
+overload set whose base case says "this is not an integer". `std/x509`'s
+`SigKey` is the original of the shape, and this is the second use of it, which
+is the point at which it stops being a trick and becomes how this language
+reads a tagged format. The cost is two rules that have to be remembered: every
+overload states the same error set, because a dispatched call has one type; and
+a subtype coerces into its supertype only at an *annotated* binding, so each
+constructor is `const v: Value = Int{ .. }; return v;`.
+
+**Parsing does not raise.** An error union carries a tag and nothing else, and
+`BadFormat` is not a thing to hand somebody holding a 200-line manifest.
+`parse` answers with a `Doc` — a table, or a message and the line it happened
+on — and everything under ingot's verbs takes a `Fault` and writes into it.
+This is the first place the language's error unions were not enough, and it is
+worth saying plainly that the answer was not to change the language: a reader
+that has lost its place should report the first failure and stop, which is a
+shape rather than a missing feature.
+
+Writing it found one real gap. `str.parse_int` existed and `str.parse_float`
+did not, so a number could be written and not read back. It is one builtin row
+over Rust's own correctly-rounded parser — the one place where reimplementing
+in W# would have been worse rather than more honest, since there is exactly one
+right answer per decimal and getting it is a hard numerical problem.
+
+#### The store, and the two ways it can be wrong
+
+`~/.wsharp/store/sha256/<hex>` holds a package's files under the hash of its
+tree, `tmp/` holds a fetch in flight, and `env/` holds the lockfiles that reach
+entries. **The tree hash is defined here rather than borrowed**, because a key
+two versions of ingot compute differently is a store that silently splits in
+half:
+
+```
+H(dir) = SHA-256 over each entry, sorted by name as bytes:
+           "f" name 0x00 <decimal size> 0x00 <contents>     for a file
+           "d" name 0x00 <hex H(sub)>   0x00                for a directory
+```
+
+Sorted, because a filesystem's own order is neither sorted nor the same on two
+machines — so the sort is half of the hash's definition and lives beside it
+rather than in `std/array`. The size written out, so that two files cannot run
+together into one. A subtree folded to its own digest, so a deep tree costs no
+more memory than a shallow one. Permissions and timestamps deliberately absent:
+a package is its text.
+
+**An install is a `rename`**, which is what W# having no `defer` makes
+structural rather than tidy: a fetch builds under `tmp/` and becomes visible in
+one step, so an interrupted install leaves rubbish rather than half a package,
+and a package that is *there* is complete by construction. Two processes that
+both win the race are both right, since the contents are what the name says.
+
+The bug worth recording is the one this item predicted in advance. `install`
+first asked whether the target *directory existed*, which is not the same
+question as whether the entry is what it claims to be — so on a store somebody
+had edited, `install` reported success and changed nothing, and `verify` went
+on saying `damaged` for ever. Testing with `check` rather than with `is_dir` is
+the fix, and telling "not installed" from "damaged" is precisely what this item
+said was the feature rather than the polish.
+
+**`verify` answers with its exit status**: `0` ready, `1` needs installing, `2`
+needs resolving, `3` broken. A path dependency edited after it was resolved is
+none of missing, damaged or fine — the store holds exactly what it was told to
+and it is the *lockfile* that is out of date — so it is `2`, and the row says
+`changed`. The lockfile records the manifest's **digest** rather than its
+modification time, for the reason stage one dropped `stat`: a checkout does not
+preserve timestamps and two machines do not agree about them.
+
+#### Two decisions about shape
+
+**A path dependency is copied into the store**, rather than used where it lies
+as most package managers do. It follows from the first principle this item took
+from Ajt: resolving, installing and building are separate verbs, and nothing
+compiles because something else was fetched. If a build read a dependency's
+working directory, then editing that directory would change what the build does
+with nothing having been resolved or installed, and the separation the other
+verbs exist for would be a fiction. The cost is an `ingot install` after every
+edit, and it is the honest one.
+
+**The tool is two hundred lines of Rust over a W# program.** `ingot/main.ws`
+holds every verb and reads its own command line through `os.args()`; the driver
+publishes the arguments and runs it. Two things stay the driver's, and both for
+the same reason — they *are* the compiler, which a W# program has no way to ask
+for: `ingot run <file.ws>`, and `--gc-stress`. `-C <dir>` is the driver's too,
+since a process has one working directory. It is a seam rather than a split:
+the verb list a user sees is one list, and the W# half prints it.
+
+#### A library module is read only if something imports it
+
+Not planned, and the largest single effect of this stage. Every `.ws` module in
+the library was parsed and inferred for every program — free at four files, and
+by twenty-five it was most of what compiling a ten-line program did.
+`load::add_library` now follows the root's imports and reads only what they
+reach; `@import("std")` still means all of `std/`, because a module path is a
+prefix and any of them can be walked into from there. `wsharp check
+examples/fib.ws` went from 0.62 seconds to 0.005, and the whole case suite from
+140 seconds to 40.
+
+That is also what made `ingot/` a library namespace beside `std/` rather than a
+table the `ingot` binary passes in. Calling PubGrub and a packfile reader
+"standard library" would be a promise this project does not intend to make, and
+a namespace of its own says what they are — while `@import("ingot/store")`
+working under plain `wsharp` is what lets `tests/cases/` test them the way it
+tests everything else, including the second pass under `--gc-stress`.
+
+The consequence to remember is the other side of the same coin: **a library
+module nothing imports is never checked.** A new one needs a case that imports
+it, or it is not compiled at all.
+
 ### The name
 
 C#'s package manager is NuGet, which sounds like *nugget*; in Minecraft nine
@@ -1727,13 +1877,10 @@ package manager* rather than about Julia:
   which means zlib inflate and delta resolution. Inflate is a few hundred lines
   and wants item 9's bit operations; delta resolution is where the surprises
   are.
-- **A manifest and a lockfile format**, and a parser for it in W#. TOML is what
-  everyone expects and is more grammar than this needs; a small line-oriented
-  format is a day's work and a lifetime of explaining why it is not TOML. Worth
-  deciding deliberately rather than by accident.
-- **A content-addressed store**, keyed by tree hash, under `~/.wsharp` -- with
-  `gc` to remove what no environment can reach, which is the half of a store
-  people forget until a disk fills.
+- ~~**A manifest and a lockfile format**~~ Done in stage two, and the decision
+  went the harder way: all of TOML 1.0, because a subset is a promise the file
+  extension makes and the code does not keep.
+- ~~**A content-addressed store**~~ Done in stage two, `gc` included.
 
 ### Decisions worth recording in advance
 

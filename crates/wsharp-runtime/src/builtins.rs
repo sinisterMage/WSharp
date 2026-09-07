@@ -325,6 +325,15 @@ fn library() -> Vec<Builtin> {
             ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, &["BadFormat"]),
             ptr: crate::strings::ws_str_parse_int as *const u8,
         },
+        // The asymmetry `str.parse_int` had left: a number could be written
+        // and not read back. `std/toml` is what found it.
+        Builtin {
+            module: STR_MODULE,
+            name: "parse_float",
+            params: &[BuiltinTy::Str],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::F64, &["BadFormat"]),
+            ptr: crate::strings::ws_str_parse_float as *const u8,
+        },
         // The other half of `from_int`, for the top half of a `u64`: an `i64`
         // cannot hold it, so converting first would print a negative number.
         Builtin {
@@ -1057,6 +1066,8 @@ pub const FS_MODULE: &str = "std/fs";
 pub const OS_MODULE: &str = "std/os";
 /// Path arithmetic, which is all W# and touches no syscall.
 pub const PATH_MODULE: &str = "std/path";
+/// TOML 1.0.0, which is what a manifest and a lockfile are written in.
+pub const TOML_MODULE: &str = "std/toml";
 /// The two rotates, which the code generator recognises by name and lowers
 /// inline rather than calling. See [`BuiltinTy::IntVar`].
 pub const BITS_ROTL: &str = "rotl";
@@ -1111,22 +1122,56 @@ pub fn std_module_sources() -> &'static [(&'static str, &'static str)] {
         (FS_MODULE, include_str!("std/fs.ws")),
         (OS_MODULE, include_str!("std/os.ws")),
         (PATH_MODULE, include_str!("std/path.ws")),
+        (TOML_MODULE, include_str!("std/toml.ws")),
         (BROKER_MODULE, include_str!("std/broker.ws")),
         (NET_MODULE, include_str!("std/net.ws")),
         (HTTP_MODULE, include_str!("std/http.ws")),
     ]
 }
 
-/// Every module path the standard library provides.
+/// The package manager's own modules, in W#.
+///
+/// A second table rather than more rows in the first, and a namespace of its
+/// own rather than a corner of `std/`, because that is what they are: PubGrub,
+/// a git client and a packfile reader are ingot's, and calling them standard
+/// library would be a promise to everyone that this project does not intend to
+/// make. They live beside `std/` because this is the crate that owns the
+/// module tables and the `.ws` sources both, and because `@import("ingot/..")`
+/// working under plain `wsharp` is what lets `tests/cases/` test them the way
+/// it tests everything else -- including a second time under `--gc-stress`.
+///
+/// Nothing is read that nothing imports, so a program that does not mention
+/// them does not pay for them.
+pub fn ingot_module_sources() -> &'static [(&'static str, &'static str)] {
+    &[
+        (INGOT_FAULT_MODULE, include_str!("ingot/fault.ws")),
+        (INGOT_MANIFEST_MODULE, include_str!("ingot/manifest.ws")),
+        (INGOT_STORE_MODULE, include_str!("ingot/store.ws")),
+        (INGOT_MAIN_MODULE, include_str!("ingot/main.ws")),
+    ]
+}
+
+pub const INGOT_FAULT_MODULE: &str = "ingot/fault";
+pub const INGOT_MANIFEST_MODULE: &str = "ingot/manifest";
+pub const INGOT_STORE_MODULE: &str = "ingot/store";
+/// The verbs, and the module the `ingot` binary runs.
+pub const INGOT_MAIN_MODULE: &str = "ingot/main";
+
+/// The namespaces an `@import` may name: what a specifier has to start with to
+/// be a library path rather than a file beside the importing one.
+pub const LIBRARY_ROOTS: &[&str] = &["std", "ingot"];
+
+/// Every module path the library provides, `std/` and `ingot/` alike.
 ///
 /// This is what tells an `@import` of `"std/nope"` from one of `"std/http"`,
 /// and what lets `@import("std")` be written and then walked into.
-pub fn std_module_paths() -> Vec<String> {
+pub fn library_module_paths() -> Vec<String> {
     let mut paths: Vec<String> = Vec::new();
     for module in builtins()
         .iter()
         .map(|b| b.module)
         .chain(std_module_sources().iter().map(|(path, _)| *path))
+        .chain(ingot_module_sources().iter().map(|(path, _)| *path))
         .chain(std::iter::once(HTTP_MODULE))
     {
         if module == PRELUDE {

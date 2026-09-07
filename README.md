@@ -361,7 +361,12 @@ library's. A module's names are private to it unless it writes `pub`.
 `std/io` reads and writes whole files; `std/fs` is the tree they sit in --
 `mkdir`, `read_dir`, `rename`, `remove`, and enough of a stat to tell a
 directory from a file and say how big one is. `std/path` is the arithmetic
-above both, and makes no syscall at all.
+above both, and makes no syscall at all. `std/toml` is TOML 1.0, read and
+written.
+
+A library module is only read if something imports it, so a program that
+mentions nothing pays for nothing: `wsharp check` on a ten-line file takes
+about five milliseconds whatever the library grows to.
 
 ```zig
 const str  = @import("std/str");
@@ -533,7 +538,10 @@ Sessions are numbered by the original feature list:
       than shelled out to, a content-addressed store, and a resolver that says
       *why* a version was ruled out rather than that it was. Stage one is in —
       a program can read its own command line and walk a directory, and
-      `struct stat` turned out not to be needed to do it.
+      `struct stat` turned out not to be needed to do it. Stage two is in too:
+      TOML 1.0 read and written in W#, a content-addressed store that can tell
+      "not installed" from "damaged", and the tool itself — a W# program with
+      two hundred lines of Rust under it.
 
 What is left, and where it plugs in, is in [ROADMAP.md](ROADMAP.md).
 Conventions and the invariants worth not breaking are in

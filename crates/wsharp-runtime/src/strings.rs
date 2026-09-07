@@ -204,6 +204,36 @@ pub unsafe extern "C" fn ws_str_parse_int(out: *mut crate::io::FallibleI64, s: *
     unsafe { out.write(result) };
 }
 
+/// The number a decimal string names.
+///
+/// Rust's own parser, which is correctly rounded -- the nearest `f64` to the
+/// decimal written, every time. That is a genuinely hard numerical problem and
+/// there is a right answer sitting in the standard library, so this is one of
+/// the few places where reimplementing in W# would be worse rather than more
+/// honest: `std/toml` validates TOML's stricter grammar and hands the cleaned
+/// text here.
+///
+/// What is accepted is what Rust accepts: an optional sign, then digits with
+/// an optional fraction and an optional exponent, or `inf`, `infinity` or
+/// `nan` in any case. Anything else is `error.BadFormat`.
+///
+/// # Safety
+/// Called from JIT-compiled code across an FFI boundary; `s` must be null or
+/// point at a W# string object, and `out` must point at storage laid out as a
+/// [`crate::io::FallibleF64`].
+pub unsafe extern "C" fn ws_str_parse_float(out: *mut crate::io::FallibleF64, s: *const u8) {
+    unsafe { crate::gc::checkpoint() };
+    let bytes = unsafe { str_bytes(s) };
+    let parsed = std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| text.parse::<f64>().ok());
+    let result = match parsed {
+        Some(v) => crate::io::FallibleF64::ok(v),
+        None => crate::io::FallibleF64::err(crate::builtins::ERROR_BAD_FORMAT),
+    };
+    unsafe { out.write(result) };
+}
+
 /// `-?[0-9]+`, and nothing else. Overflow is a failure rather than a wrap:
 /// a length header that does not fit in an `i64` is not a length.
 fn parse_decimal(bytes: &[u8]) -> Option<i64> {

@@ -74,6 +74,28 @@ impl FallibleI64 {
     }
 }
 
+/// A `!f64` as it crosses the boundary.
+///
+/// The same two-word shape, and the reason it is written out rather than
+/// generic: the code generator lays the destination out as one machine word
+/// for the tag followed by the payload's own slot, so what the runtime writes
+/// has to be a `#[repr(C)]` struct with exactly those two fields.
+#[repr(C)]
+pub struct FallibleF64 {
+    pub tag: i64,
+    pub value: f64,
+}
+
+impl FallibleF64 {
+    pub(crate) fn ok(value: f64) -> FallibleF64 {
+        FallibleF64 { tag: 0, value }
+    }
+
+    pub(crate) fn err(tag: i64) -> FallibleF64 {
+        FallibleF64 { tag, value: 0.0 }
+    }
+}
+
 /// The whole contents of a file.
 /// # Safety
 /// Called from JIT-compiled code across an FFI boundary; the string arguments

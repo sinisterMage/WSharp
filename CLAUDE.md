@@ -527,6 +527,44 @@ extra `sin_len` byte out of this code entirely.
   publishes them into a `OnceLock` before anything is compiled. It qualifies
   for the same exemption the type registry and the stack maps do -- frozen
   before any generated code runs, never written again.
+- **A library module is read only if something imports it.** Every `.ws` module
+  in `std/` and `ingot/` used to be parsed and inferred for every program,
+  which was free at four files and was costing a ten-line program most of its
+  compile time at twenty-five: `wsharp check examples/fib.ws` went from 0.62s
+  to 0.005s when `load::add_library` started following the root's imports
+  instead. `@import("std")` still means all of `std/`, because a module path is
+  a prefix and any of them can be walked into from there. The consequence to
+  remember is that **a library module nothing imports is never checked**, so a
+  new one needs a case that imports it or it is not compiled at all.
+- **A value with several shapes is a lattice, not a tagged struct.** W# has no
+  sum types and does have nominal subtyping with multiple dispatch, so the
+  shape is an empty supertype, one subtype per case carrying its payload, and
+  an overload set whose base case is the failure -- `as_int(v: Value)` returning
+  `error.BadFormat` beside `as_int(v: Int)` returning the number. `std/x509`'s
+  `SigKey` is the original and `std/toml`'s `Value` is the second. Every
+  overload must state the same error set, because a dispatched call has one
+  type; and a subtype only coerces into its supertype at an *annotated*
+  binding, which is why each constructor is `const v: Value = Int{ .. };
+  return v;` rather than a bare return.
+- **A parser answers, it does not raise.** An error union carries a tag and
+  nothing else, and `BadFormat` is not a thing to hand somebody holding a
+  200-line manifest. `std/toml.parse` answers with a `Doc` that is either a
+  table or a message and a line, and everything under `ingot`'s verbs takes a
+  `Fault` and writes into it. The first failure wins in both: a recursive
+  descent reader that has lost its place invents the rest.
+- **The store's tree hash is defined in `ingot/store.ws` and nowhere else.** A
+  key two versions of ingot compute differently is a store that silently splits
+  in half, so the definition is written out: SHA-256 over each entry sorted by
+  name as bytes, `"f" name 0 <decimal size> 0 <contents>` for a file and
+  `"d" name 0 <hex of the subtree's hash> 0` for a directory. The sort is half
+  of that definition, which is why it lives beside the hash rather than in
+  `std/array`. Permissions and timestamps are deliberately not in it.
+- **An install is a `rename`, and a damaged entry is repaired rather than
+  believed.** W# has no `defer`, so a fetch builds under `tmp/` and moves into
+  place in one step: an interrupted install leaves rubbish rather than half a
+  package. `store.install` tests the entry with `check` rather than testing
+  that the directory exists -- getting that wrong made `install` a no-op on a
+  damaged store, which is exactly the case `verify` exists to distinguish.
 - **The path separator is `/` on every platform, including Windows.** Every
   Win32 path call accepts one, `sys/windows.rs` appends its listing wildcard to
   one, and one spelling is what keeps a lockfile written on one machine
@@ -569,6 +607,16 @@ nix-shell --run "cargo test --workspace"
   The harness (`crates/wsharp-cli/tests/cases.rs`) runs the built binary as a
   subprocess, so stdout is captured for free and the test does exactly what a
   user would.
+- **`ingot`'s libraries are tested as W# cases; its verbs are tested as a
+  binary.** `ingot/*` is a library namespace beside `std/*`, so
+  `tests/cases/ingot_*.ws` reaches the store and the manifest reader directly
+  and gets the `--gc-stress` pass for free. What a case cannot reach is the
+  tool -- a verb reads a directory, writes two files and answers with an exit
+  status -- so `crates/ingot/tests/verbs.rs` drives the built binary with
+  `-C <dir>` and `WSHARP_HOME` pointed inside a temporary directory.
+- **A case cannot expect trailing whitespace.** `parse_expectations` trims each
+  header line, so a tab-separated row with an empty last field has to print
+  something -- `-` is what `ingot_manifest.ws` uses.
 - **A case that touches the filesystem builds its own directory and removes
   it.** `os.temp_dir()` says where, and the name carries `crypto.random` bytes,
   because the suite runs a second time under `--gc-stress` and the two runs may

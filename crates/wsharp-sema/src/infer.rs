@@ -559,7 +559,7 @@ impl<'a> Inferencer<'a> {
             module_paths: modules
                 .iter()
                 .map(|m| m.path.clone())
-                .chain(wsharp_runtime::builtins::std_module_paths())
+                .chain(wsharp_runtime::builtins::library_module_paths())
                 .collect(),
             struct_decl_of: HashMap::new(),
             fn_modules: Vec::new(),
