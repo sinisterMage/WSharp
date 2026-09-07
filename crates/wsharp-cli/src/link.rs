@@ -88,6 +88,16 @@ pub fn link(object: &Path, out: &Path) -> Result<(), String> {
     if !cfg!(target_os = "windows") {
         command.args(["-lpthread", "-lm", "-ldl"]);
     }
+    // Apple's arms read the platform root store through these two
+    // (`sys::bsd::system_roots`), and a staticlib carries no linker directives
+    // here the way an MSVC one does. cargo passes them when *it* links
+    // `wsharp`, because `#[link(kind = "framework")]` travels in the rlib --
+    // so the JIT works and only a built program fails, with an undefined
+    // `_SecTrustCopyAnchorCertificates` at the far end of a link. Naming them
+    // is the whole fix.
+    if cfg!(target_os = "macos") || cfg!(target_os = "ios") {
+        command.args(["-framework", "Security", "-framework", "CoreFoundation"]);
+    }
 
     let output = command.output().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {

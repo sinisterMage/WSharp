@@ -21,6 +21,12 @@ type c_void = core::ffi::c_void;
 type HANDLE = *mut c_void;
 type BOOL = i32;
 type DWORD = u32;
+/// The C runtime's `int`, which is 32 bits on every Windows target -- including
+/// the 64-bit ones, where `long` is also 32 and only a pointer is 64. Spelled
+/// here beside the Win32 aliases, as the other two arms spell theirs, rather
+/// than imported from `core::ffi`: the one call below that needs it is a *CRT*
+/// call, and this arm declares what it uses.
+type c_int = i32;
 
 // The Win32 calls this arm makes.
 //

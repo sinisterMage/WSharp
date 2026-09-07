@@ -26,6 +26,13 @@ on:
       # `v0.1.0`, and `v0.1.0-rc1` for a pre-release. Anything without the `v`
       # is left alone, so a tag can still be used for something else.
       - "v*"
+  # So a release can be retried without deleting and re-pushing a tag. A tag
+  # that has to be moved to fix a workflow is a tag that means two things.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The existing tag to build and publish, e.g. v0.1.0"
+        required: true
 
 # What `softprops/action-gh-release` needs to create the release and attach to
 # it. The token is minted for the run; there is no secret to configure.
@@ -35,6 +42,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # The tag being released, however this run was started. On a tag push
+  # `github.ref_name` *is* the tag; on a manual run it is the branch, which is
+  # never what should be packaged, so the input wins.
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   release:
@@ -65,7 +76,12 @@ jobs:
             # `<hex>  <name>` line, which is what matters: whatever reads it
             # should not have to know which machine wrote it.
             sha: shasum -a 256
-          - os: macos-13
+          # `macos-13` was the Intel image and was retired in December 2025;
+          # a job asking for it is never claimed and queues until it times out.
+          # `macos-15-intel` is the replacement label, and is itself scheduled
+          # to go in autumn 2027 -- Apple has stopped at x86_64, so this arm has
+          # an end date and the arm64 one does not.
+          - os: macos-15-intel
             triple: x86_64-apple-darwin
             exe: ""
             archive: libwsharp_start.a
@@ -90,7 +106,11 @@ jobs:
     env:
       CC: ${{ matrix.cc }}
     steps:
+      # The tag, not the branch: a manual re-run must package the same commit
+      # the tag names, or it would publish something the tag never pointed at.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
 
       # `rust-toolchain.toml` pins 1.95.0 and every hosted runner ships rustup,
       # so the pin honours itself on first use. No container: the image
@@ -147,7 +167,7 @@ jobs:
       - name: Package
         run: |
           set -eu
-          version="${GITHUB_REF_NAME#v}"
+          version="${TAG#v}"
           stage="wsharp-${version}-${{ matrix.triple }}"
           mkdir -p "dist/${stage}/lib"
           cp "target/release/wsharp${{ matrix.exe }}" "dist/${stage}/"
@@ -167,10 +187,14 @@ jobs:
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
+          # Named explicitly, because on a manual run the default is the ref --
+          # which is the branch, and would attach these to a release called
+          # `main`.
+          tag_name: ${{ env.TAG }}
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
           # `v0.1.0-rc1` is a pre-release and `v0.1.0` is not: the hyphen is
           # what semver already uses to say so.
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(env.TAG, '-') }}
           fail_on_unmatched_files: true
