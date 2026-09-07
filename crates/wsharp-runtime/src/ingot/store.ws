@@ -251,22 +251,9 @@ pub fn install_files(f: fault.Fault, h: str, files: list.List[File]) str {
             fs.remove_tree(staging) catch ignore();
             return "";
         };
-        io.write_file(where, bytes.to_str(file.data)) catch |e| {
-            // Named here rather than in a helper: handing the capture to a
-            // function types it as the whole error *union* again, and a union
-            // does not compare.
-            var why = "cannot be written";
-            const dir = path.dirname(where);
-            if (!fs.is_dir(dir)) {
-                why = text.concat("cannot be written -- there is no directory ", dir);
-            } else if (e == error.PermissionDenied) {
-                why = "cannot be written -- permission denied";
-            } else if (e == error.NotFound) {
-                why = text.concat("cannot be written -- refused, though there is a directory ", dir);
-            } else if (e == error.IoFailed) {
-                why = "cannot be written -- the write itself failed";
-            }
-            fault.fail_at(f, where, why);
+        io.write_file(where, bytes.to_str(file.data)) catch {
+            fault.fail_at(f, where, why_unwritable(path.dirname(where), where,
+                                                   text.len(bytes.to_str(file.data))));
             fs.remove_tree(staging) catch ignore();
             return "";
         };
@@ -385,11 +372,39 @@ fn ignore() void { return; }
 ///
 /// It earns its place: this is what the message said on Windows when
 /// `mkdir_all` was starting absolute paths at `/` instead of at their drive,
-/// and "cannot be written" was not enough to say so. The `catch` above names
-/// which of the three `io.write_file` raises, which turns "it did not work"
-/// into a sentence somebody can act on: `NotFound` with the directory present
-/// means the *name* was refused rather than the path, and `IoFailed` means the
-/// write itself did.
+/// and "cannot be written" was not enough to say so.
+///
+/// The failure is *asked about* rather than read off the error, because a W#
+/// error carries a tag and this needs three separate facts -- whether the
+/// directory is there, whether anything at all can be written into it, and
+/// whether something is already sitting at the name. Between them they say
+/// which of the three possible bugs it is, and each points at a different file.
+fn why_unwritable(dir: str, where: str, size: i64) str {
+    if (!fs.is_dir(dir)) {
+        return text.concat("cannot be written -- there is no directory ", dir);
+    }
+    if (!takes_a_file(dir)) {
+        return text.concat("cannot be written -- nothing can be written into ", dir);
+    }
+    var already = "";
+    if (io.exists(where)) { already = ", and something is already at that name"; }
+    return text.concat(
+        text.concat("cannot be written -- its directory takes other files", already),
+        text.concat("; this one is ", text.concat(text.from_int(size), " bytes")));
+}
+
+/// Whether *some* file can be created in `dir`, whatever happened to the one
+/// that failed.
+///
+/// The discriminator worth having: a directory that refuses everything is a
+/// permissions or handle problem, and one that takes a probe but refused the
+/// real name is a problem with the name or with what was being written.
+fn takes_a_file(dir: str) bool {
+    const probe = path.join(dir, "ingot-probe");
+    io.write_file(probe, "probe") catch { return false; };
+    fs.remove(probe) catch ignore();
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Collecting
