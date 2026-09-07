@@ -88,6 +88,23 @@ pub fn link(object: &Path, out: &Path) -> Result<(), String> {
     if !cfg!(target_os = "windows") {
         command.args(["-lpthread", "-lm", "-ldl"]);
     }
+    // Windows needs to be told this is a console program, and the reason is
+    // exact: **clang chooses the subsystem by looking for `main` in the object
+    // files it was handed**, and ours is not in one. `main` is defined in
+    // `wsharp-start`, which reaches the link as a *library* -- so clang sees an
+    // object with no entry point, passes no `-subsystem:` at all, and the MSVC
+    // linker has nothing to infer an entry from:
+    //
+    //     link.exe -out:prog.exe -defaultlib:libcmt -nologo prog.o wsharp_start.lib
+    //     LINK : fatal error LNK1561: entry point must be defined
+    //
+    // Saying `console` restores the default entry, `mainCRTStartup`, which
+    // references `main` and so pulls it out of the archive. Nothing equivalent
+    // is needed on Unix, where `ld` resolves `main` from an archive for
+    // `crt1.o` without being asked.
+    if cfg!(target_os = "windows") {
+        command.args(["-Xlinker", "-subsystem:console"]);
+    }
     // Apple's arms read the platform root store through these two
     // (`sys::bsd::system_roots`), and a staticlib carries no linker directives
     // here the way an MSVC one does. cargo passes them when *it* links
