@@ -322,6 +322,17 @@ pub fn copy_tree(f: fault.Fault, from: str, to: str) void {
         fault.fail_at(f, to, "cannot be created");
         return;
     };
+    // A postcondition, because on Windows this has been reporting success
+    // without creating anything and the lie surfaces two calls later as a
+    // write that cannot explain itself. Checked here rather than inside
+    // `mkdir_all` so the message can say how far up the tree anything actually
+    // exists, which is the fact that says *where* the creation stopped.
+    if (!fs.is_dir(to)) {
+        fault.fail_at(f, to, text.concat(
+            "mkdir_all reported success and made nothing; the deepest thing that exists is ",
+            deepest_existing(to)));
+        return;
+    }
     const names = fs.read_dir(from) catch {
         fault.fail_at(f, from, "cannot be listed");
         return;
@@ -346,6 +357,23 @@ pub fn copy_tree(f: fault.Fault, from: str, to: str) void {
         };
     }
     return;
+}
+
+/// The deepest ancestor of `p` that is a directory, or a word saying none is.
+///
+/// Walks up rather than down, so the answer is the last place a creation got
+/// to. `(nothing)` means not even the root answered, which would say the path
+/// is not being understood at all rather than that a step failed.
+fn deepest_existing(p: str) str {
+    var at = path.normalise(p);
+    var guard = 0;
+    while (guard < 64) : (guard += 1) {
+        if (fs.is_dir(at)) { return at; }
+        const up = path.dirname(at);
+        if (text.eq(up, at)) { return "(nothing)"; }
+        at = up;
+    }
+    return "(gave up walking up)";
 }
 
 /// A name nothing else is using.
