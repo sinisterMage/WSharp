@@ -47,6 +47,10 @@ mod c {
         pub(super) fn mkdir(path: *const u8, mode: mode_t) -> c_int;
         pub(super) fn rmdir(path: *const u8) -> c_int;
         pub(super) fn rename(from: *const u8, to: *const u8) -> c_int;
+        /// The permission bits only. Everything above them -- setuid, setgid,
+        /// the sticky bit -- is left to the caller's `mode`, which is masked
+        /// before it arrives here.
+        pub(super) fn chmod(path: *const u8, mode: mode_t) -> c_int;
         /// `off_t` is 64 bits on both architectures this collector supports,
         /// so this is `lseek` and not `lseek64`.
         pub(super) fn lseek(fd: c_int, offset: i64, whence: c_int) -> i64;
@@ -89,6 +93,9 @@ const O_TRUNC: c_int = 0o1000;
 /// So that a spawned worker does not inherit a descriptor it never asked for.
 const O_CLOEXEC: c_int = 0o2000000;
 const F_OK: c_int = 0;
+/// `access`'s "may this be run?", which is the only way to observe an execute
+/// bit without a `struct stat`. 1 here and 1 on the BSDs.
+const X_OK: c_int = 1;
 const SEEK_END: c_int = 2;
 
 const EPERM: c_int = 1;
@@ -257,6 +264,37 @@ pub(crate) fn rename(from: &[u8], to: &[u8]) -> Result<(), Errno> {
     }
 }
 
+/// Set a path's permission bits.
+///
+/// `mode` is masked to the low twelve bits before it gets here, so the setuid
+/// and sticky bits can be set deliberately but not by an arithmetic slip. The
+/// umask does *not* apply -- unlike `mkdir` and `create_write` above, which
+/// pass the full 0o777/0o666 and let it subtract. That is `chmod`'s contract
+/// rather than an inconsistency: a caller asking for exactly 0o755 is asking
+/// for 0o755.
+pub(crate) fn chmod(path: &[u8], mode: u32) -> Result<(), Errno> {
+    let path = c_path(path)?;
+    if unsafe { c::chmod(path.as_ptr(), mode as mode_t) } == 0 {
+        Ok(())
+    } else {
+        Err(errno())
+    }
+}
+
+/// Whether this process may run a path.
+///
+/// The counterpart to `exists`, and the only way to observe an execute bit
+/// here: reading it back would mean a `struct stat`, which is the layout
+/// minefield this arm exists to stay out of. `access` answers the question
+/// actually being asked -- not "what are the bits" but "can this be exec'd" --
+/// and a path that is not there is a "no" like any other.
+pub(crate) fn is_executable(path: &[u8]) -> bool {
+    match c_path(path) {
+        Ok(path) => (unsafe { c::access(path.as_ptr(), X_OK) }) == 0,
+        Err(_) => false,
+    }
+}
+
 /// Whether a path names a directory.
 ///
 /// Asked by opening it as one rather than by reading a `struct stat`, which is
@@ -337,7 +375,13 @@ pub(crate) fn chdir(path: &[u8]) -> Result<(), Errno> {
 /// counts as "not enough room" and [`super::self_exe`] asks again.
 pub(crate) fn self_exe(room: usize) -> Result<Option<Vec<u8>>, Errno> {
     let mut buf = vec![0u8; room];
-    let n = unsafe { c::readlink(c"/proc/self/exe".as_ptr() as *const u8, buf.as_mut_ptr(), room) };
+    let n = unsafe {
+        c::readlink(
+            c"/proc/self/exe".as_ptr() as *const u8,
+            buf.as_mut_ptr(),
+            room,
+        )
+    };
     if n < 0 {
         return Err(errno());
     }

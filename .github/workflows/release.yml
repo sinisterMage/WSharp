@@ -1,0 +1,176 @@
+# Publishing a tagged release, on GitHub-hosted runners.
+#
+# This repository lives on a self-hosted Forgejo and push-mirrors here. The
+# release is built *here* rather than there because the self-hosted runners are
+# not always up, and because these four target triples want four machines that
+# GitHub already has.
+#
+# Cutting a release is `git tag v0.1.0 && git push --tags` -- but the mirror is
+# asynchronous. A tag pushed to Forgejo reaches GitHub on the mirror's own
+# schedule (eight hours by default), so nothing fires until it syncs. Use
+# "Synchronize Now" in the mirror settings, or push the tag straight to this
+# remote.
+#
+# `.forgejo/workflows/release.yml` is the same thing for the self-hosted
+# runners, and is left in place; Forgejo Actions is disabled for this
+# repository, so only this file runs. Note that Forgejo reads `.github/workflows`
+# too, so re-enabling Actions there without deleting this would queue these jobs
+# against labels no Forgejo runner claims -- and a job whose label nothing claims
+# waits for ever rather than failing.
+
+name: Release
+
+on:
+  push:
+    tags:
+      # `v0.1.0`, and `v0.1.0-rc1` for a pre-release. Anything without the `v`
+      # is left alone, so a tag can still be used for something else.
+      - "v*"
+
+# What `softprops/action-gh-release` needs to create the release and attach to
+# it. The token is minted for the run; there is no secret to configure.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  release:
+    name: ${{ matrix.triple }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      # One target's failure must not cancel the other three. Windows is the
+      # least exercised of the four and is expected to need work; the Linux and
+      # macOS tarballs should still reach the release while it does.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+            exe: ""
+            # `crates/wsharp-start` is a staticlib, and cargo names one after
+            # the platform rather than after the crate.
+            archive: libwsharp_start.a
+            cc: cc
+            sha: sha256sum
+          - os: macos-latest
+            triple: aarch64-apple-darwin
+            exe: ""
+            archive: libwsharp_start.a
+            cc: cc
+            # macOS has no `sha256sum`. `shasum -a 256` writes the same
+            # `<hex>  <name>` line, which is what matters: whatever reads it
+            # should not have to know which machine wrote it.
+            sha: shasum -a 256
+          - os: macos-13
+            triple: x86_64-apple-darwin
+            exe: ""
+            archive: libwsharp_start.a
+            cc: cc
+            sha: shasum -a 256
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            exe: ".exe"
+            # MSVC's spelling. `crates/wsharp-cli/src/link.rs` looks for both.
+            archive: wsharp_start.lib
+            # `link.rs` drives the link with `$CC` and passes `-o`, which
+            # `cl.exe` does not understand. `windows-latest` ships LLVM, and
+            # clang takes a Unix-shaped command line while still producing an
+            # MSVC-ABI binary.
+            cc: clang
+            sha: sha256sum
+    defaults:
+      run:
+        # Git Bash on Windows, so one script works on all four. Every `run:`
+        # below is written for it.
+        shell: bash
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rust-toolchain.toml` pins 1.95.0 and every hosted runner ships rustup,
+      # so the pin honours itself on first use. No container: the image
+      # `.forgejo/workflows/ci.yml` uses is in a private registry this cannot
+      # reach, and nothing here needs it.
+      - name: Versions
+        run: |
+          rustc --version
+          cargo --version
+          "$CC" --version | head -1
+
+      # **Before the tests, and that order is load-bearing.** The case suite's
+      # AOT pass shells out to `wsharp build`, which links against
+      # `libwsharp_start.a` found beside the binary -- but `cargo test` does not
+      # build `crates/wsharp-start` at all, because it declares `test = false`
+      # and nothing depends on it. On a clean runner `cargo test` alone would
+      # therefore link against an archive that is not there and every built case
+      # would fail. Building the workspace first is what puts it in
+      # `target/debug`.
+      - name: Build for the test suite
+        run: cargo build --workspace --locked
+
+      # A tag that cannot pass its own tests is not a release. This repeats what
+      # CI already did for the commit, which is the point: a tag can be pushed
+      # at any commit, including one CI never saw.
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # `ingot` is a W# program, so cargo does not produce it: `wsharp` does,
+      # from the `ingot/main` module compiled into it. This is the bootstrap,
+      # and it is also the first real use of `wsharp build` in anger -- a
+      # release that cannot compile the package manager is not a release.
+      - name: Bootstrap ingot
+        run: |
+          set -eu
+          ./target/release/wsharp${{ matrix.exe }} build --module ingot/main \
+            -o "target/release/ingot${{ matrix.exe }}"
+          ./target/release/ingot${{ matrix.exe }} help > /dev/null
+
+      # The standard library is `include_str!`'d into the binary
+      # (`wsharp-runtime/src/builtins.rs`), so the archive needs no `std`
+      # directory beside it. It does need `lib/`: an installation is one
+      # *directory* rather than one executable, because a compiler that links
+      # needs something to link against, and `wsharp build` looks for the
+      # runtime archive beside itself and under `../lib`.
+      #
+      # The checksum is a per-target sidecar rather than a shared `SHA256SUMS`,
+      # because four matrix jobs writing one file would each overwrite the
+      # others. Anything installing a toolchain wants one tarball and one
+      # digest anyway.
+      - name: Package
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          stage="wsharp-${version}-${{ matrix.triple }}"
+          mkdir -p "dist/${stage}/lib"
+          cp "target/release/wsharp${{ matrix.exe }}" "dist/${stage}/"
+          cp "target/release/ingot${{ matrix.exe }}" "dist/${stage}/"
+          cp README.md LICENSE "dist/${stage}/"
+          cp "target/release/${{ matrix.archive }}" "dist/${stage}/lib/"
+          tar -czf "dist/${stage}.tar.gz" -C dist "${stage}"
+          rm -r "dist/${stage}"
+          cd dist
+          ${{ matrix.sha }} "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+          ls -l
+          cat "${stage}.tar.gz.sha256"
+
+      # Creates the release at this tag if it is not there yet and attaches
+      # this target's two files. Every matrix job does the same, so the four
+      # converge on one release holding eight assets.
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          # `v0.1.0-rc1` is a pre-release and `v0.1.0` is not: the hyphen is
+          # what semver already uses to say so.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true

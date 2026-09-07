@@ -56,6 +56,28 @@ pub extern "C" fn ws_os_raw_args() -> *mut u8 {
     alloc_str(&crate::fs::length_prefixed(args))
 }
 
+/// What this build was built for, as a target triple.
+///
+/// `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, and so on -- spelled the
+/// way the compiler that produced this binary spelled it, because the string is
+/// set from cargo's own `TARGET` by `build.rs` rather than reassembled here.
+/// [`std::env::consts`] cannot answer this: it has `ARCH` and `OS` and no
+/// vendor or environment between them.
+///
+/// The question a program asks when it has to fetch something built for the
+/// machine it is running on, which is the whole of a version manager's first
+/// step. Infallible -- a build always has a target -- and constant, so there is
+/// nothing to block on and no `worker::blocking` here.
+///
+/// The AOT and JIT answers agree: a compiled program links the runtime archive
+/// built for its own target, and `wsharp run` executes this out of a `wsharp`
+/// built for the machine it is running on.
+#[unsafe(no_mangle)]
+pub extern "C" fn ws_os_target() -> *mut u8 {
+    unsafe { crate::gc::checkpoint() };
+    alloc_str(env!("WSHARP_TARGET").as_bytes())
+}
+
 /// One environment variable, or null.
 ///
 /// Not an error union: a variable that is not set is the ordinary case, and

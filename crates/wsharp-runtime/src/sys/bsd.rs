@@ -58,6 +58,10 @@ mod c {
         pub(super) fn mkdir(path: *const u8, mode: mode_t) -> c_int;
         pub(super) fn rmdir(path: *const u8) -> c_int;
         pub(super) fn rename(from: *const u8, to: *const u8) -> c_int;
+        /// The permission bits only, and `mode_t` is 16 bits here where Linux
+        /// has 32 -- the narrowing is done at the call site, on a value already
+        /// masked to twelve bits, so it cannot lose anything.
+        pub(super) fn chmod(path: *const u8, mode: mode_t) -> c_int;
         /// `off_t` is 64 bits everywhere in this family that the collector's
         /// inline assembly supports.
         pub(super) fn lseek(fd: c_int, offset: i64, whence: c_int) -> i64;
@@ -88,11 +92,7 @@ mod c {
         pub(super) fn _NSGetExecutablePath(buf: *mut u8, size: *mut u32) -> c_int;
     }
 
-    #[cfg(any(
-        target_os = "freebsd",
-        target_os = "dragonfly",
-        target_os = "netbsd"
-    ))]
+    #[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
     unsafe extern "C" {
         pub(super) fn sysctl(
             name: *const c_int,
@@ -163,6 +163,8 @@ const O_WRONLY: c_int = 1;
 const O_CREAT: c_int = 0x0200;
 const O_TRUNC: c_int = 0x0400;
 const F_OK: c_int = 0;
+/// `access`'s "may this be run?". 1 here and 1 on Linux.
+const X_OK: c_int = 1;
 const SEEK_END: c_int = 2;
 
 /// Close-on-exec is set afterwards rather than asked for in the flags, because
@@ -338,6 +340,31 @@ pub(crate) fn rename(from: &[u8], to: &[u8]) -> Result<(), Errno> {
         Ok(())
     } else {
         Err(errno())
+    }
+}
+
+/// Set a path's permission bits.
+///
+/// `mode` arrives masked to twelve bits, so narrowing it to this family's
+/// 16-bit `mode_t` cannot lose anything. The umask does not apply, which is
+/// `chmod`'s contract: a caller asking for 0o755 is asking for 0o755.
+pub(crate) fn chmod(path: &[u8], mode: u32) -> Result<(), Errno> {
+    let path = c_path(path)?;
+    if unsafe { c::chmod(path.as_ptr(), mode as mode_t) } == 0 {
+        Ok(())
+    } else {
+        Err(errno())
+    }
+}
+
+/// Whether this process may run a path.
+///
+/// `access` rather than a mode read back, for the reason `is_dir` below opens a
+/// directory rather than stat'ing one: no `struct stat` in this arm.
+pub(crate) fn is_executable(path: &[u8]) -> bool {
+    match c_path(path) {
+        Ok(path) => (unsafe { c::access(path.as_ptr(), X_OK) }) == 0,
+        Err(_) => false,
     }
 }
 

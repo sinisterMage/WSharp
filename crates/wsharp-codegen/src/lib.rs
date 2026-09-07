@@ -349,7 +349,13 @@ pub fn compile_object(
     ctx.func.name = ir::UserFuncName::user(0, shim.as_u32());
     {
         let b = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
-        lower::entry_shim(b, &mut module, &built.decls, built.entry, built.entry_returns_value);
+        lower::entry_shim(
+            b,
+            &mut module,
+            &built.decls,
+            built.entry,
+            built.entry_returns_value,
+        );
     }
     module
         .define_function(shim, &mut ctx)
@@ -476,8 +482,7 @@ pub(crate) fn group_trampolines<'a>(
     program: &hir::Program,
     found: &'a [Trampoline],
 ) -> Vec<(String, &'a Trampoline, Vec<&'a Trampoline>)> {
-    let mut services: Vec<Vec<&Trampoline>> =
-        program.services.iter().map(|_| Vec::new()).collect();
+    let mut services: Vec<Vec<&Trampoline>> = program.services.iter().map(|_| Vec::new()).collect();
     for t in found {
         services[t.service].push(t);
     }
@@ -620,11 +625,7 @@ fn collect_layouts(program: &hir::Program, store: &mut TypeStore) -> Layouts {
     }
 }
 
-fn struct_layouts(
-    program: &hir::Program,
-    store: &mut TypeStore,
-    out: &mut Vec<(u32, TypeLayout)>,
-) {
+fn struct_layouts(program: &hir::Program, store: &mut TypeStore, out: &mut Vec<(u32, TypeLayout)>) {
     for def in &program.structs {
         // A generic struct has no instances of its own; each instantiation is
         // laid out separately, with the offsets its arguments imply.

@@ -685,6 +685,32 @@ fn library() -> Vec<Builtin> {
             link: "ws_fs_rename",
             ptr: crate::fs::ws_fs_rename as *const u8,
         },
+        // A file arrives from a download or an archive with whatever mode the
+        // writer chose, and 0o644 is not a thing that can be run. These two are
+        // what a program that writes another program needs: one to set the bit
+        // and one to see it. There is deliberately no mode *reader* -- that
+        // would mean `struct stat`, which is the layout minefield `crate::sys`
+        // exists to stay out of, and the question being asked is "will this
+        // start" rather than "which bits are set".
+        Builtin {
+            module: FS_MODULE,
+            name: "chmod",
+            params: &[BuiltinTy::Str, BuiltinTy::I64],
+            ret: BuiltinTy::ErrUnion(
+                &BuiltinTy::Void,
+                &["NotFound", "PermissionDenied", "IoFailed"],
+            ),
+            link: "ws_fs_chmod",
+            ptr: crate::fs::ws_fs_chmod as *const u8,
+        },
+        Builtin {
+            module: FS_MODULE,
+            name: "is_executable",
+            params: &[BuiltinTy::Str],
+            ret: BuiltinTy::Bool,
+            link: "ws_fs_is_executable",
+            ptr: crate::fs::ws_fs_is_executable as *const u8,
+        },
         Builtin {
             module: FS_MODULE,
             name: "is_dir",
@@ -723,6 +749,16 @@ fn library() -> Vec<Builtin> {
             ret: BuiltinTy::Str,
             link: "ws_os_raw_args",
             ptr: crate::os::ws_os_raw_args as *const u8,
+        },
+        // Infallible for `raw_args`' reason and more so: a build always has a
+        // target, and this one is a constant baked in at compile time.
+        Builtin {
+            module: OS_MODULE,
+            name: "raw_target",
+            params: &[],
+            ret: BuiltinTy::Str,
+            link: "ws_os_target",
+            ptr: crate::os::ws_os_target as *const u8,
         },
         Builtin {
             module: OS_MODULE,
@@ -1798,7 +1834,11 @@ mod tests {
         }
         // The three rows the code generator compiles at the call site, and
         // nothing else, may decline to name a symbol.
-        let inline: Vec<String> = all.iter().filter(|b| b.is_inline()).map(|b| b.symbol()).collect();
+        let inline: Vec<String> = all
+            .iter()
+            .filter(|b| b.is_inline())
+            .map(|b| b.symbol())
+            .collect();
         assert_eq!(inline, ["std/bits.rotl", "std/bits.rotr", "std/array.new"]);
     }
 }

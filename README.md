@@ -337,10 +337,13 @@ wsharp build <file.ws> -o <prog>  # compile to a native executable
 `run` compiles into memory and runs there, which is what you want while writing
 something. `build` writes a real program: the collector, the workers, TLS and
 the rest of the runtime are linked into it, and it needs no compiler on the
-machine that runs it. Linking is done by `$CC`, or `cc`, against a
-`libwsharp_start.a` that `wsharp` looks for beside itself and under `../lib` —
-so an installation is a directory rather than a single file. `--emit=obj`
-stops at the relocatable object, which is the half that needs no C compiler.
+machine that runs it. Linking is done by `$CC`, or `cc`, against a runtime
+archive that `wsharp` looks for beside itself and under `../lib` — so an
+installation is a directory rather than a single file. The archive is
+`libwsharp_start.a`, or `wsharp_start.lib` where MSVC named it: cargo names a
+staticlib after the platform rather than after the crate, and both spellings are
+looked for. `--emit=obj` stops at the relocatable object, which is the half that
+needs no C compiler.
 
 Anything after the file is the program's, not the compiler's, and reaches it
 through `std/os`:
@@ -411,10 +414,17 @@ an overload set renamed once still dispatches on every member.
 
 `std/io` reads and writes whole files; `std/fs` is the tree they sit in --
 `mkdir`, `read_dir`, `rename`, `remove`, and enough of a stat to tell a
-directory from a file and say how big one is. `std/path` is the arithmetic
-above both, and makes no syscall at all. `std/os` is what the process knows
-about itself -- `args`, `get`, `home`, `temp_dir`, `cwd`. `std/toml` is TOML
-1.0, read and written.
+directory from a file and say how big one is. It also has `chmod` and
+`is_executable`, which are what a program that *writes another program* needs:
+a file written by `io.write_file` is 0o644, and 0o644 is not a thing that can be
+run. There is no mode *reader* -- that would mean a `struct stat`, whose layout
+differs on every system in the BSD family, and the question worth asking is
+"will this start" rather than "which bits are set". Windows has no permission
+bits, so `chmod` succeeds there without doing anything and `is_executable` is
+`exists`. `std/path` is the arithmetic above both, and makes no syscall at all.
+`std/os` is what the process knows about itself -- `args`, `get`, `home`,
+`temp_dir`, `cwd`, and `target`, the triple this binary was built for.
+`std/toml` is TOML 1.0, read and written.
 
 A library module is only read if something imports it, so a program that
 mentions nothing pays for nothing: `wsharp check` on a ten-line file takes

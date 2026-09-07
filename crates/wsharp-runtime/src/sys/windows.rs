@@ -425,6 +425,31 @@ pub(crate) fn rename(from: &[u8], to: &[u8]) -> Result<(), Errno> {
     }
 }
 
+/// Set a path's permission bits, which Windows does not have.
+///
+/// Succeeds and does nothing, and that is the honest answer rather than a
+/// stub. There is no execute bit here: whether a file can be run is decided by
+/// its extension and by an ACL that has no twelve-bit spelling, so a `chmod`
+/// arm that mapped 0o755 onto `SetNamedSecurityInfoW` would be inventing a
+/// meaning the caller did not ask for. The one thing a caller actually wants --
+/// "make this downloaded program runnable" -- is already true here.
+///
+/// Read-only is the one bit that *could* be mapped, via `FILE_ATTRIBUTE_READONLY`.
+/// It is left alone on purpose: nothing in this project asks to make a file
+/// unwritable, and a half-mapping is worse than none.
+pub(crate) fn chmod(_path: &[u8], _mode: u32) -> Result<(), Errno> {
+    Ok(())
+}
+
+/// Whether this process may run a path.
+///
+/// No execute bit to consult, so this is `exists` -- which agrees with `chmod`
+/// above: if permission bits do not exist, a file that is there is one that can
+/// be run.
+pub(crate) fn is_executable(path: &[u8]) -> bool {
+    exists(path)
+}
+
 fn attributes(path: &[u8]) -> Result<WIN32_FILE_ATTRIBUTE_DATA, Errno> {
     let path = wide_path(path)?;
     let mut data = WIN32_FILE_ATTRIBUTE_DATA {
@@ -562,7 +587,8 @@ pub(crate) fn chdir(path: &[u8]) -> Result<(), Errno> {
 /// Linux arm's `readlink` has, for the same reason.
 pub(crate) fn self_exe(room: usize) -> Result<Option<Vec<u8>>, Errno> {
     let mut buf = vec![0u16; room];
-    let written = unsafe { GetModuleFileNameW(core::ptr::null_mut(), buf.as_mut_ptr(), room as DWORD) };
+    let written =
+        unsafe { GetModuleFileNameW(core::ptr::null_mut(), buf.as_mut_ptr(), room as DWORD) };
     if written == 0 {
         return Err(last_error());
     }

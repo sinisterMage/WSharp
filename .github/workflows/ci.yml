@@ -1,0 +1,99 @@
+# Continuous integration for W#, on GitHub-hosted runners.
+#
+# The counterpart to `.forgejo/workflows/ci.yml`, which does the same on the
+# self-hosted runners this repository push-mirrors from. Forgejo Actions is
+# disabled for the repository, so this is what actually runs; the Forgejo file
+# is left in place for when those runners come back.
+#
+# No container. The Forgejo jobs run in a digest-pinned image from a private
+# registry, which exists because Forgejo runs `actions/checkout` with `node`
+# *inside* the job's container and the stock Rust image has none. GitHub's
+# runners have node, rustup and a C compiler already, and `rust-toolchain.toml`
+# pins 1.95.0 so the toolchain honours itself on first use.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace costs nothing until something panics, and when something does
+  # panic in CI the log is all there is to debug from.
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore cargo and target caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          # `target` holds artifacts built with one profile by one toolchain;
+          # keying on the job as well as the lockfile keeps `test` and `lint`
+          # from overwriting each other's cache on every run.
+          key: cargo-test-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-test-
+
+      - name: Versions
+        run: |
+          rustc --version
+          cargo --version
+          cc --version | head -1
+
+      # **Before the tests, and that order is load-bearing.** The case suite's
+      # AOT pass shells out to `wsharp build`, which links against
+      # `libwsharp_start.a` found beside the binary -- but `cargo test` does not
+      # build `crates/wsharp-start` at all, because it declares `test = false`
+      # and nothing depends on it. Without this step a cold cache has no
+      # archive and every built case fails; a warm one links whatever an
+      # earlier commit left behind, which is worse, because it passes.
+      - name: Build for the test suite
+        run: cargo build --workspace --locked
+
+      # Runs the end-to-end case suite twice -- once normally and once under
+      # `--gc-stress`, which collects at every allocation and checks every root
+      # the stack maps describe. That second pass is the collector's main
+      # defence, so it is the reason CI runs the whole workspace rather than
+      # only the unit tests.
+      - name: Test
+        run: cargo test --workspace --locked
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore cargo and target caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-lint-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-lint-
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      # `--all-targets` so tests and examples are linted too, and `-D warnings`
+      # so a lint that is only a warning locally still fails the build.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

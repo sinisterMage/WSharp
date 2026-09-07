@@ -7,28 +7,54 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The archive holding the runtime and the `main` a compiled program starts
-/// in. Built from `crates/wsharp-start`.
-const ARCHIVE: &str = "libwsharp_start.a";
+/// What the archive holding the runtime is called, which is not one name.
+///
+/// `crates/wsharp-start` is a `staticlib`, and cargo names one after the
+/// platform's own convention rather than after the crate: the Unix spelling is
+/// `libwsharp_start.a`, and MSVC's is `wsharp_start.lib`. A `windows-gnu`
+/// build keeps the Unix spelling, so the platform alone does not settle it.
+///
+/// Both are looked for on Windows rather than one being chosen from
+/// `target_env`, because the question is what is *on disk* next to this binary
+/// -- and a `wsharp` can perfectly well be handed an archive built by the other
+/// toolchain. Asking is cheaper than deciding, and it cannot be wrong.
+const ARCHIVE_NAMES: &[&str] = if cfg!(target_os = "windows") {
+    &["wsharp_start.lib", "libwsharp_start.a"]
+} else {
+    &["libwsharp_start.a"]
+};
 
 /// Where to look for the runtime archive, in order.
 ///
 /// The last of these is what makes a checkout work with no setup: `cargo
-/// build` puts `wsharp` and `libwsharp_start.a` in the same directory. The
-/// first is what makes an unusual installation work at all.
+/// build` puts `wsharp` and the archive in the same directory. The first is
+/// what makes an unusual installation work at all.
+///
+/// Each directory is tried under every name the archive can have, directory by
+/// directory rather than name by name: an installation that somehow holds both
+/// spellings should use the one nearest this binary, not the one that happens
+/// to be listed first.
 fn candidates() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
     let mut out = Vec::new();
     if let Some(explicit) = std::env::var_os("WSHARP_RUNTIME_LIB") {
+        // Names a file, not a directory, so it is taken as given -- including
+        // its name, which is the point of being able to set it.
         out.push(PathBuf::from(explicit));
     }
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
         // A release tarball puts the archive under `lib/` beside the binary.
-        out.push(dir.join("lib").join(ARCHIVE));
-        out.push(dir.join("..").join("lib").join(ARCHIVE));
+        dirs.push(dir.join("lib"));
+        dirs.push(dir.join("..").join("lib"));
         // A cargo build puts it right there.
-        out.push(dir.join(ARCHIVE));
+        dirs.push(dir.to_path_buf());
+    }
+    for dir in dirs {
+        for name in ARCHIVE_NAMES {
+            out.push(dir.join(name));
+        }
     }
     out
 }
@@ -42,8 +68,9 @@ fn find_archive() -> Result<PathBuf, String> {
     }
     let list: Vec<String> = tried.iter().map(|p| format!("  {}", p.display())).collect();
     Err(format!(
-        "cannot find {ARCHIVE}, which holds the W# runtime a compiled program \
+        "cannot find {}, which holds the W# runtime a compiled program \
          links against. Looked in:\n{}\nSet WSHARP_RUNTIME_LIB to its path.",
+        ARCHIVE_NAMES.join(" or "),
         list.join("\n")
     ))
 }

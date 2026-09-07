@@ -201,6 +201,7 @@ pub extern "C" fn ws_gc_poll() {
     unsafe { mark::safepoint() };
 }
 
+pub(crate) use crate::worker::set_evacuating;
 /// Set while a trace is moving objects, and read by the load barrier in front
 /// of every reference the program loads out of a heap object.
 ///
@@ -208,7 +209,6 @@ pub extern "C" fn ws_gc_poll() {
 /// a path that is taken on every field read: while it is zero the barrier
 /// costs a load, a test and a branch that falls through.
 pub use crate::worker::{EVACUATING_FLAG_SYMBOL, evacuating_flag_address};
-pub(crate) use crate::worker::set_evacuating;
 
 /// Whether *this* worker is moving objects.
 pub fn evacuating() -> bool {

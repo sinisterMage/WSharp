@@ -83,6 +83,45 @@ pub unsafe extern "C" fn ws_fs_rename(from: *const u8, to: *const u8) -> i64 {
     }
 }
 
+/// Set a path's permission bits.
+///
+/// `mode` is an `i64` because that is the only integer a W# literal is, and it
+/// is written the way C would write it: `fs.chmod(p, 0o755)`. A negative one is
+/// refused rather than wrapped -- `as u32` on a negative would set every bit,
+/// and the one thing worse than failing to make a file executable is making it
+/// setuid by accident.
+///
+/// # Safety
+/// Called from JIT-compiled code across an FFI boundary; `path` must be null or
+/// point at a W# string object.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_fs_chmod(path: *const u8, mode: i64) -> i64 {
+    unsafe { crate::gc::checkpoint() };
+    let path = unsafe { str_bytes(path) }.to_vec();
+    let Ok(mode) = u32::try_from(mode) else {
+        return crate::builtins::ERROR_IO_FAILED;
+    };
+    match crate::worker::blocking(|| sys::chmod(&path, mode)) {
+        Ok(()) => 0,
+        Err(e) => sys::error_tag(e),
+    }
+}
+
+/// Whether this process may run a path.
+///
+/// No failure case, for `is_dir`'s reason: a path that is not there cannot be
+/// run, and neither can one that cannot be reached.
+///
+/// # Safety
+/// Called from JIT-compiled code across an FFI boundary; `path` must be null or
+/// point at a W# string object.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_fs_is_executable(path: *const u8) -> bool {
+    unsafe { crate::gc::checkpoint() };
+    let path = unsafe { str_bytes(path) }.to_vec();
+    crate::worker::blocking(|| sys::is_executable(&path))
+}
+
 /// Whether a path names a directory.
 ///
 /// No failure case, exactly as `io.exists` has none: a path that is not there

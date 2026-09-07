@@ -429,8 +429,14 @@ fn a_built_program_reports_the_collector_doing_its_work() {
             .unwrap_or_else(|| panic!("no number before `{what}` in:\n{line}"))
     };
 
-    assert!(number_before("traces") > 0, "no trace ever started:\n{line}");
-    assert!(number_before("moved") > 0, "nothing was ever moved:\n{line}");
+    assert!(
+        number_before("traces") > 0,
+        "no trace ever started:\n{line}"
+    );
+    assert!(
+        number_before("moved") > 0,
+        "nothing was ever moved:\n{line}"
+    );
     assert!(
         number_before("roots seen") > 0,
         "the stack walk found no roots at all, which would make every root \

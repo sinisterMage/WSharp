@@ -159,8 +159,37 @@ pub(crate) fn rename(from: &[u8], to: &[u8]) -> Result<(), Errno> {
     imp::rename(from, to)
 }
 
+/// Set a path's permission bits.
+///
+/// The call a program that *writes* another program cannot do without: a file
+/// arrives from a download or an archive with whatever mode the writer chose,
+/// and 0o644 is not a thing that can be run. `mkdir` and `create_write` pass a
+/// blanket 0o777/0o666 and let the umask subtract, but this does not -- asking
+/// for 0o755 asks for 0o755, which is `chmod`'s contract everywhere it exists.
+///
+/// `mode` is masked to twelve bits here rather than in each arm, so the two
+/// Unix arms are handed a value their own `mode_t` can hold whatever its width,
+/// and the Windows arm is handed one it can ignore.
+///
+/// Windows has no permission bits and its arm succeeds without doing anything.
+/// That is deliberate: the question this exists to answer is "can this be run",
+/// and there it is already yes.
+pub(crate) fn chmod(path: &[u8], mode: u32) -> Result<(), Errno> {
+    imp::chmod(path, mode & 0o7777)
+}
+
 pub(crate) fn is_dir(path: &[u8]) -> bool {
     imp::is_dir(path)
+}
+
+/// Whether this process may run a path.
+///
+/// The observable half of [`chmod`], and the reason there is no `mode` reader:
+/// what a caller wants to know is not which bits are set but whether the thing
+/// it just unpacked will start, and that is one `access` rather than a `struct
+/// stat` in three layouts.
+pub(crate) fn is_executable(path: &[u8]) -> bool {
+    imp::is_executable(path)
 }
 
 pub(crate) fn file_size(path: &[u8]) -> Result<i64, Errno> {

@@ -91,17 +91,13 @@ impl Blob {
     }
 
     fn pad(&mut self, to: usize) {
-        while self.bytes.len() % to != 0 {
+        while !self.bytes.len().is_multiple_of(to) {
             self.bytes.push(0);
         }
     }
 
     /// Emit this as an exported data object, with a relocation per code address.
-    fn define<M: Module>(
-        mut self,
-        module: &mut M,
-        symbol: &str,
-    ) -> Result<DataId, CodegenError> {
+    fn define<M: Module>(mut self, module: &mut M, symbol: &str) -> Result<DataId, CodegenError> {
         self.pad(8);
         let mut desc = DataDescription::new();
         let relocs = std::mem::take(&mut self.relocs);

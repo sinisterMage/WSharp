@@ -30,6 +30,19 @@ pub fn get(name: str) ?str {
     return env(name);
 }
 
+/// What this program was built for, as a target triple.
+///
+/// `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, and so on. Baked in when
+/// the runtime was compiled rather than asked of the machine at startup, so it
+/// says what this binary *is* and not what it happens to be running on -- an
+/// x86_64 build under Rosetta answers `x86_64-apple-darwin`, which is the
+/// truthful answer for anything choosing what to link or fetch.
+///
+/// Not fallible and not a `?str`: a build always has a target.
+pub fn target() str {
+    return raw_target();
+}
+
 /// The current user's home directory.
 ///
 /// `HOME` on Unix and `USERPROFILE` on Windows, tried in that order rather
