@@ -251,8 +251,22 @@ pub fn install_files(f: fault.Fault, h: str, files: list.List[File]) str {
             fs.remove_tree(staging) catch ignore();
             return "";
         };
-        io.write_file(where, bytes.to_str(file.data)) catch {
-            fault.fail_at(f, where, why_unwritable(path.dirname(where)));
+        io.write_file(where, bytes.to_str(file.data)) catch |e| {
+            // Named here rather than in a helper: handing the capture to a
+            // function types it as the whole error *union* again, and a union
+            // does not compare.
+            var why = "cannot be written";
+            const dir = path.dirname(where);
+            if (!fs.is_dir(dir)) {
+                why = text.concat("cannot be written -- there is no directory ", dir);
+            } else if (e == error.PermissionDenied) {
+                why = "cannot be written -- permission denied";
+            } else if (e == error.NotFound) {
+                why = text.concat("cannot be written -- refused, though there is a directory ", dir);
+            } else if (e == error.IoFailed) {
+                why = "cannot be written -- the write itself failed";
+            }
+            fault.fail_at(f, where, why);
             fs.remove_tree(staging) catch ignore();
             return "";
         };
@@ -371,13 +385,11 @@ fn ignore() void { return; }
 ///
 /// It earns its place: this is what the message said on Windows when
 /// `mkdir_all` was starting absolute paths at `/` instead of at their drive,
-/// and "cannot be written" was not enough to say so.
-fn why_unwritable(dir: str) str {
-    if (!fs.is_dir(dir)) {
-        return text.concat("cannot be written -- there is no directory ", dir);
-    }
-    return "cannot be written";
-}
+/// and "cannot be written" was not enough to say so. The `catch` above names
+/// which of the three `io.write_file` raises, which turns "it did not work"
+/// into a sentence somebody can act on: `NotFound` with the directory present
+/// means the *name* was refused rather than the path, and `IoFailed` means the
+/// write itself did.
 
 // ---------------------------------------------------------------------------
 // Collecting
