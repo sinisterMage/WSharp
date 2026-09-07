@@ -2,18 +2,15 @@
 
 [![CI](https://forgejo-hagc.srv1954822.hstgr.cloud/ofekbickel/WSharp/actions/workflows/ci.yml/badge.svg)](https://forgejo-hagc.srv1954822.hstgr.cloud/ofekbickel/WSharp/actions?workflow=ci.yml)
 
-**A Julia alternative for the programs Julia isn't for.**
+**A compiled language built on multiple dispatch, for services, tools and
+long-running processes.**
 
-Julia's central idea is right: multiple dispatch is a better way to organise a
-program than either classes or a growing `switch`. Julia's execution model is
-built around a different priority — numerical work in a REPL — and pays for it
-with dynamic types, boxed values, and a stop-the-world collector.
-
-W# keeps the idea and changes the priorities. Dispatch is multiple, but resolved
-at compile time wherever the types allow. Types are inferred rather than
-declared, but *checked* rather than advisory. Values are unboxed. The collector
-is built for low pause times. The target is services, tools, and long-running
-processes.
+Multiple dispatch is a better way to organise a program than either classes or
+a growing `switch`: a special case is a function you add, not a branch you
+insert into something that already works. W# takes that idea and compiles it.
+Dispatch is resolved at compile time wherever the types allow. Types are
+inferred rather than declared, and checked across the whole program before it
+builds. Values are unboxed. The collector is built for low pause times.
 
 ```wsharp
 // The status types come from the standard library; nothing is declared here.
@@ -39,23 +36,52 @@ rather than silently changing which code runs.
 
 The whole example is in [`examples/status.ws`](examples/status.ws).
 
-## Compared with Julia
+## What it's good at
 
-|  | Julia | W# |
-|---|---|---|
-| Dispatch | multiple, always dynamic | multiple, static wherever inference pins the types |
-| Types | dynamic; annotations optional and advisory | Hindley-Milner; annotations optional and **checked** |
-| Generics | one method, specialised at run time | monomorphised at compile time; unreachable copies dropped |
-| Values | boxed by default | unboxed — the sized integers, `f64`, `bool`, optionals and error unions live in registers, and a `u8` costs a byte |
-| Errors | exceptions | `?T` optionals and `!T` error unions, Zig-style, with the error set inferred into the type |
-| Collector | generational, stop-the-world | reference counting with a coalescing barrier, a concurrent mark trace for cycles, and compaction |
-| Aimed at | arrays, notebooks, science | services, tools, systems |
+- **Dispatch that mostly isn't there at run time.** When inference pins the
+  arguments, the call lowers to an ordinary direct call — no dispatch code at
+  all. When it can't, the test is one subtract and one unsigned compare against
+  a contiguous range of type ids: no vtable, no inline cache, no method-table
+  lookup. Type ids are assigned in a preorder walk of the subtype lattice,
+  which is what makes that range contiguous.
+- **Types you never write and can still rely on.** Hindley-Milner inference
+  over the whole program, so `fn add(a, b) { return a + b; }` has a signature
+  rather than a hope. Annotations are optional everywhere and checked where
+  written. An ambiguous pair of overloads, an error raised outside a declared
+  `!{…}` set, and a function that can reach the end of its body without
+  returning a value are all compile errors.
+- **Failure in the type, and it says which.** `!T` carries the error *set* —
+  inferred from what a function raises and propagates, or written down as
+  `!{NotFound, IoFailed}str` and checked — so the `e` bound by `catch |e|` is
+  worth testing against. Nothing caps how many errors a set may name.
+- **Values that cost what they say.** A `u8` is a byte and `[]u8` is a byte
+  array. `?T` and `!T` are a tag and a payload in registers: no boxing, no
+  allocation for an optional. Generics are monomorphised, so `fn(T) T` becomes
+  one copy per instantiation and the unreachable ones are never emitted.
+- **Pauses that don't grow with the heap.** Reference counting with a
+  coalescing write barrier, a concurrent mark trace for the cycles counting
+  can't reclaim, and compaction that runs while the program does. The longest
+  pause measured 40 microseconds on 120,000 live objects — and the same on
+  15,000, because a pause visits what the program changed rather than what it
+  holds.
+- **Threads that share no heap.** A worker is an ordinary module: `init` makes
+  the state, and any function taking that state first is something the worker
+  can be asked to do. Values cross as bytes, so there is no shared collector,
+  no lock on the fast path, and no data race to write. `std/broker` is the same
+  idea at the other end — topics, partitions, consumer groups with their own
+  offsets, and replay.
+- **A standard library written in the language.** SHA-2, ChaCha20-Poly1305,
+  AES-GCM, X25519, P-256, P-384, RSA, X.509 and TLS 1.3 are all `.ws` files
+  compiled with your program, so `http.get("https://…")` is W# the whole way
+  down. They are monomorphised per use and dropped when nothing calls them.
+- **Nothing you didn't ask for.** A library module is read only if something
+  imports it, so `wsharp check` on a ten-line file takes about five
+  milliseconds however far the library grows. The runtime crate has no
+  dependencies at all; the operating system is declared by hand.
 
-What Julia still does far better: a vast numerical ecosystem, a mature REPL and
-package manager (W#'s is item 11, and is called *ingot*), and a decade of
-tuning. W# is a young language with a small
-standard library. The table is a statement of design priorities, not a claim to
-have replaced anything.
+W# is young and its standard library is small. What is here is tested end to
+end, and the whole case suite runs a second time under a collector that
+collects at every allocation and validates every root.
 
 ## The language
 
@@ -154,7 +180,7 @@ An overload set can also be named. `const g: fn(i64) i64 = f;` picks the member
 with that signature and gives you an ordinary function value; `const g = f;`
 binds an alias that dispatches just as `f` does.
 
-Selection is Julia's rule: an overload wins if it is at least as specific as
+Selection is by specificity: an overload wins if it is at least as specific as
 every other applicable one in every argument, and strictly more in at least
 one. Two overloads that could both match the same call, with neither more
 specific, are a **compile error**:
