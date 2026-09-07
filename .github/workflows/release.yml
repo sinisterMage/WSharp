@@ -154,14 +154,29 @@ jobs:
       # is what lets both find the real one, and this runner is thrown away
       # afterwards.
       #
-      # An earlier attempt used `ilammy/msvc-dev-cmd` instead. That made things
-      # worse: setting `LIB` and `INCLUDE` convinces rustc the environment is
-      # already configured, so it stops using its own absolute path and starts
-      # resolving `link.exe` from `PATH` -- which broke `cargo build` itself,
-      # a step that had been passing.
+      # This has to happen *before* the step below, and the two are one fix
+      # rather than two. Each was tried alone and each failed differently:
+      #
+      #   - `msvc-dev-cmd` alone: setting `LIB` and `INCLUDE` convinces rustc
+      #     the environment is already configured, so it stops invoking MSVC by
+      #     its own absolute path and starts resolving `link.exe` from `PATH`
+      #     -- where it found coreutils. That broke `cargo build`, which had
+      #     been passing.
+      #   - removing it alone: `cargo build` recovered, and `clang` then failed
+      #     at the link with no `LIB` to find `libcmt.lib` in.
+      #
+      # Together they agree: the impostor is gone, so resolving `link.exe` from
+      # `PATH` finds the real one, and `LIB` is set for whoever needs it.
       - name: Remove the `link.exe` that is not a linker
         if: runner.os == 'Windows'
         run: rm -f "/c/Program Files/Git/usr/bin/link.exe"
+
+      # What `wsharp build` needs and cannot arrange for itself: `link.rs`
+      # drives the link by running `$CC`, and a bare `clang` inherits only the
+      # environment. cargo never needed this because rustc finds MSVC itself.
+      - name: The MSVC environment, for the linker
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
 
       # `rust-toolchain.toml` pins 1.95.0 and every hosted runner ships rustup,
       # so the pin honours itself on first use. No container: the image
