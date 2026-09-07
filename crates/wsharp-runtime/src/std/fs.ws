@@ -32,8 +32,18 @@ pub fn mkdir_all(dir: str) !void {
     const parts = text.split(full, "/");
     const n = array.len(parts);
     var so_far = "";
-    if (path.is_absolute(full)) { so_far = "/"; }
     var i = 0;
+    if (path.is_absolute(full)) {
+        // **A Windows path begins at its drive, not at `/`.** `C:/Users/x`
+        // splits into `C:`, `Users`, `x`; seeding with `/` builds `/C:` and
+        // fails on the first `mkdir`. That is what it did, and the message said
+        // so with the seam visible in it -- `...\home/store/sha256: cannot be
+        // created`, backslashes on one side and slashes on the other.
+        //
+        // The drive is `parts[0]`, so starting there means starting at 1.
+        so_far = path.drive(full);
+        if (text.len(so_far) > 0) { i = 1; } else { so_far = "/"; }
+    }
     while (i < n) : (i += 1) {
         const part = parts[i];
         if (text.len(part) == 0) { continue; }

@@ -119,7 +119,12 @@ pub fn normalise(p: str) str {
 }
 
 /// `C:` when `p` starts with a drive letter, and `""` otherwise.
-fn drive(p: str) str {
+///
+/// Public because a walk *down* a path has to start somewhere, and on Windows
+/// that somewhere is the drive rather than `/`. `std/fs.mkdir_all` seeds itself
+/// with this; building `/C:/Users` instead is a `mkdir` that fails on its very
+/// first step.
+pub fn drive(p: str) str {
     if (text.len(p) >= 2 and text.byte_at(p, 1) == COLON) { return text.substr(p, 0, 2); }
     return "";
 }
