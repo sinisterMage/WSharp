@@ -266,7 +266,27 @@ fn wide_path(path: &[u8]) -> Result<Vec<u16>, Errno> {
         return Err(Errno(ERROR_FILE_NOT_FOUND));
     }
     let text = String::from_utf8_lossy(path);
-    let mut out: Vec<u16> = text.encode_utf16().collect();
+    // **One separator, chosen here rather than hoped for above.** Everything
+    // above this layer writes `/`, because `std/path` uses it on every
+    // platform; the environment hands back `\`, so a joined path routinely
+    // wears both. Win32 does accept `/` in most places -- but not in all of
+    // them, and "most" is what makes the failure so hard to read: `mkdir_all`
+    // normalises before it creates, so a directory would be made under one
+    // spelling and then not found under the other, with both calls reporting
+    // success and the write three lines later reporting nothing useful.
+    //
+    // Converting once, at the boundary where a path stops being ours and
+    // becomes Win32's, is the only place this can be settled for every caller.
+    let mut out: Vec<u16> = text
+        .encode_utf16()
+        .map(|c| {
+            if c == u16::from(b'/') {
+                u16::from(b'\\')
+            } else {
+                c
+            }
+        })
+        .collect();
     out.push(0);
     Ok(out)
 }

@@ -383,7 +383,19 @@ fn ignore() void { return; }
 /// which of the three possible bugs it is, and each points at a different file.
 fn why_unwritable(dir: str, where: str, size: i64) str {
     if (!fs.is_dir(dir)) {
-        return text.concat("cannot be written -- there is no directory ", dir);
+        // `mkdir_all` normalises before it creates and every other call passes
+        // the path as it was built, so the two can disagree about what they are
+        // naming. If the normalised spelling is there and this one is not, the
+        // directory was made all right and nothing else can find it.
+        const flat = path.normalise(dir);
+        if (fs.is_dir(flat)) {
+            return text.concat(
+                text.concat("cannot be written -- the directory is there as ", flat),
+                text.concat(" but not as ", dir));
+        }
+        return text.concat(
+            text.concat("cannot be written -- there is no directory ", dir),
+            text.concat(" nor ", flat));
     }
     if (!takes_a_file(dir)) {
         return text.concat("cannot be written -- nothing can be written into ", dir);
