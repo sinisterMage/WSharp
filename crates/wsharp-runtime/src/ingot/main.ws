@@ -92,6 +92,10 @@ fn usage() void {
     print("`-C <dir>` works from somewhere else. `--gc-stress` belongs to what");
     print("is being run. Output is tab-separated, and WSHARP_HOME says where");
     print("the store is.");
+    print("");
+    print("`install` also writes ingot.env, which is how the compiler finds a");
+    print("package's files. It holds absolute paths, so it is derived rather");
+    print("than committed -- `install` writes it again whenever it is missing.");
     return;
 }
 
@@ -252,6 +256,17 @@ fn resolve(f: fault.Fault) i64 {
         fault.fail_at(f, lock_path(), "cannot be written");
         return FAILED;
     };
+    // The environment describes a resolution that is no longer this one, and a
+    // compiler reading a stale one would build against the versions chosen last
+    // time -- silently, since those store entries are still there and still
+    // hold what they always did. Removed rather than rewritten, because where
+    // things land is `install`'s answer and not this verb's.
+    if (io.exists(manifest.ENV_NAME)) {
+        fs.remove(manifest.ENV_NAME) catch {
+            fault.fail_at(f, manifest.ENV_NAME, "cannot be removed");
+            return FAILED;
+        };
+    }
     print(row2("resolved", text.from_int(list.len(lock.packages))));
     return OK;
 }
@@ -278,26 +293,90 @@ fn install(f: fault.Fault) i64 {
         fault.fail(f, "cannot work out where the store is: neither WSHARP_HOME nor a home directory");
         return FAILED;
     };
+    const here = project_dir(f) orelse return FAILED;
     const net = plan.network();
-    var installed = 0;
+    var entries: list.List[manifest.Installed] = list.new();
     for (list.to_array(lock.packages)) |p| {
         const digest = digest_of(p.tree);
-        if (store.check(h, digest) == store.READY) { continue; }
-        const dir = plan.source_dir(f, net, p.source) orelse return FAILED;
-        const got = store.install(f, h, dir);
-        if (!f.ok) { return FAILED; }
-        if (!text.eq(got, digest)) {
-            fault.fail(f, text.concat(text.concat("`", p.name),
-                "` has changed since it was resolved -- run `ingot resolve`"));
-            return NEEDS_RESOLVING;
+        if (store.check(h, digest) != store.READY) {
+            const dir = plan.source_dir(f, net, p.source) orelse return FAILED;
+            const got = store.install(f, h, dir);
+            if (!f.ok) { return FAILED; }
+            if (!text.eq(got, digest)) {
+                fault.fail(f, text.concat(text.concat("`", p.name),
+                    "` has changed since it was resolved -- run `ingot resolve`"));
+                return NEEDS_RESOLVING;
+            }
+            print(row3("installed", p.name, digest));
         }
-        print(row3("installed", p.name, digest));
-        installed += 1;
+        // Built for every package rather than only the ones that had to be
+        // fetched: `ingot.env` describes the whole project, and a second
+        // `install` that had nothing to do must still leave one behind.
+        const entry = store.entry(h, digest);
+        list.push(entries, manifest.Installed{
+            .name = p.name,
+            .dir = entry,
+            .root = facade(f, entry, p.name),
+            .deps = p.deps,
+        });
     }
-    store.register(f, h, lock_path());
+
+    const root = manifest.Installed{
+        .name = m.name,
+        .dir = here,
+        .root = m.root,
+        .deps = dep_names(m),
+    };
+    io.write_file(manifest.ENV_NAME, manifest.write_env(root, entries)) catch {
+        fault.fail_at(f, manifest.ENV_NAME, "cannot be written");
+        return FAILED;
+    };
+    // The absolute path, not `ingot.lock`. `env/` names a lockfile by the hash
+    // of its path, so a relative one makes every project on the machine the
+    // same environment -- and then one project's `install` unregisters
+    // another's, whose entries the next `gc` deletes.
+    store.register(f, h, path.join(here, lock_path()));
     if (!f.ok) { return FAILED; }
     print(row2("ready", text.from_int(list.len(lock.packages))));
     return OK;
+}
+
+/// Where this process is, absolutely and spelled with `/`.
+///
+/// `-C` has already moved us, so the working directory *is* the project. The
+/// answer has to be absolute twice over: `ingot.env` is read by a compiler that
+/// may be run from anywhere, and an environment is named by its lockfile's path.
+fn project_dir(f: fault.Fault) ?str {
+    const d = os.cwd() catch {
+        fault.fail(f, "cannot work out which directory this is");
+        return null;
+    };
+    return path.normalise(d);
+}
+
+/// Which file in a store entry an `@import` of that package resolves to.
+///
+/// The package's own manifest says so, and a package that was resolved has one.
+/// The fallback is written out rather than asserted because a store entry is
+/// content-addressed and its `ingot.toml` is a file in it like any other: a
+/// tree that has lost one is a tree, and `default_root` is what `init` would
+/// have written anyway.
+fn facade(f: fault.Fault, entry: str, name: str) str {
+    const file = path.join(entry, manifest.MANIFEST_NAME);
+    if (!io.exists(file)) { return default_root(name); }
+    const m = manifest.read(f, file) orelse {
+        f.ok = true;
+        return default_root(name);
+    };
+    if (text.len(m.root) == 0) { return default_root(name); }
+    return m.root;
+}
+
+/// What the root package may import: the names its manifest asked for.
+fn dep_names(m: manifest.Manifest) []str {
+    var out = []str{};
+    for (list.to_array(m.deps)) |d| { out = array.push(out, d.name); }
+    return out;
 }
 
 /// Ready, or the smallest thing that has to happen first.
@@ -347,6 +426,15 @@ fn verify(f: fault.Fault) i64 {
                 f.ok = true;
             }
         }
+    }
+    // A store that satisfies the lockfile is still not a project that can be
+    // compiled: the loader finds a package's files through `ingot.env`, and
+    // only `install` writes one. Asked last and only when nothing else is
+    // wrong, because a project that is missing entries needs `install` anyway
+    // and has already been told so.
+    if (worst == OK and !io.exists(manifest.ENV_NAME)) {
+        print(row2("needs", "install"));
+        worst = NEEDS_INSTALLING;
     }
     if (worst == OK) { print(row2("ready", text.from_int(list.len(lock.packages)))); }
     return worst;

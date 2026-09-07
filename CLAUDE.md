@@ -506,6 +506,31 @@ extra `sin_len` byte out of this code entirely.
   cannot see is simply what it has no key for. A local binding shadows an
   imported module, so adding an import cannot break code that already used the
   name.
+- **A re-export is a second key, not a second thing.** `pub const T = other.T;`
+  puts one more entry in `struct_ids`, and `pub const f = other.f;` one more in
+  `globals`, both holding the *same* `StructId` or `GlobalRef` -- so the alias
+  and the original unify, dispatch and lay out identically because they are one
+  type and one function set, and nothing below sema knows it happened. Two
+  passes, because a type must be aliased before struct fields are laid out
+  (`alias_reexported_types`, inside `collect_structs`) and a value only after
+  every module's globals exist (`alias_reexported_values`); each runs to a
+  fixpoint so a facade may re-export from a facade. There is no case for a
+  cycle on purpose: such a `const` is written in a module that imported the
+  other, so a cycle among re-exports is a cycle among imports and the loader
+  refused it first. One thing has to be told: `is_alias` decides that a key is
+  a second name for an overload set by comparing *bare* names, which a
+  re-export defeats -- `pkg.parse` really is called `parse` -- so
+  `check_overloads` asks the `reexported` key set instead and every overload
+  diagnostic is said once.
+- **The `for` protocol's dependency edges are the whole program's.** `iter` and
+  `next` resolve in the module that declares the subject's type, which
+  inference has not run yet to know, so `infer_all` over-approximates. It must
+  over-approximate across *every* module, not the ones this one imports: a
+  subject's type arrives through functions that forward it and facades that
+  re-export it, and an edge that is missing leaves the iterator ungeneralised
+  and reports `no overload of iter accepts (T)` about a `T` that is right
+  there. Sound for the reason the narrower version was: an edge only matters
+  when it closes a cycle, and an iterator does not call back into its user.
 - **`Span` is two `u32`s with no file in it.** Files are laid end to end in one
   offset space and a span's file is the range it falls in (`diag::SourceMap`);
   the first starts at offset 1, which keeps 0 meaning `Span::EMPTY`. Widening
@@ -630,7 +655,38 @@ extra `sin_len` byte out of this code entirely.
   Win32 path call accepts one, `sys/windows.rs` appends its listing wildcard to
   one, and one spelling is what keeps a lockfile written on one machine
   readable on another. `std/path.normalise` turns a `\` that arrives from
-  outside into one; nothing here ever produces one.
+  outside into one; nothing here ever produces one. `os.cwd` and `os.home`
+  answer with what the system said and normalise nothing, because a path is
+  arithmetic and the environment is a fact about the process -- `std/os` does
+  not import `std/path`, and every caller of either normalises.
+- **`ingot.env` is derived, absolute and read by the compiler.** `install`
+  writes it beside the lockfile; `Loader::follow`'s third rule is the only
+  thing that reads it. Not TOML, and that is the decision: the loader is Rust
+  and every reader this project owns is W#, so a lockfile the compiler parsed
+  would be a second TOML implementation kept in step with `std/toml` for ever
+  -- and a whole one, since a package's own `ingot.toml` is a file a person
+  wrote. One line per package, tab-separated: name, directory, facade, and then
+  one field per dependency, so the file has one separator and a package name is
+  whatever a name is. Unreadable and malformed get the same answer, `run ingot
+  install`, because writing it again is the fix for both. **`resolve` removes
+  it**: a new resolution names new store entries and the old ones are still
+  there holding what they always did, so an environment left behind would build
+  the previous version of a dependency and say nothing. `add` and `remove` do
+  not, because the environment they leave is still a true statement about what
+  was installed -- it is `resolve` that makes one false.
+- **A package may import only what its own manifest asked for.** The lockfile
+  is the whole project's, because the solver chooses one version per package
+  for the project -- so without the scope check in `follow_package` a manifest
+  would describe what gets fetched rather than what may be named, and an
+  undeclared dependency would work until something else stopped needing it. The
+  owner of a file is the entry whose directory is the *longest* prefix of it:
+  longest, because `WSHARP_HOME` may sit inside the project, which is where
+  `crates/ingot/tests/verbs.rs` puts it.
+- **A package presents one file.** `Manifest.root` is the facade, and nothing
+  outside can name any other file in the tree -- `@import("util/inside")` is
+  not a spelling. What a package of several files shows is what its facade
+  re-exports, which is the same rule `pub` sets one level down: a surface is
+  stated rather than leaked.
 - **The closure environment is dead after the prologue.** Captures are copied
   into declared locals before the first safepoint and `env` is never read
   again, so it is not a root and need not be. Re-reading it after a call would

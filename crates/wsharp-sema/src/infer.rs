@@ -374,6 +374,107 @@ enum Binding {
     },
 }
 
+/// A top-level `const` that is a second name for something another module
+/// declares: `pub const parse = reader.parse;`.
+///
+/// This is what a package facade is made of. A package presents one file, and
+/// nothing else in it can be reached from outside -- so the facade has to be
+/// able to say "and this name means that one", for a function, an overload set,
+/// a constant or a type alike.
+///
+/// No new syntax carries it. `const x = a.b;` already parses; it was rejected
+/// as a computed global, which it is not: nothing is computed, because a name
+/// is not a value here any more than `const g = f;` in the same module is.
+struct Reexport<'a> {
+    module: usize,
+    /// The name this module gives it.
+    local: Ident,
+    /// Everything left of the last dot, as written. Kept as an AST node
+    /// because resolving it needs the importing module's alias table.
+    obj: &'a ast::Expr,
+    /// The name in that module.
+    member: Ident,
+    /// `const g: fn(i64) i64 = other.f;` picks one member of an overload set,
+    /// exactly as the same annotation does for a `const` naming a local one.
+    annotation: Option<&'a ast::TypeExpr>,
+    /// Set by the type pass, so the value pass can tell "already answered"
+    /// from "clashes with something this module declares".
+    aliased_type: bool,
+    /// Set by the value pass once this one has been settled, one way or the
+    /// other. What is still false when the fixpoint stops is what is reported.
+    settled: bool,
+}
+
+/// The `const x = a.b;` declarations in one module, in source order.
+///
+/// `obj` must be a path of plain names: `a`, or `a.b`. Anything else -- a call,
+/// an index -- is a computed global, which W# does not have, and is left to
+/// [`Inferencer::declare_const`] to say so in the words it always did.
+fn source_reexports<'a>(m: usize, module: &'a ast::Module) -> Vec<Reexport<'a>> {
+    module
+        .items
+        .iter()
+        .filter_map(|item| {
+            let ast::Item::Const(decl) = item else {
+                return None;
+            };
+            let (obj, member) = reexport_parts(decl)?;
+            Some(Reexport {
+                module: m,
+                local: decl.name.clone(),
+                obj,
+                member: member.clone(),
+                annotation: decl.ty.as_ref(),
+                aliased_type: false,
+                settled: false,
+            })
+        })
+        .collect()
+}
+
+/// The two halves of `const x = a.b;`, if that is what this declaration is.
+///
+/// Shared with [`Inferencer::collect_module_globals`], which has to leave such
+/// a declaration alone: what it names lives in another module, and no module's
+/// globals are all known until every module has been collected.
+fn reexport_parts(decl: &ast::ConstDecl) -> Option<(&ast::Expr, &Ident)> {
+    let ast::Expr::Field { obj, name, .. } = &decl.value else {
+        return None;
+    };
+    is_name_path(obj).then_some((&**obj, name))
+}
+
+/// Whether an expression is a chain of plain names, which is what a module
+/// path is written as.
+fn is_name_path(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Ident(_) => true,
+        ast::Expr::Field { obj, .. } => is_name_path(obj),
+        _ => false,
+    }
+}
+
+/// The first name in such a chain: the one that has to be an import.
+fn leading_name(expr: &ast::Expr) -> &Ident {
+    match expr {
+        ast::Expr::Field { obj, .. } => leading_name(obj),
+        ast::Expr::Ident(name) => name,
+        _ => unreachable!("only a path of names is a re-export"),
+    }
+}
+
+/// A path of plain names, spelled the way it was written.
+///
+/// For a diagnostic only. The module path it resolves to is a file's location,
+/// which is not what the reader typed and not what they want to be shown.
+fn name_path_text(expr: &ast::Expr) -> String {
+    match expr {
+        ast::Expr::Ident(name) => name.to_string(),
+        ast::Expr::Field { obj, name, .. } => format!("{}.{name}", name_path_text(obj)),
+        _ => String::new(),
+    }
+}
+
 /// The names a `for` over a non-array subject calls, resolved in the module
 /// that declares the subject's type. Two rather than one because an iterator
 /// has state the subject does not: `iter` makes it, `next` advances it.
@@ -471,6 +572,18 @@ struct Inferencer<'a> {
     /// Where each global was first declared, for the same reason. Builtins
     /// and lazily materialised status types have no entry.
     global_spans: HashMap<String, Span>,
+    /// The `const x = other.x;` declarations in every module, in the order
+    /// they were written. Collected once because two passes need them: a type
+    /// is aliased before struct fields are laid out, and a value after every
+    /// module's globals are known.
+    reexports: Vec<Reexport<'a>>,
+    /// The keys those two passes installed.
+    ///
+    /// `check_overloads` is what needs it. That pass decides whether a key is a
+    /// second name for an overload set by comparing bare names, which a
+    /// re-export defeats: `pkg.parse` really is called `parse`, so without this
+    /// the set behind it would be walked twice and every diagnostic said twice.
+    reexported: HashSet<String>,
     consts: Vec<ConstDef>,
     /// `const`s bound to a function name and pinned by an annotation.
     fn_consts: Vec<FuncConst>,
@@ -517,16 +630,16 @@ struct Inferencer<'a> {
     arrays: Vec<hir::ArrayConst>,
 
     frames: Vec<Frame>,
-    /// Qualified keys another module may *not* name. Private is the default, so
-    /// this records the exceptions rather than the rule -- and a name a module
-    /// declares is always visible to itself, which is why one flat set is
-    /// enough: a qualified lookup only ever crosses a module boundary, since a
-    /// module that imported itself would be a cycle.
     /// The services this program spawns, and the module each came from. Built
     /// on demand: a module is a service because something spawned it, and a
     /// program pays for no service it does not start.
     services: Vec<hir::ServiceDef>,
     service_of: HashMap<usize, Option<ServiceId>>,
+    /// Qualified keys another module may *not* name. Private is the default, so
+    /// this records the exceptions rather than the rule -- and a name a module
+    /// declares is always visible to itself, which is why one flat set is
+    /// enough: a qualified lookup only ever crosses a module boundary, since a
+    /// module that imported itself would be a cycle.
     private: HashSet<String>,
     /// Spans a privacy error has already been reported at. One qualified name
     /// is resolved more than once -- a call asks whether its callee is an
@@ -571,6 +684,8 @@ impl<'a> Inferencer<'a> {
             struct_type_params: HashMap::new(),
             globals: HashMap::new(),
             global_spans: HashMap::new(),
+            reexports: Vec::new(),
+            reexported: HashSet::new(),
             consts: Vec::new(),
             fn_consts: Vec::new(),
             fn_asts: Vec::new(),
@@ -783,14 +898,95 @@ impl<'a> Inferencer<'a> {
             self.current = m;
             self.collect_imports(m);
         }
+        self.collect_visibility();
         for m in 0..self.modules.len() {
             self.current = m;
             self.collect_module_structs(m);
         }
+        self.reexports = (0..self.modules.len())
+            .flat_map(|m| source_reexports(m, self.modules[m].ast))
+            .collect();
+        self.alias_reexported_types();
         self.current = 0;
 
         self.resolve_struct_parents();
         self.layout_struct_fields();
+    }
+
+    /// What each module keeps to itself, recorded before any name is resolved
+    /// through a module path.
+    ///
+    /// Structs and values share the key shape, so one set covers `struct_ids`
+    /// and `globals` both. Ahead of the structs rather than beside the rest of
+    /// the globals, because a re-export is checked for visibility where it is
+    /// written and the type half of that runs before `collect_globals` does.
+    fn collect_visibility(&mut self) {
+        for m in 0..self.modules.len() {
+            for item in &self.modules[m].ast.items {
+                let public = match item {
+                    ast::Item::Fn(d) => d.is_public,
+                    ast::Item::Struct(d) => d.is_public,
+                    ast::Item::Const(d) => d.is_public,
+                };
+                if !public {
+                    let key = self.key_in(m, item.name().as_str());
+                    self.private.insert(key);
+                }
+            }
+        }
+    }
+
+    /// `pub const Ast = reader.Ast;` -- a second name for a type another module
+    /// declares.
+    ///
+    /// A struct's identity is a `StructId`, so this is one more key in
+    /// `struct_ids` and no new type at all: the alias and the original unify,
+    /// dispatch and lay out the same way, because they *are* the same type.
+    ///
+    /// Before parents and fields are resolved, so a field may be written
+    /// `pkg.Ast`, and to a fixpoint, so a facade may re-export from a facade.
+    /// Nothing is reported here: a re-export that names no type may still name
+    /// a value, and [`Inferencer::alias_reexported_values`] is where both
+    /// answers are in.
+    fn alias_reexported_types(&mut self) {
+        loop {
+            let mut installed = false;
+            for i in 0..self.reexports.len() {
+                if self.reexports[i].aliased_type {
+                    continue;
+                }
+                self.current = self.reexports[i].module;
+                let Some(target) = self.reexport_target(i) else {
+                    continue;
+                };
+                let Some(&id) = self.struct_ids.get(&target) else {
+                    continue;
+                };
+                let key = self.key_in(self.current, self.reexports[i].local.as_str());
+                // Declining rather than reporting: the value pass sees a name
+                // this module already has and says so once, with the whole
+                // question answered.
+                if self.struct_ids.contains_key(&key) {
+                    continue;
+                }
+                let member = self.reexports[i].member.clone();
+                self.check_visible(&target, &member);
+                self.struct_ids.insert(key.clone(), id);
+                self.reexported.insert(key);
+                self.reexports[i].aliased_type = true;
+                installed = true;
+            }
+            if !installed {
+                return;
+            }
+        }
+    }
+
+    /// The qualified key a re-export names, or `None` if its left-hand side is
+    /// not a module this file imported.
+    fn reexport_target(&mut self, i: usize) -> Option<String> {
+        let path = self.module_path_of(self.reexports[i].obj)?;
+        Some(format!("{path}.{}", self.reexports[i].member))
     }
 
     fn collect_module_structs(&mut self, m: usize) {
@@ -1170,22 +1366,6 @@ impl<'a> Inferencer<'a> {
     }
 
     fn collect_globals(&mut self) {
-        // What each module keeps to itself, recorded before any name is
-        // resolved through a module path. Structs and values share the key
-        // shape, so one set covers `struct_ids` and `globals` both.
-        for m in 0..self.modules.len() {
-            for item in &self.modules[m].ast.items {
-                let public = match item {
-                    ast::Item::Fn(d) => d.is_public,
-                    ast::Item::Struct(d) => d.is_public,
-                    ast::Item::Const(d) => d.is_public,
-                };
-                if !public {
-                    let key = self.key_in(m, item.name().as_str());
-                    self.private.insert(key);
-                }
-            }
-        }
         // First, so that their ids are the ones the library's own functions
         // return. A builtin cannot look an error up by name: it is compiled
         // long before the program that catches it is read.
@@ -1230,7 +1410,142 @@ impl<'a> Inferencer<'a> {
             self.current = m;
             self.collect_module_globals(m);
         }
+        self.alias_reexported_values();
         self.current = 0;
+    }
+
+    /// `pub const parse = reader.parse;` -- a second name for a function, an
+    /// overload set, a constant or a status type another module declares.
+    ///
+    /// One more key in `globals`, holding the *same* [`GlobalRef`]. An overload
+    /// set aliased this way dispatches at every call exactly as the original
+    /// does, for the reason `const g = f;` in one module already did: a set is
+    /// resolved by its members and the members did not move.
+    ///
+    /// After every module's globals, because a facade names another module's,
+    /// and to a fixpoint, because a facade may name another facade's. What is
+    /// left when a round installs nothing is reported: either the chain closes
+    /// on itself, or the name is simply not there.
+    fn alias_reexported_values(&mut self) {
+        loop {
+            let mut installed = false;
+            for i in 0..self.reexports.len() {
+                if self.reexports[i].settled {
+                    continue;
+                }
+                self.current = self.reexports[i].module;
+                let Some(target) = self.reexport_target(i) else {
+                    continue;
+                };
+                let found = self.globals.get(&target).cloned();
+                // A struct with fields is a type and not a value, so there is
+                // nothing in `globals` to find and the type pass is the whole
+                // answer. Asked of the table rather than of `aliased_type`,
+                // because the type pass declines a name this module already
+                // declares -- and *that* is a clash to report below, not a
+                // target that is missing.
+                if found.is_none() && !self.struct_ids.contains_key(&target) {
+                    continue;
+                }
+                self.reexports[i].settled = true;
+                installed = true;
+
+                let local = self.reexports[i].local.clone();
+                let key = self.key_in(self.current, local.as_str());
+                // A name this module already has, and that this re-export did
+                // not give it. `aliased_type` is what tells the two apart:
+                // without it, the type pass's own key would read as a clash.
+                if !self.reexports[i].aliased_type
+                    && (self.has_global(local.as_str())
+                        || self.struct_named(local.as_str()).is_some())
+                {
+                    self.report_redeclaration(&local);
+                    continue;
+                }
+                let member = self.reexports[i].member.clone();
+                self.check_visible(&target, &member);
+                let Some(global) = found else {
+                    continue;
+                };
+                let global = match self.reexports[i].annotation {
+                    // The same rule a `const` naming a local overload set
+                    // follows: with a signature it is one member, and which one
+                    // cannot be decided until the members have been inferred.
+                    Some(annot) if matches!(global, GlobalRef::Func(_)) => {
+                        let GlobalRef::Func(ids) = global else {
+                            unreachable!("just matched")
+                        };
+                        let ty = self.resolve_type_expr(annot);
+                        self.fn_consts.push(FuncConst {
+                            ids,
+                            ty,
+                            span: self.reexports[i].local.span,
+                            name: member.to_string(),
+                            chosen: None,
+                            failed: false,
+                        });
+                        GlobalRef::FuncValue(self.fn_consts.len() - 1)
+                    }
+                    Some(annot) => {
+                        self.error(
+                            annot.span(),
+                            "a `const` that renames something cannot have a type annotation",
+                        )
+                        .help = Some(
+                            "it has whatever type the name it renames has; an annotation is \
+                             only for picking one member out of an overload set"
+                                .into(),
+                        );
+                        global
+                    }
+                    None => global,
+                };
+                self.globals.insert(key.clone(), global);
+                self.global_spans.insert(key.clone(), local.span);
+                self.reexported.insert(key);
+            }
+            if !installed {
+                break;
+            }
+        }
+
+        for i in 0..self.reexports.len() {
+            if self.reexports[i].settled || self.reexports[i].aliased_type {
+                continue;
+            }
+            self.current = self.reexports[i].module;
+            self.report_dangling_reexport(i);
+        }
+    }
+
+    /// A re-export that never named anything, once the fixpoint is done.
+    ///
+    /// There is no case for a chain that closes on itself, and that is a fact
+    /// about the loader rather than an omission: `pub const x = a.x;` is
+    /// written in a module that imported `a`, so a cycle among re-exports is a
+    /// cycle among imports, and the loader has already refused to read the
+    /// second file. A chain that ends in a name that is simply not there
+    /// reports at every link, which is one error per line that has to change.
+    fn report_dangling_reexport(&mut self, i: usize) {
+        let member = self.reexports[i].member.clone();
+        if self.reexport_target(i).is_none() {
+            let first = leading_name(self.reexports[i].obj).clone();
+            self.error(first.span, format!("cannot find module `{first}`"))
+                .help = Some(format!(
+                "bind it first, as in `const {first} = @import(\"std/{first}\");`"
+            ));
+            return;
+        }
+        let written = name_path_text(self.reexports[i].obj);
+        self.error(
+            member.span,
+            format!("`{written}` has nothing called `{member}`"),
+        )
+        .help = Some(
+            "a top-level `const` may be a second name for something another module declares, \
+             which is how a package of several files presents one of them"
+                .into(),
+        );
     }
 
     /// Bind each `const name = @import("path");` in this module.
@@ -1259,9 +1574,10 @@ impl<'a> Inferencer<'a> {
                 _ => {
                     self.error(*span, format!("cannot find module `{path}`"))
                         .help = Some(
-                        "a path is either a file next to this one, such as \
-                         `@import(\"./util.ws\")`, or one of the standard library's, \
-                         such as `@import(\"std/http\")`"
+                        "a path is a file next to this one, such as \
+                         `@import(\"./util.ws\")`, one of the standard library's, such as \
+                         `@import(\"std/http\")`, or a package this project depends on, \
+                         such as `@import(\"acme/json\")`"
                             .into(),
                     );
                     continue;
@@ -1309,6 +1625,10 @@ impl<'a> Inferencer<'a> {
                         self.declare_function(&decl.name, func, decl.span, false);
                     } else if matches!(decl.value, ast::Expr::Ident(_)) {
                         aliases.push(decl);
+                    } else if reexport_parts(decl).is_some() {
+                        // Another module's name. Left to `alias_reexported_*`,
+                        // which cannot run until every module has been
+                        // collected -- and, for a type, has already run.
                     } else {
                         self.declare_const(decl);
                     }
@@ -1839,6 +2159,20 @@ impl<'a> Inferencer<'a> {
 
     fn infer_all(&mut self) {
         let count = self.fn_asts.len();
+        // Every `iter` and `next` in the program, gathered once. Why it is the
+        // whole program rather than what one module imports is argued at the
+        // use below.
+        let protocol: Vec<usize> = self
+            .globals
+            .iter()
+            .filter(|(key, _)| PROTOCOL_NAMES.contains(&bare_name(key)))
+            .filter_map(|(_, global)| match global {
+                GlobalRef::Func(ids) => Some(ids.clone()),
+                _ => None,
+            })
+            .flatten()
+            .map(|id| id as usize)
+            .collect();
         let mut edges: Vec<Vec<usize>> = vec![Vec::new(); count];
         for (id, deps) in edges.iter_mut().enumerate() {
             let Some(func) = self.fn_asts[id] else {
@@ -1880,21 +2214,25 @@ impl<'a> Inferencer<'a> {
                 };
                 // The `for` protocol resolves in the module that declares the
                 // subject's type, which inference has not run yet to know. So
-                // every `iter` and `next` this module can see is a dependency.
+                // every `iter` and `next` **in the program** is a dependency.
                 //
-                // Over-approximating is sound rather than merely convenient: a
-                // dependency only matters when it is part of a cycle, and a
-                // library's iterator never calls back into the program using
-                // it -- so `std/list.next` is simply inferred and generalised
-                // first. An iterable declared in the same file genuinely does
-                // belong in the same binding group.
+                // The whole program rather than what this module imports, and
+                // the difference is not hypothetical: a subject's type can come
+                // from a module this one never named -- through a function that
+                // forwards it, and through a facade that re-exports it, which
+                // is what every iterable in a package looks like. Depending on
+                // what is in reach of the wrong module leaves the iterator
+                // ungeneralised and reports `no overload of iter accepts (T)`
+                // about a `T` that is right there.
+                //
+                // Over-approximating is sound rather than merely convenient: an
+                // edge only matters when it closes a cycle, and an iterator
+                // never calls back into the program using it -- so
+                // `std/list.next` is simply inferred and generalised first. An
+                // iterable declared beside its user genuinely does belong in
+                // the same binding group, and still lands in it.
                 if PROTOCOL_NAMES.contains(&name.as_str()) {
-                    for path in self.imports[module].values() {
-                        let key = format!("{path}.{name}");
-                        if let Some(GlobalRef::Func(ids)) = self.globals.get(&key) {
-                            deps.extend(ids.iter().map(|id| *id as usize));
-                        }
-                    }
+                    deps.extend(protocol.iter().copied());
                 }
                 let callees = match self.globals.get(&key) {
                     Some(GlobalRef::Func(ids)) => ids,
@@ -6078,8 +6416,15 @@ impl<'a> Inferencer<'a> {
             .filter_map(|(name, g)| match g {
                 // An alias for a set is not a set of its own: its members were
                 // already checked under the name they were declared with, and
-                // checking them twice would say everything twice.
-                GlobalRef::Func(ids) if ids.len() > 1 && !self.is_alias(bare_name(name), ids) => {
+                // checking them twice would say everything twice. A re-export
+                // is asked about by key rather than by name, because it usually
+                // keeps the name it renames -- `pkg.parse` really is `parse`,
+                // so `is_alias` cannot see it.
+                GlobalRef::Func(ids)
+                    if ids.len() > 1
+                        && !self.reexported.contains(name)
+                        && !self.is_alias(bare_name(name), ids) =>
+                {
                     Some((bare_name(name).to_string(), ids.clone()))
                 }
                 _ => None,

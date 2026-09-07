@@ -8,8 +8,10 @@
 // expect: --three
 // expect: <unset>
 // expect: yes
+// expect: absolute
 const array = @import("std/array");
 const os = @import("std/os");
+const path = @import("std/path");
 const text = @import("std/str");
 
 fn ok(p: str) str {
@@ -30,5 +32,16 @@ fn main() i64 {
     // And one that every process has. Windows matches a variable's name
     // without regard to case, so one spelling reaches all three platforms.
     print(if (os.get("PATH")) |p| ok(p) else "no");
+
+    // The working directory, which is fallible where `home` and `temp_dir` are
+    // not: those ask the environment, and this asks the kernel about a
+    // directory that can have been removed since the process entered it.
+    //
+    // Only that it is absolute is checked, since what it is depends on where
+    // the suite was started. Windows answers with `\`, which `path.normalise`
+    // is what turns into a `/` -- `std/os` never rewrites one, because a path
+    // is arithmetic and the environment is a fact about the process.
+    const here = path.normalise(os.cwd() catch return 1);
+    print(if (path.is_absolute(here)) "absolute" else "relative");
     return 0;
 }

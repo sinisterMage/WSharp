@@ -638,6 +638,19 @@ fn library() -> Vec<Builtin> {
             ret: BuiltinTy::Optional(&BuiltinTy::Str),
             ptr: crate::os::ws_os_env as *const u8,
         },
+        // Fallible where `env` is not: a variable that is unset is ordinary,
+        // and a working directory that has been removed underneath the process
+        // is not.
+        Builtin {
+            module: OS_MODULE,
+            name: "raw_cwd",
+            params: &[],
+            ret: BuiltinTy::ErrUnion(
+                &BuiltinTy::Str,
+                &["NotFound", "PermissionDenied", "IoFailed"],
+            ),
+            ptr: crate::os::ws_os_cwd as *const u8,
+        },
         // Copy an array out of this worker's heap and build it again, which
         // is what sending it somewhere does. Exposed for the reason the `gc_*`
         // counters are: the deep copy is a mechanism the language depends on,

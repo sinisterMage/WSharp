@@ -64,6 +64,7 @@ unsafe extern "system" {
     fn FindNextFileW(handle: HANDLE, data: *mut WIN32_FIND_DATAW) -> BOOL;
     fn FindClose(handle: HANDLE) -> BOOL;
     fn GetEnvironmentVariableW(name: *const u16, buf: *mut u16, size: DWORD) -> DWORD;
+    fn GetCurrentDirectoryW(size: DWORD, buf: *mut u16) -> DWORD;
 }
 
 /// What `GetFileAttributesExW` fills in at `GetFileExInfoStandard`.
@@ -500,6 +501,32 @@ pub(crate) fn env(name: &[u8]) -> Option<Vec<u8>> {
     }
     buf.truncate(written as usize);
     Some(narrow(&buf))
+}
+
+/// The working directory. `room` is ignored, and the answer is never `None`.
+///
+/// The two-call shape `GetEnvironmentVariableW` uses is available here too, and
+/// it is exact: asking with no room answers with how much is wanted rather than
+/// failing, so the growing loop [`super::cwd`] runs for the Unix arms never
+/// goes round twice on this one.
+///
+/// The separator is left as Windows wrote it. `std/path.normalise` is what
+/// turns a `\` that arrives from outside into a `/`, exactly as it does for
+/// `env` -- this layer never invents one and never rewrites one.
+pub(crate) fn cwd(_room: usize) -> Result<Option<Vec<u8>>, Errno> {
+    let wanted = unsafe { GetCurrentDirectoryW(0, core::ptr::null_mut()) };
+    if wanted == 0 {
+        return Err(last_error());
+    }
+    let mut buf = vec![0u16; wanted as usize];
+    let written = unsafe { GetCurrentDirectoryW(wanted, buf.as_mut_ptr()) };
+    // `written` excludes the terminator that `wanted` counted, so a value that
+    // reaches it means the directory changed underneath the two calls.
+    if written == 0 || written >= wanted {
+        return Err(last_error());
+    }
+    buf.truncate(written as usize);
+    Ok(Some(narrow(&buf)))
 }
 
 // ---------------------------------------------------------------------------

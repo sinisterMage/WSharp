@@ -183,6 +183,24 @@ pub(crate) fn env(name: &[u8]) -> Option<Vec<u8>> {
     imp::env(name)
 }
 
+/// The process's working directory.
+///
+/// The buffer grows rather than being sized once, because nothing here can say
+/// how long a path is: `PATH_MAX` is advisory on Linux, is not a bound at all
+/// on a `\\?\` path, and asking for it would mean declaring a constant per
+/// system to be wrong about. The one thing every arm can say is "that was not
+/// enough", so the loop asks again with twice as much. It terminates because a
+/// real path is finite; a cap here would be a second guess at the same number.
+pub(crate) fn cwd() -> Result<Vec<u8>, Errno> {
+    let mut room = 512;
+    loop {
+        if let Some(path) = imp::cwd(room)? {
+            return Ok(path);
+        }
+        room *= 2;
+    }
+}
+
 /// A NUL-terminated C string, copied out.
 ///
 /// Shared by the arms because all three read one out of a structure the

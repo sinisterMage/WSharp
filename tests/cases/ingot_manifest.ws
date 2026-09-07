@@ -1,8 +1,13 @@
-// `ingot.toml` and `ingot.lock`: read, written, and read back.
+// `ingot.toml` and `ingot.lock`: read, written, and read back. And `ingot.env`,
+// which is written and never read here.
 //
-// Both go through `std/toml` in both directions. A lockfile written by a
-// hand-rolled emitter and read by a real parser is a bug that waits for the
+// The first two go through `std/toml` in both directions. A lockfile written by
+// a hand-rolled emitter and read by a real parser is a bug that waits for the
 // one entry with a quotation mark in it, so the round trip is the test.
+//
+// The third has no round trip because it has no W# reader: the compiler's
+// loader is what reads it, and that is Rust. So what is checked here is the
+// shape the loader was written against, byte for byte.
 // expect: acme/json
 // expect: 1.2.0
 // expect: src/json.ws
@@ -33,6 +38,9 @@
 // expect: util	0.3.0	path+../util	sha256:abcd
 // expect: core
 // expect: ingot.lock: was written by a newer ingot than this one
+// expect: myapp	/work/app	src/myapp.ws	util	acme/json
+// expect: util	/store/c14b	src/util.ws
+// expect:
 const fault = @import("ingot/fault");
 const list = @import("std/list");
 const manifest = @import("ingot/manifest");
@@ -116,7 +124,31 @@ fn main() i64 {
     const h = fault.none();
     const newer = manifest.lock_of_text(h, "ingot.lock", "version = 99\n") orelse {
         print(h.message);
-        return 0;
+        return env();
     };
+    return 0;
+}
+
+/// `ingot.env`, which the compiler's loader reads and nothing here does.
+///
+/// Dependencies are the fourth field onwards rather than a list inside one, so
+/// the file has exactly one separator and a package name is whatever a name is.
+/// A package with none simply stops after three fields -- there is no empty
+/// field to leave, which is also what keeps a line trimmable by the harness.
+fn env() i64 {
+    const root = manifest.Installed{
+        .name = "myapp",
+        .dir = "/work/app",
+        .root = "src/myapp.ws",
+        .deps = []str{ "util", "acme/json" },
+    };
+    var packages: list.List[manifest.Installed] = list.new();
+    list.push(packages, manifest.Installed{
+        .name = "util",
+        .dir = "/store/c14b",
+        .root = "src/util.ws",
+        .deps = []str{},
+    });
+    print(manifest.write_env(root, packages));
     return 0;
 }

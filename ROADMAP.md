@@ -22,7 +22,12 @@ product item 9 reserved a place for unnecessary. Session 11 finished it: stage f
 is the protocol — Ed25519 and ECDSA, a strict DER reader, the record layer and
 the handshake at both ends, replayed against RFC 8448's published traces byte
 for byte — and stage five is the certificate, so `http.get("https://…")` now
-returns a page.
+returns a page. Sessions 12 and 13 delivered item 11, **ingot**: a program that
+can read its own command line and walk a directory, TOML 1.0 and a
+content-addressed store, a PubGrub resolver that answers a conflict with the
+derivation that caused it, a git client that speaks smart HTTP rather than
+shelling out — and then the one branch in the loader and the two table keys in
+the type checker that turn all of that into `@import("acme/json")`.
 
 This file records what was built and why it was built that way, the limitations
 that were chosen rather than stumbled into, and — for the items still ahead —
@@ -1605,7 +1610,7 @@ The decisions taken in advance about these two stages, and how they turned out:
 
 ---
 
-## 11. Package management — **in progress**
+## 11. Package management — **done**
 
 Item 6 left one line: *"No package management. An import is a relative path or
 a library one; there is nothing that fetches anything."* This is that, and it
@@ -1620,7 +1625,7 @@ having before the next exists.
 | Two | TOML, the manifest and lockfile, and the content-addressed store | **done** |
 | Three | Semantic versions, and a PubGrub resolver that explains itself | **done** |
 | Four | Git spoken rather than shelled out to: inflate, pkt-line, a packfile | **done** |
-| Five | The loader hook, and the re-export a package facade needs | to do |
+| Five | The loader hook, and the re-export a package facade needs | **done** |
 
 ### Stage one — the language can see the world — **done**
 
@@ -2064,6 +2069,163 @@ from being every *program's* problem, but `ingot`'s own verbs genuinely reach
 all of it, and the fix -- if it is worth one -- is caching a compiled program
 rather than loading less.
 
+### Stage five — the import that reaches a package — **done**
+
+| Piece | Where |
+|---|---|
+| `os.cwd`, on three arms | `sys/{mod,linux,bsd,windows}.rs`, `os.rs`, `std/os.ws` |
+| `ingot.env`: where each package's files are on *this* machine | `ingot/manifest.ws` — `Installed`, `write_env` |
+| `install` writing one, `verify` noticing it is missing | `ingot/main.ws` |
+| The loader's third rule, and the scope check | `wsharp-cli/src/load.rs` — `Packages`, `follow_package` |
+| Re-export: `pub const parse = reader.parse;` | `wsharp-sema/src/infer.rs` — `alias_reexported_{types,values}` |
+| A bug in `store.register` that made every project one environment | `ingot/main.ws` |
+| A bug in the `for` protocol's dependency edges | `infer.rs` — `infer_all` |
+
+`ingot.toml` can say `util = { path = "../util" }`, and `@import("util")` now
+compiles -- under `ingot run` and under plain `wsharp run` alike, because
+nothing about finding a package needs the tool.
+
+#### The loader hook really was one branch
+
+This is the thing the item said in advance would be easy, and it was:
+`Loader::follow` had two rules and now has three, and *nothing downstream
+changed*. A module's identity is already its canonical path, so a package file
+loaded out of `~/.wsharp/store/sha256/<hex>/src/util.ws` is a module named by
+that path and the type checker never learns it came from a store. Two versions
+of a package are two directories, so they are two modules, exactly as predicted.
+
+What was not free is the *input*. The loader is Rust; `std/toml` and
+`ingot/manifest` are W#. Reading the lockfile in the compiler would mean a
+second TOML implementation kept in step with the first for ever -- and it would
+have to be a whole one, because a package's own `ingot.toml` is a file a person
+wrote. So `ingot install` writes **`ingot.env`** beside the lockfile: one line
+per package, tab-separated, absolute.
+
+```
+myapp	/home/u/work/app	src/myapp.ws	util
+util	/home/u/.wsharp/store/sha256/c14b…	src/util.ws
+```
+
+Name, directory, facade, and then one field per dependency -- the fourth field
+onwards rather than a list inside one, so the file has exactly one separator and
+a package name is whatever a name is. It is derived, machine-local and
+regenerable, which is what lets "unreadable" and "from a newer ingot" have the
+same answer: write it again. `verify` reports `needs install` when it is gone,
+which is the smallest true thing to say about a store that is otherwise fine.
+
+That also keeps the split the item opened with. `wsharp` still works on a
+machine with no network and no store; it now also reads a file when there is
+one, and a program that is not in a project pays one directory walk for that.
+
+**`resolve` removes it**, which is the one thing about this file that is not
+obvious. A new resolution names new store entries, and the *old* ones are still
+there holding exactly what they always did -- so an environment left behind
+would build the previous version of a dependency and say nothing at all, which
+is the worst way for a package manager to be wrong. `add` and `remove` leave it,
+because the environment they leave is still a true statement about what was
+installed; it is `resolve` that makes one false.
+
+#### A package may import only what it asked for
+
+The lockfile is the whole graph's, because the solver chooses one version of a
+package for the *project*. What a package may **name** is narrower: what its own
+manifest asked for. Without that rule `ingot.env` would make every package
+reachable from every other, and a manifest would describe what gets fetched
+rather than what may be written down -- a dependency you never declared would
+work until the day something else stopped depending on it.
+
+The check needs to know which package a file is *in*, which is the entry whose
+directory is the longest prefix of it. Longest rather than first, because
+`WSHARP_HOME` may sit inside the project; ingot's own verb tests put it there.
+
+#### Re-export is two keys in tables that already existed
+
+A package presents one file. That was the design before this stage -- the
+manifest has had a `root` since stage two -- and it is why the item said a
+facade needs re-export: `const x = @import("./inner.ws");` binds a *module*, and
+a module cannot be reached through.
+
+The answer needs no new syntax at all:
+
+```zig
+const inner = @import("./inside.ws");
+
+pub const Pair  = inner.Pair;      // a type
+pub const twice = inner.twice;     // a function, or a whole overload set
+pub const SCALE = inner.SCALE;     // a constant
+```
+
+`const x = a.b;` already parsed. It was rejected as a computed global, which it
+is not: naming a name is not evaluating one, exactly as `const g = f;` in one
+module was never a computation. And it turns out to be **one more key in
+`struct_ids` and one more in `globals`**, both already keyed
+`"<module path>.<name>"`, both holding the *same* `StructId` or `GlobalRef`. So
+the alias and the original are the same type and the same function set: they
+unify, dispatch and lay out identically, because they are not copies. Nothing in
+`hir.rs`, `mono.rs`, `ty.rs` or code generation knows this happened.
+
+Two passes rather than one, because a type has to be aliased before struct
+fields are laid out (a field may be written `pkg.Pair`) and a value only after
+every module's globals are known. Each runs to a fixpoint, so a facade may
+re-export from a facade. There is deliberately no case for a chain that closes
+on itself: `pub const x = a.x;` is written in a module that imported `a`, so a
+cycle among re-exports is a cycle among *imports*, and the loader has already
+refused to read the second file.
+
+**A facade states its surface, name by name.** That is the same rule `pub`
+already set -- a module's surface is something it says rather than something it
+leaks -- and it is why the alternative was not taken. Making
+`pub const inner = @import("./inside.ws");` reachable through would have been
+smaller, and it would mean every user of a package had to know the names of the
+files inside it, which is exactly what a facade exists to stop.
+
+#### Two bugs, and what hid each of them
+
+**Every project on a machine was the same environment.** `store.register` names
+an environment by the hash of its lockfile's path, and it was being handed the
+bare relative `"ingot.lock"` -- so the hash was the same for every project,
+`install` in one silently unregistered another, and the next `ingot gc` deleted
+that project's store entries. The verb tests could not see it because each of
+them gets a `WSHARP_HOME` of its own; two projects in one store is the smallest
+thing that shows it, and is now a test. The fix wanted the project's absolute
+directory, which W# could not ask for -- so `os.cwd` is in this stage, and
+`ingot.env` needed it anyway.
+
+**A `for` over a type from two modules away did not compile.** The `for`
+protocol resolves `iter` and `next` in the module that declares the subject's
+type, which inference has not run yet to know -- so the dependency graph
+over-approximates and made every `iter` and `next` *this module can see* a
+dependency. "Can see" was the bug: a subject's type can come from a module the
+program never named, through a function that forwards it and, now, through a
+facade that re-exports it. The edge was missing, the iterator was still
+ungeneralised when its user was inferred, and what came out was
+`no overload of iter accepts (Walk)` about a `Walk` that was right there. It is
+now every `iter` and `next` in the program, which is sound for the reason the
+original over-approximation was: an edge only matters when it closes a cycle,
+and an iterator does not call back into the program using it.
+
+This one is worth recording as a *class*. It was found by writing a package with
+an iterable type in it, and it had nothing to do with packages: a plain
+forwarding function through a third module fails the same way, and had done
+since item 6. A facade is a forwarding function that hides where things came
+from, so it finds every place the compiler was quietly relying on "the user
+imported it directly".
+
+#### What is left
+
+- **No registry.** `plan.unsourced` still says a version-only dependency is one
+  `ingot cannot yet fetch`. Path and git dependencies are the two sources.
+- **`struct : pkg.Base` is not spellable.** A supertype is an `Ident` rather
+  than a type path, so a subtype of a re-exported type has to be declared in the
+  module the parent was declared in. A re-exported name is nameable everywhere
+  else a type is.
+- **Two versions of a package still meet as two identically-named types**, and
+  the mismatch says so without saying why. As written in advance: the
+  diagnostic is the work, not the semantics.
+- **`ingot.env` is trusted, not checked.** Compiling does not re-hash a store
+  entry, because `verify` is a separate verb precisely so that building need
+  not pay for one.
+
 ### The name
 
 C#'s package manager is NuGet, which sounds like *nugget*; in Minecraft nine
@@ -2110,6 +2272,11 @@ package manager* rather than about Julia:
   went the harder way: all of TOML 1.0, because a subset is a promise the file
   extension makes and the code does not keep.
 - ~~**A content-addressed store**~~ Done in stage two, `gc` included.
+- ~~**A loader that can resolve a package path**~~ Done in stage five, and it
+  really was one branch. What it needed that this did not foresee is an *input*
+  the loader can read without a TOML parser of its own, which is `ingot.env`.
+- ~~**Re-export**~~ Done in stage five, as `pub const x = other.x;` -- no new
+  syntax, and two more keys in tables that already existed.
 
 ### Decisions worth recording in advance
 
@@ -2140,6 +2307,15 @@ package manager* rather than about Julia:
   what the language is actually missing -- and every gap it finds is one a user
   would have found instead.
 
+Kept as written, because they were right. The loader hook was one branch and
+nothing downstream changed; two versions of a package are two modules and the
+diagnostic is indeed the work; re-export was the one thing the type checker
+needed, and deciding it early is what kept it to two keys in existing tables.
+The last one is the one to take from this item: **every gap it found is one a
+user would have found instead** -- and the gaps were not the ones a package
+manager suggests. They were `os.cwd`, a lockfile path that was relative, and a
+dependency edge for `for` that assumed you had imported the iterable yourself.
+
 ### What it costs
 
 A package manager is judged on the day it goes wrong, which means the work is
@@ -2160,6 +2336,11 @@ These are deliberate limitations, each with a clear fix:
   the top level; anything computed is rejected with a message saying so.
   Supporting the general case needs global storage plus a startup initialiser —
   and the collector would need those globals as roots.
+- **A supertype is a name, not a path.** `struct Sub : Base` resolves `Base`
+  unqualified, so a subtype of a type another module declares -- including one
+  a package facade re-exports -- has to be declared in that module. Every other
+  position takes `pkg.Base`; `StructDecl::parent` would have to become a
+  `TypeExpr` for this one to.
 - **Field access needs a known type.** Structs are nominal with no row
   polymorphism, so `fn getx(p) { return p.x; }` cannot be inferred and asks for
   an annotation instead.

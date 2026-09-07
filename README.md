@@ -103,7 +103,8 @@ everywhere.** They are checked when written and inferred when not.
 | Growable | `std/list` — a backing array plus a count, so `push` is amortised constant time |
 | Iterating | `for (xs) \|x\|` over an array walks it by index; over anything else it calls `iter` and `next` from the module that declares its type |
 | Generics | `fn first[T](a: []T) T`, `const Box = struct[T] { value: T };`, `fn [T](x: T) T` — inferred when not written |
-| Modules | `const http = @import("std/http");`, then `http.NotFound404`; `pub` is what another module may name |
+| Modules | `const http = @import("std/http");`, then `http.NotFound404`; `pub` is what another module may name, and `pub const parse = inner.parse;` renames one so a package of several files can present one |
+| Packages | `ingot` resolves and installs; `@import("acme/json")` then names a package's facade, exactly as a library path names a module |
 | Workers | `@spawn(counter, 0)` starts a thread with a heap of its own, `w.add(5)` calls into it, `@join(w)` waits for it |
 | Messages | `std/broker` — named topics, partitioned logs, consumer groups with their own offsets, and replay |
 | Bytes | `std/bytes` — `[]u8` as a buffer, the bridge to and from `str`, word accessors and hex |
@@ -381,14 +382,30 @@ when unset, empty or `0`.
 ### The standard library
 
 `@import` binds a module to a name; everything in it is reached through that
-name. A path is either a file next to the importing one or one of the
-library's. A module's names are private to it unless it writes `pub`.
+name. A path is a file next to the importing one, one of the library's, or a
+package this project depends on. A module's names are private to it unless it
+writes `pub`.
+
+A `const` may also be a second name for something another module declares,
+which is what lets a package of several files present one of them:
+
+```zig
+const inner = @import("./inside.ws");
+
+pub const Pair  = inner.Pair;      // a type
+pub const twice = inner.twice;     // a function, or a whole overload set
+```
+
+The alias and the original are the same type and the same function set rather
+than copies of them, so a value made through one is usable through the other and
+an overload set renamed once still dispatches on every member.
 
 `std/io` reads and writes whole files; `std/fs` is the tree they sit in --
 `mkdir`, `read_dir`, `rename`, `remove`, and enough of a stat to tell a
 directory from a file and say how big one is. `std/path` is the arithmetic
-above both, and makes no syscall at all. `std/toml` is TOML 1.0, read and
-written.
+above both, and makes no syscall at all. `std/os` is what the process knows
+about itself -- `args`, `get`, `home`, `temp_dir`, `cwd`. `std/toml` is TOML
+1.0, read and written.
 
 A library module is only read if something imports it, so a program that
 mentions nothing pays for nothing: `wsharp check` on a ten-line file takes
@@ -466,6 +483,56 @@ anything that moves a *reference* from one object into another is written in
 W#**, where the write barrier, the load barrier and the stack maps all apply by
 construction.
 
+## Packages
+
+`ingot` is the package manager. `wsharp` stays the compiler, and the split is on
+purpose: one of them has to work on a machine with no network and no store, and
+the other is the thing that fills the store.
+
+```sh
+ingot init myapp                    # write an ingot.toml here
+ingot add util --path ../util       # record a dependency
+ingot resolve                       # choose versions and write ingot.lock
+ingot install                       # make the store satisfy it
+ingot verify                        # 0 ready, 1 install, 2 resolve, 3 broken
+ingot why core                      # the paths that pulled it in
+```
+
+Resolving, installing and building are separate verbs: nothing compiles because
+something else was fetched. Output is tab-separated, `verify` answers with its
+exit status, and a conflict comes back as the derivation that caused it:
+
+```
+Because no versions of core match >=2.0.0 <3.0.0 and util 0.3.0 depends on
+core >=2.0.0 <3.0.0, util 0.3.0 cannot be used.
+```
+
+A dependency is a directory or a git revision — `dep = { git = "https://…",
+rev = "…" }`, fetched over the TLS client above rather than by shelling out to
+`git`. There is no registry yet. Packages live in a content-addressed store
+under `~/.wsharp` (`WSHARP_HOME` moves it), named by the hash of their tree, so
+two projects that want the same tree share one copy and `ingot gc` drops what no
+lockfile reaches.
+
+After `ingot install`, a package is just a module path:
+
+```zig
+const util = @import("util");
+
+fn main() i64 { return util.twice(21); }
+```
+
+which works under plain `wsharp run` as well as `ingot run` — `install` writes
+an `ingot.env` beside the lockfile saying where each package's files ended up,
+and the compiler reads that. A package presents exactly one file, the `root` in
+its manifest; what else it shows is what that file re-exports. And it may import
+only what its own `ingot.toml` asked for, even though the lockfile holds the
+whole graph.
+
+`ingot` is written in W#, which was the point rather than a flourish: a
+resolver, a hash, a protocol and a file format is a broad enough program to find
+out what the language is actually missing.
+
 ## How it works
 
 ```
@@ -482,7 +549,8 @@ source ──► wsharp-syntax ──► wsharp-sema ──► wsharp-codegen �
 | `wsharp-sema` | Name resolution, Hindley-Milner inference, the subtype lattice, overload selection, typed HIR, monomorphisation, value layout |
 | `wsharp-codegen` | HIR to Cranelift IR, the dispatcher, the write barrier, stack-map harvesting, JIT module setup |
 | `wsharp-runtime` | Object header, block/line heap, reference counting, the mark trace and its thread, evacuation, stack walker, type registry, builtins — a leaf crate with no dependencies at all |
-| `wsharp-cli` | The `wsharp` binary and the end-to-end test suite |
+| `wsharp-cli` | The `wsharp` binary, the module loader, and the end-to-end test suite |
+| `ingot` | The `ingot` binary: two hundred lines of Rust over `ingot/main.ws` |
 
 A few decisions worth knowing about:
 
@@ -524,7 +592,10 @@ A few decisions worth knowing about:
   prelude; what a module cannot see is what it has no key for. Everything is
   private to its module unless it says `pub`, and only a *qualified* lookup
   checks that -- an unqualified name can only mean this module's own or the
-  prelude's, and both are always visible. Files are laid
+  prelude's, and both are always visible. Re-export falls out of that shape:
+  `pub const T = other.T;` is one more key in the same table, holding the same
+  type or the same function set, so nothing below the type checker knows it
+  happened. Files are laid
   end to end in one offset space, so a `Span` stays two `u32`s with no file in
   it and the renderer works out which file a span fell in.
 
@@ -560,20 +631,21 @@ Sessions are numbered by the original feature list:
       signature scheme and X.509 structure is a `.ws` file; the whole client
       and server are replayed against RFC 8448's published traces byte for
       byte. `http.get("https://www.google.com/")` returns a page.
-- [ ] **11.** Package management, in a tool called **ingot**: git spoken rather
+- [x] **11.** Package management, in a tool called **ingot**: git spoken rather
       than shelled out to, a content-addressed store, and a resolver that says
-      *why* a version was ruled out rather than that it was. Stage one is in —
-      a program can read its own command line and walk a directory, and
-      `struct stat` turned out not to be needed to do it. Stage two is in too:
-      TOML 1.0 read and written in W#, a content-addressed store that can tell
-      "not installed" from "damaged", and the tool itself — a W# program with
-      two hundred lines of Rust under it. Stage three is the resolver: semantic
-      versions, version *sets* as unions of intervals, and PubGrub — which
-      answers a conflict with the derivation that caused it rather than with
-      "unsatisfiable", and which found a real bug in the garbage collector on
-      its way in. Stage four is git: SHA-1, zlib inflate, pkt-line framing and
-      a packfile with both kinds of delta resolved, all of it W#, replayed
-      against a conversation a real `git upload-pack` took part in.
+      *why* a version was ruled out rather than that it was. A program can read
+      its own command line and walk a directory, and `struct stat` turned out
+      not to be needed to do it. TOML 1.0 is read and written in W#; the store
+      can tell "not installed" from "damaged"; the tool itself is a W# program
+      with two hundred lines of Rust under it. The resolver is PubGrub over
+      version *sets* as unions of intervals, which answers a conflict with the
+      derivation that caused it and found a real bug in the garbage collector
+      on its way in. Git is SHA-1, zlib inflate, pkt-line framing and a
+      packfile with both kinds of delta resolved, all of it W#, replayed
+      against a conversation a real `git upload-pack` took part in. And the
+      last stage is the point of the other four: `@import("acme/json")`
+      compiles — one more branch in the loader, and a `pub const x = other.x;`
+      that lets a package of several files present one of them.
 
 What is left, and where it plugs in, is in [ROADMAP.md](ROADMAP.md).
 Conventions and the invariants worth not breaking are in

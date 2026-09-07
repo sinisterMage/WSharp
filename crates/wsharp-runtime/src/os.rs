@@ -11,6 +11,7 @@
 //! qualifies for the same reason the other two do: it is frozen before the
 //! program starts and never written again.
 
+use crate::io::FallibleStr;
 use crate::strings::{alloc_str, str_bytes};
 use crate::sys;
 use std::sync::OnceLock;
@@ -81,6 +82,30 @@ pub unsafe extern "C" fn ws_os_env(out: *mut MaybeStr, name: *const u8) {
             tag: 0,
             value: std::ptr::null_mut(),
         },
+    };
+    unsafe { out.write(result) };
+}
+
+/// The process's working directory.
+///
+/// Fallible where `home` and `temp_dir` are not, and for a reason worth stating:
+/// those two ask the environment, which either says something or does not, while
+/// this asks the kernel about a directory that can have been removed since the
+/// process entered it. A program that has lost its working directory is in a
+/// situation `orelse` cannot describe.
+///
+/// Answers with what the system said, separators and all. `std/path.normalise`
+/// is what turns a Windows `\` into a `/`; `std/os` does not import `std/path`,
+/// because a path is arithmetic and the environment is a fact about the process.
+///
+/// # Safety
+/// Called from JIT-compiled code across an FFI boundary; `out` must point at
+/// storage laid out as a [`FallibleStr`].
+pub unsafe extern "C" fn ws_os_cwd(out: *mut FallibleStr) {
+    unsafe { crate::gc::checkpoint() };
+    let result = match crate::worker::blocking(sys::cwd) {
+        Ok(dir) => FallibleStr::ok(alloc_str(&dir)),
+        Err(e) => FallibleStr::err(sys::error_tag(e)),
     };
     unsafe { out.write(result) };
 }

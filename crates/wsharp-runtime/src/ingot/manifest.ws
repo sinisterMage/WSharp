@@ -274,6 +274,63 @@ pub fn locked(l: Lock, name: str) ?Locked {
 }
 
 // ---------------------------------------------------------------------------
+// The environment
+// ---------------------------------------------------------------------------
+
+/// Where one package's files are on *this* machine.
+pub const Installed = struct {
+    name: str,
+    /// Absolute, because the compiler that reads this may be run from anywhere
+    /// -- `wsharp run` has no `-C` and does not have to be in the project.
+    dir: str,
+    /// The facade: the one file an `@import` of this package resolves to,
+    /// relative to `dir`.
+    root: str,
+    /// What this package may import, which is what its manifest asked for.
+    deps: []str,
+};
+
+pub const ENV_NAME = "ingot.env";
+
+/// `ingot.env`: one line per package, tab-separated, the root package first.
+///
+/// ```text
+/// myapp<TAB>/home/u/work/app<TAB>src/myapp.ws<TAB>acme/json<TAB>util
+/// acme/json<TAB>/home/u/.wsharp/store/sha256/9f3a…<TAB>src/json.ws<TAB>util
+/// util<TAB>/home/u/.wsharp/store/sha256/c14b…<TAB>src/util.ws
+/// ```
+///
+/// Name, directory, facade, and then one field per dependency -- the fourth
+/// field onwards rather than a comma-separated list, so the file has exactly
+/// one separator and a name is whatever a name is.
+///
+/// **Not TOML, and that is a decision rather than an economy.** The compiler's
+/// loader is Rust; every reader this project owns is written in W#. A lockfile
+/// the loader parsed for itself would mean a second TOML implementation kept in
+/// step with `std/toml` for ever, and stage two's whole argument was that a
+/// partial one is a promise the file extension makes and the code does not
+/// keep. A file with no syntax needs no second implementation.
+///
+/// Derived, absolute and machine-local: `ingot install` writes it, `ingot
+/// verify` notices it is missing, and it is not a thing to commit.
+pub fn write_env(root: Installed, packages: list.List[Installed]) str {
+    var out = env_line(root);
+    for (list.to_array(packages)) |p| {
+        out = text.concat(out, env_line(p));
+    }
+    return out;
+}
+
+fn env_line(p: Installed) str {
+    var line = text.concat(p.name, text.concat("\t", text.concat(p.dir,
+                           text.concat("\t", p.root))));
+    for (p.deps) |d| {
+        line = text.concat(line, text.concat("\t", d));
+    }
+    return text.concat(line, "\n");
+}
+
+// ---------------------------------------------------------------------------
 // Reading a TOML table without a `catch` at every step
 // ---------------------------------------------------------------------------
 

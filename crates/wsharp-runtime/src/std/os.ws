@@ -49,6 +49,20 @@ pub fn home() !str {
     return error.NotFound;
 }
 
+/// The directory this process is running in.
+///
+/// Fallible where `home` and `temp_dir` are not: those ask the environment,
+/// which either says something or does not, while this asks the kernel about a
+/// directory that can have been removed since the process entered it.
+///
+/// The separator is whatever the system wrote -- a Windows answer holds `\`.
+/// `path.normalise` is what turns one into a `/`, and it is the caller's to
+/// call: `std/path` imports nothing, and this module importing it would be the
+/// wrong way round for the reason `trimmed` below is written out by hand.
+pub fn cwd() !str {
+    return raw_cwd();
+}
+
 /// Where this system keeps files nobody intends to keep.
 ///
 /// `TMPDIR` is what macOS and the BSDs set, `TMP` and `TEMP` are what Windows

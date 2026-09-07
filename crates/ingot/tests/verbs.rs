@@ -64,6 +64,34 @@ impl Project {
         dir
     }
 
+    /// Another file in a package, beside its facade.
+    ///
+    /// A package of more than one file is the case the facade exists for, and
+    /// the only way to reach this one from outside is through what the facade
+    /// renames.
+    fn beside(&self, package: &Path, file: &str, body: &str) {
+        std::fs::write(package.join("src").join(file), body).expect("a source file");
+    }
+
+    /// Run the *compiler* rather than the tool, from outside the project.
+    ///
+    /// The point of the separation: `wsharp` needs no store, no network and no
+    /// verb to build a project somebody else installed, because everything it
+    /// needs is in the `ingot.env` beside the lockfile.
+    ///
+    /// Found beside `ingot` rather than through `CARGO_BIN_EXE_wsharp`, which
+    /// cargo only defines for a binary of the crate the test is in.
+    fn compile(&self, file: &Path) -> Output {
+        let mut wsharp = PathBuf::from(env!("CARGO_BIN_EXE_ingot"));
+        wsharp.set_file_name(format!("wsharp{}", std::env::consts::EXE_SUFFIX));
+        Command::new(wsharp)
+            .env("WSHARP_HOME", self.store())
+            .arg("run")
+            .arg(file)
+            .output()
+            .expect("wsharp runs")
+    }
+
     fn run(&self, dir: &Path, args: &[&str]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ingot"));
         command
@@ -417,5 +445,223 @@ fn run_compiles_a_program_and_hands_it_the_arguments() {
         String::from_utf8_lossy(&out.stdout),
         "one\n--two\n",
         "and nothing was interpreted on the way through"
+    );
+}
+
+/// The thing all of this was for: a program that imports a package.
+///
+/// One test rather than four, because what is interesting is the whole chain --
+/// `resolve` chooses, `install` copies the tree in and writes down where it
+/// landed, the loader reads that, and the type checker sees a module like any
+/// other. The package has two files and presents one, which is what re-export
+/// exists for: nothing outside can name `src/inside.ws` at all.
+#[test]
+fn a_program_imports_a_package_through_its_facade() {
+    let project = Project::new("import");
+    let util = project.package(
+        "util",
+        "0.3.0",
+        "",
+        "const inside = @import(\"./inside.ws\");\n\
+         pub const Pair = inside.Pair;\n\
+         pub const twice = inside.twice;\n",
+    );
+    project.beside(
+        &util,
+        "inside.ws",
+        "pub const Pair = struct { a: i64, b: i64 };\n\
+         pub fn twice(p: Pair) i64 { return (p.a + p.b) * 2; }\n",
+    );
+    let app = project.dir("app");
+    std::fs::create_dir_all(app.join("src")).expect("an app directory");
+    project.expect(&app, &["init", "myapp"], READY);
+    project.expect(&app, &["add", "util", "--path", "../util"], READY);
+    project.expect(&app, &["resolve"], READY);
+
+    // Resolved is not installed, and the compiler says which verb is missing
+    // rather than reporting a file it cannot find.
+    std::fs::write(
+        app.join("src").join("myapp.ws"),
+        "const util = @import(\"util\");\n\
+         fn main() i64 {\n\
+         \x20   print_int(util.twice(util.Pair{ .a = 3, .b = 4 }));\n\
+         \x20   return 0;\n\
+         }\n",
+    )
+    .expect("a program");
+    let out = project.compile(&app.join("src").join("myapp.ws"));
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("run `ingot install`"),
+        "an uninstalled project says which verb is missing:\n{stderr}"
+    );
+
+    project.expect(&app, &["install"], READY);
+    assert!(app.join("ingot.env").exists(), "`install` writes it");
+
+    // Through the tool, and through the compiler on its own from somewhere
+    // else entirely. Both read the same file and neither needs the other.
+    let out = project.run(&app, &["run", "src/myapp.ws"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "14\n");
+    let out = project.compile(&app.join("src").join("myapp.ws"));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "14\n",
+        "stderr was:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // What the facade does not rename cannot be reached, because nothing can
+    // name the file it is in: a package is one module.
+    std::fs::write(
+        app.join("src").join("myapp.ws"),
+        "const inside = @import(\"util/inside\");\nfn main() i64 { return 0; }\n",
+    )
+    .expect("a program");
+    let out = project.compile(&app.join("src").join("myapp.ws"));
+    assert_ne!(out.status.code(), Some(0), "a package presents one file");
+}
+
+/// A lockfile is the whole graph's, because the solver chooses one version of a
+/// package for the whole project. What a package may *name* is narrower: what
+/// its own manifest asked for, and nothing else.
+#[test]
+fn a_package_may_import_only_what_it_asked_for() {
+    let project = Project::new("scope");
+    project.package("core", "0.1.0", "", "pub fn one() i64 { return 1; }\n");
+    project.package(
+        "util",
+        "0.3.0",
+        "core = { path = \"../core\" }\n",
+        "const core = @import(\"core\");\n\
+         pub fn twice(n: i64) i64 { return n * 2 * core.one(); }\n",
+    );
+    let app = project.dir("app");
+    std::fs::create_dir_all(app.join("src")).expect("an app directory");
+    project.expect(&app, &["init", "myapp"], READY);
+    project.expect(&app, &["add", "util", "--path", "../util"], READY);
+    project.expect(&app, &["resolve"], READY);
+    project.expect(&app, &["install"], READY);
+
+    // `util` asked for `core`, so it may name it -- and does, in the answer.
+    std::fs::write(
+        app.join("src").join("myapp.ws"),
+        "const util = @import(\"util\");\n\
+         fn main() i64 { print_int(util.twice(21)); return 0; }\n",
+    )
+    .expect("a program");
+    let out = project.compile(&app.join("src").join("myapp.ws"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+
+    // `myapp` did not, even though `core` is in its lockfile.
+    std::fs::write(
+        app.join("src").join("myapp.ws"),
+        "const core = @import(\"core\");\nfn main() i64 { return core.one(); }\n",
+    )
+    .expect("a program");
+    let out = project.compile(&app.join("src").join("myapp.ws"));
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("`core` is not a dependency of `myapp`"),
+        "a dependency of a dependency is not one of ours:\n{stderr}"
+    );
+}
+
+/// An environment is a lockfile, and a lockfile is named by where it is.
+///
+/// `register` hashes the path it is handed, so handing it the bare `ingot.lock`
+/// made every project on the machine the same environment: the second
+/// `install` unregistered the first, and the next `gc` collected its entries.
+/// Two projects in one store is the smallest thing that shows it.
+#[test]
+fn two_projects_in_one_store_keep_each_others_entries() {
+    let project = Project::new("environments");
+    project.package(
+        "util",
+        "0.3.0",
+        "",
+        "pub fn twice(n: i64) i64 { return n * 2; }\n",
+    );
+    project.package("other", "0.1.0", "", "pub fn nothing() i64 { return 0; }\n");
+
+    let first = project.dir("first");
+    let second = project.dir("second");
+    for (dir, dep) in [(&first, "util"), (&second, "other")] {
+        std::fs::create_dir_all(dir).expect("a project directory");
+        project.expect(dir, &["init", "app"], READY);
+        project.expect(dir, &["add", dep, "--path", &format!("../{dep}")], READY);
+        project.expect(dir, &["resolve"], READY);
+        project.expect(dir, &["install"], READY);
+    }
+
+    let store = project.expect(&first, &["store"], READY);
+    assert_eq!(field(&store, 2, 1), "2", "one tree from each project");
+
+    // Collecting from either project keeps both, because both are registered.
+    let collected = project.expect(&first, &["gc"], READY);
+    assert_eq!(field(&collected, 0, 1), "0", "nothing is unreachable");
+    assert_eq!(field(&collected, 1, 1), "2");
+    project.expect(&second, &["verify"], READY);
+}
+
+/// Resolving again invalidates the environment, and silently getting away with
+/// it is the failure that would be hardest to see.
+///
+/// A new resolution names new store entries; the old ones are still there and
+/// still hold what they always did, so a compiler reading the environment
+/// `install` wrote last time would build the previous version of a dependency
+/// and say nothing at all. `resolve` removes it, and the next compile asks for
+/// the verb that has not been run.
+#[test]
+fn resolving_again_invalidates_the_environment() {
+    let project = Project::new("stale-env");
+    let util = project.package(
+        "util",
+        "0.3.0",
+        "",
+        "pub fn twice(n: i64) i64 { return n * 2; }\n",
+    );
+    let app = project.dir("app");
+    std::fs::create_dir_all(app.join("src")).expect("an app directory");
+    project.expect(&app, &["init", "myapp"], READY);
+    project.expect(&app, &["add", "util", "--path", "../util"], READY);
+    project.expect(&app, &["resolve"], READY);
+    project.expect(&app, &["install"], READY);
+
+    let program = app.join("src").join("myapp.ws");
+    std::fs::write(
+        &program,
+        "const util = @import(\"util\");\n\
+         fn main() i64 { print_int(util.twice(21)); return 0; }\n",
+    )
+    .expect("a program");
+    assert_eq!(
+        String::from_utf8_lossy(&project.compile(&program).stdout),
+        "42\n"
+    );
+
+    std::fs::write(
+        util.join("src").join("util.ws"),
+        "pub fn twice(n: i64) i64 { return n * 3; }\n",
+    )
+    .expect("an edit");
+    project.expect(&app, &["resolve"], READY);
+    assert!(
+        !app.join("ingot.env").exists(),
+        "`resolve` takes the environment away rather than leaving one that lies"
+    );
+
+    let out = project.compile(&program);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("run `ingot install`"),
+        "and the compiler asks for the verb that has not been run:\n{stderr}"
+    );
+
+    project.expect(&app, &["install"], READY);
+    assert_eq!(
+        String::from_utf8_lossy(&project.compile(&program).stdout),
+        "63\n",
+        "which then builds the version that was chosen"
     );
 }

@@ -63,6 +63,9 @@ mod c {
         pub(super) fn lseek(fd: c_int, offset: i64, whence: c_int) -> i64;
         pub(super) fn closedir(dir: *mut DIR) -> c_int;
         pub(super) fn getenv(name: *const u8) -> *const u8;
+        /// Answers with `buf` on success and null on failure, so the path's
+        /// length has to be found by looking for the terminator.
+        pub(super) fn getcwd(buf: *mut u8, size: usize) -> *mut u8;
     }
 
     // `opendir` and `readdir` are the *one* pair here whose symbol name is not
@@ -141,6 +144,9 @@ const EACCES: c_int = 13;
 const EEXIST: c_int = 17;
 const ENOTDIR: c_int = 20;
 const EISDIR: c_int = 21;
+/// "That buffer was too small", which `getcwd` answers with. The same 34 Linux
+/// uses -- it is the last code the two numberings agree on.
+const ERANGE: c_int = 34;
 /// 66 here and 39 on Linux: the numbering agrees only up to 34.
 const ENOTEMPTY: c_int = 66;
 
@@ -348,6 +354,21 @@ pub(crate) fn env(name: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     Some(unsafe { super::c_string(value) })
+}
+
+/// The working directory, or `None` when `room` bytes were not enough.
+///
+/// The caller asks again with more; see [`super::cwd`] for why the size is not
+/// simply `PATH_MAX`.
+pub(crate) fn cwd(room: usize) -> Result<Option<Vec<u8>>, Errno> {
+    let mut buf = vec![0u8; room];
+    if unsafe { c::getcwd(buf.as_mut_ptr(), buf.len()) }.is_null() {
+        let e = errno();
+        return if e.0 == ERANGE { Ok(None) } else { Err(e) };
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    buf.truncate(len);
+    Ok(Some(buf))
 }
 
 // ---------------------------------------------------------------------------
