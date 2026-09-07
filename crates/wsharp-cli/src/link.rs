@@ -104,6 +104,18 @@ pub fn link(object: &Path, out: &Path) -> Result<(), String> {
     // `crt1.o` without being asked.
     if cfg!(target_os = "windows") {
         command.args(["-Xlinker", "-subsystem:console"]);
+        // **The same C runtime the archive was built against.** Rust's MSVC
+        // target links the *dynamic* CRT by default; clang's driver defaults to
+        // the *static* one and passes `-defaultlib:libcmt`. Handing a Rust
+        // staticlib to a static CRT is not a near miss -- the two disagree
+        // about which allocator owns the heap, and the first symptom is a
+        // symbol that only the dynamic form defines:
+        //
+        //     error LNK2019: unresolved external symbol __imp__wspawnvp
+        //
+        // The `__imp_` prefix is the tell: it is a *DLL import*, which is what
+        // `msvcrt.lib` provides and `libcmt.lib` does not.
+        command.arg("-fms-runtime-lib=dll");
         // And the system libraries underneath, for the same reason the two
         // frameworks are named below: **a staticlib does not carry what it
         // depends on.** `#[link(name = "ws2_32")]` in `sys/windows.rs` tells

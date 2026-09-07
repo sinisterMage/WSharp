@@ -230,7 +230,7 @@ jobs:
           # The same command `link.rs` builds, plus `-v`. Kept in step with it
           # by hand: a diagnostic that links differently from the real thing
           # answers a question nobody asked.
-          clang -v -Xlinker -subsystem:console \
+          clang -v -Xlinker -subsystem:console -fms-runtime-lib=dll \
             fib.o target/debug/wsharp_start.lib -o fib.exe \
             -lkernel32 -lntdll -luserenv -lws2_32 -ldbghelp \
             -lbcrypt -lcrypt32 -ladvapi32 2>&1 | tail -100 || true
