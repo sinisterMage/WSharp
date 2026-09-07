@@ -328,10 +328,16 @@ pub fn copy_tree(f: fault.Fault, from: str, to: str) void {
     // `mkdir_all` so the message can say how far up the tree anything actually
     // exists, which is the fact that says *where* the creation stopped.
     if (!fs.is_dir(to)) {
-        fault.fail_at(f, to, text.concat(
-            text.concat("mkdir_all reported success and made nothing; the deepest thing that exists is ",
-                deepest_existing(to)),
-            text.concat("; walking down by hand: ", walk_down(to))));
+        // Printed rather than carried in the fault. The last attempt built this
+        // as one long `concat` and the fault came out *empty* -- a second
+        // failure hiding the first, and not one to debug while debugging
+        // something else. Standard output is captured by the harness and shown
+        // beside the assertion, and nothing between here and there can swallow
+        // it.
+        print(text.concat("DIAG want:    ", to));
+        print(text.concat("DIAG deepest: ", deepest_existing(to)));
+        print(text.concat("DIAG walk:    ", walk_down(to)));
+        fault.fail_at(f, to, "mkdir_all reported success and made nothing");
         return;
     }
     const names = fs.read_dir(from) catch {
