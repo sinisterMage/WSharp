@@ -104,6 +104,31 @@ pub fn link(object: &Path, out: &Path) -> Result<(), String> {
     // `crt1.o` without being asked.
     if cfg!(target_os = "windows") {
         command.args(["-Xlinker", "-subsystem:console"]);
+        // And the system libraries underneath, for the same reason the two
+        // frameworks are named below: **a staticlib does not carry what it
+        // depends on.** `#[link(name = "ws2_32")]` in `sys/windows.rs` tells
+        // *rustc* what to link when rustc is doing the linking, and travels no
+        // further; a `.lib` handed to `clang` is a bag of objects with
+        // undefined symbols in it. Without these the entry point resolves and
+        // the sockets do not:
+        //
+        //     LINK : fatal error LNK1120: unresolved externals
+        //
+        // The first five are what rustc itself passes for any Windows program
+        // -- they are what `std` needs -- and the last three are this
+        // runtime's own: `bcrypt` for `crypto.random`, `crypt32` for the root
+        // store, `advapi32` beside them. A library nothing references costs
+        // nothing, so the list errs towards complete.
+        command.args([
+            "-lkernel32",
+            "-lntdll",
+            "-luserenv",
+            "-lws2_32",
+            "-ldbghelp",
+            "-lbcrypt",
+            "-lcrypt32",
+            "-ladvapi32",
+        ]);
     }
     // Apple's arms read the platform root store through these two
     // (`sys::bsd::system_roots`), and a staticlib carries no linker directives

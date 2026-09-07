@@ -227,8 +227,13 @@ jobs:
           # Stop before linking, so there is an object to link by hand.
           ./target/debug/wsharp.exe build --emit=obj examples/fib.ws -o fib.o || true
           ls -l fib.o || true
-          # The same command `link.rs` builds, plus `-v`.
-          clang -v fib.o target/debug/wsharp_start.lib -o fib.exe 2>&1 | tail -80 || true
+          # The same command `link.rs` builds, plus `-v`. Kept in step with it
+          # by hand: a diagnostic that links differently from the real thing
+          # answers a question nobody asked.
+          clang -v -Xlinker -subsystem:console \
+            fib.o target/debug/wsharp_start.lib -o fib.exe \
+            -lkernel32 -lntdll -luserenv -lws2_32 -ldbghelp \
+            -lbcrypt -lcrypt32 -ladvapi32 2>&1 | tail -100 || true
           # Whether the archive even holds the `main` a Windows entry point
           # needs. `LNK1561` is "entry point must be defined", and the MSVC
           # linker infers the entry from the *objects* it was handed rather than
