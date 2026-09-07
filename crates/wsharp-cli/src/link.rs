@@ -115,7 +115,23 @@ pub fn link(object: &Path, out: &Path) -> Result<(), String> {
         //
         // The `__imp_` prefix is the tell: it is a *DLL import*, which is what
         // `msvcrt.lib` provides and `libcmt.lib` does not.
-        command.arg("-fms-runtime-lib=dll");
+        //
+        // Said to the *linker* rather than to the driver. `-fms-runtime-lib=dll`
+        // is the obvious spelling and does nothing here: it chooses which CRT
+        // directive gets embedded while **compiling**, and this invocation
+        // compiles nothing -- it is handed an object and an archive. clang
+        // accepted it without a warning and emitted `-defaultlib:libcmt`
+        // anyway, which is why it has to be aimed one level lower.
+        //
+        // Both halves, because they are not alternatives: clang puts `libcmt`
+        // on the line itself, so naming `msvcrt` beside it would leave the
+        // linker holding two C runtimes and choosing one.
+        command.args([
+            "-Xlinker",
+            "-nodefaultlib:libcmt",
+            "-Xlinker",
+            "-defaultlib:msvcrt",
+        ]);
         // And the system libraries underneath, for the same reason the two
         // frameworks are named below: **a staticlib does not carry what it
         // depends on.** `#[link(name = "ws2_32")]` in `sys/windows.rs` tells
