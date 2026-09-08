@@ -351,21 +351,27 @@ pub fn newest(p: Package) ?semver.Version {
     return best;
 }
 
-/// Every package this registry holds.
+/// Every package this registry holds, in byte order.
 ///
 /// A directory holding a `package.toml` is a package; anything else under
 /// `packages/` is a namespace. That rule is what lets the registry have no
 /// central list of its contents -- a file every pull request would conflict on.
+///
+/// **Sorted, because `fs.read_dir` is not.** The order a filesystem lists a
+/// directory in is neither sorted nor the same on two machines, so without this
+/// `ingot search` answers in one order on ext4 and another on APFS -- which is
+/// a difference somebody has to notice before they can distrust it. The store
+/// sorts for the same reason one level down, and `store.sorted` is that sort.
 pub fn names(ix: Index) []str {
     var out = []str{};
     const root = path.join(ix.dir, "packages");
     if (!fs.is_dir(root)) { return out; }
     const owners = fs.read_dir(root) catch return out;
-    for (owners) |owner| {
+    for (store.sorted(owners)) |owner| {
         const dir = path.join(root, owner);
         if (!fs.is_dir(dir)) { continue; }
         const held_by = fs.read_dir(dir) catch []str{};
-        for (held_by) |leaf| {
+        for (store.sorted(held_by)) |leaf| {
             if (!io.exists(path.join(path.join(dir, leaf), PACKAGE_NAME))) { continue; }
             out = array.push(out, text.concat(owner, text.concat("/", leaf)));
         }

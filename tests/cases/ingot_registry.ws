@@ -118,6 +118,11 @@ fn read_it(f: fault.Fault, root: str) bool {
 
     // A directory holding a `package.toml` is a package; that rule is why the
     // registry needs no central list of its contents.
+    //
+    // In byte order, which is asserted rather than incidental: `fs.read_dir`
+    // answers in the filesystem's order, and this case listed `acme/json`
+    // before `acme/http` on APFS and the other way round on ext4 until `names`
+    // sorted for itself.
     for (registry.names(ix)) |n| { print(n); }
 
     // A package this registry does not hold is null with *nothing said*: which
