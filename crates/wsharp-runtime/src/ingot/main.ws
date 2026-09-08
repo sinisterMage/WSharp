@@ -521,6 +521,20 @@ fn install(f: fault.Fault) i64 {
             const got = store.install(f, h, dir);
             if (!f.ok) { return FAILED; }
             if (!text.eq(got, digest)) {
+                // A path or git source that no longer hashes to what the
+                // lockfile says has been *edited*, and resolving again records
+                // what it is now. A registry source cannot have been: a
+                // published version is never changed, which is the rule the
+                // whole scheme rests on. So the same mismatch means something
+                // different -- the index promised a tree the revision does not
+                // hold -- and telling somebody to resolve again would send them
+                // round a loop that records the same promise every time.
+                if (text.starts_with(p.source, "reg+")) {
+                    fault.fail(f, text.concat(text.concat("`", p.name),
+                        text.concat("` hashes to sha256:", text.concat(got,
+                            text.concat(", and the registry promised ", p.tree)))));
+                    return BROKEN;
+                }
                 fault.fail(f, text.concat(text.concat("`", p.name),
                     "` has changed since it was resolved -- run `ingot resolve`"));
                 return NEEDS_RESOLVING;
