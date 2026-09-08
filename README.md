@@ -36,6 +36,10 @@ rather than silently changing which code runs.
 
 The whole example is in [`examples/status.ws`](examples/status.ws).
 
+The documentation is at **[wsharp.io](https://wsharp.io)**: installing, a tour
+through the examples, the language reference, the standard library, and how the
+dispatcher and the collector actually work.
+
 ## What it's good at
 
 - **Dispatch that mostly isn't there at run time.** When inference pins the
@@ -272,6 +276,33 @@ describe. The end-to-end suite runs twice, once under it, and traces start on
 the same allocation schedule in both runs so the concurrent paths are covered
 both ways. `WSHARP_GC_STATS=1` prints what the collector did on exit, including
 the number of pauses and the longest one.
+
+## Installing
+
+[**sharpie**](https://github.com/sinisterMage/sharpie) is the version manager,
+in the mould of `rustup` and `juliaup`: it installs toolchains, keeps several
+side by side, puts proxies on `PATH`, and lets a directory pin the version it
+wants.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/sinisterMage/sharpie/main/install.sh | sh
+export PATH="$HOME/.sharpie/bin:$PATH"
+sharpie install stable
+```
+
+It is written in W#, which was the point rather than a constraint for the same
+reason `ingot` was: a program that has to speak HTTP, verify a digest, read TOML
+and unpack an archive is a broad enough one to find out where the library bends.
+
+Otherwise take a release tarball from
+[Releases](https://github.com/sinisterMage/WSharp/releases) and put its
+directory on `PATH`. An installation is a directory rather than a single file,
+because `wsharp` looks for its runtime archive beside itself and under `../lib`,
+and `ingot` looks for `wsharp` beside itself before `PATH`.
+
+Builds exist for `x86_64-unknown-linux-gnu` and both Darwins.
+[wsharp.io/docs/install](https://wsharp.io/docs/install/) has the rest,
+including why there is no Windows one.
 
 ## Building and running
 
@@ -699,6 +730,15 @@ Sessions are numbered by the original feature list:
       the tree it must hash to, so resolving is arithmetic over a file and
       installing is checked against a hash somebody's CI already verified.
 
+Since that list ran out:
+[**sharpie**](https://github.com/sinisterMage/sharpie), a version manager, and
+the second real program written in W#. It finds releases by reading this
+repository's tags over git's smart HTTP rather than through a forge's REST API,
+because that answers in JSON, W# has no JSON reader, and writing one would have
+stood between sharpie and its first useful act. Two plain HTTP conversations, no
+new parser.
+
 What is left, and where it plugs in, is in [ROADMAP.md](ROADMAP.md).
 Conventions and the invariants worth not breaking are in
-[CLAUDE.md](CLAUDE.md).
+[CLAUDE.md](CLAUDE.md). The documentation is at
+[wsharp.io](https://wsharp.io).
