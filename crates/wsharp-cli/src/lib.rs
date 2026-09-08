@@ -131,17 +131,27 @@ pub fn drive(
         return Ok(ExitCode::SUCCESS);
     }
 
-    if !run && emit.is_none() {
-        return Ok(ExitCode::SUCCESS);
-    }
-
     // ---- specialisation ----
     if analysis.program.entry.is_none() {
+        // A library module has nothing to specialise and nothing to run.
+        // Checking one is a thing to want; running one is not.
+        if !run && emit.is_none() {
+            return Ok(ExitCode::SUCCESS);
+        }
         return Err(format!("{} has no `main` function", root.name()));
     }
     let mono = wsharp_sema::monomorphize(&analysis.program, &mut analysis.store);
     if report(map, &mono.diags) {
         return Ok(ExitCode::FAILURE);
+    }
+    // `check` stops here rather than above the specialisation stage, so that it
+    // accepts exactly what `run` accepts. Monomorphisation is where a generic
+    // call whose type variable nothing pinned gets reported -- `var b =
+    // array.new(32);` with nothing to say what the elements are -- and stopping
+    // before it made `check` the more permissive of the two. The diagnostic was
+    // always right; which command gave it was not.
+    if !run && emit.is_none() {
+        return Ok(ExitCode::SUCCESS);
     }
     if emit == Some(Emit::Hir) {
         println!("{:#?}", mono.program);

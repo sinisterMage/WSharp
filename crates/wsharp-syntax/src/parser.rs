@@ -417,7 +417,10 @@ impl Parser {
             // unambiguous here: the annotation slot before `=` was already
             // consumed above, and a struct body always starts with `{`.
             let parent = if self.eat(TokenKind::Colon) {
-                Some(self.ident()?)
+                // A whole type expression, so that `struct : pkg.Base` parses.
+                // What may actually be a supertype is sema's question -- it is
+                // the half that knows what a name resolves to.
+                Some(self.type_expr()?)
             } else {
                 None
             };
@@ -427,7 +430,7 @@ impl Parser {
             // lattice entirely.
             if let (false, Some(parent)) = (generics.is_empty(), &parent) {
                 self.error_with_help(
-                    parent.span,
+                    parent.span(),
                     "a generic struct cannot have a supertype",
                     "give the subtype concrete fields, or drop the type parameters",
                 );

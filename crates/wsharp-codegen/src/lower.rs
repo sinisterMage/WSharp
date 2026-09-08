@@ -142,14 +142,23 @@ pub struct Options {
 pub fn signature_of(store: &mut TypeStore, func: &hir::FuncDef, call_conv: CallConv) -> Signature {
     let mut sig = Signature::new(call_conv);
     sig.params.push(AbiParam::new(PTR));
+    let ret = repr::slot_types(store, &func.ret);
+    // A return too wide for the registers is written through a pointer the
+    // caller supplies, which goes immediately after the environment: `env` is
+    // `params[0]` in a dozen places and stays there.
+    if ret.len() > repr::MAX_RET_SLOTS {
+        sig.params.push(AbiParam::new(PTR));
+    }
     for param in &func.params {
         let ty = func.locals[*param as usize].ty.clone();
         for slot in repr::slot_types(store, &ty) {
             sig.params.push(AbiParam::new(slot));
         }
     }
-    for slot in repr::slot_types(store, &func.ret) {
-        sig.returns.push(AbiParam::new(slot));
+    if ret.len() <= repr::MAX_RET_SLOTS {
+        for slot in ret {
+            sig.returns.push(AbiParam::new(slot));
+        }
     }
     sig
 }
@@ -161,13 +170,21 @@ pub fn indirect_signature(store: &mut TypeStore, fn_ty: &Type, call_conv: CallCo
     let (params, ret) = fn_ty.as_fn().expect("callee has a function type");
     let params = params.to_vec();
     let ret = ret.clone();
+    // The same return area `signature_of` uses, in the same position, because
+    // this describes the same functions from the other end.
+    let ret_slots = repr::slot_types(store, &ret);
+    if ret_slots.len() > repr::MAX_RET_SLOTS {
+        sig.params.push(AbiParam::new(PTR));
+    }
     for param in &params {
         for slot in repr::slot_types(store, param) {
             sig.params.push(AbiParam::new(slot));
         }
     }
-    for slot in repr::slot_types(store, &ret) {
-        sig.returns.push(AbiParam::new(slot));
+    if ret_slots.len() <= repr::MAX_RET_SLOTS {
+        for slot in ret_slots {
+            sig.returns.push(AbiParam::new(slot));
+        }
     }
     sig
 }
@@ -293,6 +310,7 @@ pub fn translate<M: Module>(
         call_conv,
         locals: Vec::new(),
         loops: Vec::new(),
+        ret_area: None,
         terminated: false,
     };
     trans.build();
@@ -460,6 +478,9 @@ struct Trans<'a, 'f, M: Module> {
     /// One Cranelift variable per slot, per HIR local.
     locals: Vec<SmallVec<[Variable; 2]>>,
     loops: Vec<LoopCtx>,
+    /// Where to write a return too wide for the registers, when this function
+    /// has one. See [`repr::returns_by_pointer`].
+    ret_area: Option<ir::Value>,
     /// Whether the current block already ends in a terminator.
     terminated: bool,
 }
@@ -800,6 +821,15 @@ impl<M: Module> Trans<'_, '_, M> {
         let params: Vec<ir::Value> = self.b.block_params(entry).to_vec();
         let env = params[0];
         let mut next = 1;
+        // A return too wide for the registers arrives as a pointer into the
+        // caller's frame, right after the environment. Not a root: nothing
+        // between the store through it and the `return` can collect, and the
+        // space belongs to a frame that is not going anywhere.
+        let ret = self.func.ret.clone();
+        if repr::returns_by_pointer(self.store, &ret) {
+            self.ret_area = Some(params[1]);
+            next = 2;
+        }
         for i in 0..self.func.params.len() {
             let local = self.func.params[i];
             let width = self.locals[local as usize].len();
@@ -913,8 +943,7 @@ impl<M: Module> Trans<'_, '_, M> {
                     None => self.valueless_return(),
                 };
                 if !self.terminated {
-                    self.b.ins().return_(&values);
-                    self.terminated = true;
+                    self.emit_return(&values);
                 }
             }
 
@@ -1041,6 +1070,68 @@ impl<M: Module> Trans<'_, '_, M> {
     /// Ordinarily nothing. In a function returning `!void` it is the success
     /// tag: the union is one word, because there is no payload beside it, and
     /// `return;` there means "finished, and nothing went wrong".
+    /// Leave this function, however it hands its answer back.
+    ///
+    /// A return that fits in registers is Cranelift's `return`; one that does
+    /// not is a store per slot through the pointer the caller passed, and then
+    /// a `return` with nothing in it. Every path out goes through here so that
+    /// the two cannot drift -- `try`'s propagation is the second one, and was
+    /// the first thing to need it.
+    fn emit_return(&mut self, values: &[ir::Value]) {
+        match self.ret_area {
+            Some(area) => {
+                // Slot `i` at `i * SLOT_SIZE`, which is the stride everything
+                // else laying out a value uses, and what makes each slot
+                // aligned enough for `trusted()`'s `aligned` bit to be honest.
+                for (i, value) in values.iter().enumerate() {
+                    let at = (i as u32 * layout::SLOT_SIZE) as i32;
+                    self.b
+                        .ins()
+                        .store(MemFlagsData::trusted(), *value, area, at);
+                }
+                self.b.ins().return_(&[]);
+            }
+            None => {
+                self.b.ins().return_(values);
+            }
+        }
+        self.terminated = true;
+    }
+
+    /// Space for a call whose result is too wide to come back in registers.
+    ///
+    /// `None` when it is not. The slot is never a root and never needs to be:
+    /// the callee writes it immediately before returning and the caller reads
+    /// it immediately after, with no safepoint in between, so nothing it holds
+    /// can go stale. That is the same argument the builtin boundary makes.
+    fn ret_area_for(&mut self, ret: &Type) -> Option<(ir::StackSlot, SlotTypes)> {
+        let tys = self.slots_of(ret);
+        if tys.len() <= repr::MAX_RET_SLOTS {
+            return None;
+        }
+        let slot = self.b.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            tys.len() as u32 * layout::SLOT_SIZE,
+            layout::SLOT_SIZE.trailing_zeros() as u8,
+        ));
+        Some((slot, tys))
+    }
+
+    fn ret_area_addr(&mut self, slot: ir::StackSlot) -> ir::Value {
+        self.b.ins().stack_addr(PTR, slot, 0)
+    }
+
+    fn read_ret_area(&mut self, slot: ir::StackSlot, tys: &SlotTypes) -> Slots {
+        tys.iter()
+            .enumerate()
+            .map(|(i, ty)| {
+                self.b
+                    .ins()
+                    .stack_load(PTR, *ty, slot, (i as u32 * layout::SLOT_SIZE) as i32)
+            })
+            .collect()
+    }
+
     fn valueless_return(&mut self) -> Slots {
         let ret = self.func.ret.clone();
         let slots = self.slots_of(&ret);
@@ -1128,6 +1219,20 @@ impl<M: Module> Trans<'_, '_, M> {
             hir::ExprKind::Err(id) => {
                 let tys = self.slots_of(&expr.ty);
                 let tag = self.b.ins().iconst(ERROR_TAG, error_tag_value(*id));
+                let mut out: Slots = SmallVec::from_slice(&[tag]);
+                let payload = self.zeros(&tys[1..]);
+                out.extend(payload);
+                out
+            }
+            // The same shape, over a tag that is a value rather than a
+            // constant. An `error` and an `!T` share their first slot and its
+            // encoding -- the error's index plus one, so that zero can mean
+            // success -- so re-raising a caught error is the tag it already
+            // holds, with the payload left zero. It can never be zero itself:
+            // a `catch` binds its capture on the error branch only.
+            hir::ExprKind::Raise(inner) => {
+                let tys = self.slots_of(&expr.ty);
+                let tag = self.expr(inner)[0];
                 let mut out: Slots = SmallVec::from_slice(&[tag]);
                 let payload = self.zeros(&tys[1..]);
                 out.extend(payload);
@@ -1344,9 +1449,15 @@ impl<M: Module> Trans<'_, '_, M> {
                     BinOp::Le => self.b.ins().fcmp(FloatCC::LessThanOrEqual, l, r),
                     BinOp::Gt => self.b.ins().fcmp(FloatCC::GreaterThan, l, r),
                     BinOp::Ge => self.b.ins().fcmp(FloatCC::GreaterThanOrEqual, l, r),
-                    // Cranelift has no float remainder; inference rejects `%`
-                    // on floats before this point.
-                    BinOp::Rem => unreachable!("`%` on floats is rejected by inference"),
+                    // Cranelift has no float remainder, so this is a call --
+                    // the same shape `str ==` has, and for the same reason.
+                    //
+                    // Not `l - trunc(l / r) * r`, which is the obvious inline
+                    // form and is wrong: `l / r` rounds, so a large quotient
+                    // loses the low bits that the answer is made of. `fmod` is
+                    // defined to be exact whatever the magnitudes, and every
+                    // libm has one.
+                    BinOp::Rem => self.call_math_rem(l, r),
                     BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
                         unreachable!("a bit operator on a float is rejected by inference")
                     }
@@ -1754,8 +1865,7 @@ impl<M: Module> Trans<'_, '_, M> {
         let mut ret: Slots = SmallVec::from_slice(&[tag]);
         let rest = self.zeros(&ret_tys[1..]);
         ret.extend(rest);
-        self.b.ins().return_(&ret);
-        self.terminated = true;
+        self.emit_return(&ret);
 
         self.switch(ok_block);
         self.b.block_params(ok_block).iter().copied().collect()
@@ -1801,11 +1911,19 @@ impl<M: Module> Trans<'_, '_, M> {
                 // Top-level functions ignore the environment pointer.
                 let null_env = self.b.ins().iconst(PTR, 0);
                 let mut values = vec![null_env];
+                let area = self.ret_area_for(ty);
+                if let Some((slot, _)) = &area {
+                    let addr = self.ret_area_addr(*slot);
+                    values.push(addr);
+                }
                 for arg in args {
                     values.extend(self.expr(arg));
                 }
                 let call = self.b.ins().call(fr, &values);
-                self.b.inst_results(call).iter().copied().collect()
+                match area {
+                    Some((slot, tys)) => self.read_ret_area(slot, &tys),
+                    None => self.b.inst_results(call).iter().copied().collect(),
+                }
             }
 
             // The array constructor is lowered here rather than called: the
@@ -1834,14 +1952,27 @@ impl<M: Module> Trans<'_, '_, M> {
                     b.module == wsharp_runtime::builtins::BITS_MODULE
                 } =>
             {
+                use wsharp_runtime::builtins as names;
                 let builtins = wsharp_runtime::builtins();
-                let left = builtins[*id as usize].name == wsharp_runtime::builtins::BITS_ROTL;
+                let name = builtins[*id as usize].name;
                 let value = self.expr(&args[0])[0];
+                // The two bitcasts read one argument; the rotates read two.
+                // Native endianness, because both sides of the cast are this
+                // machine's registers -- what a wire format wants is written in
+                // W# above these, out of whichever order it actually asks for.
+                if name == names::BITS_F64_BITS {
+                    let out = self.b.ins().bitcast(types::I64, MemFlagsData::new(), value);
+                    return SmallVec::from_slice(&[out]);
+                }
+                if name == names::BITS_F64_FROM_BITS {
+                    let out = self.b.ins().bitcast(types::F64, MemFlagsData::new(), value);
+                    return SmallVec::from_slice(&[out]);
+                }
                 let amount = self.expr(&args[1])[0];
                 // Cranelift masks the amount to the operand's width, on both
                 // targets and in its own constant folding, so a rotate by the
                 // width is the identity rather than undefined.
-                let out = if left {
+                let out = if name == names::BITS_ROTL {
                     self.b.ins().rotl(value, amount)
                 } else {
                     self.b.ins().rotr(value, amount)
@@ -1941,6 +2072,11 @@ impl<M: Module> Trans<'_, '_, M> {
                 // is a root and is updated in place if it moves; the loaded
                 // word would not be.
                 let mut values = vec![closure];
+                let area = self.ret_area_for(ty);
+                if let Some((slot, _)) = &area {
+                    let addr = self.ret_area_addr(*slot);
+                    values.push(addr);
+                }
                 for arg in args {
                     values.extend(self.expr(arg));
                 }
@@ -1954,8 +2090,10 @@ impl<M: Module> Trans<'_, '_, M> {
                 let sig = indirect_signature(self.store, &fn_ty, self.call_conv);
                 let sig_ref = self.b.import_signature(sig);
                 let call = self.b.ins().call_indirect(sig_ref, code, &values);
-                let _ = ty;
-                self.b.inst_results(call).iter().copied().collect()
+                match area {
+                    Some((slot, tys)) => self.read_ret_area(slot, &tys),
+                    None => self.b.inst_results(call).iter().copied().collect(),
+                }
             }
 
             hir::Callee::Dynamic { cases } => self.dispatch(ty, cases, args),
@@ -1988,12 +2126,23 @@ impl<M: Module> Trans<'_, '_, M> {
             }
         }
 
+        // One return area for the whole chain when the answer is too wide for
+        // the registers: every case writes the same space, so `done` carries no
+        // block parameters and the value is read once, after the join.
+        let area = self.ret_area_for(ty);
+
         let done = self.b.create_block();
-        for slot in self.slots_of(ty) {
-            self.b.append_block_param(done, slot);
+        if area.is_none() {
+            for slot in self.slots_of(ty) {
+                self.b.append_block_param(done, slot);
+            }
         }
 
         let mut flat_args = vec![self.b.ins().iconst(PTR, 0)];
+        if let Some((slot, _)) = &area {
+            let addr = self.ret_area_addr(*slot);
+            flat_args.push(addr);
+        }
         for slots in &arg_slots {
             flat_args.extend(slots.iter().copied());
         }
@@ -2005,16 +2154,19 @@ impl<M: Module> Trans<'_, '_, M> {
                     let next = self.b.create_block();
                     self.brif(cond, body, NO_ARGS, next, NO_ARGS);
                     self.switch(body);
-                    self.emit_case_call(case, &flat_args, done);
+                    self.emit_case_call(case, &flat_args, done, area.is_some());
                     self.switch(next);
                 }
                 None => {
                     // No test: this case applies to every value that reaches
                     // here, so it always wins and the chain ends. Emit the call
                     // in place rather than in a block of its own.
-                    self.emit_case_call(case, &flat_args, done);
+                    self.emit_case_call(case, &flat_args, done, area.is_some());
                     self.switch(done);
-                    return self.b.block_params(done).iter().copied().collect();
+                    return match area {
+                        Some((slot, tys)) => self.read_ret_area(slot, &tys),
+                        None => self.b.block_params(done).iter().copied().collect(),
+                    };
                 }
             }
         }
@@ -2023,13 +2175,23 @@ impl<M: Module> Trans<'_, '_, M> {
         // unreachable whenever the lattice has a catch-all overload; when it
         // cannot, this is where the program finds out.
         self.panic_with(PANIC_NO_METHOD);
-        let tys = self.slots_of(ty);
-        let dead = self.zeros(&tys);
-        let dead_args = Self::args_of(&dead);
-        self.jump_to(done, &dead_args);
+        match &area {
+            // Nothing to hand over: the area is written by whichever case ran,
+            // and no case ran. What it holds is unreachable.
+            Some(_) => self.jump_to(done, NO_ARGS),
+            None => {
+                let tys = self.slots_of(ty);
+                let dead = self.zeros(&tys);
+                let dead_args = Self::args_of(&dead);
+                self.jump_to(done, &dead_args);
+            }
+        }
 
         self.switch(done);
-        self.b.block_params(done).iter().copied().collect()
+        match area {
+            Some((slot, tys)) => self.read_ret_area(slot, &tys),
+            None => self.b.block_params(done).iter().copied().collect(),
+        }
     }
 
     /// The condition under which `case` applies, or `None` if it always does.
@@ -2059,9 +2221,21 @@ impl<M: Module> Trans<'_, '_, M> {
         cond
     }
 
-    fn emit_case_call(&mut self, case: &hir::DispatchCase, args: &[ir::Value], done: ir::Block) {
+    fn emit_case_call(
+        &mut self,
+        case: &hir::DispatchCase,
+        args: &[ir::Value],
+        done: ir::Block,
+        by_pointer: bool,
+    ) {
         let fr = self.func_ref(case.func);
         let call = self.b.ins().call(fr, args);
+        if by_pointer {
+            // The answer is already in the shared area, which `args` carries a
+            // pointer to, so there is nothing to hand the join block.
+            self.jump_to(done, NO_ARGS);
+            return;
+        }
         let results: Slots = self.b.inst_results(call).iter().copied().collect();
         let block_args = Self::args_of(&results);
         self.jump_to(done, &block_args);
@@ -2166,14 +2340,32 @@ impl<M: Module> Trans<'_, '_, M> {
 
     /// Whether two strings hold the same bytes.
     fn call_str_eq(&mut self, a: ir::Value, b: ir::Value) -> ir::Value {
+        self.call_runtime(wsharp_runtime::builtins::STR_MODULE, "eq", &[a, b])
+    }
+
+    /// `%` on `f64`, which is `fmod` and has to be a call.
+    fn call_math_rem(&mut self, a: ir::Value, b: ir::Value) -> ir::Value {
+        self.call_runtime(
+            wsharp_runtime::builtins::MATH_MODULE,
+            wsharp_runtime::builtins::MATH_REM,
+            &[a, b],
+        )
+    }
+
+    /// Call a builtin by name, for an operator that needs one.
+    ///
+    /// The row is what declares the symbol to both backends, so an operator
+    /// borrows one rather than adding a second way to reach the runtime.
+    fn call_runtime(&mut self, module: &str, name: &str, args: &[ir::Value]) -> ir::Value {
         let builtins = wsharp_runtime::builtins();
         let id = builtins
             .iter()
-            .position(|x| x.module == wsharp_runtime::builtins::STR_MODULE && x.name == "eq")
-            .expect("`std/str.eq` is in the builtin table");
-        let clif = self.decls.builtins[id].expect("`std/str.eq` is a call, not lowered inline");
+            .position(|x| x.module == module && x.name == name)
+            .unwrap_or_else(|| panic!("`{module}.{name}` is in the builtin table"));
+        let clif = self.decls.builtins[id]
+            .unwrap_or_else(|| panic!("`{module}.{name}` is a call, not lowered inline"));
         let fr = self.module.declare_func_in_func(clif, self.b.func);
-        let call = self.b.ins().call(fr, &[a, b]);
+        let call = self.b.ins().call(fr, args);
         self.b.inst_results(call)[0]
     }
 

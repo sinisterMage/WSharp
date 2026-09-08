@@ -1,5 +1,5 @@
 // error: `error.Zero` is not one of `{Negative}`
-// error: which this function cannot raise
+// error: which this function cannot
 fn wrong(n: i64) !{Negative}i64 {
     if (n == 0) { return error.Zero; }
     return n;

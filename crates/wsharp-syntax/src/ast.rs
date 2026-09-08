@@ -80,7 +80,14 @@ pub struct StructDecl {
     pub generics: Vec<Ident>,
     /// The supertype written as `struct : Parent { ... }`, if any. Unresolved
     /// here; sema turns it into a `StructId` and builds the dispatch lattice.
-    pub parent: Option<Ident>,
+    ///
+    /// A whole [`TypeExpr`] rather than an [`Ident`], so that `struct :
+    /// pkg.Base` is a thing to write. It used to be a bare name, which made
+    /// this the one position in the language where a type could not be reached
+    /// through the module that declares it -- so a subtype of a type a package
+    /// facade re-exports had to be declared inside that package. Sema still
+    /// rejects everything but a name or a path: `[]T` has no subtypes to be.
+    pub parent: Option<TypeExpr>,
     pub fields: Vec<FieldDecl>,
     pub span: Span,
 }

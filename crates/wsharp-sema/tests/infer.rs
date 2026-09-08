@@ -152,10 +152,26 @@ fn a_literal_that_does_not_fit_its_type_is_reported() {
     // The one value an `i8` has that its positive twin does not: a minus sign
     // on a literal is part of the literal.
     assert_eq!(sig("fn f() i8 { return -128; }", "f"), "fn() i8");
-    // A literal is an integer and stays one; there is no coercion to `f64`.
+    // `f64` asks for a type too, so a literal used at one becomes a float
+    // literal rather than being an error.
+    assert_eq!(sig("fn f(x: f64) { return x + 1; }", "f"), "fn(f64) f64");
+    assert_eq!(sig("fn f() f64 { return 3; }", "f"), "fn() f64");
+    // Only for a value an `f64` holds exactly: above 2^53 the integers are no
+    // longer all there, and rounding a written constant silently is not an
+    // option.
     assert_error(
-        "fn f(x: f64) { return x + 1; }",
-        "`1` is an integer literal, but this is `f64`",
+        "fn f() f64 { return 9007199254740993; }",
+        "`9007199254740993` is not exactly an `f64`",
+    );
+    assert_eq!(
+        sig("fn f() f64 { return 9007199254740992; }", "f"),
+        "fn() f64"
+    );
+    // A type that is not numeric at all still reads as `i64`, rather than
+    // naming a variable nobody wrote.
+    assert_error(
+        "fn f() str { return 1; }",
+        "this return value has type `i64`, expected `str`",
     );
 }
 
@@ -185,9 +201,9 @@ fn a_number_parameter_may_not_negate() {
         "fn f(x: u8) { return -x; }",
         "`-` needs a signed number, but this is `u8`",
     );
-    // `Integer` is what a body needing `%` claims instead of `Number`.
+    // `Integer` is what a body needing the bit operators claims instead.
     assert_eq!(
-        sig("fn f(x: Integer) { return x % 2; }", "f"),
+        sig("fn f(x: Integer) { return x & 1; }", "f"),
         "fn(Integer) Integer"
     );
 }
@@ -372,7 +388,7 @@ fn try_cannot_propagate_past_a_written_set() {
         }
         fn narrow(n: i64) !{Other}i64 { return try risky(n); }
     "#;
-    assert_error(src, "which this function cannot raise");
+    assert_error(src, "which this function cannot");
 }
 
 #[test]
@@ -646,14 +662,26 @@ fn arithmetic_on_a_non_number_is_reported() {
 }
 
 #[test]
-fn remainder_needs_integers() {
-    assert_error("fn f() f64 { return 1.5 % 0.5; }", "`%` needs an integer");
-    assert_error(
-        "fn f(a: f64) f64 { var x = a; x %= 2.0; return x; }",
-        "`%` needs an integer",
+fn remainder_takes_a_float() {
+    // `%` on an `f64` is `fmod`, reached through a call because Cranelift has
+    // no instruction for one. It asks for a number, like the other four.
+    assert_eq!(sig("fn f() f64 { return 1.5 % 0.5; }", "f"), "fn() f64");
+    assert_eq!(
+        sig("fn f(a: f64) f64 { var x = a; x %= 2.0; return x; }", "f"),
+        "fn(f64) f64"
     );
+    assert_error("fn f(a: bool, b: bool) { return a % b; }", "needs a number");
     // Left unconstrained it defaults to i64, like every other operator.
     assert_eq!(sig("fn f(a, b) { return a % b; }", "f"), "fn(i64, i64) i64");
+}
+
+#[test]
+fn the_bit_operators_still_need_integers() {
+    assert_error("fn f() f64 { return 1.5 & 0.5; }", "`&` needs an integer");
+    assert_error(
+        "fn f(a: Number, b: Number) { return a | b; }",
+        "`|` needs an integer, but `Number` includes `f64`",
+    );
 }
 
 #[test]
@@ -1025,11 +1053,16 @@ fn an_abstract_type_is_not_a_type_of_a_value() {
 
 #[test]
 fn an_operator_no_member_supports_is_rejected_at_the_declaration() {
-    // Every member has to work, because the caller is the one who picks: `%`
-    // has no float form and `Number` includes `f64`.
+    // Every member has to work, because the caller is the one who picks: a bit
+    // pattern is not a thing to ask a float for, and `Number` includes `f64`.
     assert_error(
-        "fn f(a: Number, b: Number) { return a % b; }",
-        "`%` needs an integer, but `Number` includes `f64`",
+        "fn f(a: Number, b: Number) { return a ^ b; }",
+        "`^` needs an integer, but `Number` includes `f64`",
+    );
+    // `%` is no longer such an operator: every member has one.
+    assert_eq!(
+        sig("fn f(a: Number, b: Number) { return a % b; }", "f"),
+        "fn(Number, Number) Number"
     );
 }
 

@@ -462,6 +462,51 @@ fn check_reports_errors_without_running() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("type mismatch"));
 }
 
+/// `check` and `run` accept the same programs.
+///
+/// They did not: `check` stopped before monomorphisation, so a generic call
+/// whose type variable nothing pinned passed the verb whose whole job is to
+/// say whether a program is good and then failed the one that runs it. The
+/// diagnostic was right; which command gave it was not.
+#[test]
+fn check_and_run_agree_about_specialisation() {
+    let path = cases_dir().join("err_unpinned_generic.ws");
+    for verb in ["check", "run"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_wsharp"))
+            .arg(verb)
+            .arg(&path)
+            .output()
+            .expect("could not run the compiler");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "`{verb}` accepted it");
+        assert!(
+            stderr.contains("cannot tell what type `main` is being used at"),
+            "`{verb}` said: {stderr}"
+        );
+    }
+}
+
+/// A file with no `main` is a library, and checking one is a thing to want.
+#[test]
+fn check_accepts_a_file_with_no_main() {
+    let dir = std::env::temp_dir().join(format!("wsharp-check-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("could not make a directory");
+    let path = dir.join("lib.ws");
+    std::fs::write(&path, "pub fn twice(n: i64) i64 { return n * 2; }\n")
+        .expect("could not write the module");
+    let output = Command::new(env!("CARGO_BIN_EXE_wsharp"))
+        .arg("check")
+        .arg(&path)
+        .output()
+        .expect("could not run the compiler");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn emit_types_prints_inferred_signatures() {
     let path = cases_dir().join("generics.ws");

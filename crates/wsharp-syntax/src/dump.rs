@@ -49,7 +49,7 @@ impl Printer {
                 let parent = s
                     .parent
                     .as_ref()
-                    .map(|p| format!(" (parent {p})"))
+                    .map(|p| format!(" (parent {})", ty(p)))
                     .unwrap_or_default();
                 // Zero-field structs are ordinary now -- they are how the
                 // dispatch lattice is written -- so do not leave a dangling

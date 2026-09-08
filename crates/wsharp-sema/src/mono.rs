@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use wsharp_syntax::{Diagnostic, Span};
 
 use crate::hir;
-use crate::ty::{Scheme, Type, TypeStore, TypeVarId};
+use crate::ty::{Scheme, TyCon, Type, TypeStore, TypeVarId};
 
 /// A mapping from a function's quantified variables to concrete types.
 type Subst = HashMap<TypeVarId, Type>;
@@ -329,6 +329,17 @@ impl Mono<'_> {
 
     fn rewrite_expr(&mut self, expr: &mut hir::Expr, subst: &Subst) {
         expr.ty = self.apply(&expr.ty, subst);
+        // An integer literal used at an `f64` *is* a float literal. It takes
+        // the type its context asks for, exactly as `0xff` is a `u8` here and a
+        // `u32` there, and this is where that type is finally settled: a body
+        // annotated `Number` does not know which member it will be compiled at
+        // until its instantiation is substituted in, a line above. Inference
+        // has already refused a value an `f64` cannot hold exactly.
+        if let hir::ExprKind::Int(v) = expr.kind
+            && matches!(self.store.resolve(&expr.ty), Type::Con(TyCon::F64, _))
+        {
+            expr.kind = hir::ExprKind::Float(v as f64);
+        }
         match &mut expr.kind {
             // Spawning is what makes a service's functions reachable at all --
             // nothing calls them, the runtime does.
@@ -391,6 +402,7 @@ impl Mono<'_> {
             | hir::ExprKind::Unary { expr, .. }
             | hir::ExprKind::Some(expr)
             | hir::ExprKind::Ok(expr)
+            | hir::ExprKind::Raise(expr)
             | hir::ExprKind::Try(expr)
             | hir::ExprKind::Unwrap(expr) => self.rewrite_expr(expr, subst),
             hir::ExprKind::Binary { lhs, rhs, .. } | hir::ExprKind::Logical { lhs, rhs, .. } => {

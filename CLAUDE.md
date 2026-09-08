@@ -178,11 +178,21 @@ extra `sin_len` byte out of this code entirely.
   overload*, and a variable that survives to the end of a binding group is one
   some coercion elsewhere can bind to something stranger than a number. So a
   literal settles to its default at an overloaded call (`dispatched_call`),
-  when coerced to anything that is not an integer type (`coerce` -- which is
+  when coerced to anything that is not a *numeric* type (`coerce` -- which is
   what makes it *wrap* into a `?i64` rather than become one), and when it sits
   beside an equally undecided operand (`settle_literal_operand`). That last one
   must not fire when an abstract type owns the other side: that is a
   constrained generic, and settling it decides for the caller.
+- **`f64` is one of the types a literal may become, and the node changes shape
+  at monomorphisation.** `coerce` asks `wants_a_number`, not `as_int`, so the
+  variable binds to `f64` and `x + 1` on a float is not an error. The HIR node
+  is still `ExprKind::Int` at that point and must not reach code generation as
+  one -- `iconst.f64` is a verifier error -- so `mono::rewrite_expr` turns it
+  into an `ExprKind::Float` right after it substitutes the type. That is the
+  only place the type is finally settled: a body annotated `Number` does not
+  know which member it is compiled at until then. The value must be one the
+  `f64` *is*, which `check_literal_is_exact_as_f64` tests by round trip rather
+  than by range, because above 2^53 the integers are no longer all there.
 - **The worker argument buffer is zeroed before it is written.** A value
   narrower than a machine word writes only part of one, and `rpc::pack` reads
   whole words and sends them to another thread. This was already true of `bool`
@@ -260,14 +270,23 @@ extra `sin_len` byte out of this code entirely.
   Bypassing any of them loses objects or corrupts them, and the failure is
   neither immediate nor reproducible. Run `--gc-stress` if you touch them.
 - **`Number` includes the unsigned types, so a generic over it may not
-  negate.** Nor may it use `%`: the abstract type lists every numeric type
-  including `f64`, and a body annotated with it must work for *every* member,
-  because the caller picks. `Integer` is what such a body claims instead.
-  Abstract types are ordered by their member sets rather than by identity
-  (`ty.rs::is_sub_ty`), which is what makes `Integer` the more specific of the
-  two -- and which means two abstract types with *identical* members would be
-  mutually more specific and silently lose an ambiguity error. A test asserts
-  the table is a strict lattice.
+  negate.** Nor may it use a bit operator: the abstract type lists every numeric
+  type including `f64`, and a body annotated with it must work for *every*
+  member, because the caller picks. `Integer` is what such a body claims
+  instead, and `Signed` -- the four signed integer widths -- is what a body that
+  negates claims, which is why `math.abs` is one definition and not an overload
+  set. (`%` was on this list until `f64` had one.) Abstract types are ordered by
+  their member sets rather than by identity (`ty.rs::is_sub_ty`), which is what
+  makes `Integer` the more specific of `Number` and `Integer` -- and which means
+  two abstract types with *identical* members would be mutually more specific
+  and silently lose an ambiguity error. A test asserts the table is a strict
+  lattice.
+- **A `Signed` body still may not hold a float literal, which is why `f64` is
+  not a member.** `math.abs` compares against `0`, and an integer literal is
+  checked against every *integer* member of the abstract type it is used at;
+  `f64` in the set would make that check say nothing while the body still had to
+  work there. The `f64` overloads sit beside the generic one, disjoint from it,
+  so the dispatcher has nothing to call ambiguous.
 - **A subtype's fields are its supertype's, followed by its own.** That is what
   lets a field read compiled against a supertype run unchanged on any subtype,
   with no adjustment and no vtable. `collect_structs` lays types out in lattice
@@ -281,6 +300,34 @@ extra `sin_len` byte out of this code entirely.
 - **Every W# function takes a leading environment pointer.** Static calls pass
   null. Forgetting it produces a signature mismatch that Cranelift reports far
   from the cause.
+- **A return of more than `repr::MAX_RET_SLOTS` slots goes through a pointer,
+  which is the second parameter.** x86-64 hands back two values and Cranelift
+  refuses a signature asking for more rather than spilling one itself, so `!?T`
+  -- three slots -- is written into space the caller provides. Immediately after
+  the environment, so `env` stays `params[0]` in the dozen places that assume it,
+  and an ordinary parameter rather than Cranelift's `StructReturn`, because W#
+  owns both sides of every call. Three call paths have to agree: a static call,
+  an indirect one through a closure, and a dispatched one -- where every case
+  writes *one* shared area and the join block carries no block parameters at
+  all. Every path out of a function goes through `Trans::emit_return` so the two
+  forms cannot drift. The area is not a root and must not become one: the callee
+  writes it in the instructions before its `return` and the caller reads it in
+  the instructions after the call, with no safepoint between, which is the same
+  argument the runtime boundary already made for `returns_by_pointer`.
+- **A dispatched call must tell each surviving candidate what it is being called
+  at, and must recompute its tests after the arguments settle.** `dispatched_call`
+  trials candidates under a snapshot and rolls back, so one cannot pin an
+  argument for the next; that also undoes the bindings a *generic* candidate
+  needs, and where the argument is concrete they have to be made again -- safe
+  exactly because a concrete argument has no variables of the caller's to bind.
+  Without it `fn next[T](it: Iter[T]) ?T` called with an `Iter[Row]` answers
+  `?T` with `T` open, and a `for` over a list of structs gets a loop variable
+  whose type nothing decides. The second half is the dangerous one: `overlap`
+  proves applicability with `try_unify`, which *always* succeeds against a
+  variable, so an argument that is still open overlaps every candidate with no
+  test -- and a most-specific case needing no test is compiled as a *static*
+  call. That is a wrong overload with no diagnostic, so the tests are taken
+  again from the settled types before static-versus-dynamic is decided.
 - **Inference guarantees termination.** A non-`void` function whose body can
   fall through is rejected, which is also what lets code generation assume a
   fall-through means `return void`.
@@ -554,6 +601,17 @@ extra `sin_len` byte out of this code entirely.
   re-export defeats -- `pkg.parse` really is called `parse` -- so
   `check_overloads` asks the `reexported` key set instead and every overload
   diagnostic is said once.
+- **Two re-exports of one name merge; a re-export beside a declaration does
+  not.** A facade presenting a package of several files may find `render` an
+  overload set in two of them, and "only functions may share a name, as an
+  overload set" is exactly what a merge is -- so `alias_reexported_values`
+  unions the id lists rather than reporting a redeclaration. Only when the name
+  this module already has is *itself* a re-export (`reexported` is the test),
+  and only without an annotation, which picks one member and so has nothing to
+  merge with. A re-export beside a declaration of the module's own is a module
+  shadowing its own name with a foreign one, stays a clash, and
+  `err_reexport_clash.ws` is the case that says so. The first line to bind the
+  name keeps the span, so a later clash still points at where it came from.
 - **The `for` protocol's dependency edges are the whole program's.** `iter` and
   `next` resolve in the module that declares the subject's type, which
   inference has not run yet to know, so `infer_all` over-approximates. It must
@@ -591,11 +649,16 @@ extra `sin_len` byte out of this code entirely.
   is what a caller of several fallible things wants. `std/tls`'s two message
   dispatchers are written that way for exactly this reason, and the shape is
   worth recognising: the diagnostic names the wrong line.
-- **A subtype does not coerce into a supertype inside an error union.**
-  `return Sub{ .. };` from a function returning `!Base` is a type error: the
-  widening to `Base` and the wrapping into `!` are each supported and are not
-  composed. `const key: Base = Sub{ .. }; return key;` is the spelling, and
-  `std/x509.parse_spki` uses it three times.
+- **A coercion is a sequence of steps, and the wrapping step recurses.**
+  `coerce` is a reporting wrapper around `try_coerce`, whose `?T`/`!T` arm fits
+  the value to the payload *by every rule including itself* -- so `Sub` reaches
+  `!Base` by widening and then wrapping, and `Row` reaches `!?Row` by wrapping
+  twice. Each of those used to be a type error, and the spelling was an
+  annotated binding per conversion. Speculation is why the split exists: a
+  failed attempt rolls back both the bindings and the constraints it made, so
+  the diagnostic the outermost call reports is still about the type the caller
+  wrote rather than about a payload nobody mentioned. Anything added to
+  `try_coerce` has to be safe to run and undo.
 - **An `if` whose arms both leave has no merge block.** Code generation creates
   one per `if` and used to switch to it unconditionally; the function epilogue
   then closes whatever block is open with a valueless `return`, which is right

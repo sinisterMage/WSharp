@@ -320,6 +320,14 @@ pub enum ExprKind {
     Ok(Box<Expr>),
     /// An error value.
     Err(ErrorId),
+    /// Raise an error that is only known at run time: build an error union
+    /// carrying the tag this `error` value holds.
+    ///
+    /// [`Self::Err`] names its error in the source and so is a constant. This
+    /// one is what `catch |e| { return e; }` needs, where which error it is is
+    /// a fact about the value rather than about the program. The payload slots
+    /// are left zero, as they are for an `Err`.
+    Raise(Box<Expr>),
     /// `e orelse alt`
     /// `{ stmt; stmt; value }` -- the block form of a `catch` or an `orelse`.
     ///

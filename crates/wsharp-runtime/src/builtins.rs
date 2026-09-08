@@ -433,6 +433,22 @@ fn library() -> Vec<Builtin> {
             ptr: ws_panic as *const u8,
         },
         Builtin {
+            module: BITS_MODULE,
+            name: BITS_F64_BITS,
+            params: &[BuiltinTy::F64],
+            ret: BuiltinTy::U64,
+            link: INLINE,
+            ptr: ws_panic as *const u8,
+        },
+        Builtin {
+            module: BITS_MODULE,
+            name: BITS_F64_FROM_BITS,
+            params: &[BuiltinTy::U64],
+            ret: BuiltinTy::F64,
+            link: INLINE,
+            ptr: ws_panic as *const u8,
+        },
+        Builtin {
             module: STR_MODULE,
             name: "to_lower",
             params: &[BuiltinTy::Str],
@@ -541,6 +557,16 @@ fn library() -> Vec<Builtin> {
             ret: BuiltinTy::F64,
             link: "ws_math_pow",
             ptr: ws_math_pow as *const u8,
+        },
+        // What `%` on `f64` compiles to, and a name for it as well: an
+        // operator borrowing a row is how `str ==` already reaches the runtime.
+        Builtin {
+            module: MATH_MODULE,
+            name: MATH_REM,
+            params: &[BuiltinTy::F64, BuiltinTy::F64],
+            ret: BuiltinTy::F64,
+            link: "ws_math_rem",
+            ptr: ws_math_rem as *const u8,
         },
         Builtin {
             module: MATH_MODULE,
@@ -1165,6 +1191,9 @@ pub const ARRAY_MODULE: &str = "std/array";
 pub const LIST_MODULE: &str = "std/list";
 /// The standard library's arithmetic.
 pub const MATH_MODULE: &str = "std/math";
+/// The float remainder, which the code generator calls for `%` on an `f64`
+/// because Cranelift has no instruction for one.
+pub const MATH_REM: &str = "rem";
 /// The standard library's file and standard-input operations.
 pub const IO_MODULE: &str = "std/io";
 /// The standard library's byte buffers, and the bridge to `str`.
@@ -1293,6 +1322,17 @@ pub const INFLATE_MODULE: &str = "std/inflate";
 /// inline rather than calling. See [`BuiltinTy::IntVar`].
 pub const BITS_ROTL: &str = "rotl";
 pub const BITS_ROTR: &str = "rotr";
+/// The two halves of an `f64`'s representation, lowered inline as one
+/// `bitcast` each.
+///
+/// A conversion answers what the *value* is at another type, and rounds or
+/// truncates to say it: `u64(1.5)` is 1. These answer what the value *is made
+/// of*, which is a different question and the only one an IEEE-754 codec can
+/// use -- a wire format carries the eight bytes, not the number. Everything
+/// else in this module is about the bits of an integer; these are how a float
+/// joins in.
+pub const BITS_F64_BITS: &str = "f64_bits";
+pub const BITS_F64_FROM_BITS: &str = "f64_from_bits";
 
 /// What any socket operation may raise.
 ///
@@ -1454,6 +1494,17 @@ pub fn abstract_types() -> &'static [(&'static str, &'static [BuiltinTy])] {
         // a subset of `Number`'s, which is what makes it the more specific of
         // the two when both could match -- see `TypeStore::is_sub_ty`.
         ("Integer", &[I8, I16, I32, I64, U8, U16, U32, U64]),
+        // The signed integers, for a body that negates -- `math.abs` and
+        // `math.sign`, which were an `i64`/`f64` overload set until this row
+        // existed, so a narrow signed value needed a conversion to use one.
+        //
+        // `f64` is deliberately not a member, which makes this "the signed
+        // integers" rather than the whole of what unary `-` accepts. Both
+        // bodies compare against a literal `0`, and an integer literal at an
+        // `f64` is not something the language says yet; the `f64` overloads
+        // stay beside the generic one and are disjoint from it, so there is
+        // nothing for the dispatcher to call ambiguous.
+        ("Signed", &[I8, I16, I32, I64]),
     ]
 }
 
@@ -1633,6 +1684,19 @@ pub extern "C" fn ws_math_sqrt(x: f64) -> f64 {
 pub extern "C" fn ws_math_pow(x: f64, y: f64) -> f64 {
     unsafe { crate::gc::checkpoint() };
     x.powf(y)
+}
+
+/// `x % y` on floats: `fmod`, which is what Rust's `%` on an `f64` is.
+///
+/// Truncated rather than floored, so the result takes the sign of the dividend
+/// and `|result| < |y|`. That is C's definition and every other language's that
+/// has one, and it is what makes `-7.5 % 2.0` equal `-1.5` rather than `0.5`.
+/// `y` of zero gives NaN, as float division by zero gives an infinity: the
+/// integer forms panic, and the float ones have an answer to give.
+#[unsafe(no_mangle)]
+pub extern "C" fn ws_math_rem(x: f64, y: f64) -> f64 {
+    unsafe { crate::gc::checkpoint() };
+    x % y
 }
 
 #[unsafe(no_mangle)]
@@ -1834,13 +1898,22 @@ mod tests {
             );
             seen.push(b.link);
         }
-        // The three rows the code generator compiles at the call site, and
-        // nothing else, may decline to name a symbol.
+        // The rows the code generator compiles at the call site, and nothing
+        // else, may decline to name a symbol.
         let inline: Vec<String> = all
             .iter()
             .filter(|b| b.is_inline())
             .map(|b| b.symbol())
             .collect();
-        assert_eq!(inline, ["std/bits.rotl", "std/bits.rotr", "std/array.new"]);
+        assert_eq!(
+            inline,
+            [
+                "std/bits.rotl",
+                "std/bits.rotr",
+                "std/bits.f64_bits",
+                "std/bits.f64_from_bits",
+                "std/array.new",
+            ]
+        );
     }
 }

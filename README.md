@@ -98,12 +98,12 @@ everywhere.** They are checked when written and inferred when not.
 | Types | `i8` `i16` `i32` `i64` `u8` `u16` `u32` `u64` `f64` `bool` `void` `str`, `[]T` array, `?T` optional, `!T` error union, `fn(A) B` |
 | Functions | `fn add(a, b) { return a + b; }`, `fn add(a: i64, b: i64) i64 { ... }` |
 | Overloads | several `fn`s may share a name; the call picks the most specific |
-| Abstract types | `Number` stands for every numeric type and `Integer` for the eight integer ones, so an overload can claim "any number" while another claims `i64` |
+| Abstract types | `Number` stands for every numeric type, `Integer` for the eight integer ones and `Signed` for the four signed ones, so an overload can claim "any number" while another claims `i64` |
 | Control flow | `if (c) { } else { }`, `while (c) : (i += 1) { }`, `for (xs) \|x\| { }`, `break`, `continue` |
 | Expressions | `if (c) a else b`, `fn (a, b) { ... }` closures |
 | Closures | `const id = fn (x) { return x; };` generalises, may name itself, and `fn [T](a: []T) T` writes the parameters out |
-| Literals | `42`, `0xff`, `0b1010`, `0o17`, `1_000_000`, `2.5`, `"text"` with `\n \t \r \0 \\ \"`; an integer literal takes the type it is used at and defaults to `i64` |
-| Arrays | `[]i64{ 1, 2, 3 }`, `a[i]`, `for (a) \|v, i\| { }`; an index out of range panics |
+| Literals | `42`, `0xff`, `0b1010`, `0o17`, `1_000_000`, `2.5`, `"text"` with `\n \t \r \0 \\ \"`; an integer literal takes the type it is used at -- including `f64`, where the value is exact -- and defaults to `i64` |
+| Arrays | `[]i64{ 1, 2, 3 }`, `a[i]` at any integer type, `g[i][j] = v`, `for (a) \|v, i\| { }`; an index out of range panics |
 | Growable | `std/list` — a backing array plus a count, so `push` is amortised constant time |
 | Iterating | `for (xs) \|x\|` over an array walks it by index; over anything else it calls `iter` and `next` from the module that declares its type |
 | Generics | `fn first[T](a: []T) T`, `const Box = struct[T] { value: T };`, `fn [T](x: T) T` — inferred when not written |
@@ -117,12 +117,12 @@ everywhere.** They are checked when written and inferred when not.
 | Signatures | `std/rsa` — PKCS#1 v1.5 and PSS verification; `std/curve25519` — Ed25519, signing and verification; `std/nistec` — ECDSA verification on P-256 and P-384 |
 | TLS | `std/tls` — TLS 1.3, client and server; `std/x509` — certificates and chains, so `http.get("https://…")` works |
 | Structs | `const P = struct { x: i64 };`, `P{ .x = 1 }`, `p.x` |
-| Subtyping | `const Sub = struct : Base { };` — a subtype widens implicitly |
+| Subtyping | `const Sub = struct : Base { };`, or `struct : pkg.Base` — a subtype widens implicitly |
 | Singletons | a struct with no fields is also a value: its sole instance |
 | Optionals | `null`, `a orelse b`, `a.?`, `if (a) \|v\| { }`, `while (a) \|v\| { }` |
-| Errors | `error.Name`, `try f()`, `f() catch 0`, `f() catch \|e\| ...`, `f() catch return false`, `f() catch { log(); 0 }` |
+| Errors | `error.Name`, `try f()`, `f() catch 0`, `f() catch \|e\| ...`, `f() catch return e`, `f() catch return false`, `f() catch { log(); 0 }` |
 | Error sets | `!i64` infers which errors; `!{NotFound, IoFailed}str` writes them down and is checked |
-| Operators | `+ - * /`, `%` and `& \| ^ << >> ~` (integers only), `== != < <= > >=` (non-chaining), `and or !`; `u32(x)` converts |
+| Operators | `+ - * / %`, `& \| ^ << >> ~` (integers only), `== != < <= > >=` (non-chaining), `and or !`; `u32(x)` converts |
 
 `==` compares `str` by contents, so a string built at run time equals a literal.
 
@@ -152,6 +152,10 @@ one, so `return n;` is legal in a function declared `!i64`. A subtype coerces
 into its supertype for the same reason: both are one pointer, and a subtype's
 layout begins with a byte-identical copy of its supertype's.
 
+The steps compose, so `return Sub{ .. };` is legal in a function declared
+`!Base` and `!?T` is a type worth writing -- a value, nothing, or a failure, in
+one return.
+
 ### Multiple dispatch
 
 An overload set is several top-level functions sharing a name. Every parameter
@@ -161,8 +165,8 @@ resolved.
 
 Overloading is not limited to struct types. An **abstract type** stands for a
 set of concrete ones -- `Number` for every numeric type, `Integer` for the
-eight integer ones -- so a general case can be written alongside a specific
-one:
+eight integer ones, `Signed` for the four signed ones -- so a general case can
+be written alongside a specific one:
 
 ```zig
 fn show(x: i64)     str { return "an integer"; }
@@ -172,8 +176,10 @@ fn show(x: Number)  str { return "a number"; }   // catches f64
 
 Abstract types are ordered by their member sets, so `Integer` is more specific
 than `Number` and wins wherever both apply. A body annotated `Number` must work
-for *every* type it lists, which is why it may not use `%` (no float form) or
-negate (no unsigned negatives) -- `Integer` is what such a body claims.
+for *every* type it lists, which is why it may not use a bit operator (`f64` has
+no bit pattern to ask for) or negate (no unsigned negatives) -- `Integer` and
+`Signed` are what such bodies claim. `std/math`'s `abs` and `sign` are one
+definition over `Signed` for exactly that reason.
 
 An abstract type classifies values for dispatch and is never one itself: a
 parameter annotated with it is a *generic* parameter constrained to the
@@ -361,9 +367,13 @@ typical store, and it is the last line under what is left in
 
 ```sh
 wsharp run   <file.ws>            # compile and run main; exits with main's return value
-wsharp check <file.ws>            # type-check only
+wsharp check <file.ws>            # everything but the code generation
 wsharp build <file.ws> -o <prog>  # compile to a native executable
 ```
+
+`check` accepts exactly what `run` accepts: it goes as far as monomorphisation,
+which is where a generic call nothing pinned is reported, and stops before code
+generation. A file with no `main` is a library and is fine to check.
 
 `run` compiles into memory and runs there, which is what you want while writing
 something. `build` writes a real program: the collector, the workers, TLS and
@@ -494,8 +504,8 @@ serving many connections from one worker, not for keeping the collector alive.
 | `std/str` | `len` `concat` `eq` `substr` `find` `split` `join` `repeat` `starts_with` `from_int` `from_float` `byte_at` `from_byte` `parse_int` `to_lower` `trim` |
 | `std/array` | `len` `new` `concat` `push` `slice` `repeat` |
 | `std/list` | `List[T]`, a growable array: `new` `with_capacity` `from` `len` `capacity` `get` `set` `push` `pop` `insert` `remove` `extend` `clear` `iter` `next` `to_array` |
-| `std/math` | `abs` `min` `max` `sign` `sqrt` `pow` `floor` `ceil` `round` `trunc` `ipow` |
-| `std/bits` | `rotl` `rotr` — rotation, generic over `Integer`, one instruction on both targets |
+| `std/math` | `abs` `min` `max` `sign` `rem` `sqrt` `pow` `floor` `ceil` `round` `trunc` `ipow` |
+| `std/bits` | `rotl` `rotr` — rotation, generic over `Integer`, one instruction on both targets; `f64_bits` `f64_from_bits` — an `f64`'s representation, which is what a wire format carries |
 | `std/io` | `read_file` `read_line` `write_file` `exists` — the fallible ones name their errors, e.g. `!{NotFound, PermissionDenied, IoFailed}str` |
 | `std/net` | TCP: `Socket` `Listener` and `connect` `listen` `accept` `read` `write` `write_all` `read_exactly` `read_all` `set_nonblocking` `close`. UDP: `Datagrams` `Peer` `Datagram` and `udp` `send_to` `receive` `reply`. Readiness: `Poller` `Event` and `poller` `watch` `wait`. IPv4 or IPv6, with the family the resolver's choice |
 | `std/http` | the 27 HTTP status types, materialised on first mention, plus an HTTP/1.1 client and server: `get` `post` `request` `read_request` `respond` `header` `status_of`; and since item 10, `https://` over `std/tls` |

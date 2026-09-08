@@ -849,6 +849,7 @@ fn types_in_expr(expr: &hir::Expr, out: &mut Vec<Type>) {
         | hir::ExprKind::Unary { expr, .. }
         | hir::ExprKind::Some(expr)
         | hir::ExprKind::Ok(expr)
+        | hir::ExprKind::Raise(expr)
         | hir::ExprKind::Try(expr)
         | hir::ExprKind::Unwrap(expr)
         | hir::ExprKind::Field { obj: expr, .. } => types_in_expr(expr, out),

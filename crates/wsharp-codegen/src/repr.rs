@@ -37,6 +37,26 @@ pub fn error_tag_value(id: u32) -> i64 {
     id as i64 + 1
 }
 
+/// How many slots a W# function may hand back in registers.
+///
+/// Two, which is what the targets have room for -- x86-64 SysV returns in
+/// `rax` and `rdx` -- and Cranelift refuses a signature asking for more rather
+/// than spilling one itself. Until a coercion could compose two wraps there was
+/// no W# type wider than this: `!str` and `?i64` are a tag and a word, and a
+/// struct is one word. `!?T` is three, and is what this exists for.
+pub const MAX_RET_SLOTS: usize = 2;
+
+/// Whether a value of this type is returned through a pointer the caller
+/// provides rather than in registers.
+///
+/// The same bargain the runtime boundary already strikes one ABI down (see
+/// `lower::returns_by_pointer`), and struck here for a different reason: there
+/// it is what C does with a `#[repr(C)]` pair, here it is what the machine has
+/// registers for.
+pub fn returns_by_pointer(store: &mut TypeStore, ret: &Type) -> bool {
+    slot_types(store, ret).len() > MAX_RET_SLOTS
+}
+
 /// The machine type a W# integer type rides in.
 ///
 /// Signedness is absent on purpose: Cranelift has `I8`/`I16`/`I32`/`I64` and

@@ -27,7 +27,13 @@ can read its own command line and walk a directory, TOML 1.0 and a
 content-addressed store, a PubGrub resolver that answers a conflict with the
 derivation that caused it, a git client that speaks smart HTTP rather than
 shelling out — and then the one branch in the loader and the two table keys in
-the type checker that turn all of that into `@import("acme/json")`.
+the type checker that turn all of that into `@import("acme/json")`. Item 12
+compiled the whole of it ahead of time, so `ingot` is a native binary that was
+written in W#. Item 13 spent a session on the small print: eight of the
+"Smaller follow-ups" below, six things a driver written *against* the language
+found, and one thing that was on neither list — a dispatched call whose argument
+nothing had pinned compiled to the wrong overload with no diagnostic, which is
+the only silently wrong answer this compiler has produced.
 
 This file records what was built and why it was built that way, the limitations
 that were chosen rather than stumbled into, and — for the items still ahead —
@@ -978,12 +984,15 @@ Doing it turned up two things:
   become one generic over `Number`, and the reason changed: it used to be that
   an integer literal was an `i64`, which `comptime_int` has retired; it is now
   that negation is meaningless on an unsigned type. A narrow signed value needs
-  a conversion.
+  a conversion. **Item 13 closed this** with `Signed`, an abstract type listing
+  the four signed integer widths -- which is the annotation this was missing
+  rather than a change to what `Number` means.
 - **An array index is still an `i64`.** "Every literal index works" is true and
   is not the case that chafes; writing item 10's ciphers found the one that
   does, and it is a *byte-valued* index -- `table[b]`. `i64(b)` covers it, and
   it turned out to be barely met, because a table indexed by a secret byte is
-  the thing constant-time code must not do anyway.
+  the thing constant-time code must not do anyway. **Item 13 closed this**: any
+  integer type indexes, and the widening is emitted where it is used.
 - **No `u128`, and no `usize`.** The second is deliberate — this language has
   no pointer arithmetic to size, and a type whose overload depends on the
   target is a type whose overflow does. The first was an open question, and
@@ -1689,7 +1698,11 @@ CI, so that is a trap nothing here would have caught.
 `AlreadyExists`, because W# has no way to re-raise a caught error — which is
 the first thing this item has found that the language cannot say, and it is
 noted rather than fixed: the store publishes by `rename` precisely so that two
-processes racing is not a case anything has to get right.
+processes racing is not a case anything has to get right. **Item 13 gave the
+language the missing half**, so a caught error may now be handed on with
+`return e;`. `mkdir_all` is left as it is: asking is still cheaper than racing,
+and the three questions it asks are the ones `sys/` can answer without
+declaring a `struct stat`.
 
 ### Stage two — TOML, the store, and the tool — **done**
 
@@ -2289,7 +2302,9 @@ having said so in the doc comment before writing them.
 - **`struct : pkg.Base` is not spellable.** A supertype is an `Ident` rather
   than a type path, so a subtype of a re-exported type has to be declared in the
   module the parent was declared in. A re-exported name is nameable everywhere
-  else a type is.
+  else a type is. **Item 13 closed this**: `StructDecl::parent` is a `TypeExpr`,
+  and aliasing already ran before parents did, so a facade's name for a type
+  works as well as the original.
 - **Two versions of a package still meet as two identically-named types**, and
   the mismatch says so without saying why. As written in advance: the
   diagnostic is the work, not the semantics.
@@ -2489,6 +2504,177 @@ which is what says the stack maps survived being written to a file.
 
 ---
 
+## 13. The edge cases a real program found — **done**
+
+Two lists had accumulated. One was the "Smaller follow-ups" section below, which
+opens by calling each item a deliberate limitation with a clear fix. The other
+came out of writing a program *against* the language rather than in it:
+[quantydb/client](https://github.com/QuantyRoot/QuantyDatabase), a driver for a
+database wire protocol, in pure W# and depending on nothing but `std`. Its
+README grew a section called "Two things about W# worth knowing", which is the
+kind of section a language does not want.
+
+### The one that was not a limitation
+
+**A dispatched call on an argument nothing had pinned compiled to a static call
+to the most specific overload.** No diagnostic, wrong answer.
+
+`dispatched_call` trials each candidate under a snapshot and rolls it back, so
+that one candidate cannot pin an argument for the next. That rollback also undid
+the bindings that tell a *generic* candidate which type it is being called at,
+and nothing put them back: the only re-binding afterwards covered arguments that
+still had variables in them, and abstract parameters. A candidate generic in a
+structural position -- `fn next[T](it: Iter[T]) ?T` -- called with a perfectly
+concrete `Iter[Row]` therefore answered `?T` with `T` open.
+
+`for` over anything that is not an array walks straight into that. It desugars
+to `iter` and then `next`, both dispatched, so the loop variable's type came out
+a variable nothing would ever bind. Two things then went wrong in the body, and
+the second is the bad one:
+
+- `v.field` deferred a `HasField` constraint on a variable, and reported at the
+  end that it could not tell which type the field belonged to.
+- `render(v)` re-entered `dispatched_call` with an open argument. `overlap`
+  tests applicability with `try_unify`, which *always* succeeds against a
+  variable, so every candidate came back "applies, no test needed" -- and a
+  most-specific case needing no test is compiled as a static call. Three
+  subtypes held at their supertype all printed what the most specific overload
+  said.
+
+`tests/cases/for_list.ws` had covered this since item 6 and passed, because its
+elements are `i64` and `str` and `print_int` in the body pins the variable from
+the other end. A struct has nothing that does. `for_list_structs.ws` is the case
+that fails both ways without the fix.
+
+The fix is two changes in `dispatched_call`. Where an argument is already
+concrete, unify it into each surviving candidate's parameter -- safe precisely
+because a concrete argument has no variables of the caller's to bind, so the
+only ones such a unification can reach are the candidate's own. And then, once
+the open arguments have been settled by the join coercion below it, ask `overlap`
+again and rebuild the dispatch tests from the settled types, so that a call which
+has to choose at run time is not compiled as though it did not.
+
+### Coercion composes
+
+W# widened a subtype into its supertype, and wrapped a value into a `?T` or an
+`!T`, and did not do both -- so `return Sub{ .. };` from a function returning
+`!Base` was a type error, and the spelling was an annotated binding per
+conversion. `std/x509.parse_spki` has three, `std/toml` has seven, and the
+driver had eleven.
+
+Two wraps did not compose either, which is what made `!?T` unwritable: it parses,
+and `Row` could not reach it.
+
+`coerce` is now a reporting wrapper around a `try_coerce` that may fail, and the
+wrapping step recurses through it -- so `Sub` reaches `!Base` by widening and
+then wrapping, and `Row` reaches `!?Row` by wrapping twice. A failed attempt
+rolls back both the bindings and the constraints it made, so the diagnostic the
+outermost call reports is still about the type the caller actually wrote.
+
+### Three machine words of return
+
+`!?Row` is a tag, a tag and a pointer. x86-64 hands back two values and Cranelift
+refuses the signature rather than spilling one itself, which is where the driver
+stopped: its cursor is `advance` then `row` rather than one call answering
+`!?Row`, and says so in a comment.
+
+A return over the limit is written through a pointer the caller passes, placed
+immediately after the environment so that `env` stays `params[0]` everywhere.
+An ordinary parameter rather than Cranelift's `StructReturn`: W# owns both sides
+of every call, and this keeps the convention ours. All three call paths had to
+agree -- a static call, an indirect one through a closure, and a dispatched one,
+where every case writes *one* shared area and the join block carries nothing.
+
+The area is not a root and does not need to be. The callee writes it in the
+instructions before its `return` and the caller reads it in the instructions
+after the call, with no safepoint in between, so nothing it holds can go stale.
+That is the same argument the runtime boundary already made for a builtin
+answering a `#[repr(C)]` pair, which is where the shape came from.
+
+### The rest, in a paragraph each
+
+**A supertype is a type expression.** `StructDecl::parent` was an `Ident`, which
+made it the one position in the language where a type could not be reached
+through the module that declares it. Aliasing already runs before parents do, so
+a facade's name for a type works as well as the original -- `struct Sub :
+pkg.Base` and `struct Sub : inner.Base` name one `StructId` and produce siblings
+rather than two lattices.
+
+**An integer literal may be an `f64`.** A literal takes the type its context
+asks for, and `f64` did not count as asking. It does now, and the node becomes a
+float literal at monomorphisation, which is where the type is finally settled --
+so a body annotated `Number` may hold one and be compiled at `f64` and at `i64`
+both. Only for a value the `f64` *is*: above 2^53 the integers are no longer all
+representable, and the check is the round trip rather than a range, because
+rounding a written constant silently is not a thing to do.
+
+**`%` on `f64`.** Cranelift has no float remainder, so it is a call to the
+runtime -- the shape `str ==` already had. Not `l - trunc(l / r) * r`, which is
+the obvious inline form and is wrong: `l / r` rounds, so a large quotient loses
+the low bits the answer is made of. `10000000000000000.0 % 3.0` is 1.0 and the
+inline form says 0.0, which is the case in `floats_rem.ws`. `Need::Integer` is
+now the bit operators alone.
+
+**`Signed`.** One row in the abstract-type table, and `math.abs` and `math.sign`
+stop being an overload set. The signed integers only: both bodies compare against
+a literal zero, and `f64` keeps an overload of its own, disjoint from the generic
+one so there is nothing to be ambiguous about.
+
+**Any integer type indexes.** An index is an `i64` at the machine level and the
+widening is emitted where it is used. Conversions between numeric types are
+written and never inferred, and this is not that: an index is not a value the
+program keeps, it is an argument to one operation whose type is fixed. A `u64`
+past `i64`'s range arrives negative and is caught anyway, because the bounds
+check is one *unsigned* compare.
+
+**`g[i][j] = v`.** The base of a place is evaluated once into a hidden local, so
+a compound assignment can read the place and write it back without the base
+appearing twice -- which is the thing the old restriction was standing in for.
+`nested_assign.ws` puts a side effect in the base and counts it.
+
+**Re-raising a caught error.** `catch |e|` bound the error and there was nowhere
+to put it: an error union carries a tag, and the only thing that could build one
+was an `error.X` written in the source. So a function that wanted to handle one
+case and pass the rest on could not, which is why `std/fs.mkdir_all` asks the
+filesystem three questions rather than catching `AlreadyExists`. An `error` value
+and an `!T` share their first slot and its encoding, so this is one move; the set
+is held to the same subset rule `try` is, and the diagnostic stopped saying
+"`try` propagates" because it is now true of two different spellings.
+
+**`check` monomorphises.** It stopped above the specialisation stage, so the verb
+whose whole job is to say whether a program is good was the more permissive of
+the two. A file with no `main` is still fine to check and still not to run.
+
+**A facade may present one name from two files.** `pub const render = one.render;
+pub const render = two.render;` merges into one overload set. Only when the name
+this module already has is itself a re-export: a re-export beside a declaration
+of the module's own is a module shadowing its own name with a foreign one, which
+stays a clash and has a case saying so.
+
+**`bits.f64_bits` and `bits.f64_from_bits`.** Two rows and two `bitcast`s. `u64(x)`
+converts a value and rounds to say it; these answer what the value is made of,
+which is the only question an IEEE-754 codec can use, because a wire format
+carries the eight bytes and not the number. The driver had ninety lines of exact
+arithmetic standing in for them -- with a screen of proof about why halving and
+doubling stays exact into the subnormal range -- and its transcribed bit patterns
+now check the builtin instead.
+
+### What it cost, and what checked it
+
+No new pass and no new stage: one new HIR node (`Raise`), one new abstract type,
+three new builtin rows, one new runtime entry point, and a return convention
+that only exists above two slots. Twelve new cases in `tests/cases/`, three
+error cases, three module fixtures, and two retired -- `err_float_rem.ws` and
+`err_rem_on_number.ws` described rules that are no longer true.
+
+The driver is the other half of the check, because it is what found six of these.
+It dropped its "Two things about W# worth knowing" section, its NaN limitation,
+ninety lines of `ieee.ws`, and the forwarding functions its facade needed; its
+cursor answers `!?Row`; and its six offline cases pass unchanged, which includes
+the page of IEEE-754 vectors now pointed at the new builtin.
+
+---
+
 ## Smaller follow-ups
 
 These are deliberate limitations, each with a clear fix:
@@ -2497,44 +2683,38 @@ These are deliberate limitations, each with a clear fix:
   the top level; anything computed is rejected with a message saying so.
   Supporting the general case needs global storage plus a startup initialiser —
   and the collector would need those globals as roots.
-- **A supertype is a name, not a path.** `struct Sub : Base` resolves `Base`
-  unqualified, so a subtype of a type another module declares -- including one
-  a package facade re-exports -- has to be declared in that module. Every other
-  position takes `pkg.Base`; `StructDecl::parent` would have to become a
-  `TypeExpr` for this one to.
 - **Field access needs a known type.** Structs are nominal with no row
   polymorphism, so `fn getx(p) { return p.x; }` cannot be inferred and asks for
   an annotation instead.
 - **`==` is limited to the integer types, `f64`, `bool` and `str`.** Structs
   still need a decision about identity versus structural equality.
-- **An integer literal is never an `f64`.** Item 9 made a literal take the
-  integer type it is used at, but not a float one: `1.0` must still be written
-  where an `f64` is wanted. The diagnostic now says so in those words rather
-  than reporting a bare mismatch.
-- **`%` is integer-only.** Cranelift has no float remainder, and a float `%`
-  is rejected by inference rather than emulated.
-- **`math.abs` and `math.sign` are `i64`/`f64` overloads**, so a narrow signed
-  value needs a conversion. One generic over `Number` is not available: the
-  abstract type includes the unsigned types, and negation is meaningless there.
-- **An array index is an `i64`.** Every literal index works without saying so,
-  and `i64(i)` covers the rest.
 - **x86-64 and aarch64 only.** The collector reads the frame pointer with
   inline assembly; other architectures get a `compile_error!`.
-- **`g[i][j] = v` is rejected**, because the base of a place must be a variable
-  or a field chain -- a compound assignment evaluates its target twice, and
-  restricting the base is what keeps that unobservable. `var row = g[i];
-  row[j] = v;` is the spelling, and it is correct rather than merely accepted,
-  since an array is a reference. Found while writing item 10's AES, where it
-  cost nothing: the state is a flat sixteen-byte buffer, which is how AES is
-  written anyway.
-- **`wsharp check` accepts a program `wsharp run` rejects**, when a generic
-  call's type variable is never pinned. `var b = array.new(32);` with nothing
-  to say what the elements are passes the first and fails the second with
-  `cannot tell what type main is being used at`, because `check` does not
-  monomorphise. The diagnostic is right; which command reports it is not.
 - **A top-level `const` array can be written through an alias.** `K[0] = 1` is
   rejected, and `var a = K; a[0] = 1;` is not: the second is a local holding
   the same address, and W# has no way to say that a reference is read-only.
   The data is emitted writable rather than read-only for that reason, so the
   mistake is a shared table quietly changing rather than a fault with no
   message.
+
+### Closed by item 13
+
+The eight below were on this list and are not any more. Each is written up in
+item 13; they are kept here as one line apiece so that a reader who remembers
+the limitation finds out where it went.
+
+- **A supertype is a name, not a path** — `StructDecl::parent` is a `TypeExpr`
+  now, so `struct Sub : pkg.Base` resolves as every other type position does.
+- **An integer literal is never an `f64`** — it is, when the `f64` holds the
+  value exactly.
+- **`%` is integer-only** — `f64` has one, through a call, because Cranelift
+  still has no instruction for it.
+- **`math.abs` and `math.sign` are `i64`/`f64` overloads** — one definition over
+  a new abstract type, `Signed`, plus the `f64` one.
+- **An array index is an `i64`** — any integer type indexes.
+- **`g[i][j] = v` is rejected** — the base is evaluated once into a hidden
+  local, which is what the restriction was standing in for.
+- **`wsharp check` accepts a program `wsharp run` rejects** — `check`
+  monomorphises.
+- **A facade cannot present one name from two files** — two re-exports of one
+  name merge into one overload set.

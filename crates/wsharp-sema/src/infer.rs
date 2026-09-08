@@ -262,9 +262,10 @@ enum Constraint {
 enum Need {
     /// `+ - * /` and the ordering comparisons: any number at all.
     Number,
-    /// `% & | ^ << >>` and `~`. `f64` is not enough: `%` has no float form,
-    /// because Cranelift has no float remainder and the language does not
-    /// define one, and a bit pattern is not a thing to ask a float for.
+    /// `& | ^ << >>` and `~`. A bit pattern is not a thing to ask a float for
+    /// -- `f64_bits` is, and says so. `%` used to be here as well, because
+    /// Cranelift has no float remainder; it is a call now, and asks for a
+    /// number like the other four.
     Integer,
     /// Unary `-`. Every signed integer and `f64`, and no unsigned type: `-x`
     /// on a `u8` is not an error the machine reports, it is 256 - x, which is
@@ -296,7 +297,7 @@ impl Need {
     fn help(self) -> &'static str {
         match self {
             Need::Number => "arithmetic works on the integer types and on `f64`",
-            Need::Integer => "the bit operators and `%` work on the integer types",
+            Need::Integer => "the bit operators work on the integer types",
             Need::Signed => "an unsigned type has no negatives; `~x + 1` is the wrapping form",
         }
     }
@@ -1183,27 +1184,80 @@ impl<'a> Inferencer<'a> {
             let ast::Item::Struct(decl) = item else {
                 continue;
             };
-            let (Some(parent_name), Some(id)) =
+            let (Some(written), Some(id)) =
                 (decl.parent.as_ref(), self.struct_named(decl.name.as_str()))
             else {
                 continue;
             };
-            let Some(parent) = self.lookup_struct(parent_name.as_str()) else {
-                if !self.reject_abstract(parent_name.as_str(), parent_name.span) {
-                    self.error(
-                        parent_name.span,
-                        format!("unknown supertype `{parent_name}`"),
-                    )
-                    .help = Some(
-                        "a supertype must be a struct declared in this file, or a status type"
-                            .into(),
-                    );
-                }
+            let Some(parent) = self.resolve_parent(written) else {
                 continue;
             };
             self.structs[id as usize].parent = Some(parent);
             self.store.set_struct_parent(id, parent);
         }
+    }
+
+    /// The struct a `struct : ...` names, reporting what cannot be one.
+    ///
+    /// A name or a path, resolved exactly as any other type position resolves
+    /// one, so a supertype may live in another module and may be reached
+    /// through a facade that re-exports it -- `alias_reexported_types` has
+    /// already run by the time this does. Anything else is refused here rather
+    /// than in the parser, because "is `Base` a struct" is a question only this
+    /// side can answer.
+    fn resolve_parent(&mut self, written: &ast::TypeExpr) -> Option<StructId> {
+        let (found, name, span) = match written {
+            ast::TypeExpr::Named(name) => (
+                self.lookup_struct(name.as_str()),
+                name.to_string(),
+                name.span,
+            ),
+            ast::TypeExpr::Path { segments, args, .. } => {
+                let name = segments.last().expect("a path has a last segment");
+                if !args.is_empty() {
+                    // A generic struct stands outside the dispatch lattice, so
+                    // there is no instantiation of one to inherit from either.
+                    self.error(
+                        written.span(),
+                        format!("`{name}` is generic, so it cannot be a supertype"),
+                    )
+                    .help = Some(
+                        "type ids are fixed before a generic struct has instantiations".into(),
+                    );
+                    return None;
+                }
+                let found = match self.split_path(segments) {
+                    Some(module) => {
+                        let found = self.lookup_struct_in(&module, name.as_str());
+                        if found.is_some() {
+                            let key = format!("{module}.{name}");
+                            self.check_visible(&key, name);
+                        }
+                        found
+                    }
+                    None if segments.len() == 1 => self.lookup_struct(name.as_str()),
+                    None => {
+                        self.report_unknown_module(segments);
+                        return None;
+                    }
+                };
+                (found, name.to_string(), name.span)
+            }
+            other => {
+                let at = other.span();
+                self.error(at, "a supertype must be a struct").help =
+                    Some("only a struct type has subtypes".into());
+                return None;
+            }
+        };
+        if found.is_none() && !self.reject_abstract(&name, span) {
+            self.error(span, format!("unknown supertype `{name}`")).help = Some(
+                "a supertype must be a struct in scope -- write `pkg.Base` for one another \
+                 module declares -- or a status type"
+                    .into(),
+            );
+        }
+        found
     }
 
     /// Break cycles before anything walks a parent chain.
@@ -1452,10 +1506,31 @@ impl<'a> Inferencer<'a> {
 
                 let local = self.reexports[i].local.clone();
                 let key = self.key_in(self.current, local.as_str());
+                // Two re-exports of one name merge into one overload set.
+                //
+                // A facade presenting a package of several files is the case:
+                // `render` may be an overload set in two of them, and a facade
+                // binds one name to one thing -- so it had to forward by hand,
+                // writing out a function per member to say what `pub const
+                // render = ..` already says. An overload set is exactly what
+                // "only functions may share a name" promises, and this is a
+                // second name for two sets rather than for one.
+                //
+                // Only when the name this module already has is *itself* a
+                // re-export. A re-export beside a declaration of this module's
+                // own is a module shadowing its own name with a foreign one,
+                // which stays a clash -- see `err_reexport_clash.ws`. And not
+                // with an annotation, which picks one member out of a set and
+                // so has nothing to merge with.
+                let merging = self.reexports[i].annotation.is_none()
+                    && self.reexported.contains(&key)
+                    && matches!(found, Some(GlobalRef::Func(_)))
+                    && matches!(self.globals.get(&key), Some(GlobalRef::Func(_)));
                 // A name this module already has, and that this re-export did
                 // not give it. `aliased_type` is what tells the two apart:
                 // without it, the type pass's own key would read as a clash.
-                if !self.reexports[i].aliased_type
+                if !merging
+                    && !self.reexports[i].aliased_type
                     && (self.has_global(local.as_str())
                         || self.struct_named(local.as_str()).is_some())
                 {
@@ -1500,8 +1575,27 @@ impl<'a> Inferencer<'a> {
                     }
                     None => global,
                 };
+                let global = match (
+                    merging.then(|| self.globals.get(&key).cloned()).flatten(),
+                    global,
+                ) {
+                    (Some(GlobalRef::Func(have)), GlobalRef::Func(more)) => {
+                        let mut ids = have;
+                        for id in more {
+                            if !ids.contains(&id) {
+                                ids.push(id);
+                            }
+                        }
+                        GlobalRef::Func(ids)
+                    }
+                    (_, global) => global,
+                };
                 self.globals.insert(key.clone(), global);
-                self.global_spans.insert(key.clone(), local.span);
+                // The first line to bind the name keeps the span, so a later
+                // clash still points at where the name came from.
+                if !merging {
+                    self.global_spans.insert(key.clone(), local.span);
+                }
                 self.reexported.insert(key);
             }
             if !installed {
@@ -2546,7 +2640,10 @@ impl<'a> Inferencer<'a> {
             }
 
             ast::Stmt::Assign(assign) => {
-                let (place, target_ty) = self.infer_place(&assign.target)?;
+                // Whatever the target's base needs evaluated first: one hidden
+                // `let` per level, so `g[i][j] += v` reads `g[i]` once.
+                let mut prologue = Vec::new();
+                let (place, target_ty) = self.infer_place(&assign.target, &mut prologue)?;
                 let value = if let Some(op) = assign.op {
                     // `x += e` is checked as `x = x + e`, so the operand rules
                     // (numeric, matching types) apply unchanged.
@@ -2557,7 +2654,12 @@ impl<'a> Inferencer<'a> {
                     self.infer_expr(&assign.value)
                 };
                 let value = self.coerce(value, &target_ty, "this assignment");
-                Some(hir::Stmt::Assign { place, value })
+                let assign = hir::Stmt::Assign { place, value };
+                if prologue.is_empty() {
+                    return Some(assign);
+                }
+                prologue.push(assign);
+                Some(hir::Stmt::Block(hir::Block { stmts: prologue }))
             }
 
             ast::Stmt::Expr(expr) => Some(hir::Stmt::Expr(self.infer_expr(expr))),
@@ -3556,9 +3658,50 @@ impl<'a> Inferencer<'a> {
         }
     }
 
+    /// Evaluate the base of a place once, into a hidden local.
+    ///
+    /// A compound assignment is checked and lowered as `x = x <op> e`, so the
+    /// target is read and then written and its base expression appears twice.
+    /// That used to be handled by refusing any base but a variable or a field
+    /// chain, which made `g[i][j] = v` a type error -- and `var row = g[i];
+    /// row[j] = v;` the spelling, which is correct rather than merely accepted,
+    /// since an array is a reference. This does the same thing without asking:
+    /// one evaluation, into a local nothing can name, and re-reading a local is
+    /// free.
+    ///
+    /// A base that is already a variable or a field chain is left alone, so
+    /// nothing that compiled before gains a local.
+    fn hoist_place_base(
+        &mut self,
+        base: &'a ast::Expr,
+        prologue: &mut Vec<hir::Stmt>,
+    ) -> hir::Expr {
+        let value = self.infer_expr(base);
+        if is_place_base(base) {
+            return value;
+        }
+        let span = base.span();
+        let ty = value.ty.clone();
+        // Bracketed, so it cannot collide with anything the user can write.
+        let local = self.frame().add_local("[place]", ty.clone(), false, span);
+        prologue.push(hir::Stmt::Let { local, init: value });
+        hir::Expr {
+            kind: hir::ExprKind::Local(local),
+            ty,
+            span,
+        }
+    }
+
     /// Resolve an assignment target, returning the place and the type stored
     /// there.
-    fn infer_place(&mut self, target: &'a ast::Expr) -> Option<(hir::Place, Type)> {
+    ///
+    /// Anything the target's base needs evaluated first goes into `prologue`,
+    /// which the caller emits ahead of the assignment.
+    fn infer_place(
+        &mut self,
+        target: &'a ast::Expr,
+        prologue: &mut Vec<hir::Stmt>,
+    ) -> Option<(hir::Place, Type)> {
         match target {
             ast::Expr::Ident(name)
                 if matches!(
@@ -3606,17 +3749,8 @@ impl<'a> Inferencer<'a> {
             },
             ast::Expr::Field { obj, name, .. } => {
                 // A compound assignment reads the place and writes it back, so
-                // the object expression is evaluated twice. Restricting the base
-                // to a variable or field chain keeps that from being observable.
-                if !is_place_base(obj) {
-                    self.error(obj.span(), "cannot assign through this expression")
-                        .help = Some(
-                        "the left of a `.` in an assignment must be a variable or a field of one"
-                            .into(),
-                    );
-                    return None;
-                }
-                let obj = self.infer_expr(obj);
+                // the object expression would otherwise be evaluated twice.
+                let obj = self.hoist_place_base(obj, prologue);
                 let (strukt, index, ty) = self.field_of(&obj.ty, name);
                 Some((
                     hir::Place::Field {
@@ -3629,16 +3763,6 @@ impl<'a> Inferencer<'a> {
                 ))
             }
             ast::Expr::Index { obj, index, .. } => {
-                // As for a field: a compound assignment evaluates the target
-                // twice, so the base has to be something re-reading is free of.
-                if !is_place_base(obj) {
-                    self.error(obj.span(), "cannot assign through this expression")
-                        .help = Some(
-                        "the left of a `[` in an assignment must be a variable or a field of one"
-                            .into(),
-                    );
-                    return None;
-                }
                 // A top-level `const` array is one object shared by every
                 // worker in the process. W# has no mutable globals -- the
                 // workers' design rests on it, since a worker's state has to
@@ -3656,7 +3780,12 @@ impl<'a> Inferencer<'a> {
                     );
                     return None;
                 }
-                let (arr, index, elem) = self.infer_index(obj, index);
+                // As for a field: evaluated once, so a compound assignment can
+                // read the place and write it back. `g[i][j] = v` is what this
+                // makes writable.
+                let at = obj.span();
+                let arr = self.hoist_place_base(obj, prologue);
+                let (arr, index, elem) = self.index_into(arr, at, index);
                 Some((hir::Place::Index { arr, index }, elem))
             }
             other => {
@@ -3693,9 +3822,43 @@ impl<'a> Inferencer<'a> {
         index: &'a ast::Expr,
     ) -> (hir::Expr, hir::Expr, Type) {
         let arr = self.infer_expr(obj);
+        let at = obj.span();
+        self.index_into(arr, at, index)
+    }
+
+    /// The same, over an array expression that has already been inferred.
+    ///
+    /// Split out for [`Self::infer_place`], which may need the array evaluated
+    /// into a hidden local first.
+    fn index_into(
+        &mut self,
+        arr: hir::Expr,
+        at: Span,
+        index: &'a ast::Expr,
+    ) -> (hir::Expr, hir::Expr, Type) {
         let index = self.infer_expr(index);
-        let index = self.coerce(index, &Type::i64(), "this index");
-        let elem = self.element_of(&arr.ty, obj.span());
+        // Any integer type indexes. An index is an `i64` at the machine level,
+        // so a narrower one is widened here -- signed or unsigned as its own
+        // type says, which is what `Convert` already answers for `i64(x)`.
+        //
+        // Written rather than inferred is the rule for conversions *between*
+        // numeric types, because a silent widening is how a 32-bit hash quietly
+        // becomes a 64-bit one. This is not that: an index is not a value the
+        // program keeps, it is an argument to one operation whose type is fixed,
+        // and `i64(i)` at every subscript said nothing a reader did not know.
+        //
+        // A `u64` past `i64`'s range arrives negative and is caught anyway: the
+        // bounds check is one *unsigned* compare, so it is out of range in the
+        // same instruction that catches a negative `i64`.
+        let index = match self.store.resolve(&index.ty) {
+            Type::Con(TyCon::Int(t), _) if t != IntTy::I64 => hir::Expr {
+                span: index.span,
+                ty: Type::i64(),
+                kind: hir::ExprKind::Convert(Box::new(index)),
+            },
+            _ => self.coerce(index, &Type::i64(), "this index"),
+        };
+        let elem = self.element_of(&arr.ty, at);
         (arr, index, elem)
     }
 
@@ -4632,7 +4795,10 @@ impl<'a> Inferencer<'a> {
                 ty: lhs.ty.clone(),
                 span,
                 op: op.text(),
-                need: if op == BinOp::Rem || op.is_bitwise() {
+                // `%` asks for a number like the other four arithmetic
+                // operators: `f64` has a remainder now, so only the bit
+                // operators are left needing an integer.
+                need: if op.is_bitwise() {
                     Need::Integer
                 } else {
                     Need::Number
@@ -5001,6 +5167,28 @@ impl<'a> Inferencer<'a> {
             }
         }
 
+        // Tell each surviving case what it is being called at, wherever the
+        // argument already says.
+        //
+        // The trial unifications above were rolled back so that one candidate
+        // could not pin an argument for the next -- which also undid the
+        // bindings that told a *generic* candidate which type it is. Where the
+        // argument is concrete there is nothing of the caller's left to pin:
+        // the only variables such a unification can reach are the candidate's
+        // own, freshly instantiated by `func_type` a few lines above. So this
+        // is the half of the rollback that has to be redone, and doing it here
+        // rather than after `ret` is taken is the point: `fn next[T](it:
+        // Iter[T]) ?T` called with an `Iter[Row]` otherwise answers `?T` with
+        // `T` unbound, and a `for` over a list of structs ends up with a loop
+        // variable whose type nothing ever decides.
+        for cand in &cands {
+            for (param, arg) in cand.params.iter().zip(&arg_tys) {
+                if !self.store.has_unbound(arg) {
+                    let _ = self.store.try_unify(param, arg);
+                }
+            }
+        }
+
         // Every case must produce the same type, because the call site has one.
         let ret = cands[0].ret.clone();
         for cand in &cands[1..] {
@@ -5059,6 +5247,45 @@ impl<'a> Inferencer<'a> {
                 if matches!(self.store.resolve(decl), Type::Con(TyCon::Abstract(_), _)) {
                     let _ = self.store.try_unify(param, arg);
                 }
+            }
+        }
+
+        // Ask `overlap` again, now that every argument has settled.
+        //
+        // The tests were taken against the arguments as they stood before the
+        // loop above pinned the open ones, and an argument that was still a
+        // variable overlaps *every* candidate without needing a test --
+        // `try_unify` against a variable always succeeds. Left at that, a call
+        // that has to choose at run time compiles into a static call to the
+        // most specific case, which is a wrong answer with no diagnostic
+        // attached. So the tests are recomputed from the settled types, under
+        // a snapshot for the same reason the first pass used one.
+        let settled: Vec<Type> = hir_args.iter().map(|a| a.ty.clone()).collect();
+        for cand in &mut cands {
+            let positions: Vec<(Type, Type)> = cand
+                .params
+                .iter()
+                .cloned()
+                .zip(cand.decl_params.iter().cloned())
+                .collect();
+            let snapshot = self.store.snapshot();
+            let mut tests = Vec::with_capacity(settled.len());
+            for ((param, decl), arg) in positions.iter().zip(&settled) {
+                match self.overlap(arg, param, decl) {
+                    Some(test) => tests.push(test),
+                    // Settling proved this case cannot apply after all. Leave
+                    // the tests it had: dropping the candidate here would
+                    // renumber the table, and a case that never matches costs
+                    // one compare.
+                    None => {
+                        tests.clear();
+                        break;
+                    }
+                }
+            }
+            self.store.rollback_to(snapshot);
+            if tests.len() == settled.len() {
+                cand.tests = tests;
             }
         }
 
@@ -5628,6 +5855,16 @@ impl<'a> Inferencer<'a> {
     // Coercion, unification helpers
     // -----------------------------------------------------------------------
 
+    /// Whether this type is one an integer literal may simply become.
+    ///
+    /// Every integer type, and `f64`. Anything else and the literal settles to
+    /// its default first, so that what happens next is a wrap or a mismatch
+    /// about `i64` rather than about a variable nobody wrote.
+    fn wants_a_number(&mut self, target: &Type) -> bool {
+        let resolved = self.store.resolve(target);
+        resolved.as_int().is_some() || matches!(resolved, Type::Con(TyCon::F64, _))
+    }
+
     /// Unify, reporting a readable mismatch on failure.
     fn expect(&mut self, actual: &Type, expected: &Type, span: Span, what: &str) {
         if let Err(err) = self.store.unify(actual, expected) {
@@ -5669,27 +5906,56 @@ impl<'a> Inferencer<'a> {
     /// work in a function declared `!i64`, and `return 1;` in one declared
     /// `?i64`.
     fn coerce(&mut self, expr: hir::Expr, target: &Type, what: &str) -> hir::Expr {
+        let (expr, failed) = self.try_coerce(expr, target);
+        if let Some(err) = failed {
+            self.report_unify_error(err, &expr.ty, target, expr.span, what);
+        }
+        expr
+    }
+
+    /// The whole of [`Self::coerce`] bar the diagnostic, so that a step can be
+    /// attempted and abandoned.
+    ///
+    /// Split out because the wrapping step *composes*: `Sub` reaches `!Base` by
+    /// widening and then wrapping, and `Row` reaches `!?Row` by wrapping twice.
+    /// Each of those used to be a type error -- the steps existed and were not
+    /// put together -- and the workaround was an annotated binding per
+    /// conversion, which `std/x509` and `std/toml` were both written around.
+    /// Trying a step means it may fail, and a failed attempt must leave nothing
+    /// behind: both the bindings and the constraints it made are rolled back,
+    /// so the diagnostic the outermost call reports is still about the type the
+    /// caller actually wrote.
+    ///
+    /// The expression comes back either way -- `None` is success -- because a
+    /// failure still has to hand it to whoever will report about it, and a
+    /// `Result` whose two variants both carry one says less than it costs.
+    fn try_coerce(&mut self, expr: hir::Expr, target: &Type) -> (hir::Expr, Option<UnifyError>) {
         // An integer literal has no type of its own until something asks for
         // one. If an integer type is what is being asked for, it simply
         // becomes that -- which is what makes `0xff` a `u8` here and a `u32`
-        // there. Anything else and it settles for `i64` first, so that it is
-        // *wrapped* into a `?i64` rather than becoming one, and so that a
-        // literal where a `str` is wanted still reads "has type `i64`,
-        // expected `str`" rather than naming a variable nobody wrote.
+        // there. `f64` counts as asking, so `const x: f64 = 1;` is a float
+        // literal written without its point; monomorphisation turns the node
+        // into one once the type is settled, and the `IntLiteral` constraint
+        // refuses a value an `f64` cannot hold exactly.
+        //
+        // Anything else and it settles for `i64` first, so that it is *wrapped*
+        // into a `?i64` rather than becoming one, and so that a literal where a
+        // `str` is wanted still reads "has type `i64`, expected `str`" rather
+        // than naming a variable nobody wrote.
         if let hir::ExprKind::Int(value) = expr.kind
             && matches!(self.store.resolve(&expr.ty), Type::Var(_))
-            && self.store.resolve(target).as_int().is_none()
+            && !self.wants_a_number(target)
         {
             let _ = self.store.unify(&expr.ty, &default_int_ty(value));
         }
         let Err(direct) = self.store.try_unify_checked(&expr.ty, target) else {
-            return expr;
+            return (expr, None);
         };
         // Widening to a supertype. Free at run time: a subtype's layout starts
         // with a copy of its supertype's, and every struct is one pointer slot,
         // so there is nothing to emit.
         if self.store.is_sub_ty(&expr.ty, target) {
-            return expr;
+            return (expr, None);
         }
         let resolved = self.store.resolve(target);
         // `error.X` written where an `error` value is wanted -- next to a
@@ -5705,11 +5971,14 @@ impl<'a> Inferencer<'a> {
                 widens: false,
                 span: expr.span,
             });
-            return hir::Expr {
-                kind: expr.kind,
-                ty: resolved,
-                span: expr.span,
-            };
+            return (
+                hir::Expr {
+                    kind: expr.kind,
+                    ty: resolved,
+                    span: expr.span,
+                },
+                None,
+            );
         }
         // A narrower error set where a wider one is wanted. Free at run time --
         // the tag is the same number -- and exactly the widening `try` does
@@ -5724,30 +5993,73 @@ impl<'a> Inferencer<'a> {
             && have_set.iter().all(|e| want_set.contains(e))
             && self.store.try_unify(&have[0].clone(), &want[0].clone())
         {
-            return expr;
+            return (expr, None);
+        }
+        // An `error` value where an error union is wanted: re-raising something
+        // that was caught. `catch |e|` binds the error and there was no way to
+        // hand it on, so a function that wanted to pass one through had to test
+        // for the case it meant to handle *before* the call rather than catch
+        // it after -- which is why `std/fs.mkdir_all` asks the filesystem three
+        // questions instead of catching `AlreadyExists`.
+        //
+        // The same subset edge `try` contributes, because this is the same
+        // thing said with a value instead of a control flow: what arrives must
+        // be something this function is allowed to raise.
+        if let (Type::Con(TyCon::ErrUnion, want), Type::Con(TyCon::Error, have)) =
+            (&resolved, &self.store.resolve(&expr.ty))
+        {
+            self.constraints.push(Constraint::ErrorSubset {
+                sub: have[0].clone(),
+                sup: want[1].clone(),
+                span: expr.span,
+            });
+            let span = expr.span;
+            return (
+                hir::Expr {
+                    kind: hir::ExprKind::Raise(Box::new(expr)),
+                    ty: resolved,
+                    span,
+                },
+                None,
+            );
         }
         let wrap = match &resolved {
             Type::Con(TyCon::Optional, args) => Some((args[0].clone(), true)),
             Type::Con(TyCon::ErrUnion, args) => Some((args[0].clone(), false)),
             _ => None,
         };
-        if let Some((inner, is_optional)) = wrap
-            && self.store.try_unify(&expr.ty, &inner)
-        {
-            let span = expr.span;
-            let kind = if is_optional {
-                hir::ExprKind::Some(Box::new(expr))
-            } else {
-                hir::ExprKind::Ok(Box::new(expr))
-            };
-            return hir::Expr {
-                kind,
-                ty: resolved,
-                span,
-            };
+        if let Some((inner, is_optional)) = wrap {
+            // Fit the value to what the wrapper holds, by every rule above
+            // including this one: that is what makes `Sub` reach `!Base` and
+            // `Row` reach `!?Row`. Speculative, so the store and the constraint
+            // list are put back if it does not.
+            let snapshot = self.store.snapshot();
+            let pending = self.constraints.len();
+            match self.try_coerce(expr, &inner) {
+                (inner_expr, None) => {
+                    let span = inner_expr.span;
+                    let kind = if is_optional {
+                        hir::ExprKind::Some(Box::new(inner_expr))
+                    } else {
+                        hir::ExprKind::Ok(Box::new(inner_expr))
+                    };
+                    return (
+                        hir::Expr {
+                            kind,
+                            ty: resolved,
+                            span,
+                        },
+                        None,
+                    );
+                }
+                (expr, Some(_)) => {
+                    self.store.rollback_to(snapshot);
+                    self.constraints.truncate(pending);
+                    return (expr, Some(direct));
+                }
+            }
         }
-        self.report_unify_error(direct, &expr.ty, target, expr.span, what);
-        expr
+        (expr, Some(direct))
     }
 
     /// Resolve `obj.field`. When the object's type is not yet known the work is
@@ -6020,6 +6332,26 @@ impl<'a> Inferencer<'a> {
             .help = Some(format!("`{name}` holds {lo} to {hi}"));
     }
 
+    /// An integer literal used at an `f64` must be a value an `f64` *is*.
+    ///
+    /// Not a range check: `f64` reaches far past `i64` and is exact for none of
+    /// the top of it. Above 2^53 only the multiples of the current power of two
+    /// are representable, so the honest test is the round trip -- which is also
+    /// what makes `9007199254740993` an error and `9007199254740992` fine. A
+    /// silent rounding here would be a constant that is quietly not the number
+    /// somebody wrote.
+    fn check_literal_is_exact_as_f64(&mut self, value: i128, span: Span) {
+        if (value as f64) as i128 == value {
+            return;
+        }
+        self.error(span, format!("`{value}` is not exactly an `f64`"))
+            .help = Some(
+            "an `f64` holds every integer up to 2^53 and only some above it -- write the value \
+             this rounds to if that is what you meant"
+                .into(),
+        );
+    }
+
     fn solve_constraints(&mut self) {
         let constraints = std::mem::take(&mut self.constraints);
         // Which variables an abstract type already holds to a set of concrete
@@ -6146,9 +6478,12 @@ impl<'a> Inferencer<'a> {
                     }
                     let names = self.show_err_set(&missing);
                     let shown = self.show_err_set(&sup);
+                    // Not "`try` propagates": a caught error handed on with
+                    // `return e;` arrives here too, and this is the one
+                    // sentence that is true of both.
                     self.error(
                         span,
-                        format!("`try` propagates `{names}`, which this function cannot raise"),
+                        format!("this raises `{names}`, which this function cannot"),
                     )
                     .help = Some(format!(
                         "this function's error set is `{shown}`; widen it, or catch what it \
@@ -6197,14 +6532,25 @@ impl<'a> Inferencer<'a> {
                             // every member -- the caller picks, not the body.
                             if let Some(&id) = constrained.get(&v) {
                                 for member in abstract_members(id) {
-                                    if let Some(t) = member.as_int() {
-                                        self.check_literal_fits(t, value, span);
+                                    match member.as_int() {
+                                        Some(t) => self.check_literal_fits(t, value, span),
+                                        None if matches!(member, Type::Con(TyCon::F64, _)) => {
+                                            self.check_literal_is_exact_as_f64(value, span);
+                                        }
+                                        None => {}
                                     }
                                 }
                             }
                         }
                         ref other => match other.as_int() {
                             Some(t) => self.check_literal_fits(t, value, span),
+                            // `f64` takes an integer literal too, when it can
+                            // hold the value exactly. Monomorphisation turns
+                            // the node into a float literal once the type is
+                            // settled; all that is left here is the value.
+                            None if matches!(other, Type::Con(TyCon::F64, _)) => {
+                                self.check_literal_is_exact_as_f64(value, span);
+                            }
                             None => {
                                 let shown = self.store.show(other);
                                 self.error(
@@ -6214,7 +6560,8 @@ impl<'a> Inferencer<'a> {
                                     ),
                                 )
                                 .help = Some(
-                                    "an integer literal takes the type it is used at, and there                                      is no integer type here -- write `1.0` rather than `1` for                                      an `f64`"
+                                    "an integer literal takes the type it is used at, and this is \
+                                     not a numeric type"
                                         .into(),
                                 );
                             }
@@ -6954,6 +7301,7 @@ fn patch_targs_expr(expr: &mut hir::Expr, targs_for: &HashMap<hir::FuncId, Vec<T
         | hir::ExprKind::Unary { expr, .. }
         | hir::ExprKind::Some(expr)
         | hir::ExprKind::Ok(expr)
+        | hir::ExprKind::Raise(expr)
         | hir::ExprKind::Try(expr)
         | hir::ExprKind::Unwrap(expr)
         | hir::ExprKind::Field { obj: expr, .. } => patch_targs_expr(expr, targs_for),
@@ -7082,6 +7430,7 @@ fn fixup_expr(expr: &mut hir::Expr, structs: &[hir::StructDef], store: &mut Type
         | hir::ExprKind::Unary { expr, .. }
         | hir::ExprKind::Some(expr)
         | hir::ExprKind::Ok(expr)
+        | hir::ExprKind::Raise(expr)
         | hir::ExprKind::Try(expr)
         | hir::ExprKind::Unwrap(expr) => fixup_expr(expr, structs, store),
         hir::ExprKind::Binary { lhs, rhs, .. } | hir::ExprKind::Logical { lhs, rhs, .. } => {

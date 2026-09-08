@@ -4,13 +4,17 @@
 // comparing two numbers says nothing about which kind they are: each is a
 // constrained generic, compiled once per type it is used at.
 //
-// `abs` and `sign` cannot be, and the reason changed when item 9 landed. It
-// used to be that they compare against a literal zero and an integer literal
-// was an `i64`, so a single definition would pin `Number` to `i64` at the
-// comparison; `comptime_int` retired that. What stands instead is that both
-// negate, and negation is meaningless on an unsigned type -- which `Number`
-// includes. They are an overload set for that reason, and a narrow signed
-// value needs a conversion to use one.
+// `abs` and `sign` are written over `Signed`, which is the four signed integer
+// types. Not `Number` and not `Integer`: both bodies negate, and negation is
+// meaningless on an unsigned type -- `-x` on a `u8` is 256 - x, which is the
+// kind of wrong that survives to production. That is what kept these an
+// `i64`/`f64` overload set until there was an abstract type saying so, and why
+// a narrow signed value used to need a conversion to use one.
+//
+// `f64` is not in `Signed` and so keeps an overload of its own here. The two
+// are disjoint, so there is nothing to be ambiguous about; what stops the
+// generic one covering both is the literal zero each body compares against,
+// which is an integer literal and has no `f64` reading yet.
 //
 // The rest are `f64` machine instructions and come from the builtin table.
 
@@ -24,7 +28,13 @@ pub fn max(a: Number, b: Number) {
     return b;
 }
 
-pub fn abs(x: i64) i64 {
+/// `x` without its sign.
+///
+/// One definition for every signed integer width, compiled once per width it
+/// is used at. `abs(i64::MIN)` is `i64::MIN`, as it is everywhere else here:
+/// `-` wraps, and the one value with no positive counterpart cannot be given
+/// one.
+pub fn abs(x: Signed) {
     if (x < 0) { return -x; }
     return x;
 }
@@ -35,7 +45,7 @@ pub fn abs(x: f64) f64 {
 }
 
 /// The sign of `x`: -1, 0 or 1.
-pub fn sign(x: i64) i64 {
+pub fn sign(x: Signed) {
     if (x < 0) { return -1; }
     if (x > 0) { return 1; }
     return 0;
