@@ -6,6 +6,8 @@
 //                       did not finish, and `gc` removes it
 // env/<hex>.lock        a lockfile some project resolved to, which is what
 //                       `gc` reaches store entries through
+// git/<hex>             which tree a git revision was found to be
+// registry/<hex>        which commit and tree a registry index was fetched at
 // ```
 //
 // **An install is a `rename`.** A fetch builds the tree under `tmp/`, hashes
@@ -67,6 +69,7 @@ pub fn prepare(f: fault.Fault, h: str) void {
     make(f, scratch(h));
     make(f, environments(h));
     make(f, fetches(h));
+    make(f, indexes(h));
     return;
 }
 
@@ -293,6 +296,70 @@ pub fn remember(f: fault.Fault, h: str, source: str, digest: str) void {
     const file = path.join(fetches(h), bytes.to_hex(hash.sha256(bytes.of(source))));
     io.write_file(file, digest) catch fault.fail_at(f, file, "cannot be written");
     return;
+}
+
+// ---------------------------------------------------------------------------
+// Remembering an index
+// ---------------------------------------------------------------------------
+//
+// A registry's index is fetched like anything else and lands in an ordinary
+// store entry, so it gets the atomic publish and the damage check for nothing.
+// What it does *not* get is the memo above: a git revision names one tree for
+// ever and a *branch* does not, so this is a separate file that `ingot update`
+// overwrites rather than a second key in something built never to be
+// invalidated. Confusing the two would make `ingot update` a no-op.
+//
+// One line, `<commit>\t<digest>`: which commit was fetched, and which entry its
+// tree became. The commit is not needed to find the files and is kept because
+// "what am I resolving against" is the question an index makes people ask.
+
+pub fn indexes(h: str) str { return path.join(h, "registry"); }
+
+/// A registry index that has been fetched.
+pub const Fetched = struct { commit: str, digest: str };
+
+fn pointer(h: str, url: str) str {
+    return path.join(indexes(h), bytes.to_hex(hash.sha256(bytes.of(url))));
+}
+
+fn read_pointer(file: str) ?Fetched {
+    if (!io.exists(file)) { return null; }
+    const line = text.trim(io.read_file(file) catch return null);
+    const tab = text.find(line, "\t");
+    if (tab < 0) { return null; }
+    const digest = text.substr(line, tab + 1, text.len(line));
+    if (text.len(digest) != 64) { return null; }
+    return Fetched{ .commit = text.substr(line, 0, tab), .digest = digest };
+}
+
+/// What was last fetched for this registry, if anything was.
+pub fn index_at(h: str, url: str) ?Fetched { return read_pointer(pointer(h, url)); }
+
+pub fn remember_index(f: fault.Fault, h: str, url: str, commit: str, digest: str) void {
+    make(f, indexes(h));
+    if (!f.ok) { return; }
+    const file = pointer(h, url);
+    io.write_file(file, text.concat(commit, text.concat("\t", digest)))
+        catch fault.fail_at(f, file, "cannot be written");
+    return;
+}
+
+/// Every index this store is holding, as digests.
+///
+/// What `gc` needs: an index is reached by a pointer file rather than by a
+/// lockfile, so without this the first collection after an update deletes the
+/// registry and the next resolve fetches it again.
+pub fn held_indexes(h: str) []str {
+    const dir = indexes(h);
+    if (!fs.is_dir(dir)) { return []str{}; }
+    const names = fs.read_dir(dir) catch return []str{};
+    var out = []str{};
+    for (names) |name| {
+        if (read_pointer(path.join(dir, name))) |fetched| {
+            out = array.push(out, fetched.digest);
+        }
+    }
+    return out;
 }
 
 /// What `verify` answers about one entry.

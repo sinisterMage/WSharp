@@ -1375,6 +1375,7 @@ pub fn ingot_module_sources() -> &'static [(&'static str, &'static str)] {
         (INGOT_PKTLINE_MODULE, include_str!("ingot/pktline.ws")),
         (INGOT_PACKFILE_MODULE, include_str!("ingot/packfile.ws")),
         (INGOT_GIT_MODULE, include_str!("ingot/git.ws")),
+        (INGOT_REGISTRY_MODULE, include_str!("ingot/registry.ws")),
         (INGOT_MAIN_MODULE, include_str!("ingot/main.ws")),
     ]
 }
@@ -1388,6 +1389,7 @@ pub const INGOT_PLAN_MODULE: &str = "ingot/plan";
 pub const INGOT_PKTLINE_MODULE: &str = "ingot/pktline";
 pub const INGOT_PACKFILE_MODULE: &str = "ingot/packfile";
 pub const INGOT_GIT_MODULE: &str = "ingot/git";
+pub const INGOT_REGISTRY_MODULE: &str = "ingot/registry";
 /// The verbs, and the module the `ingot` binary runs.
 pub const INGOT_MAIN_MODULE: &str = "ingot/main";
 

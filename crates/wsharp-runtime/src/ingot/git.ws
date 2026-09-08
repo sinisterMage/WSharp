@@ -114,6 +114,20 @@ pub fn parse_refs(f: fault.Fault, body: str) ?list.List[Ref] {
     return out;
 }
 
+/// The object id a reference has, or null.
+///
+/// Beside the other byte-level functions rather than in the caller, because
+/// "which commit is `refs/heads/main`?" is a question about an `ls-refs` answer
+/// and is testable against a recorded one. It is also the step that lets a
+/// *branch* be fetched at all: `fetch` wants a full object id, and a registry
+/// is named by its branch rather than by a revision that would never move.
+pub fn ref_id(refs: list.List[Ref], name: str) ?str {
+    for (list.to_array(refs)) |r| {
+        if (text.eq(r.name, name)) { return r.id; }
+    }
+    return null;
+}
+
 /// The body of a `fetch` request for one commit.
 ///
 /// `deepen 1` makes it a shallow fetch: one commit and the tree under it, which

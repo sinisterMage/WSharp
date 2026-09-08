@@ -670,6 +670,44 @@ extra `sin_len` byte out of this code entirely.
   table or a message and a line, and everything under `ingot`'s verbs takes a
   `Fault` and writes into it. The first failure wins in both: a recursive
   descent reader that has lost its place invents the rest.
+- **A registry is a directory, and fetching one over git is only how the
+  directory arrives.** `registry.open` takes a path; `INGOT_REGISTRY` naming an
+  existing directory is used where it lies, with no certificate store read and
+  no socket opened. That is what makes a private registry, an offline checkout
+  and the whole of `tests/cases/ingot_registry.ws` the same case as the public
+  one -- the git client speaks HTTP, and no case in this suite may stand up a
+  server. `crates/wsharp-cli/tests/verbs.rs` therefore points `INGOT_REGISTRY`
+  at a directory on **every** invocation, whether or not the test uses a
+  registry: the variable falls back to the public URL, so a test that left it
+  unset resolves against the real Foundry over the real network.
+- **A published version is never edited, and the fetch memo is why.**
+  `store.remembered` maps a source string to a tree digest and never
+  invalidates it, so `reg+acme/json@1.2.0` must name one tree for ever. The
+  registry's CI enforces it; a mistake is a new version, and a withdrawal is
+  `yanked = true`, which is filtered out of *selection* and stays readable
+  because a lockfile that already names it must still install. An index, by
+  contrast, does change -- which is why `store.index_at`/`remember_index` is a
+  separate pointer file rather than a second key in the memo, and why `ingot
+  update` exists at all.
+- **A registry release carries its tree hash, so resolving fetches nothing.** A
+  git dependency must be fetched during `resolve` because only the fetched tree
+  holds the manifest saying what it depends on; a registry entry *is* that data
+  and also names the store key. So `Source.tree` non-empty means "do not hash a
+  directory, this is the answer", and `install`'s existing refusal of a digest
+  that is not the lockfile's becomes the integrity check. Anything that makes a
+  registry entry's tree not the tree that gets installed breaks that silently.
+- **A path or git dependency overrides the registry for the name it supplies.**
+  `plan.from_registry` skips a name `locally` already answers, or the solver
+  would be offered published versions of a package somebody is editing beside
+  their project and could choose one.
+- **`registry.package` answers null two ways, and the caller must tell them
+  apart.** Null with `f.ok` still true means the registry does not hold it --
+  the caller writes that sentence, because which package and what asked for it
+  is known one level up. Null with a fault means the entry is there and
+  unreadable, and that message is already better. Getting the test backwards
+  produces *no* message rather than a wrong one, because `fault.fail` keeps the
+  first failure; that shipped once and `ingot add acme/nope` exited 4 in
+  silence.
 - **The store's tree hash is defined in `ingot/store.ws` and nowhere else.** A
   key two versions of ingot compute differently is a store that silently splits
   in half, so the definition is written out: SHA-256 over each entry sorted by

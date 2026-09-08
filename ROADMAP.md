@@ -2211,10 +2211,81 @@ since item 6. A facade is a forwarding function that hides where things came
 from, so it finds every place the compiler was quietly relying on "the user
 imported it directly".
 
+### Stage six: a place for versions to come from
+
+The four stages above built everything a registry needs and no registry. A
+version dependency parsed, walked the graph, and was refused by one line saying
+`ingot cannot yet fetch one` -- which was the honest thing to say and the thing
+this stage deletes.
+
+The registry is **Foundry**, a git repository beside this one, in the shape of
+Julia's General: `packages/<owner>/<name>/` holding a `package.toml` that says
+where the source is and a `versions.toml` with one `[[version]]` per release.
+Plain TOML, read with `std/toml`, fetched with the client stage four wrote.
+
+Four decisions are the whole of it.
+
+**An index rather than a protocol.** A resolver has to know what versions exist
+before it can choose between them, and asking a git host that one package at a
+time is not a conversation a solver can hold -- `pubgrub.Provider`'s two
+closures may not fail and may not block. So the answer is published as data and
+read as a file, and the reachable subgraph is materialised before the solve, in
+exactly the shape `plan.discover` already used for path dependencies. The
+provider stayed total; nothing about the solver changed.
+
+**A release records its tree hash.** This is the one that pays for itself twice.
+A *git* dependency has to be fetched during `resolve`, because only the fetched
+tree holds the manifest saying what it depends on; a registry entry already is
+that manifest data, and it carries `tree = "sha256:…"` -- the store's own key.
+So resolving a registry graph fetches nothing at all, and `install`'s existing
+refusal of a tree whose digest is not the one the lockfile named
+(`main.ws`, "has changed since it was resolved") becomes an integrity check for
+free. The client ends up trusting a hash rather than a host. What makes the
+hash worth trusting is the registry's CI, which fetches every entry a pull
+request adds and hashes it before merging -- and that validator is a W# program
+importing `ingot/registry`, so the format has one implementation and the thing
+enforcing it is the thing reading it.
+
+**A registry is a directory.** Fetching one over git is only how the directory
+arrives. `INGOT_REGISTRY` naming a directory is used where it lies, with no
+certificate store read and no socket opened. That was written for testability --
+the git client speaks HTTP and no case in this suite may stand up a server, so
+without it none of this could be tested here at all -- and it turned out to be
+the definition of a private registry and an offline one as well. The lesson is
+the one `std/tls` and `ingot/git` already taught: separate the bytes from the
+transport and the bytes become testable.
+
+**A path or git dependency overrides the registry.** A name the graph already
+supplies from a directory is not looked up, because offering the solver
+published versions of a package somebody is editing beside their project lets it
+choose one -- which is not what a checkout beside your project means.
+
+Two smaller things fell out. `git.discover` and `ls_refs_request` had been
+written, tested against a real `git upload-pack` and called from nowhere since
+stage four; a registry is named by a *branch* rather than by a revision that
+never moves, so turning that branch into an object id is their first caller, and
+`git.ref_id` is the one function that was missing. And `ingot gc` had to learn
+that an index is a store entry reached by a pointer file rather than by a
+lockfile, or the first collection after an update would delete the registry.
+
+The bug worth recording: `registry.package` answers null two ways -- "not in
+this registry", with no fault, and "here and unreadable", with one -- and two of
+the three callers tested `!f.ok` where they meant `f.ok`. Since `fault.fail`
+keeps the *first* failure, the effect was not a wrong message but no message at
+all: `ingot add acme/nope` exited 4 in silence. An optional that means two
+things needs its callers written the same way, and this is the argument for
+having said so in the doc comment before writing them.
+
 #### What is left
 
-- **No registry.** `plan.unsourced` still says a version-only dependency is one
-  `ingot cannot yet fetch`. Path and git dependencies are the two sources.
+- **A registry index is fetched whole.** `packfile.read` builds every object in
+  memory, so the index costs what it costs; the same bound a git dependency has
+  always had, and the right trade until a registry is large enough to notice.
+- **A registry entry is verified by its publisher's CI, and by nobody else
+  afterwards.** `install` checks the fetched tree against the hash the lockfile
+  names, which is the hash the registry gave — so a registry that lied at merge
+  time is believed. The check that closes that is a signature, and a signature
+  needs somebody to hold a key.
 - **`struct : pkg.Base` is not spellable.** A supertype is an `Ident` rather
   than a type path, so a subtype of a re-exported type has to be declared in the
   module the parent was declared in. A re-exported name is nameable everywhere

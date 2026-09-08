@@ -18,6 +18,8 @@
 // expect: refused: the server does not speak git protocol version 2
 // expect: HEAD 63e2817089c3d11d6f227abe4ac80847cc195167
 // expect: refs/heads/main 63e2817089c3d11d6f227abe4ac80847cc195167
+// expect: main is 63e2817089c3d11d6f227abe4ac80847cc195167
+// expect: trunk is nowhere
 // expect: packfile bytes: 2591
 // expect: ingot.toml 42
 // expect: src/demo.ws 10085
@@ -58,6 +60,12 @@ fn main() i64 {
     for (list.to_array(refs)) |r| {
         print(text.concat(r.name, text.concat(" ", r.id)));
     }
+
+    // Picking a branch out of that list is what makes a *registry* fetchable:
+    // a package names a revision that never moves, and an index is named by a
+    // branch that must, so `fetch` gets its object id from here.
+    print(text.concat("main is ", git.ref_id(refs, "refs/heads/main") orelse "nowhere"));
+    print(text.concat("trunk is ", git.ref_id(refs, "refs/heads/trunk") orelse "nowhere"));
 
     // The packfile, out of the sections and side bands it arrives wrapped in.
     const pack = git.parse_packfile(f, plain(fixture.fetched())) orelse {

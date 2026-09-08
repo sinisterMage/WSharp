@@ -510,7 +510,8 @@ the other is the thing that fills the store.
 
 ```sh
 ingot init myapp                    # write an ingot.toml here
-ingot add util --path ../util       # record a dependency
+ingot add acme/json                 # record a dependency, from the registry
+ingot add util --path ../util       # or on a directory
 ingot resolve                       # choose versions and write ingot.lock
 ingot install                       # make the store satisfy it
 ingot verify                        # 0 ready, 1 install, 2 resolve, 3 broken
@@ -526,12 +527,33 @@ Because no versions of core match >=2.0.0 <3.0.0 and util 0.3.0 depends on
 core >=2.0.0 <3.0.0, util 0.3.0 cannot be used.
 ```
 
-A dependency is a directory or a git revision — `dep = { git = "https://…",
-rev = "…" }`, fetched over the TLS client above rather than by shelling out to
-`git`. There is no registry yet. Packages live in a content-addressed store
-under `~/.wsharp` (`WSHARP_HOME` moves it), named by the hash of their tree, so
-two projects that want the same tree share one copy and `ingot gc` drops what no
-lockfile reaches.
+A dependency is a version, a directory or a git revision. A version comes from
+the registry — [Foundry](https://github.com/sinisterMage/Foundry), an index of
+plain TOML in a git repository, in the shape of Julia's General:
+
+```sh
+ingot add acme/json          # the newest published version, as a caret
+ingot search json            # what is published
+ingot update                 # fetch the index again
+```
+
+A registry release records the hash of its own tree, which is the store key —
+so `resolve` chooses versions and writes a lockfile having fetched no package at
+all, and the fetch `install` does afterwards is *checked against that hash*. The
+client trusts a hash rather than a host, and the registry's own CI is what makes
+the hash a promise: every entry is fetched and hashed before it is merged.
+Packages are W# source; nothing is precompiled, because `wsharp build` is
+ahead-of-time and the machine that installs is the machine that compiles.
+
+A registry is a **directory**, and cloning one over git is only how the
+directory arrives — `INGOT_REGISTRY` naming a directory is used where it lies
+and never fetched, which is what a private registry is, an offline one, and how
+this project tests the whole path with no server. A path or git dependency
+overrides the registry for the name it supplies.
+
+Packages live in a content-addressed store under `~/.wsharp` (`WSHARP_HOME`
+moves it), named by the hash of their tree, so two projects that want the same
+tree share one copy and `ingot gc` drops what no lockfile reaches.
 
 After `ingot install`, a package is just a module path:
 
@@ -671,7 +693,11 @@ Sessions are numbered by the original feature list:
       against a conversation a real `git upload-pack` took part in. And the
       last stage is the point of the other four: `@import("acme/json")`
       compiles — one more branch in the loader, and a `pub const x = other.x;`
-      that lets a package of several files present one of them.
+      that lets a package of several files present one of them. And there is a
+      registry, [Foundry](https://github.com/sinisterMage/Foundry): an index of
+      TOML in a git repository, recording per version the commit to fetch and
+      the tree it must hash to, so resolving is arithmetic over a file and
+      installing is checked against a hash somebody's CI already verified.
 
 What is left, and where it plugs in, is in [ROADMAP.md](ROADMAP.md).
 Conventions and the invariants worth not breaking are in

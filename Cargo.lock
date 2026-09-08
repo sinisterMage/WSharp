@@ -696,7 +696,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "wsharp-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "wsharp-codegen",
@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "wsharp-codegen"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -723,11 +723,11 @@ dependencies = [
 
 [[package]]
 name = "wsharp-runtime"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "wsharp-sema"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "wsharp-runtime",
  "wsharp-syntax",
@@ -735,11 +735,11 @@ dependencies = [
 
 [[package]]
 name = "wsharp-start"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "wsharp-runtime",
 ]
 
 [[package]]
 name = "wsharp-syntax"
-version = "0.1.0"
+version = "0.1.1"

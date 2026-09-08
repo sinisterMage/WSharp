@@ -19,6 +19,7 @@ const list = @import("std/list");
 const manifest = @import("ingot/manifest");
 const path = @import("std/path");
 const pubgrub = @import("ingot/pubgrub");
+const registry = @import("ingot/registry");
 const semver = @import("ingot/semver");
 const store = @import("ingot/store");
 const tls = @import("std/tls");
@@ -30,10 +31,15 @@ pub const Source = struct {
     name: str,
     version: semver.Version,
     /// The directory it was read from: relative to the project for a path
-    /// dependency, and inside the store for a fetched one.
+    /// dependency, and inside the store for a fetched one. Empty for a registry
+    /// release, whose files are not here yet and do not need to be.
     dir: str,
     /// How the lockfile names where it came from.
     origin: str,
+    /// The store key, `sha256:<hex>`, when it is known without looking: a
+    /// registry says what its releases hash to. Empty means `dir` is the
+    /// answer and has to be hashed.
+    tree: str,
     needs: list.List[pubgrub.Need],
     /// The same, by name, for the lockfile.
     deps: []str,
@@ -45,7 +51,24 @@ pub const Source = struct {
 /// once here rather than per request, which is what `http.request_with` exists
 /// for. `ready` is false when there is no store to be had, and every git
 /// dependency then fails with that rather than with a handshake error.
-pub const Network = struct { cfg: tls.Config, ready: bool, tried: bool };
+pub const Network = struct {
+    cfg: tls.Config,
+    ready: bool,
+    tried: bool,
+    /// The registry index, opened once. `looked` is false until something has
+    /// asked for it, for the reason `tried` is: a project of path dependencies
+    /// must resolve without an index, and a machine that has never fetched one
+    /// must still be able to build such a project.
+    index: registry.Index,
+    looked: bool,
+    have: bool,
+    /// Whether an index that is not here yet may be fetched. `resolve` says
+    /// yes, so a first use needs no separate step; anything that must not reach
+    /// the network says no and is told to run `ingot update`.
+    may_fetch: bool,
+};
+
+fn no_index() registry.Index { return registry.Index{ .dir = "", .name = "", .version = 0 }; }
 
 /// A network nothing has needed yet.
 ///
@@ -54,12 +77,28 @@ pub const Network = struct { cfg: tls.Config, ready: bool, tried: bool };
 /// project of path dependencies resolves without touching it, and a machine
 /// with no store can still use one.
 pub fn network() Network {
-    return Network{ .cfg = tls.client_config(""), .ready = false, .tried = false };
+    return Network{
+        .cfg = tls.client_config(""),
+        .ready = false,
+        .tried = false,
+        .index = no_index(),
+        .looked = false,
+        .have = false,
+        .may_fetch = true,
+    };
 }
 
 /// A network that will refuse, for a caller that must not reach one.
 pub fn offline() Network {
-    return Network{ .cfg = tls.client_config(""), .ready = false, .tried = true };
+    return Network{
+        .cfg = tls.client_config(""),
+        .ready = false,
+        .tried = true,
+        .index = no_index(),
+        .looked = false,
+        .have = false,
+        .may_fetch = false,
+    };
 }
 
 fn connect(f: fault.Fault, net: Network) bool {
@@ -74,7 +113,52 @@ fn connect(f: fault.Fault, net: Network) bool {
     return true;
 }
 
-/// Every package reachable from `m` by following path dependencies.
+/// The registry index, opened once per process.
+///
+/// A local registry -- which is what `INGOT_REGISTRY` naming a directory means
+/// -- is opened without connecting at all, so the certificate store is not read
+/// and nothing is fetched. That is not an optimisation: it is what makes a
+/// private registry, an offline checkout and this project's own tests work.
+fn opened(f: fault.Fault, net: Network) ?registry.Index {
+    if (net.looked) {
+        if (net.have) { return net.index; }
+        return null;
+    }
+    net.looked = true;
+    const home = store.home() catch {
+        fault.fail(f, "cannot work out where the store is");
+        return null;
+    };
+    const where = registry.location();
+    if (!registry.is_local(where)) {
+        if (!connect(f, net)) { return null; }
+    }
+    const dir = registry.directory(f, home, where, net.cfg, net.may_fetch) orelse return null;
+    const ix = registry.open(f, dir) orelse return null;
+    net.index = ix;
+    net.have = true;
+    return ix;
+}
+
+/// The registry, for a verb that has something to ask it directly.
+pub fn index(f: fault.Fault, net: Network) ?registry.Index { return opened(f, net); }
+
+/// Fetch the registry index again, whatever is already here.
+///
+/// What `ingot update` is. `opened` deliberately uses what it has rather than
+/// asking every time -- an index that is refetched per resolve is a network
+/// round trip on every build -- so being current is a thing you ask for.
+pub fn update_index(f: fault.Fault, net: Network) ?registry.Fetch {
+    const home = store.home() catch {
+        fault.fail(f, "cannot work out where the store is");
+        return null;
+    };
+    if (!connect(f, net)) { return null; }
+    return registry.fetch(f, home, registry.location(), net.cfg);
+}
+
+/// Every package reachable from `m`, by following path and git dependencies
+/// on disk and version dependencies through the registry.
 ///
 /// Breadth first, and a package reached twice by two routes is read once: two
 /// spellings of one directory are one package, and `path.normalise` is what
@@ -85,7 +169,8 @@ pub fn discover(f: fault.Fault, net: Network, m: manifest.Manifest) ?list.List[S
     var queue: list.List[str] = list.new();
     var wanted: list.List[str] = list.new();
     var origins: list.List[str] = list.new();
-    if (!enqueue(f, net, m, m.dir, queue, wanted, origins)) { return null; }
+    var named: list.List[str] = list.new();
+    if (!enqueue(f, net, m, m.dir, queue, wanted, origins, named)) { return null; }
     var at = 0;
     while (at < list.len(queue)) : (at += 1) {
         const dir = list.get(queue, at);
@@ -103,18 +188,22 @@ pub fn discover(f: fault.Fault, net: Network, m: manifest.Manifest) ?list.List[S
         }
         const source = describe(f, sub, dir, list.get(origins, at)) orelse return null;
         list.push(found, source);
-        if (!enqueue(f, net, sub, dir, queue, wanted, origins)) { return null; }
+        if (!enqueue(f, net, sub, dir, queue, wanted, origins, named)) { return null; }
     }
+    // Afterwards, because a package supplied on disk is not looked up at all
+    // and the whole graph has to be walked to know which those are.
+    if (!from_registry(f, net, m.name, found, named)) { return null; }
     return found;
 }
 
-/// Add a manifest's path dependencies to the walk.
+/// Add a manifest's dependencies to the walk.
 ///
-/// A dependency written as a *version* is left alone here: something else in
-/// the graph may be the package it names, and this is not the place to decide
-/// -- `unsourced` asks afterwards, when the whole graph is known.
+/// A dependency written as a *version* is recorded by name and looked up once
+/// the whole graph is known, for two reasons: a package reached by two routes
+/// should be read once, and something already in the graph may supply it.
 fn enqueue(f: fault.Fault, net: Network, m: manifest.Manifest, from: str,
-           queue: list.List[str], wanted: list.List[str], origins: list.List[str]) bool {
+           queue: list.List[str], wanted: list.List[str], origins: list.List[str],
+           named: list.List[str]) bool {
     for (list.to_array(m.deps)) |d| {
         if (text.len(d.git) > 0) {
             const dir = fetched(f, net, d) orelse return false;
@@ -125,7 +214,10 @@ fn enqueue(f: fault.Fault, net: Network, m: manifest.Manifest, from: str,
             }
             continue;
         }
-        if (text.len(d.dir) == 0) { continue; }
+        if (text.len(d.dir) == 0) {
+            if (text.len(d.req) > 0 and !holds(named, d.name)) { list.push(named, d.name); }
+            continue;
+        }
         const dir = path.normalise(path.join(from, d.dir));
         if (!fs.is_dir(dir)) {
             fault.fail(f, text.concat(text.concat(text.concat("`", d.name), "` points at "),
@@ -145,6 +237,82 @@ fn enqueue(f: fault.Fault, net: Network, m: manifest.Manifest, from: str,
 /// together name one tree for ever.
 fn source_name(d: manifest.Dep) str {
     return text.concat("git+", text.concat(d.git, text.concat("#", d.rev)));
+}
+
+/// How a lockfile names a registry release: the package and the version, which
+/// together name one tree for ever because a published version is never edited.
+fn release_source(name: str, v: semver.Version) str {
+    return text.concat("reg+", text.concat(name, text.concat("@", semver.render(v))));
+}
+
+/// Every version of every package the graph asks the registry for.
+///
+/// Breadth first over *names* rather than over directories, and this is the
+/// half a registry exists for: a release is not fetched to find out what it
+/// depends on, because the index already said. So the whole reachable subgraph
+/// is read before the solver starts -- which is what keeps `provider` total,
+/// exactly as materialising every path dependency first does, and what makes
+/// `resolve` reach the network for nothing but the index.
+///
+/// **A package supplied on disk is not looked up.** A path or git dependency is
+/// an override: taking registry versions of it as well would offer the solver
+/// candidates the person editing that directory did not ask for, and it could
+/// choose one.
+fn from_registry(f: fault.Fault, net: Network, root: str, found: list.List[Source],
+                 named: list.List[str]) bool {
+    if (list.len(named) == 0) { return true; }
+    const ix = opened(f, net) orelse return false;
+    var seen: list.List[str] = list.new();
+    var at = 0;
+    // `named` grows as releases name what *they* need, which is the walk.
+    while (at < list.len(named)) : (at += 1) {
+        const name = list.get(named, at);
+        if (holds(seen, name)) { continue; }
+        list.push(seen, name);
+        if (text.eq(name, root)) { continue; }
+        if (locally(found, name)) { continue; }
+
+        const p = registry.package(f, ix, name) orelse {
+            if (!f.ok) { return false; }
+            fault.fail(f, text.concat(text.concat("`", name),
+                text.concat("` is not in ", ix.name)));
+            return false;
+        };
+        var usable = 0;
+        for (list.to_array(p.releases)) |r| {
+            if (r.yanked) { continue; }
+            usable += 1;
+            list.push(found, Source{
+                .name = name,
+                .version = r.version,
+                .dir = "",
+                .origin = release_source(name, r.version),
+                .tree = r.tree,
+                .needs = r.needs,
+                .deps = r.deps,
+            });
+            for (list.to_array(r.needs)) |need| {
+                if (!holds(named, need.package)) { list.push(named, need.package); }
+            }
+        }
+        // Said here rather than left to the solver, which would report "no
+        // versions of X match ^1.0.0" -- true, and silent about the reason.
+        if (usable == 0) {
+            fault.fail(f, text.concat(text.concat("`", name),
+                text.concat("` has no versions in ", text.concat(ix.name,
+                    " that are not yanked"))));
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Whether the graph already supplies `name` from a directory.
+fn locally(found: list.List[Source], name: str) bool {
+    for (list.to_array(found)) |s| {
+        if (text.eq(s.name, name) and text.len(s.dir) > 0) { return true; }
+    }
+    return false;
 }
 
 /// A git dependency's files, in the store, and where they are.
@@ -203,6 +371,7 @@ pub fn source_dir(f: fault.Fault, net: Network, source: str) ?str {
     if (text.starts_with(source, "path+")) {
         return text.substr(source, 5, text.len(source));
     }
+    if (text.starts_with(source, "reg+")) { return release_dir(f, net, source); }
     if (!text.starts_with(source, "git+")) {
         fault.fail(f, text.concat("ingot does not know the source ", source));
         return null;
@@ -235,11 +404,79 @@ fn last_hash(s: str) i64 {
     return -1;
 }
 
-/// The first package something asks for that nothing in the graph supplies.
+/// The last `@`, which separates a package from a version.
+fn last_at(s: str) i64 {
+    var i = text.len(s) - 1;
+    while (i >= 0) : (i -= 1) {
+        if (text.byte_at(s, i) == 64) { return i; }
+    }
+    return -1;
+}
+
+/// A registry release's files, in the store, fetching them if they are not.
 ///
-/// Saying "ingot cannot yet fetch one" beats the solver's own honest "no
-/// versions of X match ^1.0.0": both are true, and only one names the thing to
-/// do about it.
+/// The index is what turns `reg+acme/json@1.2.0` into a URL and a revision, so
+/// `install` needs one -- which is the price of a lockfile that says where a
+/// package came from rather than flattening it to somebody's URL. The memo is
+/// sound here for the reason it is for a git revision: a published version is
+/// never edited, so the source string names one tree for ever.
+fn release_dir(f: fault.Fault, net: Network, source: str) ?str {
+    const home = store.home() catch {
+        fault.fail(f, "cannot work out where the store is");
+        return null;
+    };
+    if (store.remembered(home, source)) |digest| {
+        if (store.check(home, digest) == store.READY) { return store.entry(home, digest); }
+    }
+    const rest = text.substr(source, 4, text.len(source));
+    const at = last_at(rest);
+    if (at < 0) {
+        fault.fail(f, text.concat("this source names no version: ", source));
+        return null;
+    }
+    const name = text.substr(rest, 0, at);
+    const spelled = text.substr(rest, at + 1, text.len(rest));
+    const version = semver.parse(spelled) orelse {
+        fault.fail(f, text.concat(text.concat("`", spelled), "` is not a version"));
+        return null;
+    };
+    const ix = opened(f, net) orelse return null;
+    const p = registry.package(f, ix, name) orelse {
+        // Null and *no* fault means the registry simply does not hold it, which
+        // is this caller's sentence to write. Null with one means the entry is
+        // there and unreadable, and that message is already better than this.
+        if (f.ok) {
+            fault.fail(f, text.concat(text.concat("`", name),
+                text.concat("` is not in ", ix.name)));
+        }
+        return null;
+    };
+    // A yanked release is still found, because a lockfile that already names
+    // one has to keep working: yanking withdraws a version from being *chosen*.
+    const r = registry.release(p, version) orelse {
+        fault.fail(f, text.concat(text.concat("`", name),
+            text.concat("` has no version ", text.concat(spelled,
+                text.concat(" in ", ix.name)))));
+        return null;
+    };
+    if (!connect(f, net)) {
+        if (f.ok) {
+            fault.fail(f, text.concat(text.concat("`", name),
+                "` has not been fetched, and nothing here can fetch it"));
+        }
+        return null;
+    }
+    return pull(f, net, home, p.repo, r.rev, source);
+}
+
+/// The first package something asks for that nothing supplies.
+///
+/// A backstop rather than the ordinary answer: every route to a package now
+/// reports its own failure by name -- a path that is not a directory, a
+/// revision that cannot be fetched, a name the registry does not hold, a
+/// package whose every version is yanked. This stays because the one diagnosis
+/// that is true whatever went wrong is the solver's "no versions of X match",
+/// and falling back to it would throw away which package and which route.
 fn unsourced(root: Source, found: list.List[Source]) ?str {
     for (list.to_array(root.needs)) |need| {
         if (!supplied(root, found, need.package)) { return need.package; }
@@ -279,6 +516,9 @@ fn describe(f: fault.Fault, m: manifest.Manifest, dir: str, origin: str) ?Source
         .version = version,
         .dir = dir,
         .origin = origin,
+        // A manifest on disk says nothing about its own hash, so the directory
+        // is the answer and `resolve` hashes it.
+        .tree = "",
         .needs = needs,
         .deps = names,
     };
@@ -335,7 +575,7 @@ pub fn resolve(f: fault.Fault, net: Network, m: manifest.Manifest) Plan {
 
     if (unsourced(root, found)) |name| {
         fault.fail(f, text.concat(text.concat("`", name),
-            "` is not a path dependency, and ingot cannot yet fetch one"));
+            "` is asked for and nothing supplies it"));
         return failed("");
     }
 
@@ -352,13 +592,19 @@ pub fn resolve(f: fault.Fault, net: Network, m: manifest.Manifest) Plan {
             fault.fail(f, text.concat(text.concat("`", name), "` was chosen and then could not be found"));
             return failed("");
         };
-        const digest = store.tree_hash(f, source.dir);
-        if (!f.ok) { return failed(""); }
+        // A registry said what its release hashes to, so nothing is fetched to
+        // find out; anything on disk is hashed where it lies.
+        var tree = source.tree;
+        if (text.len(tree) == 0) {
+            const digest = store.tree_hash(f, source.dir);
+            if (!f.ok) { return failed(""); }
+            tree = text.concat("sha256:", digest);
+        }
         list.push(packages, manifest.Locked{
             .name = source.name,
             .version = semver.render(source.version),
             .source = source.origin,
-            .tree = text.concat("sha256:", digest),
+            .tree = tree,
             .deps = source.deps,
         });
     }

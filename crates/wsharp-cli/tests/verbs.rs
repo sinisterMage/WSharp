@@ -79,11 +79,58 @@ impl Project {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("a directory to work in");
-        Project { root }
+        let project = Project { root };
+        // An *empty* registry rather than none, because `INGOT_REGISTRY` naming
+        // something that is not a directory is a URL, and a URL is fetched. A
+        // test that meant "this package is published nowhere" would otherwise
+        // go to the network to find that out.
+        std::fs::create_dir_all(project.registry()).expect("a registry directory");
+        std::fs::write(
+            project.registry().join("Registry.toml"),
+            "[registry]\nversion = 1\nname = \"Testing\"\n",
+        )
+        .expect("a Registry.toml");
+        project
     }
 
     fn store(&self) -> PathBuf {
         self.root.join("home")
+    }
+
+    /// The registry every verb in this file is pointed at.
+    ///
+    /// **Set on every invocation, whether or not the test uses a registry.**
+    /// `INGOT_REGISTRY` falls back to the public one, so a test that left it
+    /// unset would resolve against the real Foundry over the real network --
+    /// which is slow, needs a machine to be online, and makes what this suite
+    /// asserts depend on what somebody published this morning. Pointing it at a
+    /// directory that may not even exist is what keeps the suite hermetic: a
+    /// registry is a directory, so this is not a mock.
+    fn registry(&self) -> PathBuf {
+        self.root.join("registry")
+    }
+
+    /// Write a registry holding one version of one package.
+    ///
+    /// `deps` is the body of the release's `[version.dependencies]`, so `""` is
+    /// a package that needs nothing.
+    fn publish(&self, name: &str, version: &str, repo: &str, rev: &str, tree: &str, deps: &str) {
+        let dir = self.registry().join("packages").join(name);
+        std::fs::create_dir_all(&dir).expect("a package directory");
+        std::fs::write(
+            dir.join("package.toml"),
+            format!("[package]\nname = \"{name}\"\nrepo = \"{repo}\"\n"),
+        )
+        .expect("a package.toml");
+        let versions = dir.join("versions.toml");
+        let mut body = std::fs::read_to_string(&versions).unwrap_or_default();
+        body.push_str(&format!(
+            "\n[[version]]\nversion = \"{version}\"\nrev = \"{rev}\"\ntree = \"sha256:{tree}\"\n"
+        ));
+        if !deps.is_empty() {
+            body.push_str(&format!("\n[version.dependencies]\n{deps}\n"));
+        }
+        std::fs::write(&versions, body).expect("a versions.toml");
     }
 
     fn dir(&self, name: &str) -> PathBuf {
@@ -133,6 +180,7 @@ impl Project {
         let mut command = Command::new(ingot());
         command
             .env("WSHARP_HOME", self.store())
+            .env("INGOT_REGISTRY", self.registry())
             .arg("-C")
             .arg(dir)
             .args(args);
@@ -384,13 +432,13 @@ fn a_verb_that_cannot_be_carried_out_says_why() {
     project.expect(&app, &["init", "myapp"], READY);
     project.expect(&app, &["init"], FAILED);
 
-    // A version requirement needs a resolver, which is a later stage; saying
-    // so beats "unsatisfiable".
+    // A version requirement on a package the registry does not hold names the
+    // package and the registry, which beats the solver's "no versions match".
     project.expect(&app, &["add", "acme/json", "1.0.0"], READY);
     let out = project.run(&app, &["resolve"]);
     assert_eq!(out.status.code(), Some(FAILED));
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("cannot yet fetch"),
+        String::from_utf8_lossy(&out.stderr).contains("`acme/json` is not in Testing"),
         "stderr was:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -430,14 +478,14 @@ fn a_requirement_that_cannot_be_met_is_explained() {
     project.expect(&app, &["add", "core", "--path", "../core"], READY);
     project.expect(&app, &["resolve"], READY);
 
-    // A package nothing in the graph supplies is refused by name rather than
-    // as the solver's honest but unhelpful "no versions match".
+    // A package neither the graph nor the registry supplies is refused by name
+    // rather than as the solver's honest but unhelpful "no versions match".
     project.expect(&app, &["add", "elsewhere", "^2.0.0"], READY);
     let out = project.run(&app, &["resolve"]);
     assert_eq!(out.status.code(), Some(FAILED));
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
-        stderr.contains("cannot yet fetch"),
+        stderr.contains("`elsewhere` is not in Testing"),
         "a dependency with no source says so:\n{stderr}"
     );
     project.expect(&app, &["remove", "elsewhere"], READY);
@@ -458,6 +506,139 @@ fn a_requirement_that_cannot_be_met_is_explained() {
             && stderr.contains("util 0.3.0 depends on core >=2.0.0 <3.0.0"),
         "the solver explains itself:\n{stderr}"
     );
+}
+
+/// A version dependency, resolved out of the registry.
+///
+/// **This stops at `resolve`, and that is the whole of what a registry adds to
+/// it.** A release records the hash of its own tree, so choosing versions and
+/// writing a lockfile fetches nothing at all -- which is what makes this
+/// testable here. `install` is the verb that goes to the network, and it does
+/// it through `plan.pull`, which the git-dependency path already exercises;
+/// there is no git server in this suite to point a `repo` at.
+#[test]
+fn a_project_takes_a_dependency_from_the_registry() {
+    let project = Project::new("registry");
+    project.publish(
+        "acme/json",
+        "1.2.0",
+        "https://example.invalid/json.git",
+        "2222222222222222222222222222222222222222",
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        "\"acme/http\" = \"^1.0.0\"\n",
+    );
+    // A newer version that is withdrawn, so `add` has something to skip.
+    project.publish(
+        "acme/json",
+        "2.0.0",
+        "https://example.invalid/json.git",
+        "3333333333333333333333333333333333333333",
+        "3333333333333333333333333333333333333333333333333333333333333333",
+        "",
+    );
+    let versions = project.registry().join("packages/acme/json/versions.toml");
+    let body = std::fs::read_to_string(&versions).expect("the versions file");
+    std::fs::write(&versions, format!("{body}yanked = true\n")).expect("a yank");
+    project.publish(
+        "acme/http",
+        "1.1.0",
+        "https://example.invalid/http.git",
+        "4444444444444444444444444444444444444444",
+        "4444444444444444444444444444444444444444444444444444444444444444",
+        "",
+    );
+
+    let app = project.dir("app");
+    std::fs::create_dir_all(&app).expect("an app directory");
+    project.expect(&app, &["init", "myapp"], READY);
+
+    // `search` finds it, and reports the newest version worth having.
+    let found = project.expect(&app, &["search", "json"], READY);
+    assert_eq!(field(&found, 0, 0), "acme/json");
+    assert_eq!(
+        field(&found, 0, 1),
+        "1.2.0",
+        "the yanked 2.0.0 is not newest"
+    );
+    assert_eq!(field(&found, 1, 1), "1");
+
+    // `add` with no version records a caret on the newest that is not yanked.
+    project.expect(&app, &["add", "acme/json"], READY);
+    let manifest = std::fs::read_to_string(app.join("ingot.toml")).expect("a manifest");
+    assert!(
+        manifest.contains("\"acme/json\" = \"^1.2.0\""),
+        "add records the newest version:\n{manifest}"
+    );
+
+    // Resolving walks the index transitively and hashes nothing: the tree is
+    // what the registry said it was.
+    let resolved = project.expect(&app, &["resolve"], READY);
+    assert_eq!(field(&resolved, 0, 1), "2", "the transitive dependency too");
+    let listed = project.expect(&app, &["list"], READY);
+    assert_eq!(field(&listed, 0, 0), "acme/json");
+    assert_eq!(field(&listed, 0, 2), "reg+acme/json@1.2.0");
+    assert_eq!(
+        field(&listed, 0, 3),
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    );
+    assert_eq!(field(&listed, 1, 0), "acme/http");
+    assert_eq!(field(&listed, 1, 2), "reg+acme/http@1.1.0");
+
+    // Nothing has been fetched, so the store cannot satisfy the lockfile yet --
+    // and `verify` says which entries are missing without going to look.
+    let out = project.run(&app, &["verify"]);
+    assert_eq!(out.status.code(), Some(NEEDS_INSTALLING));
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(field(&stdout, 0, 0), "missing", "stdout was:\n{stdout}");
+
+    // A local registry is already the index, so `update` fetches nothing.
+    let updated = project.expect(&app, &["update"], READY);
+    assert_eq!(field(&updated, 0, 0), "local");
+    assert_eq!(field(&updated, 0, 1), "Testing");
+}
+
+/// A path dependency overrides the registry for the name it supplies.
+#[test]
+fn a_path_dependency_is_preferred_to_a_published_one() {
+    let project = Project::new("override");
+    project.publish(
+        "acme/http",
+        "1.1.0",
+        "https://example.invalid/http.git",
+        "4444444444444444444444444444444444444444",
+        "4444444444444444444444444444444444444444444444444444444444444444",
+        "",
+    );
+    // The same package, in a directory, at a version that satisfies the same
+    // requirement. Without the override rule the solver would be offered both
+    // and could take the published one, which is not what editing a checkout
+    // beside your project means.
+    std::fs::create_dir_all(project.dir("http").join("src")).expect("a package directory");
+    std::fs::write(
+        project.dir("http").join("ingot.toml"),
+        "[package]\nname = \"acme/http\"\nversion = \"1.5.0\"\nroot = \"src/http.ws\"\n",
+    )
+    .expect("a manifest");
+    std::fs::write(
+        project.dir("http").join("src/http.ws"),
+        "pub fn one() i64 { return 1; }\n",
+    )
+    .expect("a source file");
+
+    let app = project.dir("app");
+    std::fs::create_dir_all(&app).expect("an app directory");
+    project.expect(&app, &["init", "myapp"], READY);
+    project.expect(&app, &["add", "acme/http", "--path", "../http"], READY);
+    project.expect(&app, &["resolve"], READY);
+
+    let listed = project.expect(&app, &["list"], READY);
+    assert_eq!(field(&listed, 0, 0), "acme/http");
+    assert_eq!(
+        field(&listed, 0, 1),
+        "1.5.0",
+        "the directory, not the registry"
+    );
+    assert_eq!(field(&listed, 0, 2), "path+../http");
 }
 
 /// `ingot run` is the one verb that is the compiler, and it passes the rest of

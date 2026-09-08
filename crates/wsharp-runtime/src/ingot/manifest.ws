@@ -179,11 +179,13 @@ pub fn write(m: Manifest) str {
 pub const Locked = struct {
     name: str,
     version: str,
-    /// Where it came from, in one string: `path+../util`, or
-    /// `git+https://host/repo#<rev>`.
+    /// Where it came from, in one string: `path+../util`,
+    /// `git+https://host/repo#<rev>`, or `reg+acme/json@1.2.0`.
     source: str,
-    /// The store key, `sha256:<hex>`, or `""` for a path dependency, which is
-    /// used where it lies and never copied in.
+    /// The store key, `sha256:<hex>`. Every source has one, path dependencies
+    /// included -- they are copied into the store rather than used where they
+    /// lie, which is what stops editing a directory changing a build nothing
+    /// resolved.
     tree: str,
     deps: []str,
 };
@@ -342,6 +344,11 @@ pub fn string_at(t: toml.Table, key: str) ?str {
 pub fn int_at(t: toml.Table, key: str) ?i64 {
     const v = toml.get(t, key) orelse return null;
     return toml.as_int(v) catch return null;
+}
+
+pub fn bool_at(t: toml.Table, key: str) ?bool {
+    const v = toml.get(t, key) orelse return null;
+    return toml.as_bool(v) catch return null;
 }
 
 pub fn table_at(t: toml.Table, key: str) ?toml.Table {

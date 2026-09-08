@@ -32,6 +32,8 @@ const manifest = @import("ingot/manifest");
 const os = @import("std/os");
 const path = @import("std/path");
 const plan = @import("ingot/plan");
+const registry = @import("ingot/registry");
+const semver = @import("ingot/semver");
 const store = @import("ingot/store");
 const text = @import("std/str");
 const toml = @import("std/toml");
@@ -82,6 +84,8 @@ fn main() i64 {
     if (text.eq(verb, "init")) { code = init(f, rest); }
     else if (text.eq(verb, "add")) { code = add(f, rest); }
     else if (text.eq(verb, "remove")) { code = remove(f, rest); }
+    else if (text.eq(verb, "update")) { code = update(f); }
+    else if (text.eq(verb, "search")) { code = search(f, rest); }
     else if (text.eq(verb, "resolve")) { code = resolve(f); }
     else if (text.eq(verb, "install")) { code = install(f); }
     else if (text.eq(verb, "verify")) { code = verify(f); }
@@ -192,9 +196,11 @@ fn usage() void {
     print("ingot -- the W# package manager");
     print("");
     print("  init [name]              write an ingot.toml here");
-    print("  add <name> <version>     record a dependency");
+    print("  add <name> [version]     record a dependency, newest by default");
     print("  add <name> --path <dir>  record a dependency on a directory");
     print("  remove <name>            take one out");
+    print("  update                   fetch the registry index again");
+    print("  search [text]            what the registry holds");
     print("  resolve                  choose versions and write ingot.lock");
     print("  install                  make the store satisfy ingot.lock");
     print("  verify                   0 ready, 1 install, 2 resolve, 3 broken");
@@ -207,6 +213,10 @@ fn usage() void {
     print("`-C <dir>` works from somewhere else. `--gc-stress` belongs to what");
     print("is being run, so `run` passes it on and nothing else reads it.");
     print("Output is tab-separated, and WSHARP_HOME says where the store is.");
+    print("");
+    print("INGOT_REGISTRY says which registry to use, as a URL or as a");
+    print("directory. A directory is used where it lies and is never fetched,");
+    print("which is what a private or an offline registry is.");
     print("");
     print("`run` hands over to `wsharp`, which is looked for beside this");
     print("program and then on PATH: this binary is a W# program and the");
@@ -274,7 +284,16 @@ fn add(f: fault.Fault, args: []str) i64 {
     }
     const m = read_here(f) orelse return FAILED;
     const name = args[0];
-    const d = new_dependency(f, name, array.slice(args, 1, array.len(args))) orelse return FAILED;
+    var rest = array.slice(args, 1, array.len(args));
+    // `ingot add acme/json` means the newest the registry has, which is the
+    // spelling people reach for. Asked here rather than in the parser below,
+    // because it is the one form that needs an index -- every other spelling of
+    // `add` is an edit to a file and touches nothing else.
+    if (array.len(rest) == 0) {
+        const req = newest_requirement(f, name) orelse return FAILED;
+        rest = []str{ req };
+    }
+    const d = new_dependency(f, name, rest) orelse return FAILED;
     var kept: list.List[manifest.Dep] = list.new();
     for (list.to_array(m.deps)) |old| {
         if (!text.eq(old.name, name)) { list.push(kept, old); }
@@ -288,6 +307,32 @@ fn add(f: fault.Fault, args: []str) i64 {
     // stops `install` being run against a stale one.
     if (io.exists(lock_path())) { print(row2("stale", lock_path())); }
     return OK;
+}
+
+/// `^<newest>`, out of the registry.
+///
+/// A caret rather than an exact version, because recording what is newest today
+/// as what this package *requires* is how a project ends up unable to share a
+/// dependency with anything else.
+fn newest_requirement(f: fault.Fault, name: str) ?str {
+    const net = plan.network();
+    const ix = plan.index(f, net) orelse return null;
+    const p = registry.package(f, ix, name) orelse {
+        // Null and no fault means it is not in the registry; null with one
+        // means the entry is unreadable and has already said so.
+        if (f.ok) {
+            fault.fail(f, text.concat(text.concat("`", name),
+                text.concat("` is not in ", text.concat(ix.name,
+                    " -- give a version, a `--path` or a `--git` instead"))));
+        }
+        return null;
+    };
+    const v = registry.newest(p) orelse {
+        fault.fail(f, text.concat(text.concat("`", name),
+            "` has no version that is not yanked or a pre-release"));
+        return null;
+    };
+    return text.concat("^", semver.render(v));
 }
 
 fn new_dependency(f: fault.Fault, name: str, rest: []str) ?manifest.Dep {
@@ -353,6 +398,56 @@ fn write_manifest(f: fault.Fault, m: manifest.Manifest) void {
     io.write_file(manifest_path(), manifest.write(m))
         catch fault.fail_at(f, manifest_path(), "cannot be written");
     return;
+}
+
+// ---------------------------------------------------------------------------
+// update, search
+// ---------------------------------------------------------------------------
+
+/// Fetch the registry index again.
+///
+/// `resolve` uses whatever index is already here, because refetching one per
+/// build is a network round trip on every build. Being current is therefore a
+/// thing you ask for, and this is the asking.
+fn update(f: fault.Fault) i64 {
+    const where = registry.location();
+    // A directory is already the index. Fetching nothing and reporting a commit
+    // that does not exist would be the wrong kind of success.
+    if (registry.is_local(where)) {
+        const ix = registry.open(f, where) orelse return FAILED;
+        print(row3("local", ix.name, where));
+        return OK;
+    }
+    const got = plan.update_index(f, plan.network()) orelse return FAILED;
+    print(row3("updated", where, got.commit));
+    return OK;
+}
+
+/// What the registry holds, filtered by a substring of the name.
+fn search(f: fault.Fault, args: []str) i64 {
+    var needle = "";
+    if (array.len(args) > 0) { needle = args[0]; }
+    const ix = plan.index(f, plan.network()) orelse return FAILED;
+    var found = 0;
+    for (registry.names(ix)) |name| {
+        if (text.len(needle) > 0 and text.find(name, needle) < 0) { continue; }
+        const p = registry.package(f, ix, name) orelse {
+            // One unreadable entry is one entry, not the end of a search: the
+            // rule a trust store follows, for the same reason. A chain is a
+            // structure and a bag is a bag.
+            f.ok = true;
+            f.message = "";
+            continue;
+        };
+        // `-` rather than nothing, because a row whose last field is empty is a
+        // row with trailing whitespace, which the case harness trims away.
+        var newest = "-";
+        if (registry.newest(p)) |v| { newest = semver.render(v); }
+        print(row3(name, newest, p.repo));
+        found += 1;
+    }
+    print(row2("found", text.from_int(found)));
+    return OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -682,6 +777,10 @@ fn gc(f: fault.Fault) i64 {
         };
         for (list.to_array(lock.packages)) |p| { list.push(keep, digest_of(p.tree)); }
     }
+    // A registry index is an ordinary store entry reached by a pointer file
+    // rather than by a lockfile, so without this the first collection after an
+    // update deletes the registry and the next resolve fetches it again.
+    for (store.held_indexes(h)) |digest| { list.push(keep, digest); }
     const removed = store.collect(f, h, keep);
     if (!f.ok) { return FAILED; }
     print(row2("removed", text.from_int(removed)));
