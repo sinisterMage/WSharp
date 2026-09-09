@@ -230,24 +230,33 @@ pub fn innermost_generated_frame() -> Option<GeneratedFrame> {
 /// Windows records a function's frame register in its unwind info rather than
 /// promising `push rbp; mov rbp, rsp`, so `rbp` is not a chain here; see
 /// [`crate::sys::Frames`] for what that looked like when it was followed anyway.
+///
+/// **The walk happens inside the capture rather than after it**, because the
+/// captured `CONTEXT` describes the frame it was taken in and unwinding out of
+/// that frame reads it. See [`crate::sys::Frames::with_here`], which is where
+/// that cost a collector that found no roots at all.
+///
+/// The flag is read before the capture, so that reading it cannot be one of the
+/// calls that would have scribbled on the frame being described.
 #[cfg(target_os = "windows")]
 #[inline(never)]
 pub fn innermost_generated_frame() -> Option<GeneratedFrame> {
     let trace = crate::gc::env_flag("WSHARP_GC_TRACE");
-    let mut frames = crate::sys::Frames::here();
-    for _ in 0..MAX_FRAMES {
-        let pc = frames.pc();
-        if trace {
-            eprintln!("  crossing pc={pc:#x}");
+    crate::sys::Frames::with_here(|frames| {
+        for _ in 0..MAX_FRAMES {
+            let pc = frames.pc();
+            if trace {
+                eprintln!("  crossing pc={pc:#x}");
+            }
+            if function_at(pc).is_some() {
+                return Some((frames.frame_pointer(), pc));
+            }
+            if !frames.step() {
+                return None;
+            }
         }
-        if function_at(pc).is_some() {
-            return Some((frames.frame_pointer(), pc));
-        }
-        if !frames.step() {
-            return None;
-        }
-    }
-    None
+        None
+    })
 }
 
 /// Visit the roots of `frame` and of every generated frame above it.

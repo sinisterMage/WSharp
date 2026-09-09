@@ -1291,18 +1291,38 @@ pub(crate) struct Frames {
 }
 
 impl Frames {
-    /// Capture the caller's frame and those above it.
+    /// Capture this thread's frames and hand them to `walk`.
     ///
-    /// `#[inline(never)]` for the reason `current_frame_pointer`'s users are:
-    /// the innermost frame captured is this one, and a caller that had it
-    /// inlined would be describing a frame that is about to be reused.
+    /// **A closure rather than a returned `Frames`, and that is the whole
+    /// correctness argument.** `RtlCaptureContext` describes the frame it is
+    /// called in -- its `Rsp` and `Rbp` point into *this* frame -- and the first
+    /// `step` unwinds out of that frame by reading the saved registers and the
+    /// return address in it. A `Frames` handed back to a caller therefore
+    /// describes a frame that has already been popped, and the walk reads
+    /// whatever the caller has since put there.
+    ///
+    /// That is not theoretical and `#[inline(never)]` does not help: it is what
+    /// this did, and it is what made every W# program crash on Windows once the
+    /// collector ran. The caller read an environment variable and called
+    /// `eprintln!` between the capture and the walk, both of which reuse exactly
+    /// that memory; the walk got two plausible frames out and then a return
+    /// address of `0x4800000002b94100`, which is not code. `RtlLookupFunctionEntry`
+    /// had nothing for it, so the walk stopped, `innermost_generated_frame`
+    /// answered `None`, and the collector -- told there were no roots -- freed
+    /// the live heap. The failure surfaced far away, as a segfault or a stack
+    /// overflow in whatever touched a freed object next.
+    ///
+    /// Inverting it fixes the lifetime by construction. This frame is alive for
+    /// as long as `walk` runs, and everything `walk` calls builds its frames
+    /// *below* the captured `Rsp`, where the unwind never looks.
     #[inline(never)]
-    pub(crate) fn here() -> Frames {
+    pub(crate) fn with_here<T>(walk: impl FnOnce(&mut Frames) -> T) -> T {
         // Sound: `RtlCaptureContext` writes every field it is documented to,
         // and the rest are only ever passed back to Win32.
         let mut context: CONTEXT = unsafe { core::mem::zeroed() };
         unsafe { RtlCaptureContext(&raw mut context) };
-        Frames { context }
+        let mut frames = Frames { context };
+        walk(&mut frames)
     }
 
     /// The program counter in the current frame.
@@ -1352,5 +1372,63 @@ impl Frames {
         };
         // A zero return address is the thread entry: there is nothing above it.
         self.context.Rip != 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Frames of known depth, so that a walk can be asked to cross them.
+    ///
+    /// `#[inline(never)]`, and something after the recursive call, because the
+    /// recursion is the point: a tail call turns this into a loop and there is
+    /// nothing left to walk.
+    #[inline(never)]
+    fn nested(depth: usize, crossed: &mut usize) {
+        if depth > 0 {
+            nested(depth - 1, crossed);
+            std::hint::black_box(depth);
+        } else {
+            *crossed = Frames::with_here(|frames| {
+                let mut seen = 0;
+                // Far above ten and far below any real stack, so a walk that
+                // never terminates fails as a wrong count rather than as a hang.
+                while seen < 256 {
+                    seen += 1;
+                    if !frames.step() {
+                        break;
+                    }
+                }
+                seen
+            });
+        }
+    }
+
+    /// The walk crosses the whole stack, not the first frame or two.
+    ///
+    /// **The regression this exists for.** `Frames` used to be *returned* from
+    /// its capture, so the `CONTEXT` described a frame that had already been
+    /// popped, and the first unwind read stack memory the caller had since
+    /// reused. It got two plausible frames out and then a return address of
+    /// `0x4800000002b94100`, which is not code and which
+    /// `RtlLookupFunctionEntry` had nothing for -- so the walk stopped there,
+    /// the collector was told the stack held no roots, and it freed the live
+    /// heap. Every W# program on Windows crashed as soon as it allocated enough
+    /// to collect, and the case suite never saw it because `cargo test` and the
+    /// AOT pass put different things in that memory.
+    ///
+    /// Ten nested frames and the harness's own above them, so a walk reading
+    /// live memory crosses well over ten. A walk reading a dead frame gives up
+    /// in the first handful, whatever the garbage happens to be that day.
+    #[test]
+    fn the_walk_crosses_every_frame_it_is_given() {
+        let mut crossed = 0;
+        nested(10, &mut crossed);
+        assert!(
+            crossed > 10,
+            "the walk crossed {crossed} frames, and was given at least ten to cross: \
+             it is reading a frame that is no longer there"
+        );
     }
 }

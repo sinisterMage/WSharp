@@ -1,0 +1,94 @@
+# Temporary. Delete before this branch merges.
+#
+# `cargo test` on Windows passed with the root-walk bug in place, twice a
+# release, so it is not the thing that says whether the fix works. What said so
+# was sharpie: six of its eight cases died, and the `sharpie.exe` this compiler
+# built segfaulted on `version`. So the proof is to build a `wsharp` from this
+# branch and point sharpie's own suite at it.
+#
+# A release build, because that is what a published toolchain is, and because a
+# fault whose symptom depends on what the stack happens to hold is not one to
+# reproduce in a different build profile.
+
+name: Windows proof
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  proof:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      CC: clang
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+
+      # Git Bash's coreutils `link` comes before MSVC's linker on `PATH`, and
+      # clang resolves the name rather than the program.
+      - name: Remove the link.exe that is not a linker
+        run: rm -f "/c/Program Files/Git/usr/bin/link.exe"
+
+      - name: Set up the MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build the toolchain
+        run: |
+          set -eu
+          cargo build --release --locked
+          ./target/release/wsharp.exe --version
+
+      # `ingot` is a W# program and the compiler is what produces it, so this is
+      # also the first thing that runs any generated code at all.
+      - name: Bootstrap ingot
+        run: |
+          set -eu
+          ./target/release/wsharp.exe build --module ingot/main -o target/release/ingot.exe
+          ./target/release/ingot.exe help > /dev/null
+
+      - name: Fetch sharpie
+        uses: actions/checkout@v4
+        with:
+          repository: sinisterMage/sharpie
+          path: sharpie
+
+      # The failure this branch exists for, in the place it was found. Six of
+      # these died against a released 0.1.3; all eight should pass now.
+      - name: sharpie's case suite, against this compiler
+        run: |
+          set -eu
+          cd sharpie
+          WSHARP="${GITHUB_WORKSPACE}/target/release/wsharp.exe" ./tests/run.sh
+
+      # And the built binary, which is the half `cargo test` never reaches: it
+      # links this runtime in and then has to survive its own collector.
+      - name: sharpie, built and run
+        run: |
+          set -eu
+          cd sharpie
+          "${GITHUB_WORKSPACE}/target/release/wsharp.exe" build src/main.ws -o sharpie.exe
+          ./sharpie.exe version
+          ./sharpie.exe help > /dev/null
+          home="$(pwd -W)/.sharpie-proof"
+          mkdir -p "${home}/bin"
+          cp sharpie.exe "${home}/bin/sharpie.exe"
+          SHARPIE_HOME="$home" "${home}/bin/sharpie.exe" init
+          test -x "${home}/bin/wsharp.exe"
+          test -x "${home}/bin/ingot.exe"
+          SHARPIE_HOME="$home" "${home}/bin/sharpie.exe" init > /dev/null
+          SHARPIE_HOME="$home" "${home}/bin/sharpie.exe" version
+
+      # Collect at every allocation, which is the collector's own stress test
+      # aimed at the program that found the bug.
+      - name: The same suite, collecting at every allocation
+        run: |
+          set -eu
+          cd sharpie
+          WSHARP_GC_STRESS=1 "${GITHUB_WORKSPACE}/target/release/wsharp.exe" run tests/install.ws
+          WSHARP_GC_STRESS=1 "${GITHUB_WORKSPACE}/target/release/wsharp.exe" run tests/targz.ws
