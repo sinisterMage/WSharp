@@ -15,10 +15,29 @@
 //!   stack pointer at the safepoint up to the frame pointer. So given a frame's
 //!   frame pointer, `sp = fp - frame_size`, and each root is at `sp + offset`.
 //!
-//! Walking needs frame pointers, which is why the code generator sets
-//! `preserve_frame_pointers` and why the workspace builds with
-//! `-Cforce-frame-pointers=yes` (see `.cargo/config.toml`): the chain has to be
-//! unbroken through the Rust runtime frames as well as the generated ones.
+//! A walk therefore has two halves, and they are not the same problem.
+//!
+//! *Reaching* generated code means crossing the handful of Rust frames between
+//! the collector and the runtime function generated code called into. That is
+//! `innermost_generated_frame`, and it is the half that is per-platform: the
+//! SysV arms follow `rbp`, which is why the workspace builds with
+//! `-Cforce-frame-pointers=yes` (see `.cargo/config.toml`), while Windows has to
+//! use the unwind tables because a Win64 prologue is free to establish `rbp` as
+//! `lea rbp, [rsp + n]` and nothing marks the outermost frame. See
+//! `sys::windows::Frames`.
+//!
+//! *Walking* generated code is then `rbp` on every platform, because Cranelift's
+//! prologue really is `push rbp; mov rbp, rsp` -- it ignores the calling
+//! convention -- and the code generator asks for it with
+//! `preserve_frame_pointers`. So only the first half has arms, and the walk that
+//! reads stack maps has none.
+//!
+//! The split is also what lets a *parked* worker be walked at all. Crossing the
+//! Rust frames needs the parked thread's own frame pointers or its own
+//! registers, and neither can be read from outside it, so a worker answers the
+//! first half for itself before it parks and publishes the generated frame it
+//! found. What the collector then walks is the second half, which is thread
+//! independent.
 
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -122,6 +141,13 @@ pub fn function_at(pc: usize) -> Option<&'static FunctionCode> {
 ///
 /// Every user must therefore be `#[inline(never)]` itself, or the frame it
 /// records is its caller's.
+///
+/// Not compiled for Windows, and that absence is the point rather than an
+/// oversight: reading `rbp` there answers a question about the *current*
+/// function and says nothing about its caller, so the one thing this is for --
+/// starting a walk -- is exactly what it cannot do. That arm crosses the Rust
+/// frames with the unwind tables instead.
+#[cfg(not(target_os = "windows"))]
 #[inline(always)]
 pub(crate) fn current_frame_pointer() -> usize {
     let fp: usize;
@@ -139,6 +165,11 @@ pub(crate) fn current_frame_pointer() -> usize {
 /// A backstop against an unreadable frame chain. Far above any real W# stack.
 const MAX_FRAMES: usize = 1 << 16;
 
+/// A generated frame: its frame pointer, and the program counter within it.
+///
+/// Both, because a frame pointer alone does not say whose stack map to read.
+pub type GeneratedFrame = (usize, usize);
+
 /// Call `visit` with the address of every stack slot holding a live heap
 /// reference, for every generated frame below the caller.
 ///
@@ -150,70 +181,117 @@ const MAX_FRAMES: usize = 1 << 16;
 /// `ws_alloc` or the collector's poll -- with the frame chain intact.
 #[inline(never)]
 pub unsafe fn walk_roots(visit: impl FnMut(*mut *mut u8)) {
-    // This frame's own pointer, which stays live for the call below. A helper's
-    // would not: the frame it named would be the one `walk_roots_from` is
-    // about to be given.
-    unsafe { walk_roots_from(current_frame_pointer(), visit) }
+    if let Some(frame) = innermost_generated_frame() {
+        unsafe { walk_generated(frame, visit) };
+    }
 }
 
-/// As [`walk_roots`], but starting from a frame pointer recorded elsewhere.
+/// The nearest generated frame above the caller, if there is one.
 ///
-/// This is how a worker parked in a syscall is walked. Its stack is frozen for
-/// as long as it is blocked, so the thread that walks it need not be the one
-/// that owns it -- which is what lets a collector run a pause for a mutator
-/// that cannot answer one. Nothing in the walk is thread-dependent: the code
-/// table is published once and read-only afterwards.
+/// **Answerable only about the calling thread.** Crossing the Rust frames needs
+/// this thread's frame pointers or this thread's registers, and neither can be
+/// read from outside, which is why a worker about to park calls this for itself
+/// rather than leaving it to whoever walks it afterwards.
 ///
-/// # Safety
-/// `start_fp` must be a live frame pointer on a stack that is not running:
-/// either this thread's own, or a parked worker's `parked_fp`, held parked for
-/// the whole walk.
-pub unsafe fn walk_roots_from(start_fp: usize, mut visit: impl FnMut(*mut *mut u8)) {
-    let mut fp = start_fp;
-    // Generated frames are contiguous: once the walk has entered them, the
-    // first frame that is not generated code is where W# ends. That is a
-    // sounder stop condition than waiting for a null frame pointer, which
-    // depends on whatever libc did below `main`.
-    let mut inside = false;
-    // Read once: this runs per frame, per collection.
+/// `None` means there is no generated code below the caller at all -- a runtime
+/// thread, or a mutator that has not entered W# yet. It is not an error, and it
+/// is the answer the old walk could not give: it kept climbing instead, and on
+/// Windows climbed straight off the end of the stack.
+#[cfg(not(target_os = "windows"))]
+#[inline(never)]
+pub fn innermost_generated_frame() -> Option<GeneratedFrame> {
     let trace = crate::gc::env_flag("WSHARP_GC_TRACE");
-
+    // This frame's own pointer. Every frame the search wants is above it.
+    let mut fp = current_frame_pointer();
     for _ in 0..MAX_FRAMES {
         // `[fp]` is the caller's frame pointer and `[fp + 8]` the return
         // address into it, so each iteration describes the frame *above*.
         let parent_fp = unsafe { (fp as *const usize).read() };
         if parent_fp <= fp {
             // Stacks grow down, so a parent frame is always at a higher
-            // address. Anything else means the chain is broken.
-            break;
+            // address. Anything else means the chain is broken -- and on the
+            // outermost frame the ABI's zero makes it so.
+            return None;
         }
         let pc = unsafe { ((fp + 8) as *const usize).read() };
-
         if trace {
-            match function_at(pc) {
-                Some(f) => eprintln!(
-                    "  fp={fp:#x} pc={pc:#x} generated, offset {:#x}, {} roots here",
-                    pc - f.base,
-                    f.safepoint_at(pc).map_or(0, |s| s.roots.len()),
-                ),
-                None => eprintln!("  fp={fp:#x} pc={pc:#x} not generated"),
+            eprintln!("  crossing fp={fp:#x} pc={pc:#x}");
+        }
+        if function_at(pc).is_some() {
+            return Some((parent_fp, pc));
+        }
+        fp = parent_fp;
+    }
+    None
+}
+
+/// As above, crossing the Rust frames with the unwind tables.
+///
+/// Windows records a function's frame register in its unwind info rather than
+/// promising `push rbp; mov rbp, rsp`, so `rbp` is not a chain here; see
+/// [`crate::sys::Frames`] for what that looked like when it was followed anyway.
+#[cfg(target_os = "windows")]
+#[inline(never)]
+pub fn innermost_generated_frame() -> Option<GeneratedFrame> {
+    let trace = crate::gc::env_flag("WSHARP_GC_TRACE");
+    let mut frames = crate::sys::Frames::here();
+    for _ in 0..MAX_FRAMES {
+        let pc = frames.pc();
+        if trace {
+            eprintln!("  crossing pc={pc:#x}");
+        }
+        if function_at(pc).is_some() {
+            return Some((frames.frame_pointer(), pc));
+        }
+        if !frames.step() {
+            return None;
+        }
+    }
+    None
+}
+
+/// Visit the roots of `frame` and of every generated frame above it.
+///
+/// This half needs no per-platform arm. Cranelift's prologue is `push rbp; mov
+/// rbp, rsp` whatever the calling convention, so within generated code `[fp]`
+/// really is the caller's frame pointer -- and generated frames are contiguous,
+/// so the first frame that is not generated code is where W# ends.
+///
+/// Nothing outside a confirmed generated frame is ever dereferenced, which is
+/// what keeps a broken chain from becoming a wild read.
+///
+/// # Safety
+/// `frame` must name a live generated frame on a stack that is not running:
+/// this thread's own, or a parked worker's, held parked for the whole walk.
+pub unsafe fn walk_generated(frame: GeneratedFrame, mut visit: impl FnMut(*mut *mut u8)) {
+    let (mut fp, mut pc) = frame;
+    // Read once: this runs per frame, per collection.
+    let trace = crate::gc::env_flag("WSHARP_GC_TRACE");
+
+    for _ in 0..MAX_FRAMES {
+        let Some(func) = function_at(pc) else {
+            return;
+        };
+        if trace {
+            eprintln!(
+                "  fp={fp:#x} pc={pc:#x} generated, offset {:#x}, {} roots here",
+                pc - func.base,
+                func.safepoint_at(pc).map_or(0, |s| s.roots.len()),
+            );
+        }
+        if let Some(safepoint) = func.safepoint_at(pc) {
+            let sp = fp - safepoint.frame_size as usize;
+            for &offset in safepoint.roots.iter() {
+                visit((sp + offset as usize) as *mut *mut u8);
             }
         }
-        match function_at(pc) {
-            Some(func) => {
-                inside = true;
-                if let Some(safepoint) = func.safepoint_at(pc) {
-                    let sp = parent_fp - safepoint.frame_size as usize;
-                    for &offset in safepoint.roots.iter() {
-                        visit((sp + offset as usize) as *mut *mut u8);
-                    }
-                }
-                // A generated frame with no stack map at this pc simply has no
-                // live references there; keep walking.
-            }
-            None if inside => break,
-            None => {}
+        // A generated frame with no stack map at this pc simply has no live
+        // references there; keep walking either way.
+        let parent_fp = unsafe { (fp as *const usize).read() };
+        if parent_fp <= fp {
+            return;
         }
+        pc = unsafe { ((fp + 8) as *const usize).read() };
         fp = parent_fp;
     }
 }
@@ -285,6 +363,10 @@ mod tests {
         assert_eq!(found, 0);
     }
 
+    /// Not run on Windows, where it is false and allowed to be: a Win64
+    /// prologue establishes its frame register however its unwind info says,
+    /// which is the whole reason that arm does not follow this chain.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn the_frame_pointer_chain_is_readable() {
         // If this fails, `-Cforce-frame-pointers=yes` is not in effect and the
@@ -297,28 +379,32 @@ mod tests {
         assert_ne!(pc, 0, "the return address is present");
     }
 
-    /// A frame pointer recorded in one function and walked from another names
-    /// the same chain -- which is the whole basis of walking a parked worker.
+    /// A stack with no generated code on it is answered, not climbed.
+    ///
+    /// This is what a parked worker records, and the answer a runtime thread
+    /// gives. It used to have no way to say so: the search ran to the end of
+    /// the stack instead, which is harmless where the ABI zeroes the outermost
+    /// frame pointer and, on Windows, was an access violation reading whatever
+    /// the thread entry had left in the register.
     #[test]
-    fn a_recorded_frame_pointer_walks_the_same_chain() {
+    fn a_stack_with_no_generated_code_reports_none() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         register_code(Vec::new());
+        assert!(innermost_generated_frame().is_none());
+    }
 
-        #[inline(never)]
-        fn records() -> (usize, usize) {
-            // What a safe region records, and what the chain above it is.
-            let fp = current_frame_pointer();
-            let parent = unsafe { (fp as *const usize).read() };
-            (fp, parent)
-        }
-
-        let (fp, parent) = records();
-        // The frame is gone, but the chain it named still runs upwards through
-        // this test's own frame, which is live.
-        assert!(parent > fp);
-        // And a walk from it terminates rather than running away: with no
-        // generated code registered there is nothing to find, and the walk
-        // must still stop.
-        unsafe { walk_roots_from(current_frame_pointer(), |_| unreachable!()) };
+    /// Walking generated frames stops at the first frame that is not one,
+    /// without reading past it.
+    ///
+    /// The frame handed over is a fabricated one whose pc belongs to no
+    /// registered function, so the walk must return before dereferencing it --
+    /// which is the property that keeps a broken chain from becoming a wild
+    /// read.
+    #[test]
+    fn walking_stops_before_reading_a_frame_that_is_not_generated() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        register_code(vec![func(0x1000, 0x200, vec![(0x10, 32, vec![16])])]);
+        // An address that is not mapped: reaching the read would fault.
+        unsafe { walk_generated((0x8, 0x9999), |_| unreachable!()) };
     }
 }

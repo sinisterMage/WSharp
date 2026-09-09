@@ -85,7 +85,8 @@ Things that will bite:
 | `crates/wsharp-start` | Defines `main`, so it sets `test = false`: a test harness brings its own `main` and the linker refuses two. It must be built with `-Cforce-frame-pointers=yes` or the collector's root walk breaks at its first Rust frame. |
 | `cargo test` and the runtime archive | **`cargo test --workspace` does not build `crates/wsharp-start`.** It has no test target and nothing depends on it, so cargo leaves it out of the graph entirely -- while the case suite's AOT pass shells out to `wsharp build`, which links against whatever `libwsharp_start.a` an *earlier* `cargo build` left in `target/debug`. A cold tree fails every built case with "cannot find the runtime archive"; a warm one silently links a stale runtime, which is worse, because it passes. Adding a builtin and testing it with `cargo test` alone will report an undefined reference to a symbol that is right there in the source. Run `cargo build --workspace` first -- which is why both CI workflows have a "Build for the test suite" step before their "Test" step. |
 | `cargo build` and `ingot` | Does not produce it any more. `ingot` is `wsharp build --module ingot/main -o ingot`, and `crates/wsharp-cli/tests/verbs.rs` bootstraps one to test against. |
-| Windows | **Builds, and one bug short of working.** Everything needed to compile and link is fixed: `c_int` in `sys/windows.rs`, `-subsystem:console` (clang picks a subsystem by looking for `main` in the *objects*, and ours is in the archive), the system libraries a staticlib does not carry, and `-nodefaultlib:libcmt -defaultlib:msvcrt` (Rust links the dynamic CRT, clang defaults to the static one). What remains: **`fs.mkdir_all` reports success without creating the last component**, so `ingot install` fails for any package with a `src/`. Written out step by step beside it, the identical walk *works* -- so `mkdir` and `is_dir` are both fine and the fault is in that loop. `!x` on a builtin's `bool` was suspected and normalising it in `lower.rs` did not fix it, though the normalisation is right on its own terms. Not shipped until this is understood; the release matrix has no Windows arm. Note that nothing here can be checked locally on NixOS: no rustup, no std for the target, so not even `cargo check --target`. |
+| Windows | **Builds, links and passes the suite.** Everything needed to compile and link: `c_int` in `sys/windows.rs`, `-subsystem:console` (clang picks a subsystem by looking for `main` in the *objects*, and ours is in the archive), the system libraries a staticlib does not carry, and `-nodefaultlib:libcmt -defaultlib:msvcrt` (Rust links the dynamic CRT, clang defaults to the static one). What was wrong for a long time was **the collector's stack walk, not `fs.mkdir_all`** -- see the row below. The `mkdir_all` story that stood here was a misdiagnosis: that walk is fine, and `!x` on a builtin's `bool` (normalised in `lower.rs`) really did fix what it was blamed for. Note that almost nothing here can be checked locally on NixOS: no rustup, no std for the target, so not even `cargo check --target`. It needs a real Windows machine. |
+| The `rbp` chain on Win64 | **Not a chain, and this cost the platform a release.** A Win64 prologue records its frame register in the function's *unwind info* and may establish it as `lea rbp, [rsp + n]`, for which `[rbp]` is a local rather than the caller's frame; and nothing zeroes the outermost one, where SysV requires it. `-Cforce-frame-pointers=yes` does reach this target -- it is on the `rustc` command line and checkable -- and does not make the chain followable. So the collector's walk crossed about two Rust frames, reached no generated code, found **zero roots**, and then climbed off the end of the stack: the symptom was a return address of `0x6873775c67756265`, which is `"ebug\wsh"`. Every `gc_*` case died under `--gc-stress` and `ingot install` died at `0xC0000005`, while ordinary programs looked fine because without stress the collector barely runs. `stackwalk` therefore crosses the Rust frames with `RtlVirtualUnwind` here and follows `rbp` only within generated code. |
 
 ## The operating system
 
@@ -466,6 +467,24 @@ extra `sin_len` byte out of this code entirely.
   thing that does not travel: they sit on the thread, so a collector declines a
   parked worker whose `pinned_depth` is not zero and waits for it instead, as
   everything did before safe regions existed.
+- **A root walk has two halves, and only the first one has arms.** *Reaching*
+  generated code means crossing the handful of Rust frames between the collector
+  and the runtime function generated code called into: that is
+  `stackwalk::innermost_generated_frame`, and it is per-platform, because the
+  SysV arms may follow `rbp` and Windows may not (see the platform table).
+  *Walking* generated code is then `walk_generated`, which is `rbp` everywhere,
+  because Cranelift's prologue is `push rbp; mov rbp, rsp` whatever the calling
+  convention -- it ignores the call conv entirely, which `isa/x64/abi.rs` says
+  out loud. So the half that reads stack maps has no arms and cannot drift.
+  Two things follow. **A parked worker records the generated frame itself**, in
+  `worker::blocking`, because crossing the Rust frames needs that thread's own
+  frame pointers or its own registers and a collector has neither -- what it is
+  handed is the far side of the crossing, which any thread may walk. And
+  **nothing outside a confirmed generated frame is ever dereferenced**, which is
+  what keeps a broken chain a stopped walk rather than a wild read; the old walk
+  kept climbing instead, and that is exactly how it ran off the end of a Windows
+  stack. A `None` from the first half is an ordinary answer -- a runtime thread,
+  or a mutator that has not entered W# yet -- not a failure.
 - **A forwarded header is an address, not flags.** Anything that reads a flag,
   a count, a size or a type id from an object in a block being emptied must
   test forwarding first -- `evacuate::forward`, `heap::evacuate_block` and
@@ -903,8 +922,11 @@ nix-shell --run "cargo test --workspace"
 - **A case that touches the filesystem builds its own directory and removes
   it.** `os.temp_dir()` says where, and the name carries `crypto.random` bytes,
   because the suite runs a second time under `--gc-stress` and the two runs may
-  overlap. `/tmp` hardcoded is what `tests/cases/io.ws` does and is the reason
-  it is the one case the Windows runner has ever had trouble with.
+  overlap. `tests/cases/io.ws` hardcoded `/tmp` and was for a long time the one
+  case the Windows runner had trouble with -- twice over, because `/tmp` there
+  resolves to the current drive's root, which need not exist, and because a
+  fixed name is two of the suite's passes opening one file, which Windows
+  refuses rather than tolerates. It follows the rule now.
 - Parser tests compare against the s-expression dump (`wsharp_syntax::dump`),
   which makes precedence bugs obvious.
 - **Fixtures a case imports live in `tests/cases/modules/`.** The harness runs

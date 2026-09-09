@@ -462,7 +462,9 @@ run. There is no mode *reader* -- that would mean a `struct stat`, whose layout
 differs on every system in the BSD family, and the question worth asking is
 "will this start" rather than "which bits are set". Windows has no permission
 bits, so `chmod` succeeds there without doing anything and `is_executable` is
-`exists`. `std/path` is the arithmetic above both, and makes no syscall at all.
+`exists` -- but a path that is not there is an error on every platform, because
+"succeeded and did nothing" is honest about permissions this system does not
+keep and a lie about a file that does not exist. `std/path` is the arithmetic above both, and makes no syscall at all.
 `std/os` is what the process knows about itself -- `args`, `get`, `home`,
 `temp_dir`, `cwd`, and `target`, the triple this binary was built for.
 `std/toml` is TOML 1.0, read and written.

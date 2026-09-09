@@ -26,9 +26,31 @@ env:
 
 jobs:
   test:
-    name: test
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    strategy:
+      # One platform's failure must not cancel the other's, and here that is
+      # more than politeness: the whole reason Windows is in this matrix is that
+      # it breaks in ways Linux cannot show, so its result is the interesting
+      # one precisely when it differs.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cc: cc
+          - os: windows-latest
+            # Not `cc`: `link.rs` passes `-o`, which `cl.exe` does not
+            # understand. The hosted image ships clang, which drives `link.exe`
+            # underneath and does understand it.
+            cc: clang
+    defaults:
+      run:
+        # Git Bash on Windows, so one script works on both. Every `run:` below
+        # is written for it.
+        shell: bash
+    env:
+      CC: ${{ matrix.cc }}
     steps:
       - uses: actions/checkout@v4
 
@@ -41,17 +63,35 @@ jobs:
             ~/.cargo/git/db
             target
           # `target` holds artifacts built with one profile by one toolchain;
-          # keying on the job as well as the lockfile keeps `test` and `lint`
-          # from overwriting each other's cache on every run.
-          key: cargo-test-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          # keying on the job *and the platform* as well as the lockfile keeps
+          # `test` and `lint` from overwriting each other's cache, and keeps two
+          # operating systems from restoring each other's object files.
+          key: cargo-test-${{ matrix.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
-            cargo-test-
+            cargo-test-${{ matrix.os }}-
+
+      # **Git Bash ships a coreutils `link`, and it comes before MSVC's on
+      # `PATH`.** `clang` drives the link by running `link.exe`, so it finds the
+      # one that makes hard links instead, which fails talking about operands
+      # rather than about linking. Nothing here uses `link(1)`, so the shortest
+      # fix is to take it away.
+      - name: Remove the link.exe that is not a linker
+        if: runner.os == 'Windows'
+        run: rm -f "/c/Program Files/Git/usr/bin/link.exe"
+
+      # clang finds the MSVC toolchain by itself and the Windows SDK's
+      # *libraries* not at all: `LIB` and `INCLUDE` are what `vcvars64.bat`
+      # exports, and without them the case suite's AOT pass cannot resolve
+      # `kernel32` and the seven others `link.rs` names.
+      - name: Set up the MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Versions
         run: |
           rustc --version
           cargo --version
-          cc --version | head -1
+          "$CC" --version | head -1
 
       # **Before the tests, and that order is load-bearing.** The case suite's
       # AOT pass shells out to `wsharp build`, which links against
@@ -72,9 +112,22 @@ jobs:
         run: cargo test --workspace --locked
 
   lint:
-    name: lint
-    runs-on: ubuntu-latest
+    name: lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      # **Both platforms, because a `cfg` is invisible to the other one.**
+      # `sys/windows.rs` is not compiled on Linux, so nothing Linux runs has an
+      # opinion about it -- a dead function or a needless cast there fails the
+      # build only where it is built. That is not hypothetical: the arm that
+      # crosses the Rust frames with the unwind tables left
+      # `current_frame_pointer` unused on Windows and nowhere else.
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
@@ -86,14 +139,19 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cargo-lint-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: cargo-lint-${{ matrix.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
-            cargo-lint-
+            cargo-lint-${{ matrix.os }}-
 
+      # Once only. `rustfmt` parses rather than compiles, so it formats the
+      # arms this platform does not build and answers the same on both --
+      # running it twice would only be a second way to spend a runner.
       - name: Formatting
+        if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
 
       # `--all-targets` so tests and examples are linted too, and `-D warnings`
-      # so a lint that is only a warning locally still fails the build.
+      # so a lint that is only a warning locally still fails the build. No
+      # `CC` and no MSVC environment: clippy checks, and checking does not link.
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings

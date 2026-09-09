@@ -86,16 +86,28 @@ jobs:
             archive: libwsharp_start.a
             cc: cc
             sha: shasum -a 256
-          # **There is no Windows arm, and that is a decision rather than an
-          # omission.** Everything needed to *build* there works -- the linker,
-          # the subsystem, the system libraries, the C runtime, all fixed and
-          # all kept below. What does not work is `fs.mkdir_all`, which reports
-          # success without creating a directory, so `ingot install` fails for
-          # any package with a `src/` -- which is every package.
-          #
-          # Shipping that would be shipping a toolchain whose package manager
-          # does not work, so it is not shipped. The fixes stay; the arm comes
-          # back when the last bug does.
+          # **The Windows arm is back, and what kept it out was not what this
+          # comment used to say.** It blamed `fs.mkdir_all` for reporting
+          # success without creating a directory. That walk was fine; the fault
+          # was in the collector, whose root walk followed the `rbp` chain
+          # across the Rust frames -- which Win64 does not promise and does not
+          # provide. It found no roots at all and then climbed off the end of
+          # the stack, so every `gc_*` case died under `--gc-stress` and `ingot
+          # install` died at `0xC0000005`, while everything else looked well
+          # because without stress the collector barely runs. `stackwalk` now
+          # crosses those frames with the unwind tables. See CLAUDE.md.
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            exe: ".exe"
+            # MSVC names a staticlib `wsharp_start.lib`. A `windows-gnu` build
+            # would keep the Unix spelling, which is why `link.rs` looks for
+            # both names rather than choosing one from `target_env`.
+            archive: wsharp_start.lib
+            # Not `cc`: `link.rs` passes `-o`, which `cl.exe` does not
+            # understand. clang is on the hosted image already, and drives
+            # `link.exe` underneath.
+            cc: clang
+            sha: sha256sum
     defaults:
       run:
         # Git Bash on Windows, so one script works on all four. Every `run:`
@@ -109,6 +121,25 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.TAG }}
+
+      # **Git Bash ships a coreutils `link`, and it comes before MSVC's on
+      # `PATH`.** `clang` drives the link by running `link.exe`, so it finds the
+      # one that makes hard links instead, which fails talking about operands
+      # rather than about linking. Nothing in this workflow uses `link(1)`, so
+      # the shortest fix is to take it away.
+      - name: Remove the link.exe that is not a linker
+        if: runner.os == 'Windows'
+        run: rm -f "/c/Program Files/Git/usr/bin/link.exe"
+
+      # clang finds the MSVC toolchain by itself and the Windows SDK's
+      # *libraries* not at all: `LIB` and `INCLUDE` are what `vcvars64.bat`
+      # exports, and without them the link cannot resolve `kernel32` and the
+      # seven others `link.rs` names. This action is that batch file with its
+      # environment hoisted into the job, which is the only way a later `run:`
+      # can see it.
+      - name: Set up the MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
 
       # `rust-toolchain.toml` pins 1.95.0 and every hosted runner ships rustup,
       # so the pin honours itself on first use. No container: the image
@@ -134,6 +165,17 @@ jobs:
       # A tag that cannot pass its own tests is not a release. This repeats what
       # CI already did for the commit, which is the point: a tag can be pushed
       # at any commit, including one CI never saw.
+      #
+      # **The same suite on every arm, Windows included.** The Windows job used
+      # to be handed `--skip every_case --skip built_program` because it was
+      # nineteen minutes in and unfinished -- but that was the collector
+      # crashing and a dying Windows process sitting at a crash dialog rather
+      # than exiting, not the cost of the links. With that fixed the whole
+      # `cases` target is about four minutes. Skipping those two would in any
+      # case have skipped exactly the passes that matter most here: the AOT one
+      # is the only thing that exercises the object backend, the three tables as
+      # data and `wsharp-start`'s `main`, and the stress one is the only thing
+      # that exercises the root walk -- which is the part Win64 broke.
       - name: Test
         run: cargo test --workspace --locked
 

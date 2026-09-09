@@ -62,6 +62,16 @@ pub(crate) mod windows;
 #[cfg(target_os = "windows")]
 pub(crate) use windows as imp;
 
+/// Crossing the Rust frames to reach generated code, which on this one platform
+/// is the unwind tables' job rather than the frame pointer's.
+///
+/// Re-exported here rather than reached through `imp` because it has no
+/// counterpart in the other two arms to be dispatched against: `stackwalk` asks
+/// for it under the same `cfg` that defines it. See [`windows::Frames`] for why
+/// Windows cannot answer this with `rbp`.
+#[cfg(target_os = "windows")]
+pub(crate) use windows::Frames;
+
 /// An open file or socket, as W# sees it.
 ///
 /// A signed word because that is what a W# `i64` handle is, and because every

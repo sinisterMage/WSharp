@@ -463,7 +463,18 @@ pub(crate) fn rename(from: &[u8], to: &[u8]) -> Result<(), Errno> {
 /// Read-only is the one bit that *could* be mapped, via `FILE_ATTRIBUTE_READONLY`.
 /// It is left alone on purpose: nothing in this project asks to make a file
 /// unwritable, and a half-mapping is worse than none.
-pub(crate) fn chmod(_path: &[u8], _mode: u32) -> Result<(), Errno> {
+///
+/// **A path that is not there is still an error**, and that is the one part of
+/// this that is not a no-op. "Succeeded and did nothing" is an honest answer
+/// about a file whose permissions this platform does not keep; it is a false one
+/// about a file that does not exist, where the caller's next step -- running it,
+/// or installing it -- has nothing to work on. Unix reports `ENOENT` here, so
+/// this reports its own spelling of the same thing, and a caller need not know
+/// which platform it is on to find out it named the wrong path.
+pub(crate) fn chmod(path: &[u8], _mode: u32) -> Result<(), Errno> {
+    if !exists(path) {
+        return Err(Errno(ERROR_FILE_NOT_FOUND));
+    }
     Ok(())
 }
 
@@ -1151,4 +1162,195 @@ pub(crate) fn system_roots() -> Option<Vec<u8>> {
     }
     unsafe { CertCloseStore(store, 0) };
     if out.is_empty() { None } else { Some(out) }
+}
+
+// ---------------------------------------------------------------------------
+// Walking out of the runtime, which here is not a matter of frame pointers
+// ---------------------------------------------------------------------------
+
+/// **On Windows a frame pointer chain is not a thing you may follow.**
+///
+/// The collector finds its roots by walking from inside a runtime function that
+/// generated code called into, up to the nearest generated frame. On the
+/// SysV platforms that walk is `rbp`: every frame does `push rbp; mov rbp, rsp`,
+/// so `[rbp]` is the caller's frame pointer, and the outermost frame has a zero
+/// one because the ABI says the deepest frame must mark itself that way.
+///
+/// Neither half holds here. `-Cforce-frame-pointers=yes` reaches this target --
+/// it is on the `rustc` command line, which is checkable -- and the chain still
+/// breaks two frames up, because Win64 records a function's frame register in
+/// its *unwind info* and lets the prologue establish it however it likes,
+/// including `lea rbp, [rsp + n]`, for which `[rbp]` is a local rather than the
+/// caller's frame. And nothing zeroes the outermost one, so a walk that got that
+/// far would carry on into whatever the thread entry left in the register: the
+/// symptom was a return address of `0x6873775c67756265`, which is `"ebug\wsh"`.
+///
+/// So the Rust frames are crossed with the unwind tables, which is what they are
+/// for. Generated frames are still walked by `rbp` -- Cranelift's prologue
+/// really is `push rbp; mov rbp, rsp`, on every calling convention -- so this is
+/// needed only to *reach* them, and only on this platform.
+///
+/// A `CONTEXT` is 1232 bytes and 16-byte aligned. Only three of its registers
+/// are read, but the whole layout has to be declared for their offsets to be
+/// right, so the offsets are asserted below rather than trusted.
+#[repr(C, align(16))]
+pub(crate) struct CONTEXT {
+    P1Home: u64,
+    P2Home: u64,
+    P3Home: u64,
+    P4Home: u64,
+    P5Home: u64,
+    P6Home: u64,
+    ContextFlags: DWORD,
+    MxCsr: DWORD,
+    SegCs: u16,
+    SegDs: u16,
+    SegEs: u16,
+    SegFs: u16,
+    SegGs: u16,
+    SegSs: u16,
+    EFlags: DWORD,
+    Dr0: u64,
+    Dr1: u64,
+    Dr2: u64,
+    Dr3: u64,
+    Dr6: u64,
+    Dr7: u64,
+    Rax: u64,
+    Rcx: u64,
+    Rdx: u64,
+    Rbx: u64,
+    Rsp: u64,
+    Rbp: u64,
+    Rsi: u64,
+    Rdi: u64,
+    R8: u64,
+    R9: u64,
+    R10: u64,
+    R11: u64,
+    R12: u64,
+    R13: u64,
+    R14: u64,
+    R15: u64,
+    Rip: u64,
+    /// `XMM_SAVE_AREA32`, which nothing here reads.
+    FltSave: [u8; 512],
+    VectorRegister: [u8; 416],
+    VectorControl: u64,
+    DebugControl: u64,
+    LastBranchToRip: u64,
+    LastBranchFromRip: u64,
+    LastExceptionToRip: u64,
+    LastExceptionFromRip: u64,
+}
+
+// The three fields the walk reads, at the offsets the platform documents. A
+// binding whose layout is wrong here would not fail to compile and would not
+// fail loudly: it would hand the collector a plausible number.
+const _: () = {
+    assert!(core::mem::size_of::<CONTEXT>() == 1232);
+    assert!(core::mem::offset_of!(CONTEXT, Rsp) == 0x98);
+    assert!(core::mem::offset_of!(CONTEXT, Rbp) == 0xA0);
+    assert!(core::mem::offset_of!(CONTEXT, Rip) == 0xF8);
+};
+
+/// A `RUNTIME_FUNCTION`, which is only ever handed straight back to Win32.
+enum RUNTIME_FUNCTION {}
+
+/// `RtlVirtualUnwind`'s "no handler wanted": this is a walk, not a throw.
+const UNW_FLAG_NHANDLER: DWORD = 0;
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn RtlCaptureContext(context: *mut CONTEXT);
+    fn RtlLookupFunctionEntry(
+        pc: u64,
+        image_base: *mut u64,
+        history: *mut c_void,
+    ) -> *mut RUNTIME_FUNCTION;
+    fn RtlVirtualUnwind(
+        handler_type: DWORD,
+        image_base: u64,
+        pc: u64,
+        entry: *mut RUNTIME_FUNCTION,
+        context: *mut CONTEXT,
+        handler_data: *mut *mut c_void,
+        establisher_frame: *mut u64,
+        context_pointers: *mut c_void,
+    ) -> *mut c_void;
+}
+
+/// The frames of the calling thread, newest first.
+///
+/// Only ever the *calling* thread: a `CONTEXT` describes registers, and reading
+/// another thread's while it runs would describe no moment in particular. A
+/// parked worker answers this question for itself before it parks, which is why
+/// nothing here takes a thread.
+pub(crate) struct Frames {
+    context: CONTEXT,
+}
+
+impl Frames {
+    /// Capture the caller's frame and those above it.
+    ///
+    /// `#[inline(never)]` for the reason `current_frame_pointer`'s users are:
+    /// the innermost frame captured is this one, and a caller that had it
+    /// inlined would be describing a frame that is about to be reused.
+    #[inline(never)]
+    pub(crate) fn here() -> Frames {
+        // Sound: `RtlCaptureContext` writes every field it is documented to,
+        // and the rest are only ever passed back to Win32.
+        let mut context: CONTEXT = unsafe { core::mem::zeroed() };
+        unsafe { RtlCaptureContext(&raw mut context) };
+        Frames { context }
+    }
+
+    /// The program counter in the current frame.
+    pub(crate) fn pc(&self) -> usize {
+        self.context.Rip as usize
+    }
+
+    /// The current frame's frame pointer.
+    ///
+    /// Meaningful for a *generated* frame, which is the only kind this is asked
+    /// about: Cranelift establishes `rbp` the way the collector's own walk
+    /// expects, and unwinding restores it on the way out of the Rust frames
+    /// below -- whether they saved it or never touched it.
+    pub(crate) fn frame_pointer(&self) -> usize {
+        self.context.Rbp as usize
+    }
+
+    /// Step to the frame above, answering whether there was one.
+    ///
+    /// A pc the loader has no unwind info for stops the walk rather than
+    /// guessing. That is the honest answer: the one such pc this walk expects
+    /// is generated code, and the caller tests for that before stepping.
+    pub(crate) fn step(&mut self) -> bool {
+        let pc = self.context.Rip;
+        if pc == 0 {
+            return false;
+        }
+        let mut image_base: u64 = 0;
+        let entry =
+            unsafe { RtlLookupFunctionEntry(pc, &raw mut image_base, core::ptr::null_mut()) };
+        if entry.is_null() {
+            return false;
+        }
+        let mut handler_data: *mut c_void = core::ptr::null_mut();
+        let mut establisher: u64 = 0;
+        unsafe {
+            RtlVirtualUnwind(
+                UNW_FLAG_NHANDLER,
+                image_base,
+                pc,
+                entry,
+                &raw mut self.context,
+                &raw mut handler_data,
+                &raw mut establisher,
+                core::ptr::null_mut(),
+            )
+        };
+        // A zero return address is the thread entry: there is nothing above it.
+        self.context.Rip != 0
+    }
 }

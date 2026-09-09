@@ -88,8 +88,9 @@ pub(crate) struct Stats {
 
 /// A worker running normally: it answers its own pause requests.
 pub(crate) const RUNNING: u8 = 0;
-/// Parked in a syscall. Its stack is frozen and `parked_fp` says where it is,
-/// so its collector may walk it and run the pause on its behalf.
+/// Parked in a syscall. Its stack is frozen and `parked_fp`/`parked_pc` name
+/// the generated frame it found on the way in, so its collector may walk it and
+/// run the pause on its behalf.
 pub(crate) const PARKED: u8 = 1;
 /// A collector has claimed a parked worker and is walking it. The mutator must
 /// not resume until it is let go.
@@ -102,9 +103,19 @@ pub struct Worker {
     pub(crate) mark: MarkState,
     /// [`RUNNING`], [`PARKED`] or [`SCANNING`]: the safe-region handshake.
     pub(crate) parked: AtomicU8,
-    /// Where this worker's stack was when it parked. Meaningful only while
-    /// `parked` is not [`RUNNING`], and published before it is set.
+    /// The innermost *generated* frame on this worker's stack when it parked --
+    /// its frame pointer, and the program counter within it. Meaningful only
+    /// while `parked` is not [`RUNNING`], and published before it is set.
+    ///
+    /// The frame is found by the parking thread rather than by whoever walks
+    /// it, because reaching generated code means crossing the Rust frames, and
+    /// that needs this thread's own frame pointers or its own registers. What
+    /// is published is the far side of that crossing, which any thread may walk.
+    ///
+    /// A `parked_pc` of zero means there was no generated code on the stack at
+    /// all, and so nothing to walk.
     pub(crate) parked_fp: AtomicUsize,
+    pub(crate) parked_pc: AtomicUsize,
     /// The length of this thread's [`PINNED`] list, where another thread can
     /// read it. A parked worker's stack is walkable; that list is not, because
     /// it is on the thread rather than in it.
@@ -177,6 +188,7 @@ impl Worker {
             },
             parked: AtomicU8::new(RUNNING),
             parked_fp: AtomicUsize::new(0),
+            parked_pc: AtomicUsize::new(0),
             pinned_depth: AtomicUsize::new(0),
             park_lock: Mutex::new(()),
             park_changed: Condvar::new(),
@@ -347,11 +359,17 @@ pub(crate) fn blocking<T>(f: impl FnOnce() -> T) -> T {
     crate::heap::retire_local_buffer();
     crate::heap::flush_local_counters();
 
-    // The frame pointer first, then the state: whoever sees `PARKED` must see
-    // a frame pointer that describes this stack.
-    worker
-        .parked_fp
-        .store(crate::stackwalk::current_frame_pointer(), Ordering::Relaxed);
+    // The frame first, then the state: whoever sees `PARKED` must see a frame
+    // that describes this stack.
+    //
+    // Found here rather than by the collector because this is the last moment
+    // anyone can: crossing the Rust frames to reach generated code needs this
+    // thread's frame pointers or its registers, and a collector on another
+    // thread has neither. What it is handed instead is the generated frame
+    // itself, which chains by frame pointer and so may be walked from anywhere.
+    let (fp, pc) = crate::stackwalk::innermost_generated_frame().unwrap_or((0, 0));
+    worker.parked_fp.store(fp, Ordering::Relaxed);
+    worker.parked_pc.store(pc, Ordering::Relaxed);
     worker.parked.store(PARKED, Ordering::Release);
     // A collector that has already asked for a pause is asleep waiting for one
     // that will not come until it runs it. Tell it that it can.
@@ -428,8 +446,14 @@ pub(crate) fn is_parked(worker: &Worker) -> bool {
 /// be held claimed -- [`claim_parked`] -- for the whole walk.
 pub(crate) unsafe fn walk_worker_roots(worker: &Worker, visit: impl FnMut(*mut *mut u8)) {
     if worker.parked.load(Ordering::Acquire) == SCANNING {
-        let fp = worker.parked_fp.load(Ordering::Acquire);
-        unsafe { crate::stackwalk::walk_roots_from(fp, visit) };
+        // Zero means the parked thread found no generated code on its stack,
+        // so there is nothing here to walk -- not that the walk should start
+        // somewhere else and look for some.
+        let pc = worker.parked_pc.load(Ordering::Acquire);
+        if pc != 0 {
+            let fp = worker.parked_fp.load(Ordering::Acquire);
+            unsafe { crate::stackwalk::walk_generated((fp, pc), visit) };
+        }
     } else {
         unsafe { crate::stackwalk::walk_roots(visit) };
     }
