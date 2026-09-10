@@ -28,6 +28,14 @@ fn scratch(name: &str) -> PathBuf {
 
 /// The emit, with the scratch directory's path replaced by `DIR` -- otherwise
 /// the expectation would be about where the test happened to run.
+///
+/// The needle is built the way the loader builds a module path rather than from
+/// `dir` as it was spelled here, and both halves of that matter on Windows:
+/// `canonicalize` resolves the short 8.3 form `temp_dir` may hand back, and
+/// `module_path_of` writes the result with `/` separators. Calling the loader's
+/// own function is the point -- a second copy of that rule here would be a
+/// second thing to keep in step, and this test exists to notice when the first
+/// one changes.
 fn emit(dir: &Path, root: &str) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_wsharp"))
         .arg("check")
@@ -40,7 +48,9 @@ fn emit(dir: &Path, root: &str) -> String {
         "`--emit=api` failed:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    String::from_utf8_lossy(&out.stdout).replace(dir.to_str().expect("a utf-8 path"), "DIR")
+    let canonical = dir.canonicalize().expect("the scratch directory is there");
+    let needle = wsharp_cli::load::module_path_of(&canonical);
+    String::from_utf8_lossy(&out.stdout).replace(&needle, "DIR")
 }
 
 #[test]

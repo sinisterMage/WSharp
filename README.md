@@ -453,8 +453,11 @@ $ wsharp check app/main.ws --emit=api
     (ret "app/fw".Response)))
 ```
 
-Declarations and their types; no bodies, no expressions, no spans. **Every name
-a program defines is absolute** — a type written `fw.Route` prints as
+Declarations and their types; no bodies, no expressions, no spans. A module is
+named by the path it resolved to — `std/net` for a library module, the file for
+a local one, `"main"` for the root — with `/` separators on every platform, as
+everything else in this project writes a path. **Every name a program defines is
+absolute** — a type written `fw.Route` prints as
 `"app/fw".Route` and one declared here prints with this module's own path — so a
 reader never follows an import or guesses a scope, and a bare name is one the
 language provides. Top-level `const` literals come through verbatim, which is

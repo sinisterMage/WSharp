@@ -481,7 +481,7 @@ impl Loader {
             }
         };
         // A file's identity is where it is, not how it was spelled.
-        let module_path = resolved.display().to_string();
+        let module_path = module_path_of(&resolved);
         self.add(target, module_path.clone(), text);
         Some(module_path)
     }
@@ -516,6 +516,48 @@ impl Loader {
 /// A path in a form two spellings of the same file agree on.
 fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// What a file module is *called*, given where it is.
+///
+/// A module path is an identity and a name at once: sema keys its qualified
+/// names on it, a diagnostic says it out loud, and `--emit=api` prints it as
+/// part of an interface tools are written against. So it is written in the one
+/// spelling this project uses everywhere -- separators are `/`, as they are in
+/// a lockfile, in `ingot.env`, and in every path `std/path` hands back.
+///
+/// [`canonical`] is what makes it an identity and is also what makes it need
+/// this: on Windows `canonicalize` answers with the extended-length form,
+/// `\\?\C:\Users\...`, which is a fine thing to hand to the file system and a
+/// poor thing to hand to a reader. Two machines would otherwise disagree about
+/// a module's name for reasons about path syntax rather than about the program.
+///
+/// Only on Windows. `\` is a legal character in a Unix file name, and rewriting
+/// one there would be naming a different file.
+pub fn module_path_of(path: &Path) -> String {
+    let shown = path.display().to_string();
+    if cfg!(windows) {
+        windows_module_path(&shown)
+    } else {
+        shown
+    }
+}
+
+/// [`module_path_of`]'s Windows half.
+///
+/// Split out, and taking a `&str`, so that it can be tested on a machine that
+/// is not Windows -- which is every machine this is usually written on. `cfg!`
+/// rather than `#[cfg]` above is the other half of that: both arms compile
+/// everywhere, so neither can rot unnoticed.
+fn windows_module_path(shown: &str) -> String {
+    // `\\?\UNC\server\share` is the extended-length spelling of
+    // `\\server\share`, so the prefix comes off and the two leading separators
+    // go back on. Tested before the plain prefix, which it begins with.
+    let stripped = match shown.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => shown.strip_prefix(r"\\?\").unwrap_or(shown).to_string(),
+    };
+    stripped.replace('\\', "/")
 }
 
 /// The `@import` specifiers a parsed file names, in source order.
@@ -618,5 +660,32 @@ mod tests {
         assert!(looks_like_a_package("util"));
         assert!(!looks_like_a_package("./modules/geometry.ws"));
         assert!(!looks_like_a_package("../util.ws"));
+    }
+
+    /// The Windows spelling of a module path, checked from Linux.
+    ///
+    /// This is the whole reason [`windows_module_path`] takes a `&str` instead
+    /// of being written inline under a `#[cfg]`: the rule is a fact about
+    /// strings, and a fact about strings can be checked on the machine this is
+    /// written on rather than only on the runner that found it.
+    #[test]
+    fn a_windows_module_path_is_written_with_forward_slashes() {
+        assert_eq!(
+            windows_module_path(r"\\?\C:\Users\ofek\app\fw.ws"),
+            "C:/Users/ofek/app/fw.ws",
+            "the extended-length prefix comes off and the separators turn"
+        );
+        // Already short: `canonicalize` produces the long form, but nothing
+        // here may assume that is the only thing it will ever be handed.
+        assert_eq!(windows_module_path(r"C:\app\fw.ws"), "C:/app/fw.ws");
+        // A share. `\\?\UNC\server\share` *is* `\\server\share`, so the two
+        // leading separators have to survive -- and they are the reason the
+        // UNC prefix is tested before the plain one it begins with.
+        assert_eq!(
+            windows_module_path(r"\\?\UNC\server\share\app\fw.ws"),
+            "//server/share/app/fw.ws"
+        );
+        // Nothing to do, and nothing done.
+        assert_eq!(windows_module_path("std/net"), "std/net");
     }
 }

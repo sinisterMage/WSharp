@@ -26,9 +26,10 @@
 //! has no JSON either.
 //!
 //! A module is named by the path the loader resolved it to, which for a library
-//! module is `std/net` and for a file is that file. The one exception is the
-//! root, which is `"main"` -- the loader's name for it, and what every other
-//! emit already calls it.
+//! module is `std/net` and for a file is that file, written with `/`
+//! separators on every platform -- see `load::module_path_of`. The one
+//! exception is the root, which is `"main"`: the loader's name for it, and what
+//! every other emit already calls it.
 //!
 //! ```text
 //! (api 1)
