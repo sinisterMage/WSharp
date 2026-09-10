@@ -924,24 +924,60 @@ mod socket_tests {
 
     /// Nothing is listening on a port nothing was bound to, and the failure has
     /// a name a program can act on.
+    ///
+    /// "A port nothing is listening on" is asked for rather than assumed. The
+    /// obvious spelling -- bind port 0, read the port, close, connect -- has a
+    /// race with the rest of this file: the tests in a binary run in parallel,
+    /// `a_tcp_conversation_over_loopback` also asks for an ephemeral port, and
+    /// the one released here goes straight back into the pool it draws from. It
+    /// took the Windows runner to show that, and it showed it as a *connection
+    /// that succeeded*, which reads like a broken `tcp_connect` and is not one.
+    ///
+    /// So a connect that succeeds means the port was taken rather than that the
+    /// answer is wrong, and the way to find out is to ask again with another
+    /// one. Bounded, so a system where every connect succeeds fails this test
+    /// rather than hanging it.
     #[test]
     fn connecting_to_nothing_is_refused() {
-        // Bind, ask which port, then give it up: that port was free a moment
-        // ago and is the one nothing is listening on now.
-        let bind_to = resolve(b"127.0.0.1", 0, true, true).expect("resolves");
-        let server = tcp_listen(&bind_to, 1).expect("bound");
-        let port = local_addr(server).expect("bound somewhere").port();
-        close_socket(server);
+        for attempt in 1..=ATTEMPTS {
+            // Bind, ask which port, then give it up: that port was free a
+            // moment ago and is very probably the one nothing is listening on
+            // now. `probably` is what the loop is for.
+            let bind_to = resolve(b"127.0.0.1", 0, true, true).expect("resolves");
+            let server = tcp_listen(&bind_to, 1).expect("bound");
+            let port = local_addr(server).expect("bound somewhere").port();
+            close_socket(server);
 
-        let to = resolve(b"127.0.0.1", port, true, false).expect("resolves");
-        let err = tcp_connect(&to).expect_err("nothing is listening");
-        assert_eq!(
-            error_tag(err),
-            crate::builtins::ERROR_CONNECTION_REFUSED,
-            "errno {} was not recognised as a refused connection",
-            err.0
-        );
+            let to = resolve(b"127.0.0.1", port, true, false).expect("resolves");
+            match tcp_connect(&to) {
+                Err(err) => {
+                    assert_eq!(
+                        error_tag(err),
+                        crate::builtins::ERROR_CONNECTION_REFUSED,
+                        "errno {} was not recognised as a refused connection",
+                        err.0
+                    );
+                    return;
+                }
+                // Somebody bound it between the two calls above -- almost
+                // certainly another test in this binary. Let it go and take a
+                // different port.
+                Ok(connected) => {
+                    close_socket(connected);
+                    assert!(
+                        attempt < ATTEMPTS,
+                        "every one of {ATTEMPTS} ports was claimed between being \
+                         released and being connected to, which is not a race any more"
+                    );
+                }
+            }
+        }
     }
+
+    /// How many ports [`connecting_to_nothing_is_refused`] will try before it
+    /// decides the answer is wrong rather than unlucky. Losing the race twice
+    /// is already remarkable.
+    const ATTEMPTS: u32 = 8;
 
     #[test]
     fn a_name_that_does_not_resolve_says_so() {
