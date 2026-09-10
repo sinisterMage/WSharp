@@ -115,7 +115,7 @@ Things that differ between the arms, each of which cost time:
 | A Windows `SOCKET` | Not a file descriptor and not a `HANDLE`: `closesocket`, not `CloseHandle`; `recv`, not `ReadFile`. |
 | `SO_REUSEADDR` on Windows | Lets a second socket bind a port another is *actively listening on*. The right port of the Unix workaround is to do nothing at all. |
 | `getaddrinfo` failure | Reports `EAI_*` codes, which are negative on glibc and small positive numbers on macOS -- so they would collide with `errno`. Each arm translates them to one synthetic `ERESOLVE` instead. |
-| `struct stat` | **Not declared anywhere, on purpose.** It has a different layout on macOS, FreeBSD, NetBSD and OpenBSD, and is a versioned symbol on glibc. The three questions this layer actually asks each have a one-number answer instead: `is_dir` is `opendir` succeeding, `size` is `lseek` to the end, and `is_executable` is `access(X_OK)`. Dropping `modified` is what made that possible, and the store hashes rather than comparing timestamps anyway. The same rule is why `chmod` has no counterpart that *reads* a mode: "will this start" is answerable without the struct and "which bits are set" is not, and only the first has a caller. |
+| `struct stat` | **Declared in one arm, and only because one question needs it.** It has a different layout on macOS, FreeBSD, NetBSD and OpenBSD, and is a versioned symbol on glibc, so three of the four questions this layer asks have a one-number answer instead: `is_dir` is `opendir` succeeding, `size` is `lseek` to the end, and `is_executable` is `access(X_OK)`. The fourth is `modified_at`, which a watcher needs and which hashing a whole tree per tick is not an answer to. Linux uses `statx` — kernel UAPI, one layout on every architecture, versioned by a mask rather than by a symbol — macOS uses `getattrlist`, which hands back the attributes asked for and no struct at all, and Windows reads a field `GetFileAttributesExW` was already fetching. **Only FreeBSD, NetBSD, OpenBSD and DragonFly meet `struct stat`**, as one `ST_MTIME_OFFSET` per system in `D_NAME_OFFSET`'s style, and those four numbers are the part of this runtime no machine available here can check — `cargo check --target aarch64-apple-darwin` compiles the macOS arm, which is the one that does not use them. `chmod` still has no counterpart that *reads* a mode: "will this start" is answerable with `access` and "which bits are set" is not, and only the first has a caller. |
 | `struct dirent` | `d_name` starts at 19 on Linux, 21 on macOS, 24 on FreeBSD and OpenBSD, 13 on NetBSD and 16 on DragonFly. POSIX guarantees it is NUL-terminated, so each arm carries the *offset* and nothing else -- one auditable fact per system, where a whole declared struct would be five. |
 | `readdir` on macOS | The symbol is `readdir$INODE64` on x86-64 and plain `readdir` on arm64. Linking the unsuffixed name on x86-64 gets the *old* `struct dirent`, whose `d_name` is at 8 rather than 21, and every file name comes back as the tail of another field. Same for `opendir`; `closedir` is unsuffixed. |
 | `ENOTEMPTY` | 39 on Linux and 66 on the BSDs -- the numbering agrees only up to 34, and this is the first code past it that ordinary filesystem work meets. |
@@ -225,6 +225,21 @@ extra `sin_len` byte out of this code entirely.
   parameter, and let the inner loops of anything numeric call nothing at all.
   A back-edge safepoint costs nothing here by contrast — `ws_gc_poll` does not
   collect under stress, only `on_allocation` does.
+- **`std/map` hashes with a builtin, for the row above's reason.** A hash over a
+  `str` written in W# would be one `str.byte_at` per byte and so one stack walk
+  per byte under `--gc-stress`. `str.hash` is FNV-1a -- what `broker.rs` already
+  picks a partition with -- followed by the SplitMix64 finaliser, because the
+  table masks with `capacity - 1` and reads only the low bits, which FNV-1a
+  leaves poorly distributed. Not keyed and not cryptographic: a table built from
+  attacker-chosen keys can be made to collide, and `std/hash` is what to reach
+  for when that matters. `set` and `get` hash once and hoist it out of the probe
+  loop, and compare stored hashes before comparing keys.
+- **A removed map entry stays reachable until its slot is reused**, exactly as
+  `list.pop` leaves a dead reference in the tail and for the same reason:
+  `m.keys[i] = null` only typechecks when the element type is an optional, and
+  the collector walks every element the array header claims. The slot's `state`
+  byte is what says it is dead. Known and documented, not a bug to fix by
+  nulling.
 - **A limb is 32 bits, because there is no 64x64 -> 128 product.** `std/bignum`,
   `std/nistec` and anything else doing multi-precision arithmetic hold 32-bit
   values and accumulate in a `u64`, which is what makes `t + a*b + carry` fit:
@@ -640,6 +655,81 @@ extra `sin_len` byte out of this code entirely.
   and reports `no overload of iter accepts (T)` about a `T` that is right
   there. Sound for the reason the narrower version was: an edge only matters
   when it closes a cycle, and an iterator does not call back into its user.
+- **A conversion inside an abstract-typed body must not settle the parameter.**
+  A parameter annotated `Integer` is a fresh variable carrying
+  `Constraint::Member`, and `infer_convert`'s "an unannotated argument would
+  otherwise stay a variable for ever" default used to unify it with `i64` --
+  the one defaulting site in `infer.rs` without the guard
+  `settle_literal_operand`, the `IntLiteral` pre-pass and the `Numeric` arm all
+  carry. `generalize_definition` then could not quantify it, so the function was
+  monomorphic `fn(i64)` while `fn_decl_params` still said `Integer`. With one
+  overload that surfaced as a bogus mismatch at the call; with two it got
+  through, because `overlap`'s abstract branch kept the case on the strength of
+  the *declared* type and **threw away the failed `try_unify`** -- `Some(None)`
+  means "always applies, no test needed", which is compiled as a static call, so
+  a `u8` reached a body Cranelift had compiled for `i64`. Both halves are fixed:
+  the conversion records a `Numeric` constraint instead of defaulting, and
+  `overlap` honours the unification. **Overload resolution must never be able to
+  produce IR that fails verification**, so the second fix stays even though the
+  first makes this call resolve correctly.
+- **`std/bytes` imports `std/str`, so `std/str` may not import `std/bytes`.**
+  The loader refuses the cycle, and that is why `join` and `repeat` were
+  `concat` in a loop -- which copies the accumulator, so joining 150,000 pieces
+  into 600 KB took 9.4 seconds. They assemble into one `array.new` buffer now,
+  through `str.raw_into`/`str.raw_from`: two builtin rows that are
+  `bytes.raw_from_str`/`bytes.raw_to_str` under a second name, because a `link`
+  is a symbol and no two rows may claim one. A one-line forwarder each, rather
+  than a second implementation.
+- **`==` on a struct is generated per type, and it recurses.** `lower.rs`
+  compiles it into a call for the reason `==` on a `str` already is -- nothing
+  in inference synthesises a call -- and into a *function* rather than an inline
+  sequence because a type that reaches itself would otherwise expand for ever.
+  Two per concrete type (`crate::equality`): a dispatching entry point that
+  answers identity, nulls and unequal type ids and then picks by the runtime
+  type id within the declared type's subtree, and an exact one that compares
+  that type's fields. The subtree dispatch is what makes two `Sub`s compared at
+  `Base` compare `Sub`'s fields rather than only the part `Base` declares.
+  Built through a `Trans` with a placeholder `FuncDef` so the field reads go
+  through the *same* `load_at`, and therefore the same load barrier and the same
+  rooting, as every other field read. Both parameters are declared stack-map
+  roots: they are live across `ws_str_eq` and across the recursive calls, and
+  both are safepoints. **A value that reaches itself recurses for ever**, which
+  is what derived structural equality does everywhere it exists and is said out
+  loud rather than papered over.
+- **`@spawn` returns before `init` starts, and the message loop is entered only
+  after `init` returns.** Both were implementation details of `ws_spawn` and are
+  now promises the README states, because the exit path depends on the second:
+  a worker whose `init` never returns has never dequeued anything, so it can
+  never see the `Stop` that `stop_all` sends. Joining one waits for ever, and
+  did. `Handle::serving` is set immediately before the loop, and `stop_all`
+  joins the workers that reached it and abandons the ones that could not --
+  a distinction rather than a timeout, so an ordinary program's exit stays
+  deterministic and a worker in the middle of a method still finishes. **`main`
+  returning ends the process.** `@join` on a worker that never returns still
+  blocks, because that is a program waiting on its own worker rather than the
+  exit path.
+- **The argument pins come off before generated code is entered.** `unpack`
+  pins each decoded argument because each `decode` allocates and the ones
+  already decoded sit in a `Vec` no stack map describes -- and `worker_main`
+  used to hold them for the whole of `init`. A blocking call inside `init` then
+  entered a safe region with `pinned_depth` non-zero, which a collector responds
+  to by declining the parked worker and waiting for the syscall: the regression
+  safe regions exist to remove, and an abort in any build with debug assertions
+  on. Every acceptor is exactly that shape. `unpack` returning is the last
+  moment anything can allocate before the callee's prologue stores its
+  parameters into slots its own stack maps describe, so there is no safepoint in
+  the window -- the same argument the return area and the runtime boundary
+  already make. `ws_rpc_call`'s method path is the same fix for the same reason.
+- **`--emit=api` is the only emit with a promise attached.** It is versioned,
+  it is printed after type checking so it only ever describes a program the
+  compiler accepted, and every name a program defines is absolute in it. A
+  golden test in `crates/wsharp-cli/tests/api.rs` pins the whole output for a
+  two-module program, so a format change fails there rather than quietly in
+  somebody's generator, and a change that could make an existing reader wrong is
+  a change to `api::VERSION` as well. `--emit=ast` is deliberately not this: it
+  is a debugging aid, shared with the parser tests, free to change. `--emit=obj`
+  is `build`'s alone and is now refused elsewhere -- it used to fall through
+  every branch in `drive` and *run* the program.
 - **`Span` is two `u32`s with no file in it.** Files are laid end to end in one
   offset space and a span's file is the range it falls in (`diag::SourceMap`);
   the first starts at offset 1, which keeps 0 meaning `Span::EMPTY`. Widening
@@ -980,6 +1070,12 @@ nix-shell --run "cargo test --workspace"
   `a_built_program_reports_the_collector_doing_its_work` reads the stats line
   and insists the counts are non-zero, for the reason below: a stack-map table
   that deserialised to nothing makes every root check pass vacuously.
+- **A case that spawns a worker whose `init` never returns is an assertion
+  about the exit path**, and it fails by *hanging* rather than by reporting.
+  `worker_daemon_exit.ws` is that case, and it is what probes 17 and 29 of the
+  Raython design study were. It expects nothing from the worker: `@spawn`
+  returns before `init` starts, so whether that thread printed anything before
+  `main` returned is a race and a case cannot expect the answer.
 - **The whole case suite runs a second time under `--gc-stress`**, which
   collects at every allocation and checks every root the stack maps describe.
   This is the collector's main defence, because rooting is spread over every

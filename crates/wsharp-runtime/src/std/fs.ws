@@ -1,6 +1,7 @@
 // The parts of a filesystem that build arrays, and the walks above them.
 //
-// `mkdir`, `rmdir`, `remove`, `rename`, `is_dir` and `size` are builtins;
+// `mkdir`, `rmdir`, `remove`, `rename`, `is_dir`, `size` and `modified_at` are
+// builtins;
 // `raw_read_dir` is one too, and answers with a blob rather than a `[]str`,
 // because a builtin may not allocate an array. What is here is the cutting up,
 // and the two recursive walks that a store cannot do without -- both of which

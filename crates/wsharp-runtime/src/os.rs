@@ -159,6 +159,32 @@ pub unsafe extern "C" fn ws_os_chdir(dir: *const u8) -> i64 {
     }
 }
 
+/// End the process now, with `code` as its status.
+///
+/// The off switch a program that starts workers needs. `main` returning ends
+/// the process too, but it goes through `rpc::stop_all` first, which waits for
+/// every worker that can be stopped -- and a program that wants out from
+/// somewhere else, or from inside a worker, has nothing else to say so.
+///
+/// It does *not* stop the workers, deliberately: an exit that can be blocked by
+/// a worker refusing to stop is not an exit. What it does do is what every
+/// other way out of this runtime does -- release the sockets, so a listener's
+/// port is free before the next process wants it, and print the collector's
+/// statistics if they were asked for, so `WSHARP_GC_STATS=1` says the same
+/// thing however the program ended.
+///
+/// The low byte, as C has it and as `main`'s return value already is.
+///
+/// # Safety
+/// Called from generated code across an FFI boundary.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_os_exit(code: i64) -> ! {
+    crate::net::close_all();
+    crate::gc::report_if_asked();
+    std::process::exit((code & 0xff) as i32);
+}
+
+/// The path of the running executable.
 /// The path of the running executable.
 ///
 /// What a program needs to find something installed beside it -- which is how

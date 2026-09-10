@@ -6,6 +6,8 @@
 // length is not known until the contents are -- so a buffer that can go back
 // and fill one in is what the encoders are written with. `open16` writes a
 // placeholder and answers with where it went; `close16` returns to it.
+// `open32`/`close32` are the fourth width, which a PostgreSQL frame header
+// needs and TLS does not.
 //
 // The base64 half is for PEM, which is the format a Unix machine keeps its
 // certificate store in. It is checked against Python's `base64`, including
@@ -28,6 +30,8 @@
 // expect: a character outside the alphabet refused
 // expect: a digit after the padding refused
 // expect: three padding characters refused
+// expect: 0000000916000668656c6c6f21
+// expect: 9
 const bytes = @import("std/bytes");
 const array = @import("std/array");
 
@@ -88,6 +92,18 @@ fn main() i64 {
     refuse("aGU!", "a character outside the alphabet refused");
     refuse("aGU=bG8=", "a digit after the padding refused");
     refuse("aA===", "three padding characters refused");
+
+    // The same shape again at 32 bits: a frame whose header is a four-byte
+    // length, holding a message whose own length is two bytes.
+    const f = bytes.buf(4);
+    const frame = bytes.open32(f);
+    bytes.put_u8(f, 0x16);
+    const body = bytes.open16(f);
+    bytes.put_str(f, "hello!");
+    bytes.close16(f, body);
+    bytes.close32(f, frame);
+    print(bytes.to_hex(bytes.taken(f)));
+    print_int(i64(bytes.be32(bytes.taken(f), 0)));
     return 0;
 }
 

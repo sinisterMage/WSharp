@@ -2675,6 +2675,108 @@ the page of IEEE-754 vectors now pointed at the new builtin.
 
 ---
 
+## 14. Standard library improvements — **done**
+
+Item 13 came out of writing a program *against* the language. This one came out
+of writing a **design** against it: Raython, an MVC framework, whose author
+settled every "can W# do this?" by running the compiler rather than from memory
+and left 28 probes behind as the record. Its repository is private, so nothing
+below can be followed to a source -- what is quoted is quoted, and every claim
+about the compiler that it turned on is a case in `tests/cases/` now. Its design
+document ends with a section called "What Raython would like from W#" — nine
+things in the order the pain was felt, and one thing that was a bug.
+
+The value of that list is that nothing on it is speculative. Each item is
+something a real design worked around, and the workaround is written down beside
+it.
+
+### The bug
+
+```wsharp
+fn twice(v: Integer) i64 { return i64(v) * 2; }
+fn twice(v: str) i64 { return 0; }
+fn main() i64 { const small: u8 = 7; print_int(twice(small)); return 0; }
+```
+
+`Compilation error: Verifier errors`. Two independent defects, either enough on
+its own.
+
+A parameter annotated with an abstract type is a fresh type variable carrying
+`Constraint::Member` — a *constrained generic*, which is what lets one body be
+compiled at each member the caller picks. `infer_convert` had a line reading "an
+unannotated argument would otherwise stay a variable for ever: nothing
+downstream of a conversion says anything about what went in", and it unified the
+operand with `i64`. Every other defaulting site in `infer.rs` guards against
+exactly that — `settle_literal_operand` says so in a comment — and this was the
+one that did not. So `twice` became monomorphic `fn(i64) i64` while its
+declaration still said `Integer`.
+
+With one overload that surfaced as a bogus `this argument has type u8, expected
+i64`. With two it got past inference entirely, because `overlap`'s abstract
+branch keeps a candidate on the strength of the *declared* type and then wrote
+`let _ = self.store.try_unify(arg, param);`. `Some(None)` means "this case
+always applies, no runtime test needed", which `dispatched_call` compiles as a
+**static** call — so a `u8` was handed to a body Cranelift had compiled for an
+`i64`.
+
+Both are fixed. The conversion records a `Numeric` constraint rather than
+defaulting, so the operand stays generic and a non-numeric abstract member would
+be reported properly rather than as a crash in the code generator; and `overlap`
+honours the unification. The second stays even though the first makes this
+particular call resolve: **overload resolution must never be able to produce IR
+that fails verification.**
+
+The framework's workaround was eight one-line overloads, one per integer width,
+where one over `Integer` was the obvious thing to write.
+
+### The nine
+
+| | What was asked for | What it is now |
+|---|---|---|
+| 1 | a stable machine-readable emit — the CLI read `--emit=ast`, "a debugging aid, not a documented interface" | `--emit=api`: versioned, printed after type checking, every program-defined name absolute, with a golden test pinning the format |
+| 2 | a modification time in `std/fs` — "without mtime the dev watcher hashes files" | `fs.modified_at`, by `statx` on Linux, `getattrlist` on macOS and a field Windows was already fetching; `struct stat` meets this runtime in one arm and four systems, written up in `CLAUDE.md` |
+| 3 | a hash map in `std` — "association lists are right for headers and wrong for a prepared-statement cache" | `std/map`, open addressing with tombstones over `str` keys, and a `str.hash` builtin because hashing in W# is one stack walk per byte under `--gc-stress` |
+| 4 | `str.join` in linear time — "×190 slower than `bytes.Buf`… any W# program that builds output from pieces is hitting this" | measure, allocate once, copy. 150,000 pieces into 600 KB: 9.4 s to 0.08 s, compilation included. `str.repeat` was the same shape and is fixed with it |
+| 5 | `open32`/`close32` in `std/bytes` — "TLS needed 8, 16 and 24; the PostgreSQL frame header needs 32" | four widths where there were three |
+| 6 | a documented guarantee that `@spawn` returns before `init` completes — "Raython's whole process model rests on it" | stated in the README, along with its other half: the message loop is entered only once `init` has *returned*, which is what makes a call issued straight after `@spawn` queue rather than be lost |
+| 7 | `net.shutdown`, and a decision about `main` returning with workers alive — "a server written the obvious way can neither be stopped nor exit" | `net.shutdown(s, read, write)`; `os.exit`; and `main` returning ends the process. The exit path joins the workers that reached their message loop and abandons the ones that never could, which is a distinction rather than a timeout |
+| 8 | struct equality — "test assertions compare structs constantly and today must compare field by field" | `==` on a struct, field by field, recursing into struct fields, generated once per type |
+| 9 | `to_upper` beside `to_lower`, and a `str.replace` | both |
+
+### What the probes said afterwards
+
+The suite is written so that a probe changing its answer is a section of the
+design document that needs rewriting, which is the right way round. Three
+changed:
+
+- **26** compiles and runs, so the eight one-line overloads collapse to one.
+- **17** and **29** exit instead of hanging.
+- **28** still hangs, and should: it is `@join` on a worker parked in `accept`,
+  which is a program waiting on its own worker rather than anything the exit
+  path can answer for. `shutdown` on a *listening* socket wakes `accept` on
+  Linux and answers `ENOTCONN` on the BSDs, so it is not a thing this library
+  promises — a stoppable acceptor is a `net.poller` with a tick, which is what
+  §7.2 of that design concluded independently and preferred anyway.
+
+### One thing nobody asked for
+
+Fixing item 7 uncovered a second bug in the same area. A worker's `init` runs
+with its decoded arguments pinned on the runtime's own root list, and those pins
+sit on the *thread*. A blocking call inside `init` therefore entered a safe
+region with `pinned_depth` non-zero — which a collector answers by declining the
+parked worker and waiting for the syscall, the exact regression safe regions
+were written to remove, and an abort in any build with debug assertions on.
+Every acceptor is that shape, and the probes only got away with it because they
+were run against a release build.
+
+The pins come off before generated code is entered now. `unpack` returning is
+the last moment anything can allocate, and the callee's prologue stores its
+parameters into slots its own stack maps describe before its first safepoint --
+the same "no safepoint in between" argument the return area and the runtime
+boundary already make. `worker_blocking_init.ws` is the case.
+
+---
+
 ## Smaller follow-ups
 
 These are deliberate limitations, each with a clear fix:
@@ -2686,8 +2788,6 @@ These are deliberate limitations, each with a clear fix:
 - **Field access needs a known type.** Structs are nominal with no row
   polymorphism, so `fn getx(p) { return p.x; }` cannot be inferred and asks for
   an annotation instead.
-- **`==` is limited to the integer types, `f64`, `bool` and `str`.** Structs
-  still need a decision about identity versus structural equality.
 - **x86-64 and aarch64 only.** The collector reads the frame pointer with
   inline assembly; other architectures get a `compile_error!`.
 - **A top-level `const` array can be written through an alias.** `K[0] = 1` is
@@ -2696,6 +2796,14 @@ These are deliberate limitations, each with a clear fix:
   The data is emitted writable rather than read-only for that reason, so the
   mistake is a shared table quietly changing rather than a fault with no
   message.
+
+### Closed by item 14
+
+- **`==` is limited to the integer types, `f64`, `bool` and `str`** — structural
+  it is, field by field, recursing into struct fields. Two values of different
+  concrete types are never equal, so the question "identity or structure" is
+  answered without the surprising half: `x == x` is true whatever `x` holds,
+  because the same object is tested for first.
 
 ### Closed by item 13
 

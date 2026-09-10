@@ -4854,8 +4854,21 @@ impl<'a> Inferencer<'a> {
         }
         // An unannotated argument would otherwise stay a variable for ever:
         // nothing downstream of a conversion says anything about what went in.
+        //
+        // ...unless an abstract type owns the variable. A parameter annotated
+        // `Integer` is a *constrained generic* and not an `i64`: the caller
+        // picks the member, and `i64(v)` is valid at every one of them. This
+        // is the same guard `settle_literal_operand` and the `IntLiteral`
+        // pre-pass carry, and it was the one defaulting site in this file
+        // without it -- which made `fn f(v: Integer) { .. i64(v) .. }` a
+        // monomorphic `fn(i64)` while its declaration still said `Integer`,
+        // and with a second overload beside it let a `u8` reach a body
+        // compiled for `i64`.
         if matches!(from, Type::Var(_)) {
-            self.expect(&value.ty, &Type::i64(), value.span, "the value converted");
+            match self.member_constraint(&value.ty) {
+                Some(id) => self.check_members_convertible(id, name, value.span),
+                None => self.expect(&value.ty, &Type::i64(), value.span, "the value converted"),
+            }
         }
         hir::Expr {
             kind: hir::ExprKind::Convert(Box::new(value)),
@@ -5341,8 +5354,18 @@ impl<'a> Inferencer<'a> {
             if !self.store.is_sub_ty(arg, decl) {
                 return None;
             }
-            // Records the type argument this case would be called at.
-            let _ = self.store.try_unify(arg, param);
+            // Records the type argument this case would be called at -- and the
+            // answer is not discardable. `Some(None)` says "this case always
+            // applies, no runtime test needed", which is compiled as a *static*
+            // call; if the parameter is not in fact this argument's type, that
+            // is a lie the code generator carries out, and Cranelift's verifier
+            // is what reports it. A parameter declared abstract is normally a
+            // fresh variable and this always succeeds; it can fail only when
+            // the body pinned it to one concrete member, which is a bug
+            // somewhere above -- so this is a diagnostic rather than a crash.
+            if !self.store.try_unify(arg, param) {
+                return None;
+            }
             return Some(None);
         }
         // Anything the ordinary rules already accept needs no test.
@@ -6288,26 +6311,34 @@ impl<'a> Inferencer<'a> {
     }
 
     /// Whether an abstract type already holds this type to a set of members.
+    fn is_member_constrained(&mut self, ty: &Type) -> bool {
+        self.member_constraint(ty).is_some()
+    }
+
+    /// The abstract type holding this one to a set of members, if one does.
     ///
     /// Read off the pending constraints rather than kept in a set beside them,
     /// because unification merges variables and a set would have to be told.
     /// There are only ever a handful of these -- one per abstract-annotated
     /// parameter and one per use of such a function.
-    fn is_member_constrained(&mut self, ty: &Type) -> bool {
+    fn member_constraint(&mut self, ty: &Type) -> Option<AbstractId> {
         let Type::Var(v) = self.store.resolve(ty) else {
-            return false;
+            return None;
         };
-        let members: Vec<Type> = self
+        let members: Vec<(Type, AbstractId)> = self
             .constraints
             .iter()
             .filter_map(|c| match c {
-                Constraint::Member { ty, .. } => Some(ty.clone()),
+                Constraint::Member { ty, id, .. } => Some((ty.clone(), *id)),
                 _ => None,
             })
             .collect();
         members
             .into_iter()
-            .any(|m| matches!(self.store.resolve(&m), Type::Var(other) if other == v))
+            .find_map(|(m, id)| match self.store.resolve(&m) {
+                Type::Var(other) if other == v => Some(id),
+                _ => None,
+            })
     }
 
     fn int_literal(&mut self, value: i128, span: Span) -> hir::Expr {
@@ -6592,6 +6623,30 @@ impl<'a> Inferencer<'a> {
                             TyCon::Int(_) | TyCon::F64 | TyCon::Bool | TyCon::Str | TyCon::Error,
                             _,
                         ) => {}
+                        // A struct compares field by field, and a struct field
+                        // recurses -- so what has to be decided here is whether
+                        // every field the comparison will reach is itself
+                        // comparable. Decidable, and finite: the walk is over
+                        // *types* rather than values, and a type that reaches
+                        // itself is met twice and visited once.
+                        Type::Con(TyCon::Struct(id), ref args) => {
+                            if let Some((path, shown)) = self.struct_equatable(id, &args.clone()) {
+                                let name = self.store.show(&resolved);
+                                self.error(
+                                    span,
+                                    format!(
+                                        "`{name}` values cannot be compared with `==`: \
+                                         `{path}` is `{shown}`"
+                                    ),
+                                )
+                                .help = Some(
+                                    "`==` on a struct compares its fields, so every field must \
+                                     be comparable: an array, a function or an error union is \
+                                     not"
+                                    .into(),
+                                );
+                            }
+                        }
                         t => {
                             let shown = self.store.show(&t);
                             self.error(
@@ -6599,8 +6654,8 @@ impl<'a> Inferencer<'a> {
                                 format!("`{shown}` values cannot be compared with `==`"),
                             )
                             .help = Some(
-                                "only `i64`, `f64`, `bool`, `str` and `error` can be compared \
-                                 so far"
+                                "only `i64`, `f64`, `bool`, `str`, `error` and a struct whose \
+                                 fields are all of those can be compared"
                                     .into(),
                             );
                         }
@@ -6722,6 +6777,121 @@ impl<'a> Inferencer<'a> {
                 "a parameter annotated `{name}` must work for every type `{name}` lists"
             ));
             return;
+        }
+    }
+
+    /// A conversion applied to a value an abstract type constrains.
+    ///
+    /// Decidable without knowing which member it will be, for the reason
+    /// [`Self::check_members_support`]'s question is: the conversion has to be
+    /// valid for *every* one of them, because the caller picks. Every abstract
+    /// type there is today lists numbers only, so this reports nothing -- it is
+    /// here so that the first one that does not is a diagnostic rather than an
+    /// `unreachable!` in the code generator's `convert`.
+    fn check_members_convertible(&mut self, id: AbstractId, to: &Ident, span: Span) {
+        let name = abstract_name(id);
+        for member in abstract_members(id) {
+            if member.is_numeric() {
+                continue;
+            }
+            let shown = self.store.show(&member);
+            self.error(
+                span,
+                format!("`{to}` converts a number, but `{name}` includes `{shown}`"),
+            )
+            .help = Some(format!(
+                "a parameter annotated `{name}` must work for every type `{name}` lists"
+            ));
+            return;
+        }
+    }
+
+    /// Whether `==` can compare a struct, and which field stops it if not.
+    ///
+    /// The answer is about the whole *cone*, not about this type alone: a
+    /// comparison written at `Base` may be handed two `Sub`s, and it is `Sub`'s
+    /// own fields it then has to compare. So every subtype is walked too, and
+    /// the diagnostic names the field by the type that declares it.
+    ///
+    /// Recursive on struct-typed fields, which is what makes `==` mean the same
+    /// thing at every depth. `seen` is what makes that terminate: a type that
+    /// reaches itself -- `Node` with a `?Node` field is the ordinary case -- is
+    /// met twice here and walked once. It does not terminate at *run* time on a
+    /// value that reaches itself, and that is stated where the comparison is
+    /// generated rather than pretended away.
+    fn struct_equatable(&mut self, id: StructId, args: &[Type]) -> Option<(String, String)> {
+        let mut seen = Vec::new();
+        self.cone_equatable(id, args, &mut seen)
+    }
+
+    fn cone_equatable(
+        &mut self,
+        id: StructId,
+        args: &[Type],
+        seen: &mut Vec<StructId>,
+    ) -> Option<(String, String)> {
+        // Every type in the cone, this one first so its own fields are what a
+        // diagnostic names when both it and a subtype are at fault.
+        let cone: Vec<StructId> = (0..self.structs.len() as StructId)
+            .filter(|&other| other == id || self.store.is_subtype(other, id))
+            .collect();
+        for member in cone {
+            if seen.contains(&member) {
+                continue;
+            }
+            seen.push(member);
+            // A subtype of a generic instantiation is not a thing -- a generic
+            // struct stands outside the lattice -- so the arguments travel only
+            // to the type they were written for.
+            let member_args: &[Type] = if member == id { args } else { &[] };
+            if let Some(bad) = self.fields_equatable(member, member_args, seen) {
+                return Some(bad);
+            }
+        }
+        None
+    }
+
+    fn fields_equatable(
+        &mut self,
+        id: StructId,
+        args: &[Type],
+        seen: &mut Vec<StructId>,
+    ) -> Option<(String, String)> {
+        let name = self.structs[id as usize].name.clone();
+        let fields: Vec<(String, Type)> = self.structs[id as usize]
+            .fields
+            .iter()
+            .map(|f| (f.name.to_string(), f.ty.clone()))
+            .collect();
+        for (field, declared) in fields {
+            let ty = self.substitute_params(id, args, &declared);
+            if let Some((inner, shown)) = self.field_equatable(&ty, seen) {
+                // The innermost field that is actually at fault, when the walk
+                // went through a struct to find it: "`Bag.xs` is `[]i64`" says
+                // where to look and "`Deep.inner` is `[]i64`" does not.
+                let path = if inner.is_empty() {
+                    format!("{name}.{field}")
+                } else {
+                    inner
+                };
+                return Some((path, shown));
+            }
+        }
+        None
+    }
+
+    /// `None` if a field of this type can be compared; otherwise the field to
+    /// blame -- empty for "this one" -- and how to show the type that cannot.
+    fn field_equatable(&mut self, ty: &Type, seen: &mut Vec<StructId>) -> Option<(String, String)> {
+        match self.store.resolve(ty) {
+            Type::Con(TyCon::Int(_) | TyCon::F64 | TyCon::Bool | TyCon::Str | TyCon::Error, _) => {
+                None
+            }
+            // A tag and a payload: the tags decide it unless both say present,
+            // and then the payload does, by its own rule.
+            Type::Con(TyCon::Optional, inner) => self.field_equatable(&inner[0], seen),
+            Type::Con(TyCon::Struct(id), args) => self.cone_equatable(id, &args, seen),
+            other => Some((String::new(), self.store.show(&other))),
         }
     }
 

@@ -94,6 +94,22 @@ pub struct Decls {
     pub rpc_call: FuncId,
     /// `ws_join(worker) -> tag`.
     pub join: FuncId,
+    /// The two functions each struct type `==` reaches is compiled into. See
+    /// [`crate::equality`].
+    pub equality: crate::equality::Equality,
+}
+
+impl Decls {
+    /// The comparison pair for a struct type. Every type a `==` can reach was
+    /// found before anything was declared, so a miss here is a hole in that
+    /// walk rather than something to recover from.
+    pub fn equality_fns(&self, store: &mut TypeStore, ty: &Type) -> crate::equality::EqFns {
+        let key = store.show(ty);
+        match self.equality.index.get(&key) {
+            Some(&n) => self.equality.fns[n],
+            None => panic!("no comparison generated for `{key}`"),
+        }
+    }
 }
 
 /// Where a `fn` literal's captured values sit inside its closure object, and
@@ -317,6 +333,71 @@ pub fn translate<M: Module>(
     // Finalising is what releases the shared `FunctionBuilderContext` for the
     // next function; without it the next `FunctionBuilder::new` asserts.
     trans.b.finalize(frontend_config);
+}
+
+/// Emit one of the two functions a struct's `==` is compiled into.
+///
+/// `exact` picks which: the dispatching entry point, or the comparison of one
+/// concrete type's fields. See [`crate::equality`] for what each is for and why
+/// there are two.
+///
+/// Built through a `Trans` with a placeholder `FuncDef` rather than beside one,
+/// so that the field reads go through the *same* `load_at` -- and therefore the
+/// same load barrier, and the same rooting -- as every other field read in the
+/// program. A second implementation of that is exactly the kind of thing that
+/// agrees for a year and then does not.
+pub fn equality<M: Module>(
+    builder: FunctionBuilder<'_>,
+    module: &mut M,
+    program: &hir::Program,
+    store: &mut TypeStore,
+    decls: &Decls,
+    ty: &Type,
+    exact: bool,
+) {
+    let frontend_config = module.target_config();
+    let call_conv = frontend_config.default_call_conv;
+    let placeholder = placeholder_func();
+    let mut trans = Trans {
+        b: builder,
+        module,
+        program,
+        store,
+        decls,
+        func: &placeholder,
+        call_conv,
+        locals: Vec::new(),
+        loops: Vec::new(),
+        ret_area: None,
+        terminated: false,
+    };
+    if exact {
+        trans.build_exact_equality(ty);
+    } else {
+        trans.build_dispatch_equality(ty);
+    }
+    trans.b.finalize(frontend_config);
+}
+
+/// A `FuncDef` that exists only to satisfy `Trans`, which is written against
+/// one. Nothing in an equality function reads a local or returns by pointer,
+/// so every field of it is empty.
+fn placeholder_func() -> hir::FuncDef {
+    hir::FuncDef {
+        name: "==".to_string(),
+        params: Vec::new(),
+        captures: Vec::new(),
+        locals: Vec::new(),
+        ret: Type::bool(),
+        body: hir::Block { stmts: Vec::new() },
+        scheme: wsharp_sema::ty::Scheme {
+            vars: Vec::new(),
+            ty: Type::bool(),
+        },
+        is_closure: false,
+        self_local: None,
+        span: wsharp_syntax::Span::EMPTY,
+    }
 }
 
 /// One generated function that unpacks a buffer of machine words and calls a
@@ -1276,10 +1357,24 @@ impl<M: Module> Trans<'_, '_, M> {
                 // than an instruction. Emitted here rather than turned into a
                 // library call by inference, because nothing in inference
                 // synthesises a call and this is the only place that would.
+                // `==` on a struct compares its fields, which is a call for
+                // the same reason and one more: it recurses, so it cannot be
+                // an inline sequence at all. See `crate::equality`.
                 if matches!(op, BinOp::Eq | BinOp::Ne)
-                    && matches!(self.store.resolve(&lhs.ty), Type::Con(TyCon::Str, _))
+                    && matches!(
+                        self.store.resolve(&lhs.ty),
+                        Type::Con(TyCon::Str, _) | Type::Con(TyCon::Struct(_), _)
+                    )
                 {
-                    let equal = self.call_str_eq(l, r);
+                    let equal = match self.store.resolve(&lhs.ty) {
+                        Type::Con(TyCon::Str, _) => self.call_str_eq(l, r),
+                        ref t => {
+                            let fns = self.decls.equality_fns(self.store, t);
+                            let func = self.module.declare_func_in_func(fns.dispatch, self.b.func);
+                            let call = self.b.ins().call(func, &[l, r]);
+                            self.b.inst_results(call)[0]
+                        }
+                    };
                     let result = if *op == BinOp::Ne {
                         self.b.ins().bxor_imm_u(equal, 1)
                     } else {
@@ -1429,7 +1524,7 @@ impl<M: Module> Trans<'_, '_, M> {
             NumKind::Int(t) => t,
             NumKind::Opaque => {
                 return match op {
-                    BinOp::Eq => self.b.ins().icmp(IntCC::Equal, l, r),
+                    BinOp::Eq => self.b.ins().icmp(ir::condcodes::IntCC::Equal, l, r),
                     BinOp::Ne => self.b.ins().icmp(IntCC::NotEqual, l, r),
                     other => unreachable!(
                         "`{}` on a non-numeric type is rejected by inference",
@@ -1493,7 +1588,7 @@ impl<M: Module> Trans<'_, '_, M> {
             BinOp::Sub => self.b.ins().isub(l, r),
             BinOp::Mul => self.b.ins().imul(l, r),
             BinOp::Div | BinOp::Rem => self.checked_div(op, t, l, r),
-            BinOp::Eq => self.b.ins().icmp(IntCC::Equal, l, r),
+            BinOp::Eq => self.b.ins().icmp(ir::condcodes::IntCC::Equal, l, r),
             BinOp::Ne => self.b.ins().icmp(IntCC::NotEqual, l, r),
             BinOp::Lt => self.b.ins().icmp(lt, l, r),
             BinOp::Le => self.b.ins().icmp(le, l, r),
@@ -2336,6 +2431,252 @@ impl<M: Module> Trans<'_, '_, M> {
             self.store_slots(ptr, ptr, offset, &elem_ty, value);
         }
         SmallVec::from_slice(&[ptr])
+    }
+
+    // -----------------------------------------------------------------------
+    // Structural equality
+    // -----------------------------------------------------------------------
+
+    /// The entry point a struct `==` calls.
+    ///
+    /// Answers everything that is about the *pair* rather than about the
+    /// fields, and then hands over to the exact comparison for whichever
+    /// concrete type both values turned out to be.
+    fn build_dispatch_equality(&mut self, ty: &Type) {
+        let entry = self.b.create_block();
+        self.b.append_block_params_for_function_params(entry);
+        self.switch(entry);
+        let params: Vec<ir::Value> = self.b.block_params(entry).to_vec();
+        let (a, b) = (params[0], params[1]);
+        // Live across the call below, and both are heap pointers.
+        self.b.declare_value_needs_stack_map(a);
+        self.b.declare_value_needs_stack_map(b);
+
+        let yes = self.b.create_block();
+        let no = self.b.create_block();
+
+        // The same object is equal to itself whatever it holds, which is what
+        // makes `x == x` true for a value that reaches itself -- the one cyclic
+        // case this terminates on. It also settles null against null.
+        let same = self.b.ins().icmp(ir::condcodes::IntCC::Equal, a, b);
+        let both = self.b.create_block();
+        self.brif(same, yes, NO_ARGS, both, NO_ARGS);
+
+        // Only one of them null, then: a field of struct type reads as null
+        // until its initialising store has run, and the collector's rule is
+        // that a fresh object's fields do read that way.
+        self.switch(both);
+        let a_null = self.b.ins().icmp_imm_u(ir::condcodes::IntCC::Equal, a, 0);
+        let b_null = self.b.ins().icmp_imm_u(ir::condcodes::IntCC::Equal, b, 0);
+        let either = self.b.ins().bor(a_null, b_null);
+        let neither = self.b.create_block();
+        self.brif(either, no, NO_ARGS, neither, NO_ARGS);
+
+        // Two different concrete types are never equal, and asking first is
+        // what makes the dispatch below sound: after it, one type id describes
+        // both.
+        self.switch(neither);
+        let a_id = self.type_id_of(a);
+        let b_id = self.type_id_of(b);
+        let ids_same = self.b.ins().icmp(ir::condcodes::IntCC::Equal, a_id, b_id);
+        let dispatch = self.b.create_block();
+        self.brif(ids_same, dispatch, NO_ARGS, no, NO_ARGS);
+
+        self.switch(dispatch);
+        let cone = self.equality_cone(ty);
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I8);
+        for (i, member) in cone.iter().enumerate() {
+            let exact = self.decls.equality_fns(self.store, member).exact;
+            let last = i + 1 == cone.len();
+            let call = if last {
+                // The last case needs no test: the type id is in this cone --
+                // that is what `is_sub_ty` established at the call -- so if it
+                // is none of the others it is this one.
+                None
+            } else {
+                let want = self.member_type_id(member);
+                let hit = self
+                    .b
+                    .ins()
+                    .icmp_imm_u(ir::condcodes::IntCC::Equal, a_id, want as i64);
+                let take = self.b.create_block();
+                let next = self.b.create_block();
+                self.brif(hit, take, NO_ARGS, next, NO_ARGS);
+                self.switch(take);
+                Some(next)
+            };
+            let func = self.module.declare_func_in_func(exact, self.b.func);
+            let result = self.b.ins().call(func, &[a, b]);
+            let value = self.b.inst_results(result)[0];
+            self.jump_to(done, &[BlockArg::Value(value)]);
+            if let Some(next) = call {
+                self.switch(next);
+            }
+        }
+
+        self.switch(yes);
+        let one = self.b.ins().iconst(types::I8, 1);
+        self.jump_to(done, &[BlockArg::Value(one)]);
+
+        self.switch(no);
+        let zero = self.b.ins().iconst(types::I8, 0);
+        self.jump_to(done, &[BlockArg::Value(zero)]);
+
+        self.switch(done);
+        let answer = self.b.block_params(done)[0];
+        self.b.ins().return_(&[answer]);
+        self.terminated = true;
+        self.b.seal_all_blocks();
+    }
+
+    /// One exact type's fields, compared in declaration order.
+    ///
+    /// Reached only when both values are known to be this type, so the fields
+    /// are read at this type's offsets with no further question. Inherited
+    /// fields come first, which is what a subtype's layout guarantees.
+    fn build_exact_equality(&mut self, ty: &Type) {
+        let entry = self.b.create_block();
+        self.b.append_block_params_for_function_params(entry);
+        self.switch(entry);
+        let params: Vec<ir::Value> = self.b.block_params(entry).to_vec();
+        let (a, b) = (params[0], params[1]);
+        // Live across every field's comparison, and both are heap pointers.
+        self.b.declare_value_needs_stack_map(a);
+        self.b.declare_value_needs_stack_map(b);
+
+        let Type::Con(TyCon::Struct(id), _) = self.store.resolve(ty) else {
+            unreachable!("only a struct type reaches the equality generator")
+        };
+        let shape = self.struct_shape(ty, id);
+
+        let no = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I8);
+
+        for (offset, field) in shape.fields {
+            let left = self.load_at(a, offset, &field);
+            self.gc_root(&field, &left);
+            let right = self.load_at(b, offset, &field);
+            self.gc_root(&field, &right);
+            let equal = self.slots_equal(&left, &right, &field);
+            let next = self.b.create_block();
+            self.brif(equal, next, NO_ARGS, no, NO_ARGS);
+            self.switch(next);
+        }
+        let one = self.b.ins().iconst(types::I8, 1);
+        self.jump_to(done, &[BlockArg::Value(one)]);
+
+        self.switch(no);
+        let zero = self.b.ins().iconst(types::I8, 0);
+        self.jump_to(done, &[BlockArg::Value(zero)]);
+
+        self.switch(done);
+        let answer = self.b.block_params(done)[0];
+        self.b.ins().return_(&[answer]);
+        self.terminated = true;
+        self.b.seal_all_blocks();
+    }
+
+    /// Whether two already-loaded values of type `ty` are equal.
+    ///
+    /// The recursion is over *types* and terminates here; it is the generated
+    /// calls that can recurse without end, on a value that reaches itself.
+    fn slots_equal(&mut self, a: &Slots, b: &Slots, ty: &Type) -> ir::Value {
+        match self.store.resolve(ty) {
+            // A tag and a payload. The tags settle it unless both say present,
+            // and then the payload does, by its own rule -- rather than
+            // comparing the payload slots blind, which would be right only
+            // because an absent optional happens to carry zeros.
+            Type::Con(TyCon::Optional, inner) => {
+                let inner = inner[0].clone();
+                let tags_same = self.b.ins().icmp(ir::condcodes::IntCC::Equal, a[0], b[0]);
+                let present =
+                    self.b
+                        .ins()
+                        .icmp_imm_u(ir::condcodes::IntCC::NotEqual, a[0], OPTION_NULL);
+                let deep = self.b.ins().band(tags_same, present);
+
+                let payload = self.b.create_block();
+                let shallow = self.b.create_block();
+                let done = self.b.create_block();
+                self.b.append_block_param(done, types::I8);
+                self.brif(deep, payload, NO_ARGS, shallow, NO_ARGS);
+
+                self.switch(shallow);
+                self.jump_to(done, &[BlockArg::Value(tags_same)]);
+
+                self.switch(payload);
+                let (left, right): (Slots, Slots) = (
+                    a[1..].iter().copied().collect(),
+                    b[1..].iter().copied().collect(),
+                );
+                let equal = self.slots_equal(&left, &right, &inner);
+                self.jump_to(done, &[BlockArg::Value(equal)]);
+
+                self.switch(done);
+                self.b.block_params(done)[0]
+            }
+            Type::Con(TyCon::Str, _) => self.call_str_eq(a[0], b[0]),
+            ref t @ Type::Con(TyCon::Struct(_), _) => {
+                let dispatch = self.decls.equality_fns(self.store, t).dispatch;
+                let func = self.module.declare_func_in_func(dispatch, self.b.func);
+                let call = self.b.ins().call(func, &[a[0], b[0]]);
+                self.b.inst_results(call)[0]
+            }
+            Type::Con(TyCon::F64, _) => {
+                // `fcmp`, so that a `NaN` field makes two otherwise identical
+                // values unequal -- which is what `==` on a bare `f64` already
+                // answers, and the one place a bitwise comparison would differ.
+                self.b.ins().fcmp(ir::condcodes::FloatCC::Equal, a[0], b[0])
+            }
+            _ => self.b.ins().icmp(ir::condcodes::IntCC::Equal, a[0], b[0]),
+        }
+    }
+
+    /// The runtime type id in an object's header.
+    fn type_id_of(&mut self, obj: ir::Value) -> ir::Value {
+        let meta = self
+            .b
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), obj, META_OFFSET);
+        self.b.ins().band_imm_u(meta, TYPE_ID_MASK as i64)
+    }
+
+    /// Every concrete type a value of `ty` can actually be, most derived first.
+    ///
+    /// Ordering matters only for the chain's shape: the last case carries no
+    /// test, so the *declared* type goes last and a value that is none of its
+    /// subtypes lands there.
+    fn equality_cone(&mut self, ty: &Type) -> Vec<Type> {
+        let Type::Con(TyCon::Struct(id), args) = self.store.resolve(ty) else {
+            unreachable!("only a struct type reaches the equality generator")
+        };
+        // A generic struct stands outside the dispatch lattice, so an
+        // instantiation's cone is itself.
+        if !args.is_empty() {
+            return vec![ty.clone()];
+        }
+        let def = self.program.strukt(id);
+        let (start, len) = (def.type_id, def.subtree_len);
+        let mut out: Vec<Type> = (0..self.program.structs.len() as StructId)
+            .filter(|&other| {
+                let d = self.program.strukt(other);
+                other != id && d.params.is_empty() && d.type_id >= start && d.type_id < start + len
+            })
+            .map(|other| Type::Con(TyCon::Struct(other), Vec::new()))
+            .collect();
+        out.push(ty.clone());
+        out
+    }
+
+    fn member_type_id(&mut self, ty: &Type) -> u32 {
+        match self.store.resolve(ty) {
+            Type::Con(TyCon::Struct(id), args) if args.is_empty() => {
+                self.program.strukt(id).type_id
+            }
+            _ => self.instance_type_id(ty),
+        }
     }
 
     /// Whether two strings hold the same bytes.

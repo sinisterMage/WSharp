@@ -142,11 +142,17 @@ pub(crate) fn exists(path: &[u8]) -> bool {
 //
 // A store needs more of a filesystem than reading and writing a whole file:
 // somewhere to put things, a way to list what is there, and `rename`, which is
-// what makes an install atomic. What it does *not* need is `stat` -- and the
-// arms are much better off for that, because `struct stat` has a different
+// what makes an install atomic. What it mostly does *not* need is `stat` -- and
+// the arms are much better off for that, because `struct stat` has a different
 // layout on every system in the BSD family and a versioned symbol on Linux,
-// while the two questions actually being asked ("is this a directory?" and
-// "how big is it?") each have an answer that is one number.
+// while "is this a directory?" and "how big is it?" each have an answer that is
+// one number.
+//
+// `modified_at` is the exception, and it is the only one. A watcher that had to
+// hash every file to notice a change would read the whole tree on every tick,
+// and that is a real cost rather than a tidiness argument -- so the question is
+// asked, by the narrowest call each system offers. See [`modified_at`] for
+// which arm pays what.
 
 pub(crate) fn mkdir(path: &[u8]) -> Result<(), Errno> {
     imp::mkdir(path)
@@ -204,6 +210,29 @@ pub(crate) fn is_executable(path: &[u8]) -> bool {
 
 pub(crate) fn file_size(path: &[u8]) -> Result<i64, Errno> {
     imp::file_size(path)
+}
+
+/// When a path was last written, in seconds since the Unix epoch -- the same
+/// clock [`wall_clock_secs`] reads.
+///
+/// This is the one question this layer asks that does not have a one-number
+/// answer everywhere, and the paragraph above is why that matters. Two of the
+/// three arms keep the property: Linux answers with `statx`, whose `struct
+/// statx` is kernel UAPI and so has one layout on every architecture, and
+/// Windows reads a field `GetFileAttributesExW` was already fetching and
+/// throwing away. macOS answers with `getattrlist`, which hands back the
+/// attributes asked for and no struct at all.
+///
+/// FreeBSD, NetBSD, OpenBSD and DragonFly have none of those, so there this is
+/// `stat(2)` and one offset into its result per system -- `D_NAME_OFFSET`'s
+/// shape, and `D_NAME_OFFSET`'s caveat: those four numbers are read from each
+/// system's headers and no machine available here can run them.
+///
+/// Seconds and not nanoseconds, because the question a watcher asks is "has
+/// this changed since I looked", and a second is the resolution every one of
+/// these systems agrees on.
+pub(crate) fn modified_at(path: &[u8]) -> Result<i64, Errno> {
+    imp::modified_at(path)
 }
 
 /// What a directory holds, without `.` and `..`.
@@ -828,6 +857,24 @@ pub(crate) fn set_nonblocking(fd: Fd, on: bool) -> Result<(), Errno> {
 /// asked for port 0 finds out which port it got.
 pub(crate) fn local_addr(fd: Fd) -> Result<SockAddr, Errno> {
     imp::local_addr(fd)
+}
+
+/// Close one or both directions of a connected socket, leaving the descriptor
+/// open.
+///
+/// What `close` cannot say: a client that has finished sending but still wants
+/// the answer shuts down the write half, the peer reads end-of-stream, and the
+/// connection stays open in the other direction. TLS's `close_notify` and every
+/// request/response protocol that does not frame its own end need exactly this.
+///
+/// **On a connected socket this means the same thing everywhere.** On a
+/// *listening* one it does not: Linux wakes a thread parked in `accept(2)` and
+/// the BSDs answer `ENOTCONN` and leave it parked, so a stoppable acceptor is a
+/// `net.poller` with a tick rather than a `shutdown` from another thread. That
+/// is a difference between systems rather than a thing this layer can paper
+/// over, and the one place `std/net`'s documentation says so out loud.
+pub(crate) fn shutdown(fd: Fd, read: bool, write: bool) -> Result<(), Errno> {
+    imp::shutdown(fd, read, write)
 }
 
 pub(crate) fn close_socket(fd: Fd) {

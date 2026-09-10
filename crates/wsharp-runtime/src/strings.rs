@@ -306,3 +306,129 @@ pub unsafe extern "C" fn ws_str_trim(s: *const u8) -> *mut u8 {
     let owned = trimmed.to_vec();
     alloc_str(&owned)
 }
+
+/// Every ASCII letter in upper case.
+///
+/// Only ASCII, for [`ws_str_to_lower`]'s reason: case folding anything else
+/// needs a Unicode table this runtime does not have and should not grow for the
+/// sake of a header name.
+///
+/// # Safety
+/// Called from JIT-compiled code across an FFI boundary; the string argument
+/// must be null or point at a W# string object.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_str_to_upper(s: *const u8) -> *mut u8 {
+    unsafe { crate::gc::checkpoint() };
+    let raised: Vec<u8> = unsafe { str_bytes(s) }
+        .iter()
+        .map(|b| b.to_ascii_uppercase())
+        .collect();
+    alloc_str(&raised)
+}
+
+/// `s` with every occurrence of `from` replaced by `to`.
+///
+/// Non-overlapping and left to right: after a match the search resumes past the
+/// text that was replaced, so replacing `"aa"` in `"aaa"` finds one occurrence
+/// and not two. An empty `from` returns `s` unchanged, which is `str.split`'s
+/// rule read the same way -- replacing nothing is much more often a bug than a
+/// request, and the alternative (a copy of `to` between every byte) is not what
+/// anyone meant.
+///
+/// Two passes, so the answer is allocated once: quadratic here would be
+/// `concat` in a loop, which is what `join` used to be.
+///
+/// # Safety
+/// Called from JIT-compiled code across an FFI boundary; every string argument
+/// must be null or point at a W# string object.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_str_replace(s: *const u8, from: *const u8, to: *const u8) -> *mut u8 {
+    unsafe { crate::gc::checkpoint() };
+    let hay = unsafe { str_bytes(s) };
+    let needle = unsafe { str_bytes(from) };
+    let with = unsafe { str_bytes(to) };
+    if needle.is_empty() {
+        // Copied out before allocating: `alloc_str` is a safepoint.
+        let owned = hay.to_vec();
+        return alloc_str(&owned);
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(hay.len());
+    let mut at = 0usize;
+    while at + needle.len() <= hay.len() {
+        if &hay[at..at + needle.len()] == needle {
+            out.extend_from_slice(with);
+            at += needle.len();
+        } else {
+            out.push(hay[at]);
+            at += 1;
+        }
+    }
+    out.extend_from_slice(&hay[at..]);
+    alloc_str(&out)
+}
+
+/// Write every byte of `src` into the `[]u8` `dst`, starting at `at`.
+///
+/// The same operation as `bytes.raw_from_str`, under a second name, because
+/// `std/bytes` imports `std/str` and so `std/str` cannot import `std/bytes` --
+/// the loader refuses the cycle. `str.join` needs to assemble its answer in one
+/// buffer, which is what makes it linear rather than `concat` in a loop, and
+/// this is the half of that it cannot write in W#. Two rows rather than one
+/// because a `link` is a symbol and two rows may not claim the same one.
+///
+/// # Safety
+/// Called from JIT-compiled code across an FFI boundary; `dst` must be null or
+/// point at a W# `[]u8` and `src` null or a W# `str`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_str_into_bytes(dst: *mut u8, at: i64, src: *const u8) {
+    unsafe { crate::bytes::ws_bytes_from_str(dst, at, src) }
+}
+
+/// `b[from..to]` as a `str`.
+///
+/// [`ws_str_into_bytes`]'s other half, and there for the same reason.
+///
+/// # Safety
+/// Called from JIT-compiled code across an FFI boundary; `b` must be null or
+/// point at a W# `[]u8`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_str_from_bytes(b: *const u8, from: i64, to: i64) -> *mut u8 {
+    unsafe { crate::bytes::ws_bytes_to_str(b, from, to) }
+}
+
+/// A hash of `s`'s bytes.
+///
+/// FNV-1a with a final mix. FNV-1a because it is what `crate::broker` already
+/// picks a partition with and there is no reason for this runtime to carry two
+/// non-cryptographic hashes; the mix -- the SplitMix64 finaliser -- because a
+/// table masks with `capacity - 1` and reads only the *low* bits, which FNV-1a
+/// leaves poorly distributed. Without it a run of keys differing in their last
+/// byte lands in a run of adjacent buckets, which is exactly the shape open
+/// addressing is worst at.
+///
+/// Not a cryptographic hash and not a keyed one, so a table built from
+/// attacker-chosen keys can be made to collide. `std/hash` is what to reach for
+/// when that matters; this is for a prepared-statement cache and a header
+/// table.
+///
+/// A builtin rather than a loop in W# over `str.byte_at`, because a builtin
+/// call is a stack walk under `--gc-stress` and hashing in W# would be one walk
+/// per byte.
+///
+/// # Safety
+/// Called from JIT-compiled code across an FFI boundary; the string argument
+/// must be null or point at a W# string object.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_str_hash(s: *const u8) -> u64 {
+    unsafe { crate::gc::checkpoint() };
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in unsafe { str_bytes(s) } {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^ (hash >> 31)
+}

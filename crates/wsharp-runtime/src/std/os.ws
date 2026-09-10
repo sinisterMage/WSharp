@@ -98,6 +98,25 @@ pub fn exec(program: str, args: []str) !void {
     return raw_exec(program, pack(args));
 }
 
+/// End the process now, with `code` as its status.
+///
+/// Never returns, which is a thing the type system cannot say and this comment
+/// has to -- `exec` is in the same position. Code after a call to it is dead,
+/// and W# will not tell you so.
+///
+/// `main` returning is the ordinary way out and stops the workers on the way;
+/// this is the one for a program that wants out from somewhere else, or from
+/// inside a worker, and it stops nothing. Sockets are released and
+/// `WSHARP_GC_STATS=1` still reports, so the exit looks the same from outside
+/// however it was reached.
+///
+/// The low byte, as a C program's status is, so `exit(256)` exits 0.
+pub fn exit(code: i64) void {
+    raw_exit(code);
+    return;
+}
+
+/// Work from somewhere else, as `git -C` does.
 /// Work from somewhere else, as `git -C` does.
 ///
 /// Process-wide, and meant to be called once before anything else: a program

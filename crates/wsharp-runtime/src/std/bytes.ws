@@ -265,11 +265,12 @@ pub fn put_str(b: Buf, s: str) void {
 }
 
 /// Write `n` zero bytes as a placeholder for a length, and answer with where
-/// they went. `close8`, `close16` and `close24` fill one in.
+/// they went. `close8`, `close16`, `close24` and `close32` fill one in.
 ///
-/// Three widths rather than one taking a parameter, because TLS uses all three
-/// and a `close` that had to be told the width again is a `close` that can be
-/// told the wrong one.
+/// Four fixed widths rather than one taking a parameter, because TLS uses the
+/// first three and the PostgreSQL frame header uses the fourth, and a `close`
+/// that had to be told the width again is a `close` that can be told the wrong
+/// one.
 pub fn open8(b: Buf) i64 { put_u8(b, 0); return b.used - 1; }
 
 pub fn close8(b: Buf, mark: i64) void {
@@ -288,6 +289,13 @@ pub fn open24(b: Buf) i64 { put_u24(b, 0); return b.used - 3; }
 
 pub fn close24(b: Buf, mark: i64) void {
     put_be24(b.data, mark, b.used - mark - 3);
+    return;
+}
+
+pub fn open32(b: Buf) i64 { put_u32(b, 0); return b.used - 4; }
+
+pub fn close32(b: Buf, mark: i64) void {
+    put_be32(b.data, mark, u32(b.used - mark - 4));
     return;
 }
 

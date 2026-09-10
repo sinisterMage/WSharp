@@ -174,6 +174,30 @@ pub fn accept_nonblocking(l: Listener, on: bool) !void {
     return;
 }
 
+/// Close one or both directions of a connection, leaving it open.
+///
+/// What `close` cannot say. A client that has finished sending but still wants
+/// the answer shuts down its write half; the peer reads end-of-stream and knows
+/// the request is whole, while the connection stays open the other way. Every
+/// protocol that does not frame its own end needs this, and TLS's
+/// `close_notify` is the same shape one layer up.
+///
+/// Two bools rather than a constant, as `watch` takes two: shutting down
+/// *neither* direction is the one combination `shutdown(2)` cannot spell, and
+/// it does nothing here rather than inventing a meaning for it.
+///
+/// **On a connected socket this means the same thing on every system. On a
+/// `Listener` it does not**, which is why there is no `shutdown_listener`:
+/// Linux wakes a thread parked in `accept` and the BSDs answer `ENOTCONN` and
+/// leave it parked. An acceptor that has to be stoppable is a `poller` with a
+/// tick -- `accept_nonblocking`, `watch_listener`, `wait(p, ms)` -- and the
+/// stop signal is whatever the program already has, a `std/broker` topic being
+/// the usual one because it crosses heaps.
+pub fn shutdown(s: Socket, read: bool, write: bool) !void {
+    const ignored = try raw_shutdown(s.handle, read, write);
+    return;
+}
+
 /// Close a connection. Closing one twice is harmless.
 pub fn close(s: Socket) void {
     raw_close(s.handle);

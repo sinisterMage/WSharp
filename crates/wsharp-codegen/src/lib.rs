@@ -15,6 +15,7 @@
 //! as data. Nothing below `build` may ask which backend it is in; that would be
 //! the first of two lowerings, and the second would drift.
 
+pub mod equality;
 pub mod lower;
 pub mod repr;
 pub mod tables;
@@ -49,7 +50,7 @@ impl fmt::Display for CodegenError {
 
 impl std::error::Error for CodegenError {}
 
-fn err(context: &str, e: impl fmt::Display) -> CodegenError {
+pub(crate) fn err(context: &str, e: impl fmt::Display) -> CodegenError {
     CodegenError(format!("{context}: {e}"))
 }
 
@@ -140,7 +141,12 @@ pub fn build<M: Module>(
     let call_conv = module.target_config().default_call_conv;
     let layouts = collect_layouts(program, store);
 
-    let decls = declare_all(module, program, store, builtins, call_conv, &layouts)?;
+    let mut decls = declare_all(module, program, store, builtins, call_conv, &layouts)?;
+    // Every struct type `==` reaches, declared before any body is compiled --
+    // the comparisons call each other, so declaring and defining have to be two
+    // passes whatever order the types come in.
+    decls.equality = equality::plan(program, store);
+    equality::declare(module, &mut decls.equality, call_conv)?;
 
     let mut clif = String::new();
     let mut ctx = module.make_context();
@@ -171,6 +177,20 @@ pub fn build<M: Module>(
         // linker has run -- so keep the Cranelift id and resolve it later.
         harvested.push((clif_id, harvest_stack_maps(&ctx)));
         module.clear_context(&mut ctx);
+    }
+
+    {
+        let mut sink = if emit_clif { Some(&mut clif) } else { None };
+        equality::define(
+            module,
+            program,
+            store,
+            &decls,
+            &mut ctx,
+            &mut fb_ctx,
+            &mut harvested,
+            &mut sink,
+        )?;
     }
 
     // One trampoline per service function, emitted after the functions they
@@ -537,7 +557,7 @@ pub struct HarvestedCode {
 /// keyed by the **return address** of a call, and the `u32` alongside it is the
 /// frame's `sp_to_fp` distance -- so at that safepoint the stack pointer is
 /// `fp - frame_size` and each root sits at `sp + offset`.
-fn harvest_stack_maps(ctx: &cranelift_codegen::Context) -> HarvestedCode {
+pub(crate) fn harvest_stack_maps(ctx: &cranelift_codegen::Context) -> HarvestedCode {
     let compiled = ctx.compiled_code().expect("the function was just compiled");
     let safepoints = compiled
         .buffer
@@ -1101,6 +1121,8 @@ fn declare_all<M: Module>(
     let singletons = define_singletons(module, program)?;
 
     Ok(lower::Decls {
+        // Filled in by `build` once the program has been walked for `==`.
+        equality: equality::Equality::default(),
         funcs,
         builtins: builtin_ids,
         strings,

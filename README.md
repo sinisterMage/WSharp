@@ -74,6 +74,16 @@ dispatcher and the collector actually work.
   no lock on the fast path, and no data race to write. `std/broker` is the same
   idea at the other end — topics, partitions, consumer groups with their own
   offsets, and replay.
+
+  **`@spawn` returns before `init` starts**, and a worker serves its queue only
+  once `init` has *returned*. Both halves are promises rather than accidents. A
+  call made straight after `@spawn` therefore waits rather than being lost; and
+  a module whose `init` never returns is a **self-driving daemon**, which is how
+  several acceptors come to share one listener in a few lines. Such a worker can
+  never be told to stop, so `main` returning ends the process and takes it with
+  it — the workers that can be stopped are stopped and waited for first, so an
+  ordinary program's exit is unchanged. `os.exit(code)` is the way out from
+  anywhere else, and stops nothing.
 - **A standard library written in the language.** SHA-2, ChaCha20-Poly1305,
   AES-GCM, X25519, P-256, P-384, RSA, X.509 and TLS 1.3 are all `.ws` files
   compiled with your program, so `http.get("https://…")` is W# the whole way
@@ -110,6 +120,7 @@ everywhere.** They are checked when written and inferred when not.
 | Modules | `const http = @import("std/http");`, then `http.NotFound404`; `pub` is what another module may name, and `pub const parse = inner.parse;` renames one so a package of several files can present one |
 | Packages | `ingot` resolves and installs; `@import("acme/json")` then names a package's facade, exactly as a library path names a module |
 | Workers | `@spawn(counter, 0)` starts a thread with a heap of its own, `w.add(5)` calls into it, `@join(w)` waits for it |
+| Maps | `std/map` — a hash table with `str` keys, `get`, `set`, `remove`, and `for (m) \|e\|` |
 | Messages | `std/broker` — named topics, partitioned logs, consumer groups with their own offsets, and replay |
 | Bytes | `std/bytes` — `[]u8` as a buffer, the bridge to and from `str`, word accessors and hex |
 | Crypto | `std/hash` — SHA-2, HMAC, HKDF; `std/cipher` — ChaCha20-Poly1305 and AES-GCM; `std/crypto` — the system's generator |
@@ -124,7 +135,15 @@ everywhere.** They are checked when written and inferred when not.
 | Error sets | `!i64` infers which errors; `!{NotFound, IoFailed}str` writes them down and is checked |
 | Operators | `+ - * / %`, `& \| ^ << >> ~` (integers only), `== != < <= > >=` (non-chaining), `and or !`; `u32(x)` converts |
 
-`==` compares `str` by contents, so a string built at run time equals a literal.
+`==` compares `str` by contents, so a string built at run time equals a
+literal, and it compares a **struct field by field** -- each field by its own
+type's rule, so a nested struct recurses and an `f64` field makes a `NaN`
+unequal to itself. Two values of different concrete types are never equal, so
+two subtypes compared through their supertype compare the fields they actually
+have rather than only the part the supertype declares. A field an `==` cannot
+compare -- an array, a function, an error union -- makes the struct
+uncomparable, and the compiler says which field. A value that reaches itself
+recurses for ever, as derived equality does everywhere it exists.
 
 `!T` says *which* errors: the set is inferred from what a function raises and
 propagates, or written down and checked. So the `e` bound by `catch |e|` is
@@ -384,7 +403,7 @@ installation is a directory rather than a single file. The archive is
 `libwsharp_start.a`, or `wsharp_start.lib` where MSVC named it: cargo names a
 staticlib after the platform rather than after the crate, and both spellings are
 looked for. `--emit=obj` stops at the relocatable object, which is the half that
-needs no C compiler.
+needs no C compiler, and is `build`'s alone.
 
 Anything after the file is the program's, not the compiler's, and reaches it
 through `std/os`:
@@ -407,11 +426,50 @@ the compiler is thinking:
 
 ```sh
 wsharp check examples/inference.ws --emit=types   # inferred signatures
+wsharp check examples/fib.ws       --emit=api     # the declared surface, versioned
 wsharp check examples/fib.ws       --emit=ast     # parsed syntax tree
 wsharp run   examples/fib.ws       --emit=clif    # generated Cranelift IR
 wsharp run   examples/fib.ws       --emit=hir     # typed, monomorphised IR
 wsharp check examples/fib.ws       --emit=tokens
 ```
+
+**`--emit=api` is the one with a promise attached**, and the only one. A tool
+that generates W# — a router built from the route types an application declares,
+a migration runner built from a schema — has to read the program somehow, and
+reading it through the compiler is what keeps the tool and the type checker
+from disagreeing. So this emit is narrow and versioned:
+
+```
+$ wsharp check app/main.ws --emit=api
+(api 1)
+(module "main"
+  (import fw "app/fw")
+  (pub const ROUTE_Show (str "GET /users/:id"))
+  (pub struct Show (parent "app/fw".Route)
+    (field id i64)
+    (field page (optional i64)))
+  (pub fn action
+    (param r "main".Show)
+    (ret "app/fw".Response)))
+```
+
+Declarations and their types; no bodies, no expressions, no spans. **Every name
+a program defines is absolute** — a type written `fw.Route` prints as
+`"app/fw".Route` and one declared here prints with this module's own path — so a
+reader never follows an import or guesses a scope, and a bare name is one the
+language provides. Top-level `const` literals come through verbatim, which is
+what lets a convention be overridden in source rather than by a comment. A
+re-export prints as `(alias "module".name)`, naming what it is a second name
+for. The first line carries the version, and a change that could make an
+existing reader wrong bumps it.
+
+It is printed after type checking, so it only ever describes a program the
+compiler accepted.
+
+`--emit=ast` is **not** this. It prints whatever the syntax tree happens to
+hold, it is shared with the parser tests, it renames a node whenever the parser
+does, and it leaves every qualified name for the reader to resolve. It is a
+debugging aid and carries no promise at all.
 
 `--emit=types` prints one line per top-level function, so an overload set shows
 up as several:
@@ -460,13 +518,17 @@ directory from a file and say how big one is. It also has `chmod` and
 a file written by `io.write_file` is 0o644, and 0o644 is not a thing that can be
 run. There is no mode *reader* -- that would mean a `struct stat`, whose layout
 differs on every system in the BSD family, and the question worth asking is
-"will this start" rather than "which bits are set". Windows has no permission
+"will this start" rather than "which bits are set". `modified_at` is the one
+question here that a system may make the runtime read a `struct stat` for, and
+it is asked anyway because a tool watching files it just wrote would otherwise
+have to hash the whole tree on every tick; Linux answers with `statx`, macOS
+with `getattrlist` and Windows out of a call it was already making. Windows has no permission
 bits, so `chmod` succeeds there without doing anything and `is_executable` is
 `exists` -- but a path that is not there is an error on every platform, because
 "succeeded and did nothing" is honest about permissions this system does not
 keep and a lie about a file that does not exist. `std/path` is the arithmetic above both, and makes no syscall at all.
 `std/os` is what the process knows about itself -- `args`, `get`, `home`,
-`temp_dir`, `cwd`, and `target`, the triple this binary was built for.
+`temp_dir`, `cwd`, `exit`, and `target`, the triple this binary was built for.
 `std/toml` is TOML 1.0, read and written.
 
 A library module is only read if something imports it, so a program that
@@ -503,16 +565,17 @@ serving many connections from one worker, not for keeping the collector alive.
 
 | Module | |
 |---|---|
-| `std/str` | `len` `concat` `eq` `substr` `find` `split` `join` `repeat` `starts_with` `from_int` `from_float` `byte_at` `from_byte` `parse_int` `to_lower` `trim` |
+| `std/str` | `len` `concat` `eq` `substr` `find` `split` `join` `repeat` `replace` `starts_with` `from_int` `from_float` `byte_at` `from_byte` `parse_int` `to_lower` `to_upper` `trim` `hash`. `join` and `repeat` measure, allocate once and copy, so building output from pieces is linear |
 | `std/array` | `len` `new` `concat` `push` `slice` `repeat` |
+| `std/map` | `Map[V]`, a hash table with `str` keys: `new` `with_capacity` `len` `get` `has` `set` `remove` `keys` `clear` `iter` `next`. Open addressing with tombstones, so a removal does not break the probe run other keys are reached through |
 | `std/list` | `List[T]`, a growable array: `new` `with_capacity` `from` `len` `capacity` `get` `set` `push` `pop` `insert` `remove` `extend` `clear` `iter` `next` `to_array` |
 | `std/math` | `abs` `min` `max` `sign` `rem` `sqrt` `pow` `floor` `ceil` `round` `trunc` `ipow` |
 | `std/bits` | `rotl` `rotr` — rotation, generic over `Integer`, one instruction on both targets; `f64_bits` `f64_from_bits` — an `f64`'s representation, which is what a wire format carries |
 | `std/io` | `read_file` `read_line` `write_file` `exists` — the fallible ones name their errors, e.g. `!{NotFound, PermissionDenied, IoFailed}str` |
-| `std/net` | TCP: `Socket` `Listener` and `connect` `listen` `accept` `read` `write` `write_all` `read_exactly` `read_all` `set_nonblocking` `close`. UDP: `Datagrams` `Peer` `Datagram` and `udp` `send_to` `receive` `reply`. Readiness: `Poller` `Event` and `poller` `watch` `wait`. IPv4 or IPv6, with the family the resolver's choice |
+| `std/net` | TCP: `Socket` `Listener` and `connect` `listen` `accept` `read` `write` `write_all` `read_exactly` `read_all` `set_nonblocking` `shutdown` `close`. UDP: `Datagrams` `Peer` `Datagram` and `udp` `send_to` `receive` `reply`. Readiness: `Poller` `Event` and `poller` `watch` `wait`. IPv4 or IPv6, with the family the resolver's choice |
 | `std/http` | the 27 HTTP status types, materialised on first mention, plus an HTTP/1.1 client and server: `get` `post` `request` `read_request` `respond` `header` `status_of`; and since item 10, `https://` over `std/tls` |
 | `std/broker` | `Topic[M]` `Consumer[M]` and `topic` `publish` `subscribe` `next` `commit` `seek` `len` |
-| `std/bytes` | `[]u8` as a buffer, and the bridge to and from `str`: `new` `of` `to_str` `slice` `concat` `copy` `fill` `xor` `equal`, the big- and little-endian word accessors, `to_hex` `from_hex` |
+| `std/bytes` | `[]u8` as a buffer, and the bridge to and from `str`: `new` `of` `to_str` `slice` `concat` `copy` `fill` `xor` `equal`, the big- and little-endian word accessors, `to_hex` `from_hex`; and `Buf`, which grows — `put_str` `put_bytes` `taken` `reset`, with `open8`/`close8` through `open32`/`close32` for a length written before what it counts |
 | `std/hash` | SHA-256, SHA-384 and SHA-512, one-shot and incremental, plus `hmac` `hkdf_extract` `hkdf_expand` — written once over a `Hash` value that says a block size, a digest size and how to hash |
 | `std/cipher` | ChaCha20, Poly1305, ChaCha20-Poly1305; AES-128/256, GHASH, AES-GCM. Constant-time by construction: no table is indexed by a secret byte, so AES's S-box is computed in GF(2^8) and GHASH is 128 shifts |
 | `std/crypto` | `random` — the system's generator, which is the kernel's |
@@ -742,8 +805,20 @@ Sessions are numbered by the original feature list:
       the tree it must hash to, so resolving is arithmetic over a file and
       installing is checked against a hash somebody's CI already verified.
 
-Since that list ran out:
-[**sharpie**](https://github.com/sinisterMage/sharpie), a version manager, and
+Since that list ran out, two things.
+
+**Raython**, an MVC framework, which is a design rather than a program so far
+and whose repository is private. Its author settled every "can W# do this?" by
+running the compiler rather than from memory, and left 28 probes behind as the
+record. The design ends with nine things it wanted from the language and one
+thing that was a bug: a conversion inside an abstract-typed body pinned that
+parameter to the converted type, and with a second overload beside it that got
+past inference and produced IR Cranelift refused. All ten are closed, which is
+where `--emit=api`, `std/map`, a linear `str.join`, `net.shutdown`, `os.exit`,
+`fs.modified_at`, struct `==` and `main` returning ending the process came from.
+Item 14 of [ROADMAP.md](ROADMAP.md) is the write-up.
+
+And [**sharpie**](https://github.com/sinisterMage/sharpie), a version manager,
 the second real program written in W#. It finds releases by reading this
 repository's tags over git's smart HTTP rather than through a forge's REST API,
 because that answers in JSON, W# has no JSON reader, and writing one would have

@@ -43,6 +43,20 @@ mod c {
         pub(super) fn write(fd: c_int, buf: *const u8, count: usize) -> isize;
         pub(super) fn close(fd: c_int) -> c_int;
         pub(super) fn access(path: *const u8, mode: c_int) -> c_int;
+        /// The one call in this arm that fills in a struct, and the only one
+        /// whose layout is safe to declare: `struct statx` is kernel UAPI --
+        /// one layout, the same on every architecture, versioned by a mask
+        /// rather than by a symbol. That is exactly the property `struct stat`
+        /// lacks, which is why it is not here.
+        ///
+        /// glibc has exported it since 2.28 and musl since 1.2.
+        pub(super) fn statx(
+            dirfd: c_int,
+            path: *const u8,
+            flags: c_int,
+            mask: c_uint,
+            buf: *mut u8,
+        ) -> c_int;
         pub(super) fn unlink(path: *const u8) -> c_int;
         pub(super) fn mkdir(path: *const u8, mode: mode_t) -> c_int;
         pub(super) fn rmdir(path: *const u8) -> c_int;
@@ -323,6 +337,55 @@ pub(crate) fn file_size(path: &[u8]) -> Result<i64, Errno> {
     if end < 0 { Err(errno()) } else { Ok(end) }
 }
 
+/// `statx`, and the two facts about its buffer this needs.
+///
+/// The struct is 256 bytes and `stx_mtime` is at 112, holding a signed 64-bit
+/// second count followed by nanoseconds. Written as offsets rather than as a
+/// declared struct for the reason `D_NAME_OFFSET` is: what is wanted is one
+/// number, and a whole declaration would be twenty fields nothing reads.
+const AT_FDCWD: c_int = -100;
+/// Behave exactly as `stat(2)` would, which is what makes this a drop-in
+/// answer rather than one that differs on a network filesystem.
+const AT_STATX_SYNC_AS_STAT: c_int = 0x0000;
+const STATX_MTIME: c_uint = 0x0000_0040;
+const STATX_SIZE_BYTES: usize = 256;
+const STATX_MASK_OFFSET: usize = 0;
+const STATX_MTIME_SEC_OFFSET: usize = 112;
+
+/// When a path was last written, in seconds since the Unix epoch.
+pub(crate) fn modified_at(path: &[u8]) -> Result<i64, Errno> {
+    let path = c_path(path)?;
+    let mut buf = [0u8; STATX_SIZE_BYTES];
+    let ok = unsafe {
+        c::statx(
+            AT_FDCWD,
+            path.as_ptr(),
+            AT_STATX_SYNC_AS_STAT,
+            STATX_MTIME,
+            buf.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        return Err(errno());
+    }
+    // `statx` answers with what it *did* fill in, which is not always what was
+    // asked for. Checked rather than assumed, because the alternative is
+    // reading zeroes as 1970.
+    let filled = u32::from_ne_bytes(
+        buf[STATX_MASK_OFFSET..STATX_MASK_OFFSET + 4]
+            .try_into()
+            .expect("four bytes"),
+    );
+    if filled & STATX_MTIME == 0 {
+        return Err(Errno(EIO));
+    }
+    Ok(i64::from_ne_bytes(
+        buf[STATX_MTIME_SEC_OFFSET..STATX_MTIME_SEC_OFFSET + 8]
+            .try_into()
+            .expect("eight bytes"),
+    ))
+}
+
 pub(crate) fn read_dir(path: &[u8]) -> Result<Vec<Vec<u8>>, Errno> {
     let path = c_path(path)?;
     let dir = unsafe { c::opendir(path.as_ptr()) };
@@ -469,6 +532,7 @@ mod net_c {
         -> c_int;
         pub(super) fn send(fd: c_int, buf: *const u8, len: usize, flags: c_int) -> isize;
         pub(super) fn recv(fd: c_int, buf: *mut u8, len: usize, flags: c_int) -> isize;
+        pub(super) fn shutdown(fd: c_int, how: c_int) -> c_int;
         pub(super) fn sendto(
             fd: c_int,
             buf: *const u8,
@@ -666,6 +730,27 @@ pub(crate) fn local_addr(fd: Fd) -> Result<SockAddr, Errno> {
     // The family is not asked for here and not needed: nothing creates a socket
     // from this address, it is only read for its port.
     Ok(unsafe { SockAddr::from_raw(bytes.as_ptr(), len, AF_UNSPEC, 0, 0) })
+}
+
+/// `SHUT_RD`, `SHUT_WR`, `SHUT_RDWR` -- 0, 1, 2 on Linux and on the BSDs.
+const SHUT_RD: c_int = 0;
+const SHUT_WR: c_int = 1;
+const SHUT_RDWR: c_int = 2;
+
+pub(crate) fn shutdown(fd: Fd, read: bool, write: bool) -> Result<(), Errno> {
+    let how = match (read, write) {
+        (true, true) => SHUT_RDWR,
+        (true, false) => SHUT_RD,
+        (false, true) => SHUT_WR,
+        // Asked to shut down neither direction. Nothing to do, and doing it is
+        // the honest answer: `shutdown` has no spelling for it.
+        (false, false) => return Ok(()),
+    };
+    if unsafe { net_c::shutdown(fd as c_int, how) } == 0 {
+        Ok(())
+    } else {
+        Err(errno())
+    }
 }
 
 pub(crate) fn close_socket(fd: Fd) {

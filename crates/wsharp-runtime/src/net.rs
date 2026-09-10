@@ -381,6 +381,24 @@ pub unsafe extern "C" fn ws_net_set_nonblocking(out: *mut FallibleI64, socket: i
     unsafe { out.write(result) };
 }
 
+/// Close one or both directions of a connected socket, leaving it open.
+///
+/// # Safety
+/// As [`ws_net_connect`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_net_shutdown(out: *mut FallibleI64, socket: i64, read: i8, write: i8) {
+    unsafe { crate::gc::checkpoint() };
+    let Some(fd) = lookup_any(socket) else {
+        unsafe { out.write(FallibleI64::err(no_such_socket())) };
+        return;
+    };
+    let result = match sys::shutdown(fd, read != 0, write != 0) {
+        Ok(()) => FallibleI64::ok(0),
+        Err(e) => FallibleI64::err(sys::error_tag(e)),
+    };
+    unsafe { out.write(result) };
+}
+
 /// Close a socket and forget its handle. Closing twice is harmless.
 ///
 /// # Safety

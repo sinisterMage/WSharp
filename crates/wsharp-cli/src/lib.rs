@@ -11,6 +11,7 @@ use std::process::ExitCode;
 use clap::ValueEnum;
 use wsharp_syntax::diag::{Diagnostic, Severity, SourceMap, render};
 
+pub mod api;
 pub mod link;
 pub mod load;
 
@@ -18,8 +19,13 @@ pub mod load;
 pub enum Emit {
     /// The token stream.
     Tokens,
-    /// The parsed syntax tree.
+    /// The parsed syntax tree. A debugging aid: it prints whatever the syntax
+    /// tree happens to hold, it is shared with the parser tests, and it carries
+    /// no promise at all. `api` is the one to generate code from.
     Ast,
+    /// The program's declared surface, resolved and versioned -- what a tool
+    /// that generates W# reads. See `crate::api`.
+    Api,
     /// The inferred signature of every top-level function.
     Types,
     /// The typed, monomorphised intermediate representation.
@@ -124,6 +130,23 @@ pub fn drive(
     if report(map, &analysis.diags) {
         return Ok(ExitCode::FAILURE);
     }
+    if emit == Some(Emit::Api) {
+        // After type checking rather than beside `--emit=ast`, so that what is
+        // printed always describes a program the compiler accepted: a generator
+        // reading it never has to wonder whether what it is generating from
+        // type-checks.
+        let known: Vec<api::Module<'_>> = program
+            .modules
+            .iter()
+            .map(|m| api::Module {
+                path: &m.path,
+                ast: &m.ast,
+                specifiers: &m.imports,
+            })
+            .collect();
+        print!("{}", api::emit(&known));
+        return Ok(ExitCode::SUCCESS);
+    }
     if emit == Some(Emit::Types) {
         for (name, ty) in &analysis.signatures {
             println!("{name}: {ty}");
@@ -159,6 +182,13 @@ pub fn drive(
     }
 
     // ---- code generation ----
+    // `--emit=obj` stops half way through `build` and there is no half way
+    // through the others. Said here rather than left to fall through every
+    // branch below, which is what it did -- and `check --emit=obj` then reached
+    // the JIT and *ran* the program.
+    if emit == Some(Emit::Obj) && !matches!(action, Action::Build { .. }) {
+        return Err("`--emit=obj` is `build`'s: there is no object file to stop at here".into());
+    }
     let want_clif = emit == Some(Emit::Clif);
     if let Action::Build { out } = action {
         let object = wsharp_codegen::compile_object(&mono.program, &mut analysis.store, want_clif)

@@ -519,6 +519,23 @@ pub(crate) fn file_size(path: &[u8]) -> Result<i64, Errno> {
     Ok(((u64::from(data.nFileSizeHigh) << 32) | u64::from(data.nFileSizeLow)) as i64)
 }
 
+/// When a path was last written, in seconds since the Unix epoch.
+///
+/// Out of the same call `is_dir` and `file_size` already make -- the field was
+/// being fetched and thrown away. `WIN32_FILE_ATTRIBUTE_DATA` is documented,
+/// fixed, and the same on every Windows, which is the difference between it and
+/// the POSIX `struct stat` this runtime declines to declare.
+///
+/// Converted exactly as [`wall_clock_secs`] converts the system clock, and
+/// saturating for its reason: a file dated before 1601 is not a thing, but the
+/// subtraction would wrap rather than say so.
+pub(crate) fn modified_at(path: &[u8]) -> Result<i64, Errno> {
+    let data = attributes(path)?;
+    let written = data.ftLastWriteTime;
+    let ticks = (u64::from(written.high) << 32) | u64::from(written.low);
+    Ok(ticks.saturating_sub(FILETIME_EPOCH_DELTA) as i64 / FILETIME_TICKS_PER_SECOND as i64)
+}
+
 pub(crate) fn read_dir(path: &[u8]) -> Result<Vec<Vec<u8>>, Errno> {
     // `FindFirstFileW` takes a pattern rather than a directory, so the
     // wildcard is appended here. Win32 accepts `/` as a separator, which is
@@ -728,6 +745,7 @@ mod net_c {
         pub(super) fn getsockname(s: SOCKET, addr: *mut u8, len: *mut i32) -> i32;
         pub(super) fn ioctlsocket(s: SOCKET, cmd: i32, arg: *mut u32) -> i32;
         pub(super) fn closesocket(s: SOCKET) -> i32;
+        pub(super) fn shutdown(s: SOCKET, how: i32) -> i32;
         pub(super) fn getaddrinfo(
             node: *const u8,
             service: *const u8,
@@ -929,6 +947,30 @@ pub(crate) fn local_addr(fd: Fd) -> Result<SockAddr, Errno> {
         return Err(wsa_error());
     }
     Ok(unsafe { SockAddr::from_raw(bytes.as_ptr(), len as u32, AF_UNSPEC, 0, 0) })
+}
+
+/// Winsock's `SD_RECEIVE`, `SD_SEND`, `SD_BOTH`.
+///
+/// The same three numbers Unix spells `SHUT_RD`, `SHUT_WR` and `SHUT_RDWR`,
+/// under different names -- which is why they are written out here rather than
+/// shared: a name that does not match the reference it was taken from is a name
+/// nobody can check.
+const SD_RECEIVE: i32 = 0;
+const SD_SEND: i32 = 1;
+const SD_BOTH: i32 = 2;
+
+pub(crate) fn shutdown(fd: Fd, read: bool, write: bool) -> Result<(), Errno> {
+    let how = match (read, write) {
+        (true, true) => SD_BOTH,
+        (true, false) => SD_RECEIVE,
+        (false, true) => SD_SEND,
+        (false, false) => return Ok(()),
+    };
+    if unsafe { net_c::shutdown(to_socket(fd), how) } == 0 {
+        Ok(())
+    } else {
+        Err(wsa_error())
+    }
 }
 
 pub(crate) fn close_socket(fd: Fd) {

@@ -21,6 +21,7 @@
 //! what it may touch.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Condvar, Mutex};
 
@@ -112,6 +113,15 @@ struct Handle {
     queue: Mutex<Queue>,
     arrived: Condvar,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Whether this worker has reached its message loop, and so is able to see
+    /// a `Stop`.
+    ///
+    /// `init` runs before the loop does, so a worker whose `init` never returns
+    /// never dequeues anything -- which is the whole shape of a self-driving
+    /// daemon, an acceptor on a shared listener being the usual one. Waiting
+    /// for such a worker at exit waits for ever, and [`stop_all`] uses this to
+    /// tell the two apart.
+    serving: AtomicBool,
 }
 
 struct Queue {
@@ -194,6 +204,7 @@ pub unsafe extern "C" fn ws_spawn(service_id: u32, argv: *const u64) -> i64 {
         }),
         arrived: Condvar::new(),
         thread: Mutex::new(None),
+        serving: AtomicBool::new(false),
     }));
     let id = {
         let mut list = HANDLES.lock().unwrap_or_else(|e| e.into_inner());
@@ -228,14 +239,38 @@ fn worker_main(code: &'static ServiceCode, args: Vec<Word>, handle: &'static Han
     let state_pin = Pinned::new();
     let mut state_out = [0u64; 1];
     {
-        let arg_pin = Pinned::new();
-        let argv = unsafe { unpack(&args, &arg_pin) };
+        // The pins come off before generated code is entered, and that is not
+        // tidiness. They exist to bridge one `decode` to the next -- each
+        // allocates, and the ones already decoded are held in a `Vec` no stack
+        // map describes -- and `unpack` returning is the last moment anything
+        // can allocate before the callee's prologue stores its parameters into
+        // slots its own stack maps do describe. There is no safepoint in that
+        // window, which is the same argument the return area and the runtime
+        // boundary already make.
+        //
+        // Held any longer, they are runtime roots *on the thread* for the whole
+        // of `init` -- and a worker whose `init` blocks, which is every
+        // acceptor and the shape `@spawn` exists for, would then enter a safe
+        // region with `pinned_depth` non-zero. A collector declines a parked
+        // worker holding those and waits for the syscall instead, which is the
+        // regression safe regions were written to remove; in a build with
+        // debug assertions on it is an abort.
+        let argv = {
+            let arg_pin = Pinned::new();
+            unsafe { unpack(&args, &arg_pin) }
+        };
         let init: InitFn = unsafe { std::mem::transmute(code.init) };
         unsafe { init(argv.as_ptr(), state_out.as_mut_ptr()) };
     }
     let state = state_out[0] as *mut u8;
     state_pin.add(state);
     drop(args);
+
+    // From here on this worker can see a `Stop`, which is what lets the exit
+    // path wait for it. Set after `init` and before the first `pop_front`,
+    // because that is exactly the window: an `init` that never returns never
+    // gets here, and `stop_all` must not wait for it.
+    handle.serving.store(true, Ordering::Release);
 
     loop {
         let message = {
@@ -273,14 +308,20 @@ fn worker_main(code: &'static ServiceCode, args: Vec<Word>, handle: &'static Han
                     continue;
                 };
                 let out = {
-                    let pin = Pinned::new();
-                    let argv = unsafe { unpack(&args, &pin) };
+                    // The argument pins come off before the call, for the
+                    // reason `init`'s do above: a method that blocks -- and a
+                    // worker's method is exactly where a blocking call belongs
+                    // -- must not park with runtime roots on the thread.
+                    let argv = {
+                        let pin = Pinned::new();
+                        unsafe { unpack(&args, &pin) }
+                    };
                     let mut out = vec![0u64; m.ret.len()];
                     let call: CallFn = unsafe { std::mem::transmute(m.call) };
                     unsafe { call(state, argv.as_ptr(), out.as_mut_ptr()) };
-                    // Packed while still pinned and before anything else can
-                    // allocate: a result is a reference into this heap until
-                    // it is bytes.
+                    // Packed before anything else can allocate: a result is a
+                    // reference into this heap until it is bytes, and it is
+                    // held in a `Vec` no stack map describes.
                     unsafe { pack(out.as_ptr(), m.ret) }
                 };
                 let _ = reply.send(Ok(out));
@@ -388,10 +429,28 @@ pub unsafe extern "C" fn ws_join(worker: i64) -> i64 {
     }
 }
 
-/// Stop every worker still running, at exit.
+/// Stop every worker that can be stopped, at exit.
 ///
 /// A worker parked on its queue would otherwise keep the process alive, and a
-/// worker in the middle of a trace would be left half way through it.
+/// worker in the middle of a trace would be left half way through it -- so
+/// every worker is told to stop and every worker that can hear is waited for.
+///
+/// **Not every worker can hear.** `init` runs before the message loop does, so
+/// a worker whose `init` never returns never dequeues the `Stop`; that is not a
+/// mistake but a shape the language encourages -- `@spawn` returns before
+/// `init` starts, which is what makes N acceptors on one listener a two-line
+/// program. Joining one of those waits for ever, and it did: `main` printed its
+/// last line and the process sat there until something killed it, with no way
+/// to say what was wrong. So `main` returning **ends the process**, and a
+/// worker that never reached its loop is ended with it.
+///
+/// The distinction is `serving` rather than a timeout, so an ordinary program's
+/// exit stays deterministic: a worker in the middle of a method is still waited
+/// for, and finishes. What is abandoned is only what could never have answered.
+///
+/// The race is benign in the one direction it exists: a worker that sets
+/// `serving` just after this read is abandoned although it would have stopped,
+/// and the process is exiting anyway.
 pub fn stop_all() {
     let handles: Vec<&'static Handle> = HANDLES
         .lock()
@@ -399,18 +458,23 @@ pub fn stop_all() {
         .iter()
         .copied()
         .collect();
-    for handle in handles {
+    // Every worker is told first and waited for second, so that N workers stop
+    // in parallel rather than one after another.
+    for handle in &handles {
         {
             let mut queue = handle.queue.lock().unwrap_or_else(|e| e.into_inner());
             queue.messages.push_back(Message::Stop);
         }
         handle.arrived.notify_all();
+    }
+    for handle in &handles {
         let thread = handle
             .thread
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        if let Some(t) = thread {
+        let Some(t) = thread else { continue };
+        if handle.serving.load(Ordering::Acquire) {
             let _ = t.join();
         }
     }

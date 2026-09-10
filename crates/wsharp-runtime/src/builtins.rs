@@ -465,6 +465,53 @@ fn library() -> Vec<Builtin> {
             ptr: crate::strings::ws_str_trim as *const u8,
         },
         Builtin {
+            module: STR_MODULE,
+            name: "hash",
+            params: &[BuiltinTy::Str],
+            ret: BuiltinTy::U64,
+            link: "ws_str_hash",
+            ptr: crate::strings::ws_str_hash as *const u8,
+        },
+        Builtin {
+            module: STR_MODULE,
+            name: "to_upper",
+            params: &[BuiltinTy::Str],
+            ret: BuiltinTy::Str,
+            link: "ws_str_to_upper",
+            ptr: crate::strings::ws_str_to_upper as *const u8,
+        },
+        Builtin {
+            module: STR_MODULE,
+            name: "replace",
+            params: &[BuiltinTy::Str, BuiltinTy::Str, BuiltinTy::Str],
+            ret: BuiltinTy::Str,
+            link: "ws_str_replace",
+            ptr: crate::strings::ws_str_replace as *const u8,
+        },
+        // The two below are `bytes.raw_from_str` and `bytes.raw_to_str` under a
+        // second name. `std/bytes` imports `std/str`, so `std/str` cannot
+        // import `std/bytes` -- and `join` and `repeat` need a buffer to
+        // assemble into, which is the difference between linear and `concat` in
+        // a loop. A `link` is a symbol and no two rows may claim one, so the
+        // Rust side is a pair of one-line forwarders rather than a second
+        // implementation.
+        Builtin {
+            module: STR_MODULE,
+            name: "raw_into",
+            params: &[BYTES_OF_U8, BuiltinTy::I64, BuiltinTy::Str],
+            ret: BuiltinTy::Void,
+            link: "ws_str_into_bytes",
+            ptr: crate::strings::ws_str_into_bytes as *const u8,
+        },
+        Builtin {
+            module: STR_MODULE,
+            name: "raw_from",
+            params: &[BYTES_OF_U8, BuiltinTy::I64, BuiltinTy::I64],
+            ret: BuiltinTy::Str,
+            link: "ws_str_from_bytes",
+            ptr: crate::strings::ws_str_from_bytes as *const u8,
+        },
+        Builtin {
             module: ARRAY_MODULE,
             name: "len",
             params: &[ARRAY_OF_ELEM],
@@ -711,13 +758,30 @@ fn library() -> Vec<Builtin> {
             link: "ws_fs_rename",
             ptr: crate::fs::ws_fs_rename as *const u8,
         },
+        // The one question about a path that does not have a one-number answer
+        // on every system, and the reason it is asked anyway: a dev watcher
+        // that had to hash every file to notice a change would read the whole
+        // tree on every tick. `crate::sys::modified_at` says what each arm
+        // pays. Seconds since the Unix epoch, the clock `time.now()` reads.
+        Builtin {
+            module: FS_MODULE,
+            name: "modified_at",
+            params: &[BuiltinTy::Str],
+            ret: BuiltinTy::ErrUnion(
+                &BuiltinTy::I64,
+                &["NotFound", "PermissionDenied", "IoFailed"],
+            ),
+            link: "ws_fs_modified_at",
+            ptr: crate::fs::ws_fs_modified_at as *const u8,
+        },
         // A file arrives from a download or an archive with whatever mode the
         // writer chose, and 0o644 is not a thing that can be run. These two are
         // what a program that writes another program needs: one to set the bit
-        // and one to see it. There is deliberately no mode *reader* -- that
-        // would mean `struct stat`, which is the layout minefield `crate::sys`
-        // exists to stay out of, and the question being asked is "will this
-        // start" rather than "which bits are set".
+        // and one to see it. There is deliberately no mode *reader*: the
+        // question being asked is "will this start" rather than "which bits are
+        // set", and only the first has a caller. `modified_at` above is the one
+        // question this layer asks that a system may make it read a `struct
+        // stat` for, and it is asked because a watcher needs it.
         Builtin {
             module: FS_MODULE,
             name: "chmod",
@@ -785,6 +849,16 @@ fn library() -> Vec<Builtin> {
             ret: BuiltinTy::Str,
             link: "ws_os_target",
             ptr: crate::os::ws_os_target as *const u8,
+        },
+        // Never returns, which the type system has no way to say -- so it is
+        // `void` and the doc comment carries the fact, as `exec` does.
+        Builtin {
+            module: OS_MODULE,
+            name: "raw_exit",
+            params: &[BuiltinTy::I64],
+            ret: BuiltinTy::Void,
+            link: "ws_os_exit",
+            ptr: crate::os::ws_os_exit as *const u8,
         },
         Builtin {
             module: OS_MODULE,
@@ -1002,6 +1076,14 @@ fn library() -> Vec<Builtin> {
         },
         Builtin {
             module: NET_MODULE,
+            name: "raw_shutdown",
+            params: &[BuiltinTy::I64, BuiltinTy::Bool, BuiltinTy::Bool],
+            ret: BuiltinTy::ErrUnion(&BuiltinTy::I64, NET_ERRORS),
+            link: "ws_net_shutdown",
+            ptr: crate::net::ws_net_shutdown as *const u8,
+        },
+        Builtin {
+            module: NET_MODULE,
             name: "raw_close",
             params: &[BuiltinTy::I64],
             ret: BuiltinTy::Void,
@@ -1189,6 +1271,8 @@ pub const STR_MODULE: &str = "std/str";
 pub const ARRAY_MODULE: &str = "std/array";
 /// The standard library's growable array.
 pub const LIST_MODULE: &str = "std/list";
+/// The standard library's hash table.
+pub const MAP_MODULE: &str = "std/map";
 /// The standard library's arithmetic.
 pub const MATH_MODULE: &str = "std/math";
 /// The float remainder, which the code generator calls for `%` on an `f64`
@@ -1367,6 +1451,7 @@ pub fn std_module_sources() -> &'static [(&'static str, &'static str)] {
     &[
         (ARRAY_MODULE, include_str!("std/array.ws")),
         (LIST_MODULE, include_str!("std/list.ws")),
+        (MAP_MODULE, include_str!("std/map.ws")),
         (STR_MODULE, include_str!("std/str.ws")),
         (BYTES_MODULE, include_str!("std/bytes.ws")),
         (CRYPTO_MODULE, include_str!("std/crypto.ws")),

@@ -1515,9 +1515,56 @@ fn strings_can_be_compared() {
         sig("fn same(a: str, b: str) bool { return a == b; }", "same"),
         "fn(str, str) bool"
     );
+}
+
+/// `==` on a struct compares its fields, so what is decided at the comparison
+/// is whether every field it will reach is itself comparable.
+#[test]
+fn structs_are_compared_field_by_field() {
+    assert_eq!(
+        sig(
+            "const P = struct { x: i64, name: str }; \
+             fn f(a: P, b: P) bool { return a == b; }",
+            "f"
+        ),
+        "fn(P, P) bool"
+    );
+    // A struct field recurses, and a `?T` field is its payload's rule.
+    assert_eq!(
+        sig(
+            "const P = struct { x: i64 }; const Q = struct { at: ?P }; \
+             fn f(a: Q, b: Q) bool { return a == b; }",
+            "f"
+        ),
+        "fn(Q, Q) bool"
+    );
+    // A type that reaches itself is met twice and walked once.
+    assert_eq!(
+        sig(
+            "const N = struct { v: i64, next: ?N }; \
+             fn f(a: N, b: N) bool { return a == b; }",
+            "f"
+        ),
+        "fn(N, N) bool"
+    );
+    // An array field is not comparable, and the diagnostic names it.
     assert_error(
-        "const P = struct { x: i64 }; fn f(a: P, b: P) bool { return a == b; }",
-        "cannot be compared",
+        "const P = struct { xs: []i64 }; fn f(a: P, b: P) bool { return a == b; }",
+        "`P.xs` is `[]i64`",
+    );
+    // Nor is one reached through another struct: the walk names the field that
+    // is actually at fault rather than the one it went through.
+    assert_error(
+        "const P = struct { xs: []i64 }; const Q = struct { at: ?P }; \
+         fn f(a: Q, b: Q) bool { return a == b; }",
+        "`P.xs` is `[]i64`",
+    );
+    // A comparison at a supertype is handed subtypes, so their fields count
+    // too.
+    assert_error(
+        "const B = struct { n: i64 }; const S = struct : B { xs: []i64 }; \
+         fn f(a: B, b: B) bool { return a == b; }",
+        "`S.xs` is `[]i64`",
     );
 }
 

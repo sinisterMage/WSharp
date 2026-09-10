@@ -140,6 +140,35 @@ mod c {
 
     // `errno`'s address, whose spelling is the one thing here that is not
     // shared across the family.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    unsafe extern "C" {
+        /// macOS's selective `stat`: ask for named attributes and be handed
+        /// those, packed, rather than a struct whose layout is the question.
+        ///
+        /// This is why the macOS arm needs no `struct stat` at all -- and macOS
+        /// is the one system in this file that is compiled anywhere its authors
+        /// can reach, so the arm that is checked is also the arm with nothing to
+        /// get wrong.
+        pub(super) fn getattrlist(
+            path: *const u8,
+            attrs: *const super::AttrList,
+            buf: *mut u8,
+            size: usize,
+            options: u32,
+        ) -> c_int;
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    unsafe extern "C" {
+        /// The rest of the family has neither `statx` nor `getattrlist`, so
+        /// this is the one place in this runtime that meets `struct stat`.
+        /// Nothing declares it: what is read is one offset, exactly as
+        /// `D_NAME_OFFSET` is. NetBSD renamed the symbol when the layout last
+        /// changed, which is the whole argument for not declaring the struct.
+        #[cfg_attr(target_os = "netbsd", link_name = "__stat50")]
+        pub(super) fn stat(path: *const u8, buf: *mut u8) -> c_int;
+    }
+
     #[cfg(any(
         target_os = "macos",
         target_os = "ios",
@@ -391,6 +420,99 @@ pub(crate) fn file_size(path: &[u8]) -> Result<i64, Errno> {
     if end < 0 { Err(errno()) } else { Ok(end) }
 }
 
+/// What `getattrlist` is asked for. Five bitmaps, in the order the header
+/// declares them, and a count that says how many follow.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[repr(C)]
+pub(super) struct AttrList {
+    bitmapcount: u16,
+    reserved: u16,
+    commonattr: u32,
+    volattr: u32,
+    dirattr: u32,
+    fileattr: u32,
+    forkattr: u32,
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const ATTR_BIT_MAP_COUNT: u16 = 5;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const ATTR_CMN_MODTIME: u32 = 0x0000_0400;
+
+/// When a path was last written, in seconds since the Unix epoch.
+///
+/// `getattrlist` writes a *packed* buffer: a four-byte length, then each
+/// attribute asked for, in the order the header declares them. One attribute is
+/// asked for here, so what comes back is four bytes of length and then a
+/// `struct timespec` -- and the second number, which is the one wanted, is at 4.
+/// Unaligned, hence `read_unaligned`, which is what packed means.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) fn modified_at(path: &[u8]) -> Result<i64, Errno> {
+    let path = c_path(path)?;
+    let attrs = AttrList {
+        bitmapcount: ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: ATTR_CMN_MODTIME,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    // Room for the length, the timespec, and slack: the kernel writes what it
+    // has room for and says how much, and a short buffer is a truncation rather
+    // than an error.
+    let mut buf = [0u8; 64];
+    // Zero options, so a symbolic link is followed -- which is what `stat` does
+    // and what every other question this layer asks already does.
+    let ok = unsafe { c::getattrlist(path.as_ptr(), &attrs, buf.as_mut_ptr(), buf.len(), 0) };
+    if ok != 0 {
+        return Err(errno());
+    }
+    let written = u32::from_ne_bytes(buf[0..4].try_into().expect("four bytes")) as usize;
+    if written < 4 + 8 {
+        return Err(Errno(EIO));
+    }
+    Ok(i64::from_ne_bytes(
+        buf[4..12].try_into().expect("eight bytes"),
+    ))
+}
+
+/// Where `st_mtime`'s seconds start in a `struct stat`.
+///
+/// One number per system rather than a declared struct, for exactly
+/// [`D_NAME_OFFSET`]'s reason: `struct stat` is *not the same struct* across
+/// this family -- nor across one system's own history, which is why NetBSD's
+/// symbol is `__stat50` -- and a layout written from one system's headers would
+/// be a declaration for the others that nobody had ever run. A single offset is
+/// one auditable fact per system, taken from that system's `<sys/stat.h>`.
+///
+/// macOS is not in this list: it has `getattrlist`, which answers the question
+/// without a layout at all. That is also the only system here CI compiles, so
+/// **these four numbers are the part of this runtime that no machine available
+/// to its authors can check.** They are stated rather than hidden for that
+/// reason.
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+const ST_MTIME_OFFSET: usize = 64;
+#[cfg(any(target_os = "openbsd", target_os = "dragonfly"))]
+const ST_MTIME_OFFSET: usize = 48;
+
+/// When a path was last written, in seconds since the Unix epoch.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+pub(crate) fn modified_at(path: &[u8]) -> Result<i64, Errno> {
+    let path = c_path(path)?;
+    // Generously larger than any `struct stat` in this family, which is at most
+    // about 160 bytes, so the kernel cannot write past it whatever the layout.
+    let mut buf = [0u8; 256];
+    if unsafe { c::stat(path.as_ptr(), buf.as_mut_ptr()) } != 0 {
+        return Err(errno());
+    }
+    Ok(i64::from_ne_bytes(
+        buf[ST_MTIME_OFFSET..ST_MTIME_OFFSET + 8]
+            .try_into()
+            .expect("eight bytes"),
+    ))
+}
+
 pub(crate) fn read_dir(path: &[u8]) -> Result<Vec<Vec<u8>>, Errno> {
     let path = c_path(path)?;
     let dir = unsafe { c::opendir(path.as_ptr()) };
@@ -579,6 +701,7 @@ mod net_c {
         pub(super) fn accept(fd: c_int, addr: *mut u8, len: *mut socklen_t) -> c_int;
         pub(super) fn send(fd: c_int, buf: *const u8, len: usize, flags: c_int) -> isize;
         pub(super) fn recv(fd: c_int, buf: *mut u8, len: usize, flags: c_int) -> isize;
+        pub(super) fn shutdown(fd: c_int, how: c_int) -> c_int;
         pub(super) fn sendto(
             fd: c_int,
             buf: *const u8,
@@ -765,6 +888,26 @@ pub(crate) fn local_addr(fd: Fd) -> Result<SockAddr, Errno> {
         return Err(errno());
     }
     Ok(unsafe { SockAddr::from_raw(bytes.as_ptr(), len, AF_UNSPEC, 0, 0) })
+}
+
+/// `SHUT_RD`, `SHUT_WR`, `SHUT_RDWR` -- 0, 1, 2, the same on every BSD as on
+/// Linux. This is one of the few numbers the two families agree about.
+const SHUT_RD: c_int = 0;
+const SHUT_WR: c_int = 1;
+const SHUT_RDWR: c_int = 2;
+
+pub(crate) fn shutdown(fd: Fd, read: bool, write: bool) -> Result<(), Errno> {
+    let how = match (read, write) {
+        (true, true) => SHUT_RDWR,
+        (true, false) => SHUT_RD,
+        (false, true) => SHUT_WR,
+        (false, false) => return Ok(()),
+    };
+    if unsafe { net_c::shutdown(fd as c_int, how) } == 0 {
+        Ok(())
+    } else {
+        Err(errno())
+    }
 }
 
 pub(crate) fn close_socket(fd: Fd) {

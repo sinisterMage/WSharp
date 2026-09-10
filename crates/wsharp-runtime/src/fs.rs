@@ -5,12 +5,21 @@
 //! which is what makes an install atomic, and enough of a `stat` to tell a
 //! directory from a file and say how big one is.
 //!
-//! There is deliberately no `modified`. A store answers "has this changed?" by
-//! hashing, not by comparing timestamps -- a checkout does not preserve them
-//! and two machines do not agree about them -- and dropping the question is
-//! what keeps `struct stat`, whose layout differs on every system in the BSD
-//! family and is a versioned symbol on Linux, out of [`crate::sys`] entirely.
-//! The two questions that remain each have an answer that is one number.
+//! There is a `modified_at`, and it is the one question here that a system may
+//! make [`crate::sys`] read a `struct stat` for -- whose layout differs across
+//! the BSD family and is a versioned symbol on Linux, and which every other
+//! question here is deliberately shaped to avoid. It is asked anyway because a
+//! watcher that had to hash a whole tree on every tick is a real cost rather
+//! than an inconvenience, and because two of the three arms answer it without a
+//! layout at all. `crate::sys::modified_at` says what each one pays.
+//!
+//! A *store* still answers "has this changed?" by hashing rather than by
+//! comparing timestamps: a checkout does not preserve them and two machines do
+//! not agree about them. That was never the reason this call was missing, and
+//! it is still the reason `ingot` does not use it.
+//!
+//! There is still no mode *reader*: "will this start" is answerable with
+//! `access`, "which bits are set" is not, and only the first has a caller.
 //!
 //! Every call is made inside a safe region, so a slow or remote filesystem
 //! cannot stall this worker's collector. Each follows the shape
@@ -148,6 +157,26 @@ pub unsafe extern "C" fn ws_fs_size(out: *mut FallibleI64, path: *const u8) {
     unsafe { crate::gc::checkpoint() };
     let path = unsafe { str_bytes(path) }.to_vec();
     let result = match crate::worker::blocking(|| sys::file_size(&path)) {
+        Ok(n) => FallibleI64::ok(n),
+        Err(e) => FallibleI64::err(sys::error_tag(e)),
+    };
+    unsafe { out.write(result) };
+}
+
+/// When a path was last written, in seconds since the Unix epoch.
+///
+/// The same clock `time.now()` reads, so "is this newer than when I looked" is
+/// a subtraction rather than a conversion.
+///
+/// # Safety
+/// Called from JIT-compiled code across an FFI boundary; `path` must be null or
+/// point at a W# string object, and `out` must point at storage laid out as a
+/// [`FallibleI64`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_fs_modified_at(out: *mut FallibleI64, path: *const u8) {
+    unsafe { crate::gc::checkpoint() };
+    let path = unsafe { str_bytes(path) }.to_vec();
+    let result = match crate::worker::blocking(|| sys::modified_at(&path)) {
         Ok(n) => FallibleI64::ok(n),
         Err(e) => FallibleI64::err(sys::error_tag(e)),
     };
