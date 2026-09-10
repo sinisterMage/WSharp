@@ -1,6 +1,11 @@
 # W# (WSharp)
 
-[![CI](https://forgejo-hagc.srv1954822.hstgr.cloud/ofekbickel/WSharp/actions/workflows/ci.yml/badge.svg)](https://forgejo-hagc.srv1954822.hstgr.cloud/ofekbickel/WSharp/actions?workflow=ci.yml)
+[![CI](https://github.com/sinisterMage/WSharp/actions/workflows/ci.yml/badge.svg)](https://github.com/sinisterMage/WSharp/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/sinisterMage/WSharp?sort=semver&color=blue)](https://github.com/sinisterMage/WSharp/releases/latest)
+[![License](https://img.shields.io/github/license/sinisterMage/WSharp?color=blue)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-wsharp.io-2ea44f)](https://wsharp.io)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installing)
+[![Rust](https://img.shields.io/badge/rustc-1.95-dea584?logo=rust&logoColor=white)](rust-toolchain.toml)
 
 **A compiled language built on multiple dispatch, for services, tools and
 long-running processes.**
@@ -43,7 +48,7 @@ dispatcher and the collector actually work.
 ## What it's good at
 
 - **Dispatch that mostly isn't there at run time.** When inference pins the
-  arguments, the call lowers to an ordinary direct call — no dispatch code at
+  arguments, the call lowers to an ordinary direct call - no dispatch code at
   all. When it can't, the test is one subtract and one unsigned compare against
   a contiguous range of type ids: no vtable, no inline cache, no method-table
   lookup. Type ids are assigned in a preorder walk of the subtype lattice,
@@ -54,9 +59,9 @@ dispatcher and the collector actually work.
   written. An ambiguous pair of overloads, an error raised outside a declared
   `!{…}` set, and a function that can reach the end of its body without
   returning a value are all compile errors.
-- **Failure in the type, and it says which.** `!T` carries the error *set* —
+- **Failure in the type, and it says which.** `!T` carries the error *set* -
   inferred from what a function raises and propagates, or written down as
-  `!{NotFound, IoFailed}str` and checked — so the `e` bound by `catch |e|` is
+  `!{NotFound, IoFailed}str` and checked - so the `e` bound by `catch |e|` is
   worth testing against. Nothing caps how many errors a set may name.
 - **Values that cost what they say.** A `u8` is a byte and `[]u8` is a byte
   array. `?T` and `!T` are a tag and a payload in registers: no boxing, no
@@ -65,14 +70,14 @@ dispatcher and the collector actually work.
 - **Pauses that don't grow with the heap.** Reference counting with a
   coalescing write barrier, a concurrent mark trace for the cycles counting
   can't reclaim, and compaction that runs while the program does. The longest
-  pause measured 40 microseconds on 120,000 live objects — and the same on
+  pause measured 40 microseconds on 120,000 live objects - and the same on
   15,000, because a pause visits what the program changed rather than what it
   holds.
 - **Threads that share no heap.** A worker is an ordinary module: `init` makes
   the state, and any function taking that state first is something the worker
   can be asked to do. Values cross as bytes, so there is no shared collector,
   no lock on the fast path, and no data race to write. `std/broker` is the same
-  idea at the other end — topics, partitions, consumer groups with their own
+  idea at the other end - topics, partitions, consumer groups with their own
   offsets, and replay.
 
   **`@spawn` returns before `init` starts**, and a worker serves its queue only
@@ -81,7 +86,7 @@ dispatcher and the collector actually work.
   a module whose `init` never returns is a **self-driving daemon**, which is how
   several acceptors come to share one listener in a few lines. Such a worker can
   never be told to stop, so `main` returning ends the process and takes it with
-  it — the workers that can be stopped are stopped and waited for first, so an
+  it - the workers that can be stopped are stopped and waited for first, so an
   ordinary program's exit is unchanged. `os.exit(code)` is the way out from
   anywhere else, and stops nothing.
 - **A standard library written in the language.** SHA-2, ChaCha20-Poly1305,
@@ -112,23 +117,23 @@ everywhere.** They are checked when written and inferred when not.
 | Control flow | `if (c) { } else { }`, `while (c) : (i += 1) { }`, `for (xs) \|x\| { }`, `break`, `continue` |
 | Expressions | `if (c) a else b`, `fn (a, b) { ... }` closures |
 | Closures | `const id = fn (x) { return x; };` generalises, may name itself, and `fn [T](a: []T) T` writes the parameters out |
-| Literals | `42`, `0xff`, `0b1010`, `0o17`, `1_000_000`, `2.5`, `"text"` with `\n \t \r \0 \\ \"`; an integer literal takes the type it is used at -- including `f64`, where the value is exact -- and defaults to `i64` |
+| Literals | `42`, `0xff`, `0b1010`, `0o17`, `1_000_000`, `2.5`, `"text"` with `\n \t \r \0 \\ \"`; an integer literal takes the type it is used at - including `f64`, where the value is exact - and defaults to `i64` |
 | Arrays | `[]i64{ 1, 2, 3 }`, `a[i]` at any integer type, `g[i][j] = v`, `for (a) \|v, i\| { }`; an index out of range panics |
-| Growable | `std/list` — a backing array plus a count, so `push` is amortised constant time |
+| Growable | `std/list` - a backing array plus a count, so `push` is amortised constant time |
 | Iterating | `for (xs) \|x\|` over an array walks it by index; over anything else it calls `iter` and `next` from the module that declares its type |
-| Generics | `fn first[T](a: []T) T`, `const Box = struct[T] { value: T };`, `fn [T](x: T) T` — inferred when not written |
+| Generics | `fn first[T](a: []T) T`, `const Box = struct[T] { value: T };`, `fn [T](x: T) T` - inferred when not written |
 | Modules | `const http = @import("std/http");`, then `http.NotFound404`; `pub` is what another module may name, and `pub const parse = inner.parse;` renames one so a package of several files can present one |
 | Packages | `ingot` resolves and installs; `@import("acme/json")` then names a package's facade, exactly as a library path names a module |
 | Workers | `@spawn(counter, 0)` starts a thread with a heap of its own, `w.add(5)` calls into it, `@join(w)` waits for it |
-| Maps | `std/map` — a hash table with `str` keys, `get`, `set`, `remove`, and `for (m) \|e\|` |
-| Messages | `std/broker` — named topics, partitioned logs, consumer groups with their own offsets, and replay |
-| Bytes | `std/bytes` — `[]u8` as a buffer, the bridge to and from `str`, word accessors and hex |
-| Crypto | `std/hash` — SHA-2, HMAC, HKDF; `std/cipher` — ChaCha20-Poly1305 and AES-GCM; `std/crypto` — the system's generator |
-| Key agreement | `std/curve25519` — X25519; `std/nistec` — ECDH on NIST P-256 and P-384, with the key-share validation RFC 8446 requires |
-| Signatures | `std/rsa` — PKCS#1 v1.5 and PSS verification; `std/curve25519` — Ed25519, signing and verification; `std/nistec` — ECDSA verification on P-256 and P-384 |
-| TLS | `std/tls` — TLS 1.3, client and server; `std/x509` — certificates and chains, so `http.get("https://…")` works |
+| Maps | `std/map` - a hash table with `str` keys, `get`, `set`, `remove`, and `for (m) \|e\|` |
+| Messages | `std/broker` - named topics, partitioned logs, consumer groups with their own offsets, and replay |
+| Bytes | `std/bytes` - `[]u8` as a buffer, the bridge to and from `str`, word accessors and hex |
+| Crypto | `std/hash` - SHA-2, HMAC, HKDF; `std/cipher` - ChaCha20-Poly1305 and AES-GCM; `std/crypto` - the system's generator |
+| Key agreement | `std/curve25519` - X25519; `std/nistec` - ECDH on NIST P-256 and P-384, with the key-share validation RFC 8446 requires |
+| Signatures | `std/rsa` - PKCS#1 v1.5 and PSS verification; `std/curve25519` - Ed25519, signing and verification; `std/nistec` - ECDSA verification on P-256 and P-384 |
+| TLS | `std/tls` - TLS 1.3, client and server; `std/x509` - certificates and chains, so `http.get("https://…")` works |
 | Structs | `const P = struct { x: i64 };`, `P{ .x = 1 }`, `p.x` |
-| Subtyping | `const Sub = struct : Base { };`, or `struct : pkg.Base` — a subtype widens implicitly |
+| Subtyping | `const Sub = struct : Base { };`, or `struct : pkg.Base` - a subtype widens implicitly |
 | Singletons | a struct with no fields is also a value: its sole instance |
 | Optionals | `null`, `a orelse b`, `a.?`, `if (a) \|v\| { }`, `while (a) \|v\| { }` |
 | Errors | `error.Name`, `try f()`, `f() catch 0`, `f() catch \|e\| ...`, `f() catch return e`, `f() catch return false`, `f() catch { log(); 0 }` |
@@ -136,12 +141,12 @@ everywhere.** They are checked when written and inferred when not.
 | Operators | `+ - * / %`, `& \| ^ << >> ~` (integers only), `== != < <= > >=` (non-chaining), `and or !`; `u32(x)` converts |
 
 `==` compares `str` by contents, so a string built at run time equals a
-literal, and it compares a **struct field by field** -- each field by its own
+literal, and it compares a **struct field by field** - each field by its own
 type's rule, so a nested struct recurses and an `f64` field makes a `NaN`
 unequal to itself. Two values of different concrete types are never equal, so
 two subtypes compared through their supertype compare the fields they actually
 have rather than only the part the supertype declares. A field an `==` cannot
-compare -- an array, a function, an error union -- makes the struct
+compare - an array, a function, an error union - makes the struct
 uncomparable, and the compiler says which field. A value that reaches itself
 recurses for ever, as derived equality does everywhere it exists.
 
@@ -161,9 +166,9 @@ const v = risky(n) catch |e| if (e == error.Negative) 0 else -1;
 Some things that follow from optional annotations:
 
 ```zig
-fn id(x) { return x; }          // fn(T) T -- generic, and monomorphised per use
-fn add(a, b) { return a + b; }  // fn(i64, i64) i64 -- `+` defaults to i64
-fn f(x) { return x * 2.0; }     // fn(f64) f64 -- the literal decides
+fn id(x) { return x; }          // fn(T) T - generic, and monomorphised per use
+fn add(a, b) { return a + b; }  // fn(i64, i64) i64 - `+` defaults to i64
+fn f(x) { return x * 2.0; }     // fn(f64) f64 - the literal decides
 ```
 
 A plain value coerces into an optional or an error union when the context wants
@@ -172,19 +177,19 @@ into its supertype for the same reason: both are one pointer, and a subtype's
 layout begins with a byte-identical copy of its supertype's.
 
 The steps compose, so `return Sub{ .. };` is legal in a function declared
-`!Base` and `!?T` is a type worth writing -- a value, nothing, or a failure, in
+`!Base` and `!?T` is a type worth writing - a value, nothing, or a failure, in
 one return.
 
 ### Multiple dispatch
 
 An overload set is several top-level functions sharing a name. Every parameter
-of an overloaded function must be annotated — dispatch chooses *by* parameter
+of an overloaded function must be annotated - dispatch chooses *by* parameter
 type, so those types cannot themselves be inferred from the calls being
 resolved.
 
 Overloading is not limited to struct types. An **abstract type** stands for a
-set of concrete ones -- `Number` for every numeric type, `Integer` for the
-eight integer ones, `Signed` for the four signed ones -- so a general case can
+set of concrete ones - `Number` for every numeric type, `Integer` for the
+eight integer ones, `Signed` for the four signed ones - so a general case can
 be written alongside a specific one:
 
 ```zig
@@ -196,7 +201,7 @@ fn show(x: Number)  str { return "a number"; }   // catches f64
 Abstract types are ordered by their member sets, so `Integer` is more specific
 than `Number` and wins wherever both apply. A body annotated `Number` must work
 for *every* type it lists, which is why it may not use a bit operator (`f64` has
-no bit pattern to ask for) or negate (no unsigned negatives) -- `Integer` and
+no bit pattern to ask for) or negate (no unsigned negatives) - `Integer` and
 `Signed` are what such bodies claim. `std/math`'s `abs` and `sign` are one
 definition over `Signed` for exactly that reason.
 
@@ -224,7 +229,7 @@ fn pick(a: Sub,  b: Sub)  i64 { return 3; }   // ...and this settles it
 
 When inference pins every argument to a type whose subtypes cannot change the
 answer, the winner is known at compile time and the call lowers to an ordinary
-direct call — no dispatch code at all. Otherwise the compiler emits a decision
+direct call - no dispatch code at all. Otherwise the compiler emits a decision
 chain over the runtime type id. Type ids are assigned in a preorder walk of the
 subtype lattice, so every type's subtypes occupy a contiguous range and each
 test is one subtract and one unsigned compare.
@@ -264,8 +269,8 @@ High-Throughput Garbage Collection*, PLDI 2022).
   program does, which is what the **load barrier** is for: every reference read
   out of a heap object is resolved to wherever that object lives now, so the
   program can never hold an address the collector has abandoned. Whoever
-  reaches an object first -- the collector, or the program through the barrier
-  -- moves it, and one compare-and-swap on the header decides whose copy wins.
+  reaches an object first - the collector, or the program through the barrier -
+  moves it, and one compare-and-swap on the header decides whose copy wins.
   When nothing is moving the barrier costs a load, a test, and a branch that
   falls through.
 - **Holes are refilled.** A block with free lines is allocated into again
@@ -275,13 +280,13 @@ High-Throughput Garbage Collection*, PLDI 2022).
 - **Allocation takes no lock.** Each thread bumps through a buffer of its own,
   publishing the object-start bit and the line counts atomically and batching
   the statistics until the buffer is replaced. The heap lock is for handing out
-  a new buffer, freeing, sweeping and evacuating -- so an allocating thread and
+  a new buffer, freeing, sweeping and evacuating - so an allocating thread and
   a sweeping collector no longer queue behind each other on every object.
 - **Three short pauses, and they do not grow with the heap.** Only the mutator
   can walk its own stack, so the parts that need the stack run on it: take a
   root snapshot; finish marking and move what the roots point at; repoint the
-  references the marker noted. That last one visits a *list* -- the marker
-  records every reference it sees into a block being emptied -- rather than the
+  references the marker noted. That last one visits a *list* - the marker
+  records every reference it sees into a block being emptied - rather than the
   live heap, so the pause is proportional to what the program did, not to what
   it holds. On 120,000 live objects the longest pause measured 40 microseconds,
   the same as on 15,000; the previous stop-the-world collector took 1.2
@@ -353,8 +358,8 @@ chain has to be unbroken through the Rust frames as well as the generated ones.
 
 ### Fetching something over TLS
 
-Every part of this is a `.ws` file — the hash, the cipher, the curve, the
-signature, the certificate parser and the handshake — and the trust anchors are
+Every part of this is a `.ws` file - the hash, the cipher, the curve, the
+signature, the certificate parser and the handshake - and the trust anchors are
 the ones the machine already has.
 
 ```zig
@@ -378,7 +383,7 @@ nix-shell --run "cargo run -p wsharp-cli -- run /tmp/fetch.ws"
 
 `example.com`, `github.com`, `nixos.org`, `www.cloudflare.com` and
 `crates.io` all work, which between them cover RSA, P-256 and P-384 chains.
-What does not is a chain through a P-521 key — there is one such root in a
+What does not is a chain through a P-521 key - there is one such root in a
 typical store, and it is the last line under what is left in
 [ROADMAP.md](ROADMAP.md).
 
@@ -398,7 +403,7 @@ generation. A file with no `main` is a library and is fine to check.
 something. `build` writes a real program: the collector, the workers, TLS and
 the rest of the runtime are linked into it, and it needs no compiler on the
 machine that runs it. Linking is done by `$CC`, or `cc`, against a runtime
-archive that `wsharp` looks for beside itself and under `../lib` — so an
+archive that `wsharp` looks for beside itself and under `../lib` - so an
 installation is a directory rather than a single file. The archive is
 `libwsharp_start.a`, or `wsharp_start.lib` where MSVC named it: cargo names a
 staticlib after the platform rather than after the crate, and both spellings are
@@ -414,9 +419,9 @@ wsharp run prog.ws -- one two    # os.args() is ["one", "two"]
 
 The process exits with the low byte of `main`'s return value, as a C program
 does, so `return 256;` exits 0. A compile error exits 1. A failure the type
-system allows but the program must not perform — `.?` on a null optional, a
+system allows but the program must not perform - `.?` on a null optional, a
 failed `assert`, integer division by zero, a signed `MIN / -1`, an index
-outside an array, a call no overload matches — prints `W# panic: <reason>` to
+outside an array, a call no overload matches - prints `W# panic: <reason>` to
 stderr and exits with status 101. Ordinary overflow is not one of them:
 `+`, `-` and `*` wrap, which for an unsigned type is the definition rather than
 a concession.
@@ -434,8 +439,8 @@ wsharp check examples/fib.ws       --emit=tokens
 ```
 
 **`--emit=api` is the one with a promise attached**, and the only one. A tool
-that generates W# — a router built from the route types an application declares,
-a migration runner built from a schema — has to read the program somehow, and
+that generates W# - a router built from the route types an application declares,
+a migration runner built from a schema - has to read the program somehow, and
 reading it through the compiler is what keeps the tool and the type checker
 from disagreeing. So this emit is narrow and versioned:
 
@@ -454,11 +459,11 @@ $ wsharp check app/main.ws --emit=api
 ```
 
 Declarations and their types; no bodies, no expressions, no spans. A module is
-named by the path it resolved to — `std/net` for a library module, the file for
-a local one, `"main"` for the root — with `/` separators on every platform, as
+named by the path it resolved to - `std/net` for a library module, the file for
+a local one, `"main"` for the root - with `/` separators on every platform, as
 everything else in this project writes a path. **Every name a program defines is
-absolute** — a type written `fw.Route` prints as
-`"app/fw".Route` and one declared here prints with this module's own path — so a
+absolute** - a type written `fw.Route` prints as
+`"app/fw".Route` and one declared here prints with this module's own path - so a
 reader never follows an import or guesses a scope, and a bare name is one the
 language provides. Top-level `const` literals come through verbatim, which is
 what lets a convention be overridden in source rather than by a comment. A
@@ -514,12 +519,12 @@ The alias and the original are the same type and the same function set rather
 than copies of them, so a value made through one is usable through the other and
 an overload set renamed once still dispatches on every member.
 
-`std/io` reads and writes whole files; `std/fs` is the tree they sit in --
+`std/io` reads and writes whole files; `std/fs` is the tree they sit in -
 `mkdir`, `read_dir`, `rename`, `remove`, and enough of a stat to tell a
 directory from a file and say how big one is. It also has `chmod` and
 `is_executable`, which are what a program that *writes another program* needs:
 a file written by `io.write_file` is 0o644, and 0o644 is not a thing that can be
-run. There is no mode *reader* -- that would mean a `struct stat`, whose layout
+run. There is no mode *reader* - that would mean a `struct stat`, whose layout
 differs on every system in the BSD family, and the question worth asking is
 "will this start" rather than "which bits are set". `modified_at` is the one
 question here that a system may make the runtime read a `struct stat` for, and
@@ -527,10 +532,10 @@ it is asked anyway because a tool watching files it just wrote would otherwise
 have to hash the whole tree on every tick; Linux answers with `statx`, macOS
 with `getattrlist` and Windows out of a call it was already making. Windows has no permission
 bits, so `chmod` succeeds there without doing anything and `is_executable` is
-`exists` -- but a path that is not there is an error on every platform, because
+`exists` - but a path that is not there is an error on every platform, because
 "succeeded and did nothing" is honest about permissions this system does not
 keep and a lie about a file that does not exist. `std/path` is the arithmetic above both, and makes no syscall at all.
-`std/os` is what the process knows about itself -- `args`, `get`, `home`,
+`std/os` is what the process knows about itself - `args`, `get`, `home`,
 `temp_dir`, `cwd`, `exit`, and `target`, the triple this binary was built for.
 `std/toml` is TOML 1.0, read and written.
 
@@ -573,20 +578,20 @@ serving many connections from one worker, not for keeping the collector alive.
 | `std/map` | `Map[V]`, a hash table with `str` keys: `new` `with_capacity` `len` `get` `has` `set` `remove` `keys` `clear` `iter` `next`. Open addressing with tombstones, so a removal does not break the probe run other keys are reached through |
 | `std/list` | `List[T]`, a growable array: `new` `with_capacity` `from` `len` `capacity` `get` `set` `push` `pop` `insert` `remove` `extend` `clear` `iter` `next` `to_array` |
 | `std/math` | `abs` `min` `max` `sign` `rem` `sqrt` `pow` `floor` `ceil` `round` `trunc` `ipow` |
-| `std/bits` | `rotl` `rotr` — rotation, generic over `Integer`, one instruction on both targets; `f64_bits` `f64_from_bits` — an `f64`'s representation, which is what a wire format carries |
-| `std/io` | `read_file` `read_line` `write_file` `exists` — the fallible ones name their errors, e.g. `!{NotFound, PermissionDenied, IoFailed}str` |
+| `std/bits` | `rotl` `rotr` - rotation, generic over `Integer`, one instruction on both targets; `f64_bits` `f64_from_bits` - an `f64`'s representation, which is what a wire format carries |
+| `std/io` | `read_file` `read_line` `write_file` `exists` - the fallible ones name their errors, e.g. `!{NotFound, PermissionDenied, IoFailed}str` |
 | `std/net` | TCP: `Socket` `Listener` and `connect` `listen` `accept` `read` `write` `write_all` `read_exactly` `read_all` `set_nonblocking` `shutdown` `close`. UDP: `Datagrams` `Peer` `Datagram` and `udp` `send_to` `receive` `reply`. Readiness: `Poller` `Event` and `poller` `watch` `wait`. IPv4 or IPv6, with the family the resolver's choice |
 | `std/http` | the 27 HTTP status types, materialised on first mention, plus an HTTP/1.1 client and server: `get` `post` `request` `read_request` `respond` `header` `status_of`; and since item 10, `https://` over `std/tls` |
 | `std/broker` | `Topic[M]` `Consumer[M]` and `topic` `publish` `subscribe` `next` `commit` `seek` `len` |
-| `std/bytes` | `[]u8` as a buffer, and the bridge to and from `str`: `new` `of` `to_str` `slice` `concat` `copy` `fill` `xor` `equal`, the big- and little-endian word accessors, `to_hex` `from_hex`; and `Buf`, which grows — `put_str` `put_bytes` `taken` `reset`, with `open8`/`close8` through `open32`/`close32` for a length written before what it counts |
-| `std/hash` | SHA-256, SHA-384 and SHA-512, one-shot and incremental, plus `hmac` `hkdf_extract` `hkdf_expand` — written once over a `Hash` value that says a block size, a digest size and how to hash |
+| `std/bytes` | `[]u8` as a buffer, and the bridge to and from `str`: `new` `of` `to_str` `slice` `concat` `copy` `fill` `xor` `equal`, the big- and little-endian word accessors, `to_hex` `from_hex`; and `Buf`, which grows - `put_str` `put_bytes` `taken` `reset`, with `open8`/`close8` through `open32`/`close32` for a length written before what it counts |
+| `std/hash` | SHA-256, SHA-384 and SHA-512, one-shot and incremental, plus `hmac` `hkdf_extract` `hkdf_expand` - written once over a `Hash` value that says a block size, a digest size and how to hash |
 | `std/cipher` | ChaCha20, Poly1305, ChaCha20-Poly1305; AES-128/256, GHASH, AES-GCM. Constant-time by construction: no table is indexed by a secret byte, so AES's S-box is computed in GF(2^8) and GHASH is 128 shifts |
-| `std/crypto` | `random` — the system's generator, which is the kernel's |
-| `std/time` | `now` — seconds since the Unix epoch |
+| `std/crypto` | `random` - the system's generator, which is the kernel's |
+| `std/time` | `now` - seconds since the Unix epoch |
 | `std/bignum` | fixed-width unsigned limbs and Montgomery arithmetic: `from_be` `to_be` `cmp` `add` `sub` `mont` `mont_mul` `mont_add` `mont_sub` `to_mont` `from_mont` `modexp`. A limb is 32 bits, which is what makes a 64x64 → 128 product unnecessary |
-| `std/curve25519` | `x25519` `x25519_base` — and the small-order check on the *output*, which is the one a list of bad encodings misses |
-| `std/nistec` | `p256` `p384` `derive` `ecdh` `valid` `ecdsa_verify` — the NIST prime curves, one implementation over `std/bignum` |
-| `std/rsa` | `public_key` `verify_pkcs1` `verify_pss` — verification only, since TLS 1.3 does no RSA key exchange. The encoded message is built and compared, never parsed |
+| `std/curve25519` | `x25519` `x25519_base` - and the small-order check on the *output*, which is the one a list of bad encodings misses |
+| `std/nistec` | `p256` `p384` `derive` `ecdh` `valid` `ecdsa_verify` - the NIST prime curves, one implementation over `std/bignum` |
+| `std/rsa` | `public_key` `verify_pkcs1` `verify_pss` - verification only, since TLS 1.3 does no RSA key exchange. The encoded message is built and compared, never parsed |
 | `std/der` | a strict DER reader: `read_value`, `read_seq`, `read_uint`, `read_oid`, `read_bitstring`, `read_time` (item 10) |
 | `std/x509` | `SigKey` and its three subtypes, `parse_spki`, `verify_signature`; certificates, `matches_host`, `verify_chain`, `pem_certificates`, `system_roots` (item 10) |
 | `std/tls` | TLS 1.3, both ends: `client`, `server`, `feed`, `pending`, and a blocking `Session` over a socket (item 10) |
@@ -603,7 +608,7 @@ A **prelude** needs no import, because every module has it:
 | `gc_trace_start()`, `gc_trace_finish()` | the two halves of a trace, so a program can mutate the heap while the collector thread marks it |
 | `gc_live_objects()`, `gc_live_bytes()`, `gc_collections()`, `gc_traces()` | the collector's counters, for asserting on it |
 
-Most of the library is written in W# rather than Rust — `std/array`, `std/list`,
+Most of the library is written in W# rather than Rust - `std/array`, `std/list`,
 `std/math`, `std/net`, `std/http`, all of the cryptography and `str.split` are `.ws` files compiled with your program,
 monomorphised per element type and dropped when nothing calls them. The rule that draws the line
 is worth knowing if you add to it: **a builtin may read and write bytes, and
@@ -637,7 +642,7 @@ core >=2.0.0 <3.0.0, util 0.3.0 cannot be used.
 ```
 
 A dependency is a version, a directory or a git revision. A version comes from
-the registry — [Foundry](https://github.com/sinisterMage/Foundry), an index of
+the registry - [Foundry](https://github.com/sinisterMage/Foundry), an index of
 plain TOML in a git repository, in the shape of Julia's General:
 
 ```sh
@@ -646,7 +651,7 @@ ingot search json            # what is published
 ingot update                 # fetch the index again
 ```
 
-A registry release records the hash of its own tree, which is the store key —
+A registry release records the hash of its own tree, which is the store key -
 so `resolve` chooses versions and writes a lockfile having fetched no package at
 all, and the fetch `install` does afterwards is *checked against that hash*. The
 client trusts a hash rather than a host, and the registry's own CI is what makes
@@ -655,7 +660,7 @@ Packages are W# source; nothing is precompiled, because `wsharp build` is
 ahead-of-time and the machine that installs is the machine that compiles.
 
 A registry is a **directory**, and cloning one over git is only how the
-directory arrives — `INGOT_REGISTRY` naming a directory is used where it lies
+directory arrives - `INGOT_REGISTRY` naming a directory is used where it lies
 and never fetched, which is what a private registry is, an offline one, and how
 this project tests the whole path with no server. A path or git dependency
 overrides the registry for the name it supplies.
@@ -672,7 +677,7 @@ const util = @import("util");
 fn main() i64 { return util.twice(21); }
 ```
 
-which works under plain `wsharp run` as well as `ingot run` — `install` writes
+which works under plain `wsharp run` as well as `ingot run` - `install` writes
 an `ingot.env` beside the lockfile saying where each package's files ended up,
 and the compiler reads that. A package presents exactly one file, the `root` in
 its manifest; what else it shows is what that file re-exports. And it may import
@@ -682,7 +687,7 @@ whole graph.
 `ingot` is written in W#, which was the point rather than a flourish: a
 resolver, a hash, a protocol and a file format is a broad enough program to find
 out what the language is actually missing. It is now written in W# *all the way
-out* — there is no Rust driver behind it, and `cargo build` does not produce it.
+out* - there is no Rust driver behind it, and `cargo build` does not produce it.
 `wsharp build --module ingot/main -o ingot` does, which makes the package
 manager the first real user of the compiler's own `build`. The three things its
 driver used to do are W#'s now: `-C` is `os.chdir`, its diagnostics go to
@@ -704,10 +709,10 @@ source ──► wsharp-syntax ──► wsharp-sema ──► wsharp-codegen �
 |---|---|
 | `wsharp-syntax` | Lexer, recursive-descent parser with Pratt-style precedence, spans, diagnostic rendering |
 | `wsharp-sema` | Name resolution, Hindley-Milner inference, the subtype lattice, overload selection, typed HIR, monomorphisation, value layout |
-| `wsharp-codegen` | HIR to Cranelift IR, the dispatcher, the write barrier, stack-map harvesting, and both backends — the JIT and the object writer, over one lowering |
-| `wsharp-runtime` | Object header, block/line heap, reference counting, the mark trace and its thread, evacuation, stack walker, type registry, builtins — a leaf crate with no dependencies at all |
+| `wsharp-codegen` | HIR to Cranelift IR, the dispatcher, the write barrier, stack-map harvesting, and both backends - the JIT and the object writer, over one lowering |
+| `wsharp-runtime` | Object header, block/line heap, reference counting, the mark trace and its thread, evacuation, stack walker, type registry, builtins - a leaf crate with no dependencies at all |
 | `wsharp-cli` | The `wsharp` binary, the module loader, the linker driver, and the end-to-end test suites |
-| `wsharp-start` | The `main` a compiled program starts in, and the archive it links against — `wsharp-runtime` bundled with a startup that installs the emitted tables |
+| `wsharp-start` | The `main` a compiled program starts in, and the archive it links against - `wsharp-runtime` bundled with a startup that installs the emitted tables |
 
 A few decisions worth knowing about:
 
@@ -719,7 +724,7 @@ A few decisions worth knowing about:
 - **Subtyping is not in unification.** Making `unify` directional would mean
   threading a polarity through every recursive call, including function types,
   where parameters are contravariant. Instead `coerce` consults the lattice
-  after unification fails — which works because unification binds whichever side
+  after unification fails - which works because unification binds whichever side
   is still a variable, so anything reaching the subtype check is already
   concrete.
 - **Levels, not environment scans.** Type variables carry Rémy levels, so
@@ -748,7 +753,7 @@ A few decisions worth knowing about:
   table, and an unqualified lookup tries the current module and then the
   prelude; what a module cannot see is what it has no key for. Everything is
   private to its module unless it says `pub`, and only a *qualified* lookup
-  checks that -- an unqualified name can only mean this module's own or the
+  checks that - an unqualified name can only mean this module's own or the
   prelude's, and both are always visible. Re-export falls out of that shape:
   `pub const T = other.T;` is one more key in the same table, holding the same
   type or the same function set, so nothing below the type checker knows it
@@ -758,32 +763,32 @@ A few decisions worth knowing about:
 
 ## Status
 
-Sessions are numbered by the original feature list:
+Numbered by the original feature list:
 
 - [x] **1.** Core language, Zig-style syntax
 - [x] **2.** Hindley-Milner type inference
-- [x] **3.** Garbage collector — reference counting, a concurrent mark trace
+- [x] **3.** Garbage collector - reference counting, a concurrent mark trace
       for cycles, and compaction
 - [x] **4.** Multiple dispatch over a subtype lattice, with the HTTP status
       types as its standard-library instance, abstract types for scalars, and
       overload sets as values
 - [x] **5.** Arrays, `for` loops, a growable array, and explicit generic
       parameters on functions, structs and `fn` literals
-- [x] **6.** Standard library — strings, arrays, math and I/O — behind a module
+- [x] **6.** Standard library - strings, arrays, math and I/O - behind a module
       system
-- [x] **7.** Multithreading — workers with their own heaps, talking by typed
+- [x] **7.** Multithreading - workers with their own heaps, talking by typed
       RPC or through a Kafka-shaped message broker
-- [x] **8.** The operating system declared by hand — files and sockets on
+- [x] **8.** The operating system declared by hand - files and sockets on
       Linux, macOS/BSD and Windows arms, a readiness API, and a *safe region*
       that lets a thread block in a syscall while its collector walks the
       stack it left behind. `std/net` and `std/http` are on top of it.
-- [x] **9.** Sized and unsigned integers, and bitwise operators — `i8` through
+- [x] **9.** Sized and unsigned integers, and bitwise operators - `i8` through
       `u64`, `& | ^ << >> ~`, a rotate, and integer literals that take the type
       they are used at. `i64` was the right default and the wrong only choice
       the moment a program computed on bytes; ChaCha20's quarter round is now a
       test case rather than a thing the language could not say.
 - [x] **10.** TLS 1.3, written in W#, with certificate chains verified against
-      the platform's own root store — which is what turns `https://` from
+      the platform's own root store - which is what turns `https://` from
       `error.NotSupported` into a connection. Every hash, cipher, curve,
       signature scheme and X.509 structure is a `.ws` file; the whole client
       and server are replayed against RFC 8448's published traces byte for
@@ -801,7 +806,7 @@ Sessions are numbered by the original feature list:
       packfile with both kinds of delta resolved, all of it W#, replayed
       against a conversation a real `git upload-pack` took part in. And the
       last stage is the point of the other four: `@import("acme/json")`
-      compiles — one more branch in the loader, and a `pub const x = other.x;`
+      compiles - one more branch in the loader, and a `pub const x = other.x;`
       that lets a package of several files present one of them. And there is a
       registry, [Foundry](https://github.com/sinisterMage/Foundry): an index of
       TOML in a git repository, recording per version the commit to fetch and

@@ -1,47 +1,48 @@
 # W# Roadmap
 
-Sessions 1–2 delivered the core language and Hindley-Milner type inference on a
-Cranelift JIT. Sessions 3–4 delivered the garbage collector and multiple
-dispatch. Session 5 delivered arrays, explicit generics, the standard library
-and the module system — everything the original feature list asked for.
-Session 6 closed what item 5 had left open: a growable array, and `fn` literals
-that generalise. Session 7 delivered item 8: the operating system declared by
-hand on three platform arms, a safe region that lets a thread block without
-stalling its collector, and `std/net` and `std/http` above them. Session 8
-delivered item 9: eight more integer types, the bit operators, and literals
-that take the type they are used at — which is what makes item 10 writable.
-Session 9 began item 10 and delivered its symmetric half: byte buffers, the
-system's generator, SHA-2, HMAC, HKDF, ChaCha20-Poly1305 and AES-GCM, each
-against its published vectors — and, because writing them is what finds the
+The core language and Hindley-Milner type inference came first, on a Cranelift
+JIT, followed by the garbage collector and multiple dispatch, and then by
+arrays, explicit generics, the standard library and the module system -
+everything the original feature list asked for. What item 5 had left open was
+closed next: a growable array, and `fn` literals that generalise. Item 8 is the
+operating system declared by hand on three platform arms, a safe region that
+lets a thread block without stalling its collector, and `std/net` and
+`std/http` above them. Item 9 is eight more integer types, the bit operators,
+and literals that take the type they are used at - which is what makes item 10
+writable.
+
+Item 10 arrived in five stages. The symmetric half came first: byte buffers,
+the system's generator, SHA-2, HMAC, HKDF, ChaCha20-Poly1305 and AES-GCM, each
+against its published vectors - and, because writing them is what finds the
 holes, the one thing the language turned out to be missing, a `const` table.
-Session 10 delivered item 10's stages two and three, the asymmetric half:
-X25519 and P-256 for key agreement, a fixed-width bignum with Montgomery
-arithmetic, and RSA PKCS#1 v1.5 and PSS verification above it — all of it W#,
-with no compiler change at all, because a 32-bit limb is what makes the 64x64
-product item 9 reserved a place for unnecessary. Session 11 finished it: stage four
-is the protocol — Ed25519 and ECDSA, a strict DER reader, the record layer and
-the handshake at both ends, replayed against RFC 8448's published traces byte
-for byte — and stage five is the certificate, so `http.get("https://…")` now
-returns a page. Sessions 12 and 13 delivered item 11, **ingot**: a program that
-can read its own command line and walk a directory, TOML 1.0 and a
-content-addressed store, a PubGrub resolver that answers a conflict with the
-derivation that caused it, a git client that speaks smart HTTP rather than
-shelling out — and then the one branch in the loader and the two table keys in
-the type checker that turn all of that into `@import("acme/json")`. Item 12
-compiled the whole of it ahead of time, so `ingot` is a native binary that was
-written in W#. Item 13 spent a session on the small print: eight of the
-"Smaller follow-ups" below, six things a driver written *against* the language
-found, and one thing that was on neither list — a dispatched call whose argument
-nothing had pinned compiled to the wrong overload with no diagnostic, which is
-the only silently wrong answer this compiler has produced.
+Stages two and three are the asymmetric half: X25519 and P-256 for key
+agreement, a fixed-width bignum with Montgomery arithmetic, and RSA PKCS#1 v1.5
+and PSS verification above it - all of it W#, with no compiler change at all,
+because a 32-bit limb is what makes the 64x64 product item 9 reserved a place
+for unnecessary. Stage four is the protocol - Ed25519 and ECDSA, a strict DER
+reader, the record layer and the handshake at both ends, replayed against RFC
+8448's published traces byte for byte - and stage five is the certificate, so
+`http.get("https://…")` returns a page.
+
+Item 11 is **ingot**: a program that can read its own command line and walk a
+directory, TOML 1.0 and a content-addressed store, a PubGrub resolver that
+answers a conflict with the derivation that caused it, a git client that speaks
+smart HTTP rather than shelling out - and then the one branch in the loader and
+the two table keys in the type checker that turn all of that into
+`@import("acme/json")`. Item 12 compiled the whole of it ahead of time, so
+`ingot` is a native binary that was written in W#. Item 13 is the small print:
+eight of the "Smaller follow-ups" below, six things a driver written *against*
+the language found, and one thing that was on neither list - a dispatched call
+whose argument nothing had pinned compiled to the wrong overload with no
+diagnostic, which is the only silently wrong answer this compiler has produced.
 
 This file records what was built and why it was built that way, the limitations
-that were chosen rather than stumbled into, and — for the items still ahead —
+that were chosen rather than stumbled into, and - for the items still ahead -
 where each already has a place to plug into.
 
 ---
 
-## 3. Garbage collector — **done**
+## 3. Garbage collector - **done**
 
 Reference counting combined with a concurrent mark trace and compaction,
 following LXR (Zuo, Blackburn, Zigman & Yang, *Low-Latency, High-Throughput
@@ -64,20 +65,20 @@ object model.
 | Large-object space for anything over 8 KiB; never moved | same |
 | A lock-free directory of the spaces and block states, so the marker's per-reference questions take no lock | same |
 | Atomic header: 32-bit type id, 8 flags, 23-bit saturating reference count, a forwarding encoding in bit 63, and a mark bit whose meaning is a parity that flips per trace | `wsharp-runtime/src/header.rs` |
-| Coalescing write barrier — one load, one test, one not-taken branch on the fast path; its snapshot doubles as the concurrent mark's snapshot-at-the-beginning record | `wsharp-codegen/src/lower.rs` — `emit_log_barrier`, and `ws_log_object` in `gc.rs` |
-| Precise roots: every heap pointer the code generator produces is declared to Cranelift, and the maps are harvested per function | `lower.rs` — `gc_root`; `codegen/src/lib.rs` — `harvest_stack_maps` |
+| Coalescing write barrier - one load, one test, one not-taken branch on the fast path; its snapshot doubles as the concurrent mark's snapshot-at-the-beginning record | `wsharp-codegen/src/lower.rs` - `emit_log_barrier`, and `ws_log_object` in `gc.rs` |
+| Precise roots: every heap pointer the code generator produces is declared to Cranelift, and the maps are harvested per function | `lower.rs` - `gc_root`; `codegen/src/lib.rs` - `harvest_stack_maps` |
 | Frame-pointer stack walker that turns a return address into a set of root slot addresses | `wsharp-runtime/src/stackwalk.rs` |
-| Reference-count collection, with transitive freeing done iteratively, deferred while a trace is marking and suspended while it is moving objects | `gc.rs` — `collect` |
+| Reference-count collection, with transitive freeing done iteratively, deferred while a trace is marking and suspended while it is moving objects | `gc.rs` - `collect` |
 | The collector thread: concurrent marking from a root snapshot, concurrent evacuation, the concurrent sweep, the three pauses between them, and the abandon-at-exit path | `wsharp-runtime/src/mark.rs` |
-| Hole refilling: a block with free lines is allocated into again rather than waiting for a trace to evacuate it | `heap.rs` — `find_hole`, `reserve` |
-| Thread-local allocation buffers: the common allocation takes no lock at all | `heap.rs` — `tlab_alloc`, `refill_tlab` |
-| An object-start bitmap, which is what makes a heap walkable when objects are not laid end to end | `heap.rs` — `set_start`, `for_each_in_block` |
-| Concurrent evacuation of sparse blocks, with a load barrier so the program can keep running while objects move | `wsharp-runtime/src/evacuate.rs` — `ws_resolve`; `lower.rs` — `emit_load_barrier` |
-| A remembered set: the marker notes every reference into a block being emptied, so the evacuation pause revisits a list rather than the heap | `mark.rs` — `mark_all`; `evacuate.rs` — `fix_references` |
-| `--gc-stress` walks the whole heap afterwards and aborts if the remembered set missed a reference | `evacuate.rs` — `verify_no_stale_references` |
-| Loop back-edge safepoint, three instructions; also the collector thread's way of asking for the final pause | `lower.rs` — `emit_gc_poll` |
-| `--gc-stress`: collect at every allocation and check every root | `gc.rs` — `validate_roots` |
-| Pause accounting: `WSHARP_GC_STATS` reports the number of pauses and the longest | `gc.rs` — `record_pause` |
+| Hole refilling: a block with free lines is allocated into again rather than waiting for a trace to evacuate it | `heap.rs` - `find_hole`, `reserve` |
+| Thread-local allocation buffers: the common allocation takes no lock at all | `heap.rs` - `tlab_alloc`, `refill_tlab` |
+| An object-start bitmap, which is what makes a heap walkable when objects are not laid end to end | `heap.rs` - `set_start`, `for_each_in_block` |
+| Concurrent evacuation of sparse blocks, with a load barrier so the program can keep running while objects move | `wsharp-runtime/src/evacuate.rs` - `ws_resolve`; `lower.rs` - `emit_load_barrier` |
+| A remembered set: the marker notes every reference into a block being emptied, so the evacuation pause revisits a list rather than the heap | `mark.rs` - `mark_all`; `evacuate.rs` - `fix_references` |
+| `--gc-stress` walks the whole heap afterwards and aborts if the remembered set missed a reference | `evacuate.rs` - `verify_no_stale_references` |
+| Loop back-edge safepoint, three instructions; also the collector thread's way of asking for the final pause | `lower.rs` - `emit_gc_poll` |
+| `--gc-stress`: collect at every allocation and check every root | `gc.rs` - `validate_roots` |
+| Pause accounting: `WSHARP_GC_STATS` reports the number of pauses and the longest | `gc.rs` - `record_pause` |
 
 ### What is left
 
@@ -102,7 +103,7 @@ recording instead is where the remaining costs are:
   concurrent collector need. The win is that an allocating thread and a
   sweeping or evacuating collector no longer serialise on every object.
 - **A block is chosen for evacuation by line occupancy alone.** Immix has more
-  to say here -- defragmentation headroom, a budget per collection -- and this
+  to say here - defragmentation headroom, a budget per collection - and this
   takes every sparse block it finds.
 - **Large objects are never moved**, so the large-object space can fragment its
   address space in a long run. It is served by the system allocator, which does
@@ -111,7 +112,7 @@ recording instead is where the remaining costs are:
 
 ---
 
-## 4. Multiple dispatch — **done**
+## 4. Multiple dispatch - **done**
 
 Julia-style multiple dispatch over a nominal subtype lattice, with the HTTP
 status types as its standard-library instance.
@@ -128,7 +129,7 @@ status types as its standard-library instance.
   both and covers their overlap.
 - Ambiguity is a compile error rather than a coin flip.
 - A call whose most specific candidate needs no runtime test lowers to an
-  ordinary direct call — no dispatch code at all.
+  ordinary direct call - no dispatch code at all.
 - Otherwise a decision chain over the runtime type id. Type ids are assigned in
   a preorder walk of the lattice, so a type's subtypes occupy a contiguous
   range and each test is one subtract and one unsigned compare.
@@ -181,32 +182,32 @@ Specificity needs the type as *written*, not the variable it became, so
 
 **Overload sets as values.** Two forms, because they answer different
 questions. `const g: fn(Base) i64 = f;` selects the member whose signature *is*
-that type -- exactly, not by subtyping, because a value is one code pointer and
+that type - exactly, not by subtyping, because a value is one code pointer and
 widening would hand a `Base` to a body compiled for `Sub`. `const g = f;`
 binds an alias instead: `g` dispatches exactly as `f` does, and is not a value
 at all. Using an alias as a value is still an error, now one that says so.
 
-### Known limitation, uncovered by the above — **since fixed**
+### Known limitation, uncovered by the above - **since fixed**
 
 A **recursive generic function** used to fail monomorphisation with `cannot
 tell what type X is being used at`. A call within a binding group recorded no
 type arguments, so a self-call left the group's own variables unresolved. This
-predated abstract types -- `fn pick(x, c: bool) { if (c) { return pick(x,
-false); } return x; }` had always failed -- but abstract parameters made
+predated abstract types - `fn pick(x, c: bool) { if (c) { return pick(x,
+false); } return x; }` had always failed - but abstract parameters made
 generic functions easy to write on purpose, so it became much easier to meet.
 
-Fixed in session 5, where the fix predicted here turned out to be the right
-one: inference records a group's own variables as the type arguments of its
+Fixed since, and the fix predicted here turned out to be the right one:
+inference records a group's own variables as the type arguments of its
 in-group calls, once the group has generalised. See item 5.
 
 ---
 
-## 5. Arrays and generics — **done**
+## 5. Arrays and generics - **done**
 
 ### What was built
 
 - **`[]T`**, a heap object with the length in the header's `aux` word and the
-  elements inline — the shape string literals already had. `[]i64{ 1, 2, 3 }`
+  elements inline - the shape string literals already had. `[]i64{ 1, 2, 3 }`
   writes one; the element type is written rather than inferred so that `[]i64{}`
   is still a value.
 - **Indexing** `a[i]`, as a place as well as a value, so `a[i] += 1` works.
@@ -217,8 +218,8 @@ in-group calls, once the group has generalised. See item 5.
 - **Explicit type parameters**: `fn first[T](a: []T) T`, and
   `const Box = struct[T] { value: T };`.
 - **The element-stride notion** the last version of this file asked for.
-  `TypeLayout` gained `elem_stride` and `elem_ptr_offsets` — the offsets within
-  *one* element — and one function, `types::for_each_ptr_offset`, is now the
+  `TypeLayout` gained `elem_stride` and `elem_ptr_offsets` - the offsets within
+  *one* element - and one function, `types::for_each_ptr_offset`, is now the
   single definition of where an object's references are. The six places that
   used to walk `ptr_offsets` themselves go through it.
 - **Per-instantiation layout for generic structs.** `Box[?i64]` and `Box[i64]`
@@ -268,7 +269,7 @@ in-group calls, once the group has generalised. See item 5.
   the group generalises, which is sound because Hindley-Milner holds a group
   monomorphic.
 - **A generic `fn` literal is a definition, not a value.** A closure value is
-  one code pointer, and two instantiations need two -- so a `const` bound to a
+  one code pointer, and two instantiations need two - so a `const` bound to a
   generic literal binds a *name*, and each use materialises a closure at the
   type that use needs. This is the second time the language has needed that
   shape: `const g = f;` over an overload set is the first, and for the same
@@ -278,7 +279,7 @@ in-group calls, once the group has generalised. See item 5.
   is one storage location holding one function value; `const f: fn(i64) i64 =
   fn ...` says which one. Both name a single type, so neither generalises. The
   dead `Expr::is_syntactic_value`, which claimed sema did this and had no
-  callers, is gone -- the rule now lives where it is used.
+  callers, is gone - the rule now lives where it is used.
 - **A variable a constraint still owns is not quantified.** `solve_constraints`
   runs once per binding group, which is why `fn add(a, b) { return a + b; }` is
   `fn(i64, i64) i64` and not generic: `Numeric` defaults it before anything is
@@ -291,7 +292,7 @@ in-group calls, once the group has generalised. See item 5.
   is the initialiser of and so was not in scope in its own body. Binding it
   first is only half the fix; the other half is what the name means. A literal
   is only ever entered *through* a closure value, and a call passes that value
-  as the environment pointer -- so the environment already *is* a closure for
+  as the environment pointer - so the environment already *is* a closure for
   this function at this instantiation. The name binds to it, copied into a
   declared local in the prologue beside the captures, and the recursive
   reference costs a register rather than an allocation. Monomorphisation needed
@@ -303,7 +304,7 @@ in-group calls, once the group has generalised. See item 5.
 - **Captures are snapshotted at the definition.** Each use builds its own
   closure object, so a captured `var` assigned in between would otherwise
   change what the closure sees. The definition emits one hidden local per
-  capture -- bracketed, as the `for` desugaring's are -- and every
+  capture - bracketed, as the `for` desugaring's are - and every
   instantiation shares them, which is sound because a capture's type belongs
   to the enclosing frame and so is never one of the quantified variables.
 - **Monomorphisation composes rather than replaces.** A closure body refers to
@@ -312,12 +313,12 @@ in-group calls, once the group has generalised. See item 5.
   That also keeps the cache key right for free: the key is the whole map, so
   one literal used at two types inside one enclosing instantiation gets two
   copies, and one used at one type inside two enclosing instantiations still
-  gets two. **The code generator did not change at all** -- each specialisation
+  gets two. **The code generator did not change at all** - each specialisation
   is an ordinary `FuncId` with a closure layout of its own, and a call through
   a definition is the indirect call it always was.
 - **`for` asks the type's own module how to walk it.** A `for` whose subject
   is not an array desugars to `while (M.next([iter])) |v|`, with `iter` and
-  `next` resolved in the module that *declares* the subject's type -- so
+  `next` resolved in the module that *declares* the subject's type - so
   `for (xs)` over a list needs no import beyond the list, and `std/list` says
   how a list is iterated without the type checker knowing it exists. `?T` is
   what says the walk is over, which makes the desugaring `while (c) |v|`
@@ -327,20 +328,20 @@ in-group calls, once the group has generalised. See item 5.
   and there is nothing yet to choose it from; and a `for` names `iter` and
   `next` as dependencies of *every* module it imports, because which one
   applies is not knowable before inference. Over-approximating there is sound
-  rather than merely convenient -- a dependency only matters inside a cycle,
+  rather than merely convenient - a dependency only matters inside a cycle,
   and a library's iterator never calls back into the program using it.
 - **The growable array is a library type, not a language one.** `List[T]` is
   an ordinary generic struct in an ordinary `.ws` file; nothing in the lexer,
   the parser, inference or the code generator knows it exists. That it could
   be written at all is the argument that item 5's generic structs and
-  header-counted arrays were the right primitives — and it is why the whole
+  header-counted arrays were the right primitives - and it is why the whole
   module is 178 lines with no Rust beside it.
 - **A list bounds-checks against its count, not its capacity.** Indexing the
   backing array directly would happily hand back a spare slot, so the check is
   in W#. That needed a way to fail as well as generated code does: the prelude
   gained `panic_index`, which is the same entry point `a[i]` calls and gives
   the same `index 5 out of bounds (len 3)`. Exposed for the reason the `gc_*`
-  counters are — a library written in W# should be held to the standard the
+  counters are - a library written in W# should be held to the standard the
   code generator is.
 
 ### What is left
@@ -350,7 +351,7 @@ in-group calls, once the group has generalised. See item 5.
 - **A definition builds its closure at each use.** A call through one is an
   indirect call on a freshly materialised closure, so it allocates an
   environment object per use rather than per binding. Cheap, and the price of
-  needing no new calling convention -- but it is a cost, not a nothing.
+  needing no new calling convention - but it is a cost, not a nothing.
 - **`pop` and `remove` leave the vacated tail slot holding its old
   reference.** The collector walks every element the header claims, so that
   object stays alive until the slot is overwritten, the list grows or the list
@@ -360,7 +361,7 @@ in-group calls, once the group has generalised. See item 5.
 
 ---
 
-## 6. Standard library — **done**
+## 6. Standard library - **done**
 
 ### What was built
 
@@ -368,7 +369,7 @@ A module system, and four modules behind it.
 
 | Module | Contents |
 |---|---|
-| `std/str` | `len`, `concat`, `eq`, `substr`, `find`, `split`, `join`, `repeat`, `starts_with`, `from_int`, `from_float`, and — since item 8 — `byte_at`, `from_byte`, `parse_int`, `to_lower`, `trim` |
+| `std/str` | `len`, `concat`, `eq`, `substr`, `find`, `split`, `join`, `repeat`, `starts_with`, `from_int`, `from_float`, and - since item 8 - `byte_at`, `from_byte`, `parse_int`, `to_lower`, `trim` |
 | `std/array` | `len`, `new`, `concat`, `push`, `slice`, `repeat` |
 | `std/list` | `List[T]` and `new`, `with_capacity`, `from`, `len`, `capacity`, `get`, `set`, `push`, `pop`, `insert`, `remove`, `extend`, `clear`, `iter`, `next`, `to_array` |
 | `std/math` | `abs`, `min`, `max`, `sign`, `sqrt`, `pow`, `floor`, `ceil`, `round`, `trunc`, `ipow` |
@@ -384,15 +385,15 @@ A module system, and four modules behind it.
 | `std/bytes` | `[]u8` as a buffer and the bridge to `str`: `new`, `of`, `to_str`, `slice`, `concat`, `copy`, `fill`, `xor`, `equal`, the big- and little-endian word accessors, `to_hex`, `from_hex` (item 10) |
 | `std/hash` | SHA-256, SHA-384, SHA-512 one-shot and incremental; `hmac`, `hkdf_extract`, `hkdf_expand` (item 10); SHA-1, for git's object ids (item 11) |
 | `std/cipher` | ChaCha20, Poly1305, ChaCha20-Poly1305; AES-128/256, GHASH, AES-GCM (item 10) |
-| `std/crypto` | `random` — the system's generator (item 10) |
-| `std/time` | `now` — seconds since the Unix epoch (item 10) |
+| `std/crypto` | `random` - the system's generator (item 10) |
+| `std/time` | `now` - seconds since the Unix epoch (item 10) |
 | `std/bignum` | fixed-width limbs and Montgomery arithmetic: `from_be`, `to_be`, `cmp`, `add`, `sub`, `mont`, `mont_mul`, `mont_add`, `mont_sub`, `to_mont`, `from_mont`, `modexp` (item 10) |
 | `std/curve25519` | `x25519`, `x25519_base` (item 10) |
 | `std/nistec` | the NIST prime curves: `p256`, `p384`, `derive`, `ecdh`, `valid`, `ecdsa_verify` (item 10) |
 | `std/rsa` | `public_key`, `verify_pkcs1`, `verify_pss` (item 10) |
 
-`==` on `str` works, comparing contents. The prelude — `print`, `assert`, the
-`gc_*` counters — stays global, because every module has it without asking.
+`==` on `str` works, comparing contents. The prelude - `print`, `assert`, the
+`gc_*` counters - stays global, because every module has it without asking.
 
 ### The module system
 
@@ -404,7 +405,7 @@ A module system, and four modules behind it.
   walks into it: a module path is a prefix, and each further segment extends it.
 - Names are stored qualified in one flat table, and an unqualified lookup tries
   the current module and then the prelude. What a module *cannot* see is simply
-  what it has no key for — so two files may each declare a `helper`.
+  what it has no key for - so two files may each declare a `helper`.
 - A local binding shadows an imported module, so adding an import cannot break
   code that already used the name.
 - Import cycles are detected and reported with the chain.
@@ -426,8 +427,8 @@ A module system, and four modules behind it.
   memcpy'd elements between arrays, and `--gc-stress` caught it: the copied
   references had never been through the load barrier, so they named objects in
   blocks that were about to be released. Generated code cannot make that
-  mistake — every reference it stores came through the barrier, and the
-  registers holding one are roots — so the fix was to stop writing that code by
+  mistake - every reference it stores came through the barrier, and the
+  registers holding one are roots - so the fix was to stop writing that code by
   hand rather than to reproduce three barriers in Rust.
 - **`array.new` is lowered inline** rather than called: only the call site
   knows the element type, and so the stride and the type id to stamp. It is the
@@ -439,16 +440,16 @@ A module system, and four modules behind it.
 - **`abs` is an overload set, `min` is not.** `min(a: Number, b: Number)`
   compares two numbers and says nothing about which kind they are, so it is one
   constrained generic. `abs` compares against a literal zero, and an integer
-  literal is an `i64` — so a single definition would pin `Number` to `i64` at
+  literal is an `i64` - so a single definition would pin `Number` to `i64` at
   the comparison. Two overloads instead, which is what the language is for.
 - **A fallible builtin returns a `!T` directly.** The tag and the payload cross
   the boundary as the two words a `#[repr(C)]` pair is returned in. The tag is
   an index into the program's error table plus one, so the library's error
-  names are interned before any program's — `builtin_errors()` fixes them.
+  names are interned before any program's - `builtin_errors()` fixes them.
 - **An error set is a second type argument, and `unify` was not touched.**
   `!T` is `Con(ErrUnion, [payload, set])`, and a set is an interned
-  `TyCon::ErrorSet`. Two error unions therefore unify by unifying their sets --
-  which merges two variables, or binds one to a written set -- while *widening*
+  `TyCon::ErrorSet`. Two error unions therefore unify by unifying their sets -
+  which merges two variables, or binds one to a written set - while *widening*
   a smaller set into a larger one is `coerce`'s job. That is exactly where
   widening a subtype into its supertype already lived, and works for the same
   reason: by the time anything asks, unification has bound whichever side was a
@@ -462,14 +463,14 @@ A module system, and four modules behind it.
   closed instead, and then the same contributions are checked against it.
 
   A set nothing decides is *not* an error. `fn f() !i64 { return 1; }` has the
-  empty set and prints as the bare `!i64` every signature was before -- so the
+  empty set and prints as the bare `!i64` every signature was before - so the
   variable is left alone through generalisation, which is what lets
   `fn twice(f: fn(i64) !i64, ..)` be generic over what its argument raises, and
   is closed to the empty set at monomorphisation instead. That needed the store
   to know which variables stand for a set, because one standing alone as a call
   site's type argument is indistinguishable from any other unresolved variable.
 
-  Two consequences fell out. A builtin's set has to be written in its row --
+  Two consequences fell out. A builtin's set has to be written in its row -
   it is compiled long before the program that catches it. And `catch |e|` now
   binds the tag *unadjusted*: it used to bind the tag less one so the number
   was the error's index, which nothing could observe, but `e == error.X` is a
@@ -478,7 +479,7 @@ A module system, and four modules behind it.
 - **A `catch` or an `orelse` takes a block, and two different things wanted
   there decide its shape.** One is a value to use instead, after doing
   something first: a block whose last expression is written *without* a `;` is
-  that value. The other is to give up -- and a block that never produces a
+  that value. The other is to give up - and a block that never produces a
   value has to leave, by `return`, `break` or `continue`. Inference gives that
   second kind a *fresh type variable*, which is the whole of "diverging" here:
   it produces nothing, so it fits wherever it is written, and
@@ -492,13 +493,13 @@ A module system, and four modules behind it.
 
   Code generation needed one thing it had not needed before. A block with no
   value has already ended by the time the operator wants to merge, and
-  Cranelift will not let anything be appended to a block that ended -- so the
+  Cranelift will not let anything be appended to a block that ended - so the
   placeholder values the merge still expects are made in a block of their own,
   with no predecessors, which falls out in optimisation.
 - **Visibility is private by default, and only qualified lookup checks it.**
   `pub` in front of a `fn`, a `const` or a struct is what lets another module
-  name it. The check goes in the three places a *qualified* name is resolved --
-  a value, a callee, and a type -- and nowhere near `global()`, because an
+  name it. The check goes in the three places a *qualified* name is resolved -
+  a value, a callee, and a type - and nowhere near `global()`, because an
   unqualified name can only ever mean this module's own or the prelude's and
   both are always visible. That also means the flat table needed no second
   dimension: one set of the keys that are *not* public says everything, since a
@@ -508,8 +509,8 @@ A module system, and four modules behind it.
   A private name is reported rather than hidden. Resolving to nothing would
   come back as "cannot find", which sends the reader looking for a spelling
   mistake instead of at the declaration that is right there. One name is
-  resolved more than once -- a call asks whether its callee is an overload set,
-  then a builtin, then a value -- so the reported spans are remembered and the
+  resolved more than once - a call asks whether its callee is an overload set,
+  then a builtin, then a value - so the reported spans are remembered and the
   reader is told once. There is no secondary label pointing at the
   declaration, tempting as it is: a `Span` carries no file, and the renderer
   lays a diagnostic's labels out in the file its primary span falls in, which
@@ -530,7 +531,7 @@ A module system, and four modules behind it.
 
 ---
 
-## 7. Multithreading — **done**
+## 7. Multithreading - **done**
 
 The model, settled before anything is written so that the collector and the
 type system are not surprised by it later.
@@ -543,22 +544,22 @@ workers, and nothing is sent by pointer.
 The collector decides this. All three pauses run on the mutator thread because
 only a mutator can walk its own stack, and the stack walker walks exactly one
 stack. Per-worker heaps keep every worker's pauses independent and need no
-rendezvous at all. The alternative — one shared heap — needs every mutator to
+rendezvous at all. The alternative - one shared heap - needs every mutator to
 poll and stop before any pause, which turns a 40-microsecond pause into one
 that waits for the slowest thread to reach a safepoint. That is the cost, and
 it is why the shared heap is the rejected design rather than the obvious one.
 
 ### Two ways to talk
 
-1. **Typed RPC**, point to point. A worker declares a service — a set of `fn`s
-   — and a caller holds a typed handle checked against the same signatures at
-   compile time. A call returns `!T`, because a worker can die and that is not
-   an exceptional case worth a second mechanism.
+1. **Typed RPC**, point to point. A worker declares a service - a set of
+   `fn`s - and a caller holds a typed handle checked against the same
+   signatures at compile time. A call returns `!T`, because a worker can die
+   and that is not an exceptional case worth a second mechanism.
 
 2. **A message broker**, many to many, in the shape of Kafka. Named, typed
    topics; append-only partitioned logs; workers subscribe as consumer groups,
    each with its own offset; replay from an offset; at-least-once delivery. An
-   in-process broker first — durability is a later concern, and the interface
+   in-process broker first - durability is a later concern, and the interface
    does not change when it arrives.
 
 RPC is for when the caller needs the answer. The broker is for when it does
@@ -568,7 +569,7 @@ not, or when more than one worker wants the same message.
 
 **A subscriber set is an overload set.** `fn handle(m: OrderPlaced)`,
 `fn handle(m: OrderCancelled)`, and the broker picks by the message's runtime
-type id — which is exactly what the dispatcher already does, in one subtract
+type id - which is exactly what the dispatcher already does, in one subtract
 and one unsigned compare. A subscriber written for a supertype catches every
 message below it, so a topic's message lattice is the status lattice a second
 time. That the pattern turns up twice, in unrelated features, is the argument
@@ -578,7 +579,7 @@ that it is the right one.
 reason as `Numeric`: scalars, `str`, arrays and structs of transferable fields
 qualify; closures and function values do not, because they capture an
 environment belonging to another heap. The question cannot be answered where it
-is met — a generic `send[T]` meets it before `T` is known — so it is a
+is met - a generic `send[T]` meets it before `T` is known - so it is a
 constraint rather than a check.
 
 **A deep-copy walker**, which can read `TypeLayout.ptr_offsets` and the element
@@ -589,8 +590,8 @@ reference in an object, and copying one to another heap is the same walk.
 
 **Per-worker heaps.** `worker::Worker` owns the heap, the write barrier's
 buffers, the phase machine, the mark parity and the statistics. A thread-local
-pointer says which worker a thread belongs to, created on demand — a thread
-that allocates is a worker by that fact alone — and a collector thread installs
+pointer says which worker a thread belongs to, created on demand - a thread
+that allocates is a worker by that fact alone - and a collector thread installs
 its worker's pointer on entry, so a copy it makes while evacuating lands in the
 heap the original came from.
 
@@ -613,7 +614,7 @@ end-to-end suite passed unaltered, twice, and `WSHARP_GC_STATS` reported the
 same collections, roots, traces and objects moved as before, to the number.
 
 **`Transferable`, and the deep copy.** A sixth `Constraint`, created the way
-`Member` is and deferred for the same reason -- a generic `send[T]` meets the
+`Member` is and deferred for the same reason - a generic `send[T]` meets the
 question before `T` is known. Unlike an abstract type it is not a list of
 members but a structural walk: scalars, `str`, arrays and structs whose fields
 all qualify, and never a function, which is a code pointer plus an environment
@@ -625,7 +626,7 @@ is already the one definition of where an object's references are, and it
 covers an array's elements as well as a struct's fields. What *was* new is the
 list `decode` needs. It builds a graph in Rust locals, which no stack map
 describes, so every object it makes is pinned on a runtime root list until the
-graph is finished -- and that list is a fourth place a heap pointer can live,
+graph is finished - and that list is a fourth place a heap pointer can live,
 so it went into `gc::collect`'s root set, the evacuation pause's root pass,
 `evacuate::fix_references` and `--gc-stress`'s verifier, which is the standing
 rule for exactly this.
@@ -637,7 +638,7 @@ is a whole collection.
 
 **Workers, and typed RPC.** `@spawn(m, args..)` starts an OS thread running
 module `m`'s service and hands back a handle; `w.f(a, b)` calls into it;
-`@join(w)` waits for it and shuts it down. A handle is an `i64` -- an index,
+`@join(w)` waits for it and shuts it down. A handle is an `i64` - an index,
 not a pointer, because another worker's objects are not this one's to hold, and
 so the collector never sees one.
 
@@ -647,17 +648,17 @@ as its first parameter. No new declaration form was needed, because W# has no
 mutable globals: a worker's state had to be an explicit value passed in and out
 anyway, and once it is, the set of functions that take it is exactly the set of
 things the worker can be asked to do. `@spawn` and `@join` are new arms of the
-form `@import` already was -- a thing the compiler handles rather than a
+form `@import` already was - a thing the compiler handles rather than a
 function it could call, because the first argument names a *module* and no
 parameter could have a type that accepts one.
 
 Marshalling meets generated code exactly twice, and both times through a buffer
 of machine words: the call site writes its arguments into one and reads its
-result from another, and a **trampoline** -- one generated function per method
--- reads the arguments back out and calls the real function. Both are generated
+result from another, and a **trampoline** - one generated function per method -
+reads the arguments back out and calls the real function. Both are generated
 code on purpose. A reference moving from a buffer into a call goes through the
 write barrier, the load barrier and the stack maps by construction there, and a
-hand-written Rust caller would have none of the three -- the mistake
+hand-written Rust caller would have none of the three - the mistake
 `array.concat` taught. What is left for the runtime is bytes, which is what it
 may touch.
 
@@ -666,11 +667,11 @@ pinned on the runtime root list for as long as the worker lives, because
 nothing on its stack holds it between calls. And a call and a shutdown share
 one lock: a call that got in before the worker stopped is answered by the drain
 on the way out, and one that arrives after sees the worker gone under the same
-lock and is told so -- without that, a call to a worker that had been joined
+lock and is told so - without that, a call to a worker that had been joined
 waits for a reply nobody is left to send.
 
 **The broker.** Named topics, append-only partitioned logs, consumer groups
-with their own offsets, replay, at-least-once delivery -- Kafka's shape,
+with their own offsets, replay, at-least-once delivery - Kafka's shape,
 because that shape is what makes two useful things possible at once: a
 consumer that has fallen behind can catch up, and a consumer that has died can
 be replaced by one that starts where its group had got to. A message sits in
@@ -689,7 +690,7 @@ returns the topic's message type and the program writes
 `fn handle(m: OrderPlaced)` beside `fn handle(m: OrderCancelled)`; the existing
 dispatcher picks by the type id the copy carried with it, in one subtract and
 one unsigned compare. That the same pattern turns up here and in the status
-lattice, in unrelated features, is the argument that it was the right one --
+lattice, in unrelated features, is the argument that it was the right one -
 and it is why a message must be an *object* rather than merely transferable: a
 scalar carries no header, so there would be nothing to dispatch on and nothing
 to copy it by. `BuiltinTy::Message` says so, and the demand travels from the
@@ -707,8 +708,8 @@ abstract type's does.
   writing it: `std/net` is the transport and `transfer::encode` is already the
   wire format.
 - **A handle must be in a variable to be called through.** `w.f(a)` is
-  recognised from the shape -- an object that is a local holding a handle,
-  rather than a module path -- so a handle in a struct field or straight out of
+  recognised from the shape - an object that is a local holding a handle,
+  rather than a module path - so a handle in a struct field or straight out of
   a call cannot be called through yet.
 - **A service method cannot be generic and cannot return `!T`.** The first
   because a worker calls it through one machine implementation; the second
@@ -718,7 +719,7 @@ abstract type's does.
 
 ---
 
-## 8. Direct libc calls for I/O and networking — **done**
+## 8. Direct libc calls for I/O and networking - **done**
 
 `std/io` went through Rust's `std::fs` and `std::io`, which was the right trade
 while the library was four functions and stopped being one the moment
@@ -746,7 +747,7 @@ generalises it to a worker whose stack holds plenty.
 
 Two consequences fell out rather than being chosen. A worker gives its
 allocation buffer back and publishes its counters on the way *in*, because
-those live on the thread and not in the worker -- a collector running the pause
+those live on the thread and not in the worker - a collector running the pause
 would otherwise retire its own buffer and leave the mutator's block open, and
 an open block is never swept, recycled or evacuated. And the runtime's pinned
 roots do not travel, because they are on the thread too: a collector declines a
@@ -755,16 +756,16 @@ did before.
 
 **Blocking is now safe; non-blocking is for scale.** That is worth stating
 plainly, because it inverts the reason this item gave for wanting a readiness
-API. `epoll` is not what keeps the collector alive -- the safe region is. A
+API. `epoll` is not what keeps the collector alive - the safe region is. A
 readiness API is what lets one worker serve many connections.
 
 ### What was built
 
 | Piece | Where |
 |---|---|
-| The safe region: park, record, hand the stack to the collector, and the handshake that leaves it | `worker.rs` — `blocking`, `claim_parked`, `walk_worker_roots` |
-| A stack walk that starts from a recorded frame rather than the caller's | `stackwalk.rs` — `walk_roots_from` |
-| The collector's half: run the pause for a mutator that cannot | `mark.rs` — `wait_or_serve`, `serve_parked` |
+| The safe region: park, record, hand the stack to the collector, and the handshake that leaves it | `worker.rs` - `blocking`, `claim_parked`, `walk_worker_roots` |
+| A stack walk that starts from a recorded frame rather than the caller's | `stackwalk.rs` - `walk_roots_from` |
+| The collector's half: run the pause for a mutator that cannot | `mark.rs` - `wait_or_serve`, `serve_parked` |
 | Hand-declared syscalls, three arms, no new dependency | `sys/{mod,linux,bsd,windows}.rs` |
 | `std/io` ported onto them, with `errno` where `ErrorKind` was | `io.rs`, `sys/mod.rs` |
 | TCP, UDP, names and a readiness API | `net.rs`, `sys/*` |
@@ -774,7 +775,7 @@ readiness API is what lets one worker serve many connections.
 
 ### Decisions worth recording
 
-- **Hand-declared bindings, not the `libc` crate** — but not for the reason
+- **Hand-declared bindings, not the `libc` crate** - but not for the reason
   this item used to give. It said `libc` was not in the local registry cache;
   it is, and has been all along, as a transitive dependency of
   `cranelift-jit`. The half of the argument that stands is the one that was
@@ -782,7 +783,7 @@ readiness API is what lets one worker serve many connections.
   is worth more than a few dozen `extern "C"` declarations are worth avoiding.
 - **`getaddrinfo`, not a resolver of our own.** Names are the one place where
   writing it by hand would have meant reimplementing the hosts file, NSS and
-  the search domains -- and getting IPv6 wrong. It blocks, which the safe
+  the search domains - and getting IPv6 wrong. It blocks, which the safe
   region has already made safe, so the reason to avoid it went away before the
   code was written.
 - **Addresses are never laid out by hand.** `getaddrinfo` produces them and
@@ -793,8 +794,8 @@ readiness API is what lets one worker serve many connections.
   family on Linux and Windows and a `u8` length then a `u8` family on the BSDs.
 - **`poll(2)` on the BSDs, not `kqueue`, and `WSAPoll` on Windows, not IOCP.**
   Both are deviations from what this item asked for, and each has its own
-  reason. `struct kevent` is *not the same struct* across the family --
-  FreeBSD 12 added an `ext[4]` tail macOS does not have -- so a binding written
+  reason. `struct kevent` is *not the same struct* across the family -
+  FreeBSD 12 added an `ext[4]` tail macOS does not have - so a binding written
   from the macOS headers and tested on the macOS runner would be a declaration
   for FreeBSD that nobody had ever run, laid out wrongly, failing silently.
   IOCP is a different model altogether: completion rather than readiness, which
@@ -813,14 +814,14 @@ readiness API is what lets one worker serve many connections.
   no address formatting: `receive` remembers where the message came from and
   `reply` sends back to it, so the address never leaves the runtime as text and
   IPv6 costs nothing extra. The pair is assembled in W# because one builtin
-  answers with one value -- the same split the poller's `wait` and
+  answers with one value - the same split the poller's `wait` and
   `ready_socket` use.
 - **A socket handle is a number.** A socket belongs to the process rather than
   to any one worker's heap, exactly as a broker topic does, so it is an index
   into a table and W# holds the index in a one-field struct. What makes it
   typed is `std/net.ws`: a `Listener` accepts and a `Socket` reads and writes.
 - **`!void` had to be made writable first.** `std/io.write_file` returns one,
-  so the type existed -- but no W# function could produce one: `return;` was
+  so the type existed - but no W# function could produce one: `return;` was
   checked against the declared type directly rather than against the payload,
   and falling through is rejected. A valueless `return` in a function returning
   `!void` now means "finished, and nothing went wrong", which is the success
@@ -841,7 +842,7 @@ readiness API is what lets one worker serve many connections.
 | `O_NONBLOCK` | `0o4000` on Linux, `0x4` on the BSDs. `O_CLOEXEC` differs again between macOS and FreeBSD, which is why the BSD arm sets it with `fcntl` instead. |
 | `errno` numbering | The same up to 34 and different above it: `EAGAIN` is 11 on Linux and 35 on the BSDs. |
 | A Windows `SOCKET` | Not a file descriptor and not a `HANDLE`. `closesocket`, not `CloseHandle`; `recv`, not `ReadFile`. |
-| `SO_REUSEADDR` on Windows | Means something else — it lets a second socket bind a port another is *actively listening on*. The right port of the Unix workaround is to do nothing. |
+| `SO_REUSEADDR` on Windows | Means something else - it lets a second socket bind a port another is *actively listening on*. The right port of the Unix workaround is to do nothing. |
 | `EINTR`, short reads, path encoding | All ours now. `std::fs` did them; `sys` does them once, above the arms. |
 
 ### What is left
@@ -859,12 +860,12 @@ readiness API is what lets one worker serve many connections.
 - **A failed request leaks its socket.** W# has no `defer`, so a `try` that
   leaves `http.request_with` early skips the `close` below it. The process
   closes everything at exit, so this is a leak within one run rather than a
-  leak -- but a TLS connection is a much more expensive thing to leak than a
+  leak - but a TLS connection is a much more expensive thing to leak than a
   socket was, and this is the first place that shows.
 
 ---
 
-## 9. Sized and unsigned integers, and bitwise operators — **done**
+## 9. Sized and unsigned integers, and bitwise operators - **done**
 
 `i64` is the right default and was the wrong *only* choice the moment a program
 computed on bytes rather than merely moving them. SHA-256 is addition modulo
@@ -876,21 +877,21 @@ W#, and it is the shortest statement of what this item was for.
 
 | Piece | Where |
 |---|---|
-| `i8` `i16` `i32` `i64` `u8` `u16` `u32` `u64`, as one parameterised constructor rather than eight variants | `wsharp-sema/src/ty.rs` — `IntTy`, `TyCon::Int` |
+| `i8` `i16` `i32` `i64` `u8` `u16` `u32` `u64`, as one parameterised constructor rather than eight variants | `wsharp-sema/src/ty.rs` - `IntTy`, `TyCon::Int` |
 | `& \| ^ << >> ~` and their compound forms, at Zig's relative precedence | `wsharp-syntax/src/{token,lexer,parser,ast}.rs` |
-| `>>` arithmetic on a signed type and logical on an unsigned one; the four ordering comparisons and both divisions likewise | `wsharp-codegen/src/lower.rs` — `NumKind`, `binary`, `checked_div` |
-| `comptime_int`: a literal takes the type it is used at and defaults to `i64` | `infer.rs` — `Constraint::IntLiteral`, `int_literal`, `default_int_ty` |
-| Scalars packed at their natural size and alignment, through one `place` | `wsharp-sema/src/layout.rs` — `size_of`, `align_of`, `place` |
-| `u32(x)`, `i64(x)`, `f64(n)` — conversions written, never inferred | `infer.rs` — `infer_convert`; `lower.rs` — `convert` |
-| `Integer` beside `Number`, and abstract types ordered by their member sets | `wsharp-runtime/src/builtins.rs` — `abstract_types`; `ty.rs` — `is_sub_ty` |
-| `std/bits` — `rotl` and `rotr`, generic over `Integer`, lowered inline | `builtins.rs` — `BuiltinTy::IntVar`; `lower.rs` — the `BITS_MODULE` arm |
+| `>>` arithmetic on a signed type and logical on an unsigned one; the four ordering comparisons and both divisions likewise | `wsharp-codegen/src/lower.rs` - `NumKind`, `binary`, `checked_div` |
+| `comptime_int`: a literal takes the type it is used at and defaults to `i64` | `infer.rs` - `Constraint::IntLiteral`, `int_literal`, `default_int_ty` |
+| Scalars packed at their natural size and alignment, through one `place` | `wsharp-sema/src/layout.rs` - `size_of`, `align_of`, `place` |
+| `u32(x)`, `i64(x)`, `f64(n)` - conversions written, never inferred | `infer.rs` - `infer_convert`; `lower.rs` - `convert` |
+| `Integer` beside `Number`, and abstract types ordered by their member sets | `wsharp-runtime/src/builtins.rs` - `abstract_types`; `ty.rs` - `is_sub_ty` |
+| `std/bits` - `rotl` and `rotr`, generic over `Integer`, lowered inline | `builtins.rs` - `BuiltinTy::IntVar`; `lower.rs` - the `BITS_MODULE` arm |
 | `print_uint` and `str.from_uint`, for the half of `u64` an `i64` cannot hold | `builtins.rs`, `strings.rs` |
 
 ### Decisions worth recording
 
 - **Unsigned arithmetic wraps, and so does signed.** The wrapping is the point
-  for unsigned — SHA-256 *is* addition modulo 2^32, so a checked `+` would make
-  it unwritable — and for signed it is what the language already did: only
+  for unsigned - SHA-256 *is* addition modulo 2^32, so a checked `+` would make
+  it unwritable - and for signed it is what the language already did: only
   division ever panicked here, and it still does. What changed is that the
   check is now per width and is skipped entirely for unsigned division, which
   cannot overflow. The panic no longer says `i64::MIN`, because an `i32` can
@@ -909,7 +910,7 @@ W#, and it is the shortest statement of what this item was for.
   type yet, and a 64-bit mask should not have to name its type to be written
   down at all.
 - **A minus sign on a literal is part of the literal.** Without that, `-128` is
-  the negation of `128` and does not fit an `i8` — the one value each signed
+  the negation of `128` and does not fit an `i8` - the one value each signed
   type has that its positive twin does not would be unwritable. It also retires
   the `- 1` dance `panic_div_overflow.ws` had to document.
 - **Unary `-` requires a signed type.** `-x` on a `u8` is not an error the
@@ -920,8 +921,8 @@ W#, and it is the shortest statement of what this item was for.
   stated rather than hidden: a body annotated `Number` must work for *every*
   member, so it may not use `%` and may not negate. `Integer` is what such a
   body claims instead. Abstract types are now ordered by their member sets
-  rather than by identity — `Integer ⊑ Number` because every type it lists is
-  one `Number` lists too — which is one line in `is_sub_ty` and gives
+  rather than by identity - `Integer ⊑ Number` because every type it lists is
+  one `Number` lists too - which is one line in `is_sub_ty` and gives
   specificity everything it needs. Two abstract types with identical members
   would be mutually more specific, so a test asserts the table is a strict
   lattice.
@@ -929,7 +930,7 @@ W#, and it is the shortest statement of what this item was for.
   targets and is what every one of these algorithms is spelled in, so leaving
   the code generator to recognise a shift-shift-or pattern would mean sometimes
   missing it. It cannot be an `extern "C"` function either, because a Rust one
-  cannot be generic over the width — so `BuiltinTy::IntVar` gives it a type
+  cannot be generic over the width - so `BuiltinTy::IntVar` gives it a type
   constrained to `Integer` and `Trans::call` lowers it inline, exactly as
   `array.new` already was.
 - **The shift amount is masked to the operand's width.** Not a choice so much
@@ -939,7 +940,7 @@ W#, and it is the shortest statement of what this item was for.
 - **Conversions are written, never inferred.** A silent widening is how a
   32-bit hash becomes a 64-bit one that is right for a while. `u32(x)`
   truncates and says so; a float-to-integer conversion saturates rather than
-  trapping, so it is total — a value too large clamps and a NaN is zero.
+  trapping, so it is total - a value too large clamps and a NaN is zero.
 - **Cranelift is stricter than its own documentation.** Two things cost time
   and are worth writing down: `iconst` demands a *zero-extended* immediate, so
   `iconst.i32 -1` is a verifier error and a negative literal has to arrive
@@ -950,8 +951,8 @@ W#, and it is the shortest statement of what this item was for.
 ### What packing changed, and what it uncovered
 
 A scalar now occupies its natural size at its natural alignment, so `[]u8` has
-a stride of one — without which every buffer in item 10 would be eight times
-too large — and a struct of bytes costs bytes. A *tagged* value keeps a whole
+a stride of one - without which every buffer in item 10 would be eight times
+too large - and a struct of bytes costs bytes. A *tagged* value keeps a whole
 word per slot, because slot `i` of a value living at `base + i*8` is what three
 separate pieces of code depend on: the stride `load_at` and `store_slots` walk,
 and the division `repr::pointer_slots` uses to turn a byte offset back into a
@@ -959,14 +960,14 @@ slot index. Two tests state that invariant rather than leaving it in a comment.
 
 Alignment is not cosmetic here. Every load and store through these offsets uses
 Cranelift's `trusted` memory flags, whose `aligned` bit lets the instruction
-"trap or return a wrong result if the effective address is misaligned" — so
+"trap or return a wrong result if the effective address is misaligned" - so
 packing without aligning would have made that flag a lie.
 
 Doing it turned up two things:
 
 - **`layout::place` was not the single definition CLAUDE.md claimed.** Four
   more hand-rolled `offset += size_of(...)` loops existed: struct fields in
-  `infer.rs`, and three separate copies for closure captures — the layout
+  `infer.rs`, and three separate copies for closure captures - the layout
   registered with the runtime, the prologue that reads captures out, and the
   constructor that writes them in. Those three had to agree byte for byte and
   did so only by being written the same way three times. All four now call
@@ -985,20 +986,20 @@ Doing it turned up two things:
   an integer literal was an `i64`, which `comptime_int` has retired; it is now
   that negation is meaningless on an unsigned type. A narrow signed value needs
   a conversion. **Item 13 closed this** with `Signed`, an abstract type listing
-  the four signed integer widths -- which is the annotation this was missing
+  the four signed integer widths - which is the annotation this was missing
   rather than a change to what `Number` means.
 - **An array index is still an `i64`.** "Every literal index works" is true and
   is not the case that chafes; writing item 10's ciphers found the one that
-  does, and it is a *byte-valued* index -- `table[b]`. `i64(b)` covers it, and
+  does, and it is a *byte-valued* index - `table[b]`. `i64(b)` covers it, and
   it turned out to be barely met, because a table indexed by a secret byte is
   the thing constant-time code must not do anyway. **Item 13 closed this**: any
   integer type indexes, and the widening is emitted where it is used.
-- **No `u128`, and no `usize`.** The second is deliberate — this language has
+- **No `u128`, and no `usize`.** The second is deliberate - this language has
   no pointer arithmetic to size, and a type whose overload depends on the
   target is a type whose overflow does. The first was an open question, and
   item 10 answered it: Poly1305's 130-bit accumulator and GHASH's
   multiplication in GF(2^128) are the two places a 128-bit type is usually
-  reached for, and both are written without one — five 26-bit limbs in `u64`s
+  reached for, and both are written without one - five 26-bit limbs in `u64`s
   for the first, two `u64` halves and 128 shifts for the second. Neither is a
   workaround; both are the shape a portable implementation has anyway. What is
   still missing is a 64x64 -> 128 product, and this used to name RSA's `modexp`
@@ -1013,10 +1014,10 @@ Doing it turned up two things:
   argument's type.
 
 
-## 10. TLS 1.3, written in W# — **done**
+## 10. TLS 1.3, written in W# - **done**
 
 Item 8 left `https://` as `error.NotSupported` rather than a connection that
-quietly speaks the wrong protocol. Removing it is what this item is for -- and
+quietly speaks the wrong protocol. Removing it is what this item is for - and
 what the package manager needs before it can fetch anything from a host it did
 not already trust.
 
@@ -1034,12 +1035,12 @@ The rule that governs the boundary would *permit* the other answer: a cipher is
 a pure byte-to-byte transform, which is exactly what a builtin may be. So the
 reason is not the collector's; it is that a language which cannot express
 SHA-256 has a hole in it, and the fastest way to find out where the hole is, is
-to try. The handshake and X.509 have to be W# regardless -- both build object
+to try. The handshake and X.509 have to be W# regardless - both build object
 graphs, and item 6's rule sends those to `.ws` files.
 
 **Trying found exactly one hole, and it is now closed.** Every crypto primitive
-in the world is written around a table of constants -- SHA-256's sixty-four
-round words, SHA-512's eighty, AES's round constants, a hex alphabet -- and a
+in the world is written around a table of constants - SHA-256's sixty-four
+round words, SHA-512's eighty, AES's round constants, a hex alphabet - and a
 top-level `const` could only be a literal, so not one of them could be written
 down. Nothing else was missing. That is a better result than the item expected,
 and the fix is described below.
@@ -1050,11 +1051,11 @@ and the fix is described below.
 
 | Piece | Where |
 |---|---|
-| A top-level `const` array of scalars, emitted as immortal data | `infer.rs` — `const_array`; `codegen/src/lib.rs` — `define_arrays` |
+| A top-level `const` array of scalars, emitted as immortal data | `infer.rs` - `const_array`; `codegen/src/lib.rs` - `define_arrays` |
 | `[]u8` as a buffer, and the bridge to and from `str` | `std/bytes.ws`, `bytes.rs` |
-| Byte-oriented sockets: read into a buffer, write out of one | `std/net.ws` — `read_into`, `write_all_bytes`; `net.rs` |
-| The system's CSPRNG, on three arms | `sys/{linux,bsd,windows}.rs` — `random`; `crypto.rs` |
-| The wall clock, likewise | `sys/*` — `wall_clock_secs`; `std/time.now` |
+| Byte-oriented sockets: read into a buffer, write out of one | `std/net.ws` - `read_into`, `write_all_bytes`; `net.rs` |
+| The system's CSPRNG, on three arms | `sys/{linux,bsd,windows}.rs` - `random`; `crypto.rs` |
+| The wall clock, likewise | `sys/*` - `wall_clock_secs`; `std/time.now` |
 | SHA-256, SHA-384 and SHA-512, one-shot and incremental | `std/hash.ws` |
 | HMAC and HKDF, written once over a value describing the hash | same |
 | ChaCha20, Poly1305 and ChaCha20-Poly1305 | `std/cipher.ws` |
@@ -1067,21 +1068,21 @@ and the fix is described below.
   W# compiles through Cranelift, which is free to turn a branchless expression
   into a branch and a select into a jump, and there is no `black_box` to pin a
   secret away from an optimisation the compiler invented. So the primitives are
-  written constant-time *by construction* -- no secret-dependent indices, no
-  early-exit compares -- and this is stated as a best effort against a local
+  written constant-time *by construction* - no secret-dependent indices, no
+  early-exit compares - and this is stated as a best effort against a local
   attacker rather than a promise. Anyone who needs the promise needs a reviewed
   C library behind an FFI, which is a different item.
 - **AES has no S-box table, and GHASH has no multiplication table.** This is
   the visible cost of the paragraph above. A 256-byte S-box indexed by a byte
   of the state is indexed by a byte that depends on the key, and which cache
-  line that touches is exactly what a timing attack reads -- so `sbox` inverts
+  line that touches is exactly what a timing attack reads - so `sbox` inverts
   in GF(2^8) by exponentiation instead, which is about a hundred times slower
   and touches the same instructions whatever the input. GHASH is 128 shifts and
   exclusive-ors for the same reason, and needs no `u128` as a bonus.
 - **A `const` array of scalars is a literal, not a computed global.** The
   restriction it lifts was never about arrays: it was about needing storage and
   a startup initialiser, and about the collector needing globals as roots. An
-  immortal array of scalars needs neither -- it is a string literal with a wider
+  immortal array of scalars needs neither - it is a string literal with a wider
   element, emitted by the same code path, carrying the same `FLAG_IMMORTAL`, and
   holding nothing the collector has to trace. Writing an element of one through
   the `const`'s own name is rejected, because a top-level `const` is shared by
@@ -1100,27 +1101,27 @@ and the fix is described below.
   keep one buffer for its whole life. The `str` API is untouched, and `std/http`
   did not change.
 - **The generator is the system's.** `getrandom` on Linux, `arc4random_buf` on
-  the BSDs, `BCryptGenRandom` on Windows -- a fourth `#[link]`, since neither
+  the BSDs, `BCryptGenRandom` on Windows - a fourth `#[link]`, since neither
   kernel32 nor ws2_32 has it. A TLS stack is the last place to be clever about
   entropy: the kernel has it, and it knows things this process cannot, such as
   that the machine forked or was restored from a snapshot. The call blocks until
   the pool is initialised, which is correct and is safe here because it is made
   inside a safe region.
-- **HMAC is written once, over a value.** The three things it needs to know --
-  block size, digest size, and how to hash -- are three fields of a `Hash`
+- **HMAC is written once, over a value.** The three things it needs to know -
+  block size, digest size, and how to hash - are three fields of a `Hash`
   struct, the third an ordinary function value. An overload set would have read
   better and does not work: which overload is meant is a question about a
   parameter's *type*, and inside a body generic over the algorithm there is no
   type yet to ask about. This is the same shape, for the same reason, that made
   `for` ask a type's own module how to walk it.
 - **AES decryption is not written.** GCM is counter mode and encrypts even to
-  decrypt, so the inverse cipher has no caller -- and unreachable code in a
+  decrypt, so the inverse cipher has no caller - and unreachable code in a
   security-critical file is exactly the shape a bug hides in.
 - **A digest allocates once, not once per block.** The message schedule and the
   working words live in the state. This is not tuning: the whole case suite runs
   a second time under `--gc-stress`, which collects at *every* allocation, so a
   temporary inside a block loop is the difference between a test and a timeout.
-  It is checkable, and checked -- a 64-byte digest and a 64 KiB one both cost
+  It is checkable, and checked - a 64-byte digest and a 64 KiB one both cost
   six objects.
 
 ### Stages two and three: two curves, a bignum, and RSA
@@ -1155,7 +1156,7 @@ or moving the bignum across the boundary anyway.
   that genuinely wanted it. It does not: with 32-bit limbs the largest quantity
   any of this computes is `t + a*b + carry`, which is at most
   `(2^32-1)^2 + 2*(2^32-1)`, and that is exactly `2^64 - 1`. Not one bit spare
-  and not one needed. **So both stages are pure W#** -- the only Rust in the
+  and not one needed. **So both stages are pure W#** - the only Rust in the
   whole change is four lines registering four modules, and the language grew
   nothing at all.
 - **One Montgomery multiplication serves both a curve and a signature scheme.**
@@ -1167,7 +1168,7 @@ or moving the bignum across the boundary anyway.
 - **Nothing divides.** The one place a bignum usually needs a remainder is
   `R^2 mod n`, and that is `64*limbs` doublings with a masked conditional
   subtract instead. RSA verification needs no remainder and neither does the
-  curve, so a division would have been code with no caller -- which is exactly
+  curve, so a division would have been code with no caller - which is exactly
   why `std/cipher` still has no AES decryption.
 - **RSA verifies and never signs, and that changes what the code is.** TLS 1.3
   does no RSA key exchange, so the private exponent has no caller. Everything
@@ -1176,7 +1177,7 @@ or moving the bignum across the boundary anyway.
   loud that it is not constant time, and it is seventeen multiplications rather
   than two thousand, because a public exponent is 65537.
 - **The encoded message is built and compared, never parsed.** Every historical
-  PKCS#1 v1.5 break is an *acceptance* bug -- a verifier that walks the encoding
+  PKCS#1 v1.5 break is an *acceptance* bug - a verifier that walks the encoding
   left to right and is content with eight bytes of padding and a correct
   DigestInfo, whatever follows. There is exactly one byte string a valid
   signature can decrypt to, so producing it and comparing is both the shortest
@@ -1184,7 +1185,7 @@ or moving the bignum across the boundary anyway.
 - **X25519's field is sixteen limbs of sixteen bits.** TweetNaCl's shape rather
   than ref10's ten limbs of twenty-five and a half. Every partial product is at
   most 2^32, sixteen of them 2^36, and the fold that wraps 2^256 back down
-  multiplies by 38 to reach about 2^41 -- twenty-two bits of headroom for a
+  multiplies by 38 to reach about 2^41 - twenty-two bits of headroom for a
   schoolbook multiplication anyone can check by reading it. That is the third
   time this item has taken the auditable side of that trade, after AES's
   computed S-box and GHASH's 128 shifts, and it is the same argument each time.
@@ -1200,19 +1201,19 @@ or moving the bignum across the boundary anyway.
   not on P-256 at all but is on some curve with a smooth group, which leaks the
   private key a few bits per exchange. So the peer's key share is checked to be
   a well-formed uncompressed point, with both coordinates below the modulus,
-  that satisfies the curve equation -- and RFC 8446 section 4.2.8.2 says so too.
+  that satisfies the curve equation - and RFC 8446 section 4.2.8.2 says so too.
 - **`pt_add` is exception-free because of the ladder, not because of the
   formula.** `add-2007-bl` cannot add a point to itself, and the Montgomery
   ladder is what rules that out: its two accumulators satisfy `R1 - R0 = P`
   throughout and `P` is never the identity, so they are never equal. The case
-  that *is* reachable is an operand at infinity -- `R0` starts there -- and that
+  that *is* reachable is an operand at infinity - `R0` starts there - and that
   is settled by selecting the other operand with a mask, because which one it
   was is a fact about the scalar. The argument is in the code, because it is
   the thing a reviewer has to check rather than read.
 - **Scratch belongs to the caller, all the way down.** Every field and point
   routine writes into storage handed to it, and one `Work` is built per
   operation. The result is that an X25519 costs fourteen objects and a P-256
-  exchange about sixty, whatever the 255 ladder steps inside them do -- which is
+  exchange about sixty, whatever the 255 ladder steps inside them do - which is
   what lets `curve25519_x25519.ws` keep RFC 7748's thousand-round iterated
   vector at full length and take the same two seconds under `--gc-stress` as
   without it. A ladder that allocated per step would be a quarter of a million
@@ -1226,14 +1227,14 @@ or moving the bignum across the boundary anyway.
 - **Nothing new was asked of the language.** Stage one found exactly one hole
   and closed it; these two stages found none. Two curves, a bignum, two
   signature schemes and 2,100 lines of W# needed no lexer, parser, inference or
-  code-generator change -- which is a better answer than item 9's "no `u128`"
+  code-generator change - which is a better answer than item 9's "no `u128`"
   decision had any right to expect.
 
 ### Stage four: two signature schemes, the record layer, and the handshake
 
 Stages two and three left the asymmetric primitives in place and nothing above
 them. This is the protocol: the two signature schemes a TLS 1.3 client has to
-verify besides RSA, the record layer, and ClientHello through Finished --
+verify besides RSA, the record layer, and ClientHello through Finished -
 including HelloRetryRequest, which is the only part of the handshake that
 happens twice.
 
@@ -1265,7 +1266,7 @@ recorded bytes is a client whose *own* bytes nothing has ever read.
   arrived and `pending` says what to send; nothing below `Session` knows a
   socket exists. That is not an abstraction for its own sake. A handshake is a
   *negotiation*, so a blocking `connect` writes its ClientHello and then waits
-  for a reply -- and one thread cannot be both ends of one, which is how every
+  for a reply - and one thread cannot be both ends of one, which is how every
   other networking case in this tree is written. Splitting the core out is what
   makes the whole of `tls_loopback.ws` single-threaded and deterministic, and
   it is what lets RFC 8448 be replayed with no I/O at all.
@@ -1276,23 +1277,23 @@ recorded bytes is a client whose *own* bytes nothing has ever read.
 - **A public key *is* an overload set**, and that is the same argument the
   other way. A key's algorithm is known when it is parsed and never changes, so
   `RsaKey`, `EcdsaP256Key` and `Ed25519Key` are subtypes of `SigKey` and
-  `verify_signature` is three functions -- the dispatcher picks by the type id
+  `verify_signature` is three functions - the dispatcher picks by the type id
   in the header, and a fourth algorithm is a struct and a function rather than
   an edit to a chain.
 - **`std/x509` sits below `std/tls`, not beside it.** A client verifies a
   CertificateVerify with a key out of a certificate, so one module has to name
   the other's types, and W# has no re-export. The one that owns `SigKey` is the
-  one everything imports, and a public key comes from a certificate -- so the
+  one everything imports, and a public key comes from a certificate - so the
   arrow points that way and there is no cycle to break.
 - **Ed25519 signs and RSA still does not.** The rule has not changed: a
-  signing key is written when it has a caller. This one has -- the server's
-  CertificateVerify -- and Ed25519 is the scheme this library can produce
+  signing key is written when it has a caller. This one has - the server's
+  CertificateVerify - and Ed25519 is the scheme this library can produce
   without a constant-time exponentiation it does not have and without a nonce
   whose generation is the classic way to lose a private key.
 - **ECDSA verifies and does not sign**, for the reason RSA does not, and its
   code is allowed to be different *because* everything it touches is public.
   `r`, `s`, the digest and the peer's key all travel in the clear, so a branch
-  on any of them leaks nothing -- which is what makes an addition with real
+  on any of them leaks nothing - which is what makes an addition with real
   cases in it and a double-and-add that skips a zero digit legitimate here and
   not in `ecdh`.
 - **The window landed where it is free, and the ladder was left alone.** Item
@@ -1330,7 +1331,7 @@ recorded bytes is a client whose *own* bytes nothing has ever read.
 - **A HelloRetryRequest is the only message that rewrites history.** The first
   ClientHello is replaced in the transcript by a synthetic message holding its
   hash, which is what lets a server keep no state between the two flights. Both
-  ends implement it, and the server here sends a cookie and checks the echo --
+  ends implement it, and the server here sends a cookie and checks the echo -
   not because it needs to, since it is stateful, but because a client's cookie
   handling is otherwise code nothing runs.
 - **Compatibility mode is sent and accepted, and never hashed.** A 32-byte
@@ -1342,7 +1343,7 @@ recorded bytes is a client whose *own* bytes nothing has ever read.
 
 Item 8 left one line in `std/http`: `https://` was `error.NotSupported`
 "rather than a connection that quietly speaks the wrong protocol". This is that
-line removed, and everything a client needs before removing it is honest --
+line removed, and everything a client needs before removing it is honest -
 which is a certificate parser, a chain, and somewhere to get the anchors from.
 
 #### What was built
@@ -1376,13 +1377,13 @@ which is a certificate parser, a chain, and somewhere to get the anchors from.
   accidentally make two different names equal, which the folding rules can.
 - **An algorithm this library cannot verify is not a reason to refuse a
   certificate.** It was at first, and that was wrong in a way the system store
-  made obvious: a *trust anchor's* own signature is never checked -- it is
-  trusted for being in the store, not for having signed itself -- so refusing
+  made obvious: a *trust anchor's* own signature is never checked - it is
+  trusted for being in the store, not for having signed itself - so refusing
   one for its signature algorithm drops authorities for a reason that never
   applies to them. The scheme becomes zero instead, `verify_signature` refuses
   it, and a chain that actually needs the signature still fails. That change
   took the local store from 79 usable roots to 83.
-- **What was left out was 36 of them, and the reason was P-384** -- until it
+- **What was left out was 36 of them, and the reason was P-384** - until it
   was written. Thirty-five of this machine's 119 root certificates have
   `secp384r1` keys, and until `std/nistec` carried a second curve none of them
   could be used and no chain through a P-384 intermediate could be verified,
@@ -1391,13 +1392,13 @@ which is a certificate parser, a chain, and somewhere to get the anchors from.
   multiplication rather than a Solinas reduction for one prime, the second
   curve is five tables and a limb count. Eighty-three usable roots became a
   hundred and eighteen. The one still refused has a P-521 key, whose 521 bits
-  are not a whole number of 32-bit limbs -- the one place the shape of this
+  are not a whole number of 32-bit limbs - the one place the shape of this
   bignum shows through.
 - **A store is a bag, a chain is a structure.** A certificate in the store that
   this library cannot read is dropped and the rest are used; a certificate *in
-  a chain* that it cannot read is a refusal. Those are different questions --
+  a chain* that it cannot read is a refusal. Those are different questions -
   one fewer authority to trust against one connection to a peer whose identity
-  cannot be established -- and answering them the same way would either make a
+  cannot be established - and answering them the same way would either make a
   container with an odd root unusable or make a broken chain acceptable.
 - **An unknown extension marked critical is a refusal.** That is what critical
   means: the issuer saying "refuse this certificate rather than ignore me". It
@@ -1411,7 +1412,7 @@ which is a certificate parser, a chain, and somewhere to get the anchors from.
   work.** `TlsConn : Conn` with `conn_read` and `conn_write` as overloads is
   what this language is for, and it is what `https://` looks like it should be.
   It fails on a rule that is not going to change: **a dispatched call has one
-  type, so every overload must share it** -- and reading through TLS can raise
+  type, so every overload must share it** - and reading through TLS can raise
   everything a handshake can, two dozen names, where reading a socket raises
   ten. Making them agree means writing the whole set out twice and keeping two
   copies in step, or catching inside and answering with one flattened error,
@@ -1420,7 +1421,7 @@ which is a certificate parser, a chain, and somewhere to get the anchors from.
   leaving the next reader to rediscover it.
 - **The root store is the fourth arm-shaped problem, and its arms have less in
   common than any before it.** macOS has a keychain and Windows a store API,
-  and both hand back a blob of length-prefixed DER that W# cuts up -- the
+  and both hand back a blob of length-prefixed DER that W# cuts up - the
   runtime touching bytes and W# building the objects, which is the boundary
   rule this whole item is written to. Every Linux and BSD has a file instead,
   at a path that differs by distribution, so the list of candidate paths lives
@@ -1435,7 +1436,7 @@ which is a certificate parser, a chain, and somewhere to get the anchors from.
 Stage five shipped with one limitation big enough to be worth its own section,
 and this is it closed. Thirty-five of a typical machine's 119 root
 certificates have P-384 keys; none of them could be used, and a chain through
-a P-384 intermediate -- which is most of the modern web -- could not be
+a P-384 intermediate - which is most of the modern web - could not be
 verified at all.
 
 `std/p256` became `std/nistec`, and the module now carries three numbers in its
@@ -1448,7 +1449,7 @@ was already shared; what was hard-coded was the size.
   `std/bignum`'s generic Montgomery multiplication over a Solinas reduction
   written for P-256's prime, and recorded the trade: "a page that exists only
   to be faster, in a file where being wrong is a security problem". Had the
-  fast page been written, P-384 would have needed a second one -- different
+  fast page been written, P-384 would have needed a second one - different
   prime, different shifts, separately wrong. Instead it needed five byte tables
   and a limb count.
 - **A key is two types, not one carrying a curve.** `EcdsaP256Key` and
@@ -1466,9 +1467,9 @@ was already shared; what was hard-coded was the size.
   nine bits wide and `std/bignum`'s "a number's length *is* its width"
   invariant would need a mask everywhere it is read.
 
-Eighty-three usable roots became a hundred and eighteen, and `example.com` --
+Eighty-three usable roots became a hundred and eighteen, and `example.com` -
 whose chain goes through two P-384 intermediates and which was the worked
-example of the limitation -- now answers.
+example of the limitation - now answers.
 
 ### What being wrong costs here, and how that is paid
 
@@ -1482,15 +1483,15 @@ GCM, RFC 7748 for X25519 and RFC 5903 for P-256.
 
 Two habits are worth writing down because both caught something. Vectors were
 **checked against an independent implementation** rather than transcribed from
-memory -- which found that a remembered RFC ciphertext was wrong and the code
+memory - which found that a remembered RFC ciphertext was wrong and the code
 was right, and would equally have found the reverse. And every AEAD has a case
 for each *way* of being wrong: a changed ciphertext, a changed tag, changed
 additional data that is not itself transmitted, the wrong nonce, the wrong key,
 and a truncation that leaves no room for a tag.
 
 **A protocol has published traces, and they are better than vectors.** RFC 8448
-writes whole TLS 1.3 handshakes down as bytes -- every record, and every secret
-behind them -- which makes three different kinds of test possible from one
+writes whole TLS 1.3 handshakes down as bytes - every record, and every secret
+behind them - which makes three different kinds of test possible from one
 document. `tls_schedule.ws` checks the key schedule one derivation at a time, so
 a failure names which of the eleven is wrong rather than only that one is.
 `tls_rfc8448.ws` drives the client with the recorded server flight and compares
@@ -1503,17 +1504,17 @@ documented test hook, and that is a limitation worth stating: the recorded
 client offers extensions this one does not, so a hello built here would be a
 different message and nothing downstream could be compared at all. Everything
 after the hello is this implementation. What that leaves untested is the bytes
-this library *itself* produces first -- which is why stage four also has a
+this library *itself* produces first - which is why stage four also has a
 server. `tls_loopback.ws` runs the two ends against each other over all three
 cipher suites, both groups and a HelloRetryRequest, and `tls_socket.ws` does it
 once more over a real socket with the server on a worker of its own, which is
 also two threads blocking in `read(2)` inside the collector's safe region.
 
 **A certificate cannot be borrowed, so the fixtures are minted.** A real
-certificate expires and takes the test with it, and the interesting cases --
+certificate expires and takes the test with it, and the interesting cases -
 expired, not yet valid, the wrong name, an intermediate that is not a
 certificate authority, a `pathLenConstraint` violated, an unknown critical
-extension -- do not exist in the wild to be borrowed anyway. So `x509_reject.ws`
+extension - do not exist in the wild to be borrowed anyway. So `x509_reject.ws`
 has thirteen certificates made for it, each wrong in exactly one way, written
 by a hand-rolled DER encoder in a node script because node cannot issue one.
 Every certificate it produces is handed straight back to node's
@@ -1524,8 +1525,8 @@ so the case says the same thing whenever it is run.
 And once, at the end, a real one: `http.get("https://www.google.com/")`
 returning a 200 over a chain checked against this machine's own store is the
 only thing that proves the root store, the parser, the chain builder and the
-name check together. It is not a case -- the harness runs every example and a
-network-dependent one would make CI depend on the weather -- so it is a command
+name check together. It is not a case - the harness runs every example and a
+network-dependent one would make CI depend on the weather - so it is a command
 in the README instead.
 
 **RSA has no published vector this library could use**, because the ones that
@@ -1534,10 +1535,10 @@ exist are 1024-bit and SHA-1 and this only carries the three SHA-2 prefixes TLS
 implementation, every encoded message built from RFC 8017's text and signed with
 the raw private exponent, and then every one of them handed back to that first
 implementation, which agreed about all eighteen. That is what makes the forged
-ones worth having -- and the forgeries are the point, because a verifier that
+ones worth having - and the forgeries are the point, because a verifier that
 accepts too much passes every test written from the valid side. Between them
 `rsa_pkcs1.ws` and `rsa_pss.ws` make twenty-two refusals, each a different way
-of being wrong -- the AEAD discipline applied where acceptance rather than
+of being wrong - the AEAD discipline applied where acceptance rather than
 rejection is the historical failure.
 
 ### What is left
@@ -1555,7 +1556,7 @@ left is a list of things that were left on purpose:
   them cover a hundred and eighteen of a hundred and nineteen.
 - **Nothing checks revocation.** No OCSP, no CRL, no stapling. A certificate
   that was issued and then withdrawn is still accepted until it expires, which
-  is a real hole and a large piece of work -- OCSP is another protocol and
+  is a real hole and a large piece of work - OCSP is another protocol and
   stapling is another extension. Saying so is better than a half-check that
   looks like one.
 - **No name constraints and no certificate policies.** Both are extensions a
@@ -1571,12 +1572,12 @@ Smaller things left behind these stages:
 - **No 1.2-style RSA key transport and no RSA signing**, deliberately, per the
   decision above. If a signing key ever has a caller, it needs a constant-time
   `modexp` and the Chinese remainder theorem, and neither is written.
-- **A public exponent is bounded at 2^32 + 1** -- done in stage five. `modexp`
+- **A public exponent is bounded at 2^32 + 1** - done in stage five. `modexp`
   costs one modular multiplication per exponent bit, so an unbounded one is a
   peer deciding how much work this machine does.
 - **P-256's *secret* scalar multiplication is still a bare ladder.** Stage four
-  windowed the half of it that is public -- a verification is now one
-  interleaved double-and-add rather than two ladders -- and deliberately left
+  windowed the half of it that is public - a verification is now one
+  interleaved double-and-add rather than two ladders - and deliberately left
   the other half alone: a windowed ladder can reach a step where the
   accumulator equals the table entry being added, which `pt_add` cannot do, and
   ruling that out needs complete formulas or a mask over an exception where the
@@ -1610,7 +1611,7 @@ The decisions taken in advance about these two stages, and how they turned out:
   exactly right: `https://` is a field on `Conn`, a branch in `parse_url`, and
   four call sites. The chunked decoder, the header parser and the status
   mapping did not change at all. What it is *not* is a subtype and an overload
-  set, which is what the shape deserved and which the error sets forbid -- the
+  set, which is what the shape deserved and which the error sets forbid - the
   reason is above, in stage five's decisions.
 - **The wall clock now has its caller.** It went in with stage one against the
   day X.509 validity checking would want it; `std/tls` reads it once per
@@ -1619,7 +1620,7 @@ The decisions taken in advance about these two stages, and how they turned out:
 
 ---
 
-## 11. Package management — **done**
+## 11. Package management - **done**
 
 Item 6 left one line: *"No package management. An import is a relative path or
 a library one; there is nothing that fetches anything."* This is that, and it
@@ -1636,7 +1637,7 @@ having before the next exists.
 | Four | Git spoken rather than shelled out to: inflate, pkt-line, a packfile | **done** |
 | Five | The loader hook, and the re-export a package facade needs | **done** |
 
-### Stage one — the language can see the world — **done**
+### Stage one - the language can see the world - **done**
 
 Everything item 11 needs and nothing it is, which is what makes it worth having
 on its own: a program can now read its own command line and walk a directory.
@@ -1644,16 +1645,16 @@ on its own: a program can now read its own command line and walk a directory.
 | Piece | Where |
 |---|---|
 | `mkdir`, `rmdir`, `remove`, `rename`, `is_dir`, `file_size`, `read_dir`, `env`, on three arms | `sys/{mod,linux,bsd,windows}.rs` |
-| `std/fs` — the builtins, and `read_dir`, `mkdir_all`, `remove_tree` above them | `fs.rs`, `std/fs.ws` |
-| `std/os` — `args`, `get`, `home`, `temp_dir` | `os.rs`, `std/os.ws` |
-| `std/path` — `join`, `dirname`, `basename`, `extension`, `is_absolute`, `normalise` | `std/path.ws` |
+| `std/fs` - the builtins, and `read_dir`, `mkdir_all`, `remove_tree` above them | `fs.rs`, `std/fs.ws` |
+| `std/os` - `args`, `get`, `home`, `temp_dir` | `os.rs`, `std/os.ws` |
+| `std/path` - `join`, `dirname`, `basename`, `extension`, `is_absolute`, `normalise` | `std/path.ws` |
 | `wsharp run prog.ws -- a b c`, and `// args:` in a case header | `wsharp-cli/src/main.rs`, `tests/cases.rs` |
 
 **`struct stat` is not declared anywhere, and that is the interesting decision.**
 The obvious way to answer "is this a directory, and how big is it" is a
 `stat(2)`, and the obvious way to bind one is to declare `struct stat`. That
 struct has a different layout on macOS, FreeBSD, NetBSD and OpenBSD, and is a
-versioned symbol on glibc whose shape differs by architecture — so the BSD arm
+versioned symbol on glibc whose shape differs by architecture - so the BSD arm
 would carry four declarations, three of which nobody here can run. It is
 `struct kevent` again, and it gets the same answer: pick the interface that
 hides the difference. `is_dir` is `opendir` succeeding and `file_size` is
@@ -1668,8 +1669,8 @@ struct.
 
 `readdir` is where the difference could not be hidden, because a directory
 entry is a struct and nothing wraps it. Each arm carries `d_name`'s offset and
-nothing else — 19 on Linux, 21 on macOS, 24 on FreeBSD and OpenBSD, 13 on
-NetBSD, 16 on DragonFly — which is one auditable fact per system rather than
+nothing else - 19 on Linux, 21 on macOS, 24 on FreeBSD and OpenBSD, 13 on
+NetBSD, 16 on DragonFly - which is one auditable fact per system rather than
 five declared layouts, and which works because POSIX guarantees the name is
 NUL-terminated. macOS needs one thing more: `readdir` is `readdir$INODE64` on
 x86-64 and plain `readdir` on arm64, and linking the unsuffixed name on x86-64
@@ -1683,8 +1684,8 @@ CI, so that is a trap nothing here would have caught.
   bytes, and `std/os.unpack` cuts it up. That is `crypto.raw_system_roots`'s
   shape, and length prefixes rather than a separator mean the encoding says
   nothing about what a name may contain.
-- **The command line is process-wide state.** `main` takes no arguments — the
-  type checker says so — and the one word a compiled `main` receives is the
+- **The command line is process-wide state.** `main` takes no arguments - the
+  type checker says so - and the one word a compiled `main` receives is the
   closure environment pointer every W# function takes. So `os::set_args`
   publishes them into a `OnceLock` before anything is compiled, which is the
   third thing in this runtime allowed to be process-wide and qualifies for the
@@ -1695,7 +1696,7 @@ CI, so that is a trap nothing here would have caught.
   none is ever produced.
 
 `std/fs.mkdir_all` checks before each `mkdir` rather than catching
-`AlreadyExists`, because W# has no way to re-raise a caught error — which is
+`AlreadyExists`, because W# has no way to re-raise a caught error - which is
 the first thing this item has found that the language cannot say, and it is
 noted rather than fixed: the store publishes by `rename` precisely so that two
 processes racing is not a case anything has to get right. **Item 13 gave the
@@ -1704,7 +1705,7 @@ language the missing half**, so a caught error may now be handed on with
 and the three questions it asks are the ones `sys/` can answer without
 declaring a `struct stat`.
 
-### Stage two — TOML, the store, and the tool — **done**
+### Stage two - TOML, the store, and the tool - **done**
 
 | Piece | Where |
 |---|---|
@@ -1715,7 +1716,7 @@ declaring a `struct stat`.
 | One failure, with something to read on it | `ingot/fault.ws` |
 | The verbs | `ingot/main.ws` |
 | The tool: two hundred lines of Rust over them | `crates/ingot/` |
-| A library module is read only if something imports it | `wsharp-cli/src/load.rs` — `add_library` |
+| A library module is read only if something imports it | `wsharp-cli/src/load.rs` - `add_library` |
 
 `ingot init`, `add`, `remove`, `resolve`, `install`, `verify`, `list`, `why`,
 `gc`, `store` and `run` all work, against path dependencies. A registry
@@ -1744,7 +1745,7 @@ quotation mark in it. The round trip is the test.
 Two things about writing it in W# are worth recording.
 
 **A value is a lattice.** The language has no sum types, and what it has
-instead is nominal subtyping with multiple dispatch — so `Value` is an empty
+instead is nominal subtyping with multiple dispatch - so `Value` is an empty
 supertype, each shape is a subtype carrying its payload, and `as_int` is an
 overload set whose base case says "this is not an integer". `std/x509`'s
 `SigKey` is the original of the shape, and this is the second use of it, which
@@ -1756,8 +1757,8 @@ constructor is `const v: Value = Int{ .. }; return v;`.
 
 **Parsing does not raise.** An error union carries a tag and nothing else, and
 `BadFormat` is not a thing to hand somebody holding a 200-line manifest.
-`parse` answers with a `Doc` — a table, or a message and the line it happened
-on — and everything under ingot's verbs takes a `Fault` and writes into it.
+`parse` answers with a `Doc` - a table, or a message and the line it happened
+on - and everything under ingot's verbs takes a `Fault` and writes into it.
 This is the first place the language's error unions were not enough, and it is
 worth saying plainly that the answer was not to change the language: a reader
 that has lost its place should report the first failure and stop, which is a
@@ -1765,7 +1766,7 @@ shape rather than a missing feature.
 
 Writing it found one real gap. `str.parse_int` existed and `str.parse_float`
 did not, so a number could be written and not read back. It is one builtin row
-over Rust's own correctly-rounded parser — the one place where reimplementing
+over Rust's own correctly-rounded parser - the one place where reimplementing
 in W# would have been worse rather than more honest, since there is exactly one
 right answer per decimal and getting it is a hard numerical problem.
 
@@ -1784,7 +1785,7 @@ H(dir) = SHA-256 over each entry, sorted by name as bytes:
 ```
 
 Sorted, because a filesystem's own order is neither sorted nor the same on two
-machines — so the sort is half of the hash's definition and lives beside it
+machines - so the sort is half of the hash's definition and lives beside it
 rather than in `std/array`. The size written out, so that two files cannot run
 together into one. A subtree folded to its own digest, so a deep tree costs no
 more memory than a shallow one. Permissions and timestamps deliberately absent:
@@ -1798,7 +1799,7 @@ both win the race are both right, since the contents are what the name says.
 
 The bug worth recording is the one this item predicted in advance. `install`
 first asked whether the target *directory existed*, which is not the same
-question as whether the entry is what it claims to be — so on a store somebody
+question as whether the entry is what it claims to be - so on a store somebody
 had edited, `install` reported success and changed nothing, and `verify` went
 on saying `damaged` for ever. Testing with `check` rather than with `is_dir` is
 the fix, and telling "not installed" from "damaged" is precisely what this item
@@ -1806,8 +1807,8 @@ said was the feature rather than the polish.
 
 **`verify` answers with its exit status**: `0` ready, `1` needs installing, `2`
 needs resolving, `3` broken. A path dependency edited after it was resolved is
-none of missing, damaged or fine — the store holds exactly what it was told to
-and it is the *lockfile* that is out of date — so it is `2`, and the row says
+none of missing, damaged or fine - the store holds exactly what it was told to
+and it is the *lockfile* that is out of date - so it is `2`, and the row says
 `changed`. The lockfile records the manifest's **digest** rather than its
 modification time, for the reason stage one dropped `stat`: a checkout does not
 preserve timestamps and two machines do not agree about them.
@@ -1826,7 +1827,7 @@ edit, and it is the honest one.
 **The tool is two hundred lines of Rust over a W# program.** `ingot/main.ws`
 holds every verb and reads its own command line through `os.args()`; the driver
 publishes the arguments and runs it. Two things stay the driver's, and both for
-the same reason — they *are* the compiler, which a W# program has no way to ask
+the same reason - they *are* the compiler, which a W# program has no way to ask
 for: `ingot run <file.ws>`, and `--gc-stress`. `-C <dir>` is the driver's too,
 since a process has one working directory. It is a seam rather than a split:
 the verb list a user sees is one list, and the W# half prints it.
@@ -1834,7 +1835,7 @@ the verb list a user sees is one list, and the W# half prints it.
 #### A library module is read only if something imports it
 
 Not planned, and the largest single effect of this stage. Every `.ws` module in
-the library was parsed and inferred for every program — free at four files, and
+the library was parsed and inferred for every program - free at four files, and
 by twenty-five it was most of what compiling a ten-line program did.
 `load::add_library` now follows the root's imports and reads only what they
 reach; `@import("std")` still means all of `std/`, because a module path is a
@@ -1845,7 +1846,7 @@ examples/fib.ws` went from 0.62 seconds to 0.005, and the whole case suite from
 That is also what made `ingot/` a library namespace beside `std/` rather than a
 table the `ingot` binary passes in. Calling PubGrub and a packfile reader
 "standard library" would be a promise this project does not intend to make, and
-a namespace of its own says what they are — while `@import("ingot/store")`
+a namespace of its own says what they are - while `@import("ingot/store")`
 working under plain `wsharp` is what lets `tests/cases/` test them the way it
 tests everything else, including the second pass under `--gc-stress`.
 
@@ -1853,13 +1854,13 @@ The consequence to remember is the other side of the same coin: **a library
 module nothing imports is never checked.** A new one needs a case that imports
 it, or it is not compiled at all.
 
-### Stage three — the resolver that explains itself — **done**
+### Stage three - the resolver that explains itself - **done**
 
 | Piece | Where |
 |---|---|
 | Semantic versions, and sets of them as unions of intervals | `ingot/semver.ws` |
 | PubGrub: terms, incompatibilities, unit propagation, conflict resolution | `ingot/pubgrub.ws` |
-| The report: a walk of the derivation graph | same — `explain` |
+| The report: a walk of the derivation graph | same - `explain` |
 | The manifest graph, and the provider over it | `ingot/plan.ws` |
 | A bug in the collector that this was the first program to reach | `mark.rs`, `gc.rs` |
 
@@ -1897,7 +1898,7 @@ cannot yet fetch one" instead, which is the thing stage four will change.
 carry inclusivity. Both halves of that are forced:
 
 - **Intervals rather than a predicate**, because the solver takes *complements*
-  constantly -- `not foo ^1.0.0` is a term it derives and reasons about -- and
+  constantly - `not foo ^1.0.0` is a term it derives and reasons about - and
   a predicate cannot be complemented into something you can then ask for the
   best version of.
 - **Inclusive or exclusive ends rather than half-open**, because a half-open
@@ -1922,7 +1923,7 @@ the search stopped learning and ran until it hit its own step limit.
 
 - **An incompatibility must merge terms about the same package.** Resolution
   routinely produces a pair like `{not foo ^1.0.0, foo 2.0.0}`, which merged is
-  `{foo 2.0.0}` -- the clause that actually rules something out, and the one
+  `{foo 2.0.0}` - the clause that actually rules something out, and the one
   the terminal test can recognise. Left unmerged, the two are asked about the
   same package independently and nothing is learned.
 - **The difference taken during resolution is `satisfier ∖ term`**, not the
@@ -1932,8 +1933,8 @@ the search stopped learning and ran until it hit its own step limit.
   negative term as the complement of its range makes three of the four
   relation cases fall out of set arithmetic, and breaks the fourth: "foo is not
   in A" is satisfied by foo being *absent altogether*, which no set of versions
-  says. Under that representation `not foo any-version` -- which is what every
-  dependency starts life as -- allows the empty set and so looks like a term
+  says. Under that representation `not foo any-version` - which is what every
+  dependency starts life as - allows the empty set and so looks like a term
   that can never hold, and the solver decides nothing at all. `relates` has
   four cases for that reason.
 
@@ -1947,10 +1948,10 @@ layout. It showed up as a misaligned pointer dereference inside `header.rs`,
 which is a long way from the cause.
 
 The cause is a one-pause window. The evacuation pause reads two lists recorded
-during the *mark* -- the slots the marker saw pointing into a block being
+during the *mark* - the slots the marker saw pointing into a block being
 emptied, and the objects the trace touched afterwards. Counting's frees were
 deferred through the mark, as they must be, and then run at the pause that
-*finishes* marking -- which is one pause too early. `finish_marking` now arms
+*finishes* marking - which is one pause too early. `finish_marking` now arms
 `evacuating` before it settles the counts, and `defer_frees` asks
 `tracing() || evacuating()`, so the frees wait for the trace's last pause
 rather than its second. `fix_references` visiting `deferred_dead` is what that
@@ -1965,17 +1966,17 @@ keeps logging. With the fix backed out, that case trips the assertion about two
 runs in five; with it, six runs in six are clean, and the case reports 21
 traces and a thousand objects moved, which is the number to look at.
 
-### Stage four — git, spoken rather than shelled out to — **done**
+### Stage four - git, spoken rather than shelled out to - **done**
 
 | Piece | Where |
 |---|---|
 | SHA-1, because git names every object by one | `std/hash.ws` |
 | DEFLATE and the zlib wrapper, as a cursor | `std/inflate.ws` |
-| Headers of a caller's own on an HTTP request | `std/http.ws` — `send_request_with`, `request_headers` |
+| Headers of a caller's own on an HTTP request | `std/http.ws` - `send_request_with`, `request_headers` |
 | pkt-line framing and side bands | `ingot/pktline.ws` |
 | A packfile, with both delta kinds resolved | `ingot/packfile.ws` |
 | Smart HTTP v2: discovery, `ls-refs`, `fetch` | `ingot/git.ws` |
-| A fetched tree becoming a store entry | `ingot/store.ws` — `install_files`, `remember` |
+| A fetched tree becoming a store entry | `ingot/store.ws` - `install_files`, `remember` |
 | A git dependency being resolved and installed | `ingot/plan.ws` |
 | A second bug in the collector | `evacuate.rs` |
 
@@ -1983,7 +1984,7 @@ traces and a thousand objects moved, which is the number to look at.
 `ingot resolve` fetches it, reads its manifest, folds it into the search, and
 records the tree's digest in the lockfile. Fetching happens at *resolve* rather
 than at install, because resolving needs the dependency's own manifest before
-it can choose anything -- and it is remembered under `~/.wsharp/git/`, since a
+it can choose anything - and it is remembered under `~/.wsharp/git/`, since a
 revision names one tree for ever and the second resolve of a project should
 touch no network at all.
 
@@ -1995,8 +1996,8 @@ packfile is a concatenation of zlib streams with nothing between them, so only
 the decompressor knows where one ends. A `decompress(bytes) -> bytes` would
 have been the obvious thing to write and useless for the one caller there is.
 
-The decoder is Mark Adler's `puff` in outline -- canonical Huffman from a table
-of counts and a table of symbols rather than from a tree -- and the tables live
+The decoder is Mark Adler's `puff` in outline - canonical Huffman from a table
+of counts and a table of symbols rather than from a tree - and the tables live
 in the reader rather than in a block, because a block that allocated would be a
 collection per block under `--gc-stress`. It costs nothing measurable: the case
 runs in a fifth of a second under stress.
@@ -2013,7 +2014,7 @@ There is no `crc32` and no gzip wrapper, for the reason `std/der` has no writer.
 - **A copy instruction with a size of zero means 65536.** Zero would be a copy
   of nothing, which no encoder writes, so the value was given a use.
 - **A back reference whose distance is shorter than its length is how a run is
-  encoded**, so the copy is byte at a time and not a block move -- the bytes
+  encoded**, so the copy is byte at a time and not a block move - the bytes
   being read are partly the bytes being written.
 
 #### `ERR` is not a side band
@@ -2026,8 +2027,8 @@ does not have, which is the only way it would have been found.
 
 #### Tested against a real server, without a network
 
-The rule item 10 set -- a protocol is tested three ways, because a transcript
-can only do two of them -- applies here with one improvement available. Git's
+The rule item 10 set - a protocol is tested three ways, because a transcript
+can only do two of them - applies here with one improvement available. Git's
 HTTP endpoint is `git upload-pack --stateless-rpc` behind a thin proxy, and
 that command can be run directly. So:
 
@@ -2041,8 +2042,8 @@ server's willingness to answer is the assertion. The case then checks that the
 client still writes those bytes, so a change to the request is a failure rather
 than a silent divergence.
 
-The packfiles are what `git repack` actually wrote -- one with offset deltas,
-one with reference deltas, both holding a chain of length two -- and what comes
+The packfiles are what `git repack` actually wrote - one with offset deltas,
+one with reference deltas, both holding a chain of length two - and what comes
 out is checked against the object ids git itself assigned. An id is a SHA-1
 over the whole object, so a delta applied one byte wrongly is a different id.
 
@@ -2052,7 +2053,7 @@ What is **not** tested is a fetch over a real network, for the reason
 #### And a second bug in the collector, in the same pause as the first
 
 Stage three found the evacuation pause reading objects that had been *freed*.
-This stage found it reading objects that had been **forwarded** -- and the two
+This stage found it reading objects that had been **forwarded** - and the two
 are different mistakes with the same symptom.
 
 `evacuate::fix_fields` read an object's type id and walked the fields that type
@@ -2061,9 +2062,9 @@ while the program runs, and a forwarded header is an *address*: its low
 thirty-two bits are part of a pointer, which can perfectly well name a real
 type id. The pause then walked a stranger's bytes with somebody else's layout.
 
-The rule was already written down -- *"a forwarded header is an address, not
+The rule was already written down - *"a forwarded header is an address, not
 flags; anything that reads a flag, a count, a size or a type id from an object
-in a block being emptied must test forwarding first"* -- and named the three
+in a block being emptied must test forwarding first"* - and named the three
 places that follow it. `fix_fields` was the fourth and did not. It now returns
 straight away: the copy is on the same list, and the copy is what needs fixing.
 
@@ -2079,23 +2080,23 @@ what that is: `ingot/git` reaches `std/tls`, which reaches `std/x509`,
 `std/nistec`, `std/rsa` and the rest. A release build starts in about half a
 second and a debug build in three and a half. Lazy loading is what keeps that
 from being every *program's* problem, but `ingot`'s own verbs genuinely reach
-all of it, and the fix -- if it is worth one -- is caching a compiled program
+all of it, and the fix - if it is worth one - is caching a compiled program
 rather than loading less.
 
-### Stage five — the import that reaches a package — **done**
+### Stage five - the import that reaches a package - **done**
 
 | Piece | Where |
 |---|---|
 | `os.cwd`, on three arms | `sys/{mod,linux,bsd,windows}.rs`, `os.rs`, `std/os.ws` |
-| `ingot.env`: where each package's files are on *this* machine | `ingot/manifest.ws` — `Installed`, `write_env` |
+| `ingot.env`: where each package's files are on *this* machine | `ingot/manifest.ws` - `Installed`, `write_env` |
 | `install` writing one, `verify` noticing it is missing | `ingot/main.ws` |
-| The loader's third rule, and the scope check | `wsharp-cli/src/load.rs` — `Packages`, `follow_package` |
-| Re-export: `pub const parse = reader.parse;` | `wsharp-sema/src/infer.rs` — `alias_reexported_{types,values}` |
+| The loader's third rule, and the scope check | `wsharp-cli/src/load.rs` - `Packages`, `follow_package` |
+| Re-export: `pub const parse = reader.parse;` | `wsharp-sema/src/infer.rs` - `alias_reexported_{types,values}` |
 | A bug in `store.register` that made every project one environment | `ingot/main.ws` |
-| A bug in the `for` protocol's dependency edges | `infer.rs` — `infer_all` |
+| A bug in the `for` protocol's dependency edges | `infer.rs` - `infer_all` |
 
 `ingot.toml` can say `util = { path = "../util" }`, and `@import("util")` now
-compiles -- under `ingot run` and under plain `wsharp run` alike, because
+compiles - under `ingot run` and under plain `wsharp run` alike, because
 nothing about finding a package needs the tool.
 
 #### The loader hook really was one branch
@@ -2109,7 +2110,7 @@ of a package are two directories, so they are two modules, exactly as predicted.
 
 What was not free is the *input*. The loader is Rust; `std/toml` and
 `ingot/manifest` are W#. Reading the lockfile in the compiler would mean a
-second TOML implementation kept in step with the first for ever -- and it would
+second TOML implementation kept in step with the first for ever - and it would
 have to be a whole one, because a package's own `ingot.toml` is a file a person
 wrote. So `ingot install` writes **`ingot.env`** beside the lockfile: one line
 per package, tab-separated, absolute.
@@ -2119,7 +2120,7 @@ myapp	/home/u/work/app	src/myapp.ws	util
 util	/home/u/.wsharp/store/sha256/c14b…	src/util.ws
 ```
 
-Name, directory, facade, and then one field per dependency -- the fourth field
+Name, directory, facade, and then one field per dependency - the fourth field
 onwards rather than a list inside one, so the file has exactly one separator and
 a package name is whatever a name is. It is derived, machine-local and
 regenerable, which is what lets "unreadable" and "from a newer ingot" have the
@@ -2132,7 +2133,7 @@ one, and a program that is not in a project pays one directory walk for that.
 
 **`resolve` removes it**, which is the one thing about this file that is not
 obvious. A new resolution names new store entries, and the *old* ones are still
-there holding exactly what they always did -- so an environment left behind
+there holding exactly what they always did - so an environment left behind
 would build the previous version of a dependency and say nothing at all, which
 is the worst way for a package manager to be wrong. `add` and `remove` leave it,
 because the environment they leave is still a true statement about what was
@@ -2144,7 +2145,7 @@ The lockfile is the whole graph's, because the solver chooses one version of a
 package for the *project*. What a package may **name** is narrower: what its own
 manifest asked for. Without that rule `ingot.env` would make every package
 reachable from every other, and a manifest would describe what gets fetched
-rather than what may be written down -- a dependency you never declared would
+rather than what may be written down - a dependency you never declared would
 work until the day something else stopped depending on it.
 
 The check needs to know which package a file is *in*, which is the entry whose
@@ -2153,8 +2154,8 @@ directory is the longest prefix of it. Longest rather than first, because
 
 #### Re-export is two keys in tables that already existed
 
-A package presents one file. That was the design before this stage -- the
-manifest has had a `root` since stage two -- and it is why the item said a
+A package presents one file. That was the design before this stage - the
+manifest has had a `root` since stage two - and it is why the item said a
 facade needs re-export: `const x = @import("./inner.ws");` binds a *module*, and
 a module cannot be reached through.
 
@@ -2186,8 +2187,8 @@ cycle among re-exports is a cycle among *imports*, and the loader has already
 refused to read the second file.
 
 **A facade states its surface, name by name.** That is the same rule `pub`
-already set -- a module's surface is something it says rather than something it
-leaks -- and it is why the alternative was not taken. Making
+already set - a module's surface is something it says rather than something it
+leaks - and it is why the alternative was not taken. Making
 `pub const inner = @import("./inside.ws");` reachable through would have been
 smaller, and it would mean every user of a package had to know the names of the
 files inside it, which is exactly what a facade exists to stop.
@@ -2196,17 +2197,17 @@ files inside it, which is exactly what a facade exists to stop.
 
 **Every project on a machine was the same environment.** `store.register` names
 an environment by the hash of its lockfile's path, and it was being handed the
-bare relative `"ingot.lock"` -- so the hash was the same for every project,
+bare relative `"ingot.lock"` - so the hash was the same for every project,
 `install` in one silently unregistered another, and the next `ingot gc` deleted
 that project's store entries. The verb tests could not see it because each of
 them gets a `WSHARP_HOME` of its own; two projects in one store is the smallest
 thing that shows it, and is now a test. The fix wanted the project's absolute
-directory, which W# could not ask for -- so `os.cwd` is in this stage, and
+directory, which W# could not ask for - so `os.cwd` is in this stage, and
 `ingot.env` needed it anyway.
 
 **A `for` over a type from two modules away did not compile.** The `for`
 protocol resolves `iter` and `next` in the module that declares the subject's
-type, which inference has not run yet to know -- so the dependency graph
+type, which inference has not run yet to know - so the dependency graph
 over-approximates and made every `iter` and `next` *this module can see* a
 dependency. "Can see" was the bug: a subject's type can come from a module the
 program never named, through a function that forwards it and, now, through a
@@ -2228,7 +2229,7 @@ imported it directly".
 
 The four stages above built everything a registry needs and no registry. A
 version dependency parsed, walked the graph, and was refused by one line saying
-`ingot cannot yet fetch one` -- which was the honest thing to say and the thing
+`ingot cannot yet fetch one` - which was the honest thing to say and the thing
 this stage deletes.
 
 The registry is **Foundry**, a git repository beside this one, in the shape of
@@ -2240,7 +2241,7 @@ Four decisions are the whole of it.
 
 **An index rather than a protocol.** A resolver has to know what versions exist
 before it can choose between them, and asking a git host that one package at a
-time is not a conversation a solver can hold -- `pubgrub.Provider`'s two
+time is not a conversation a solver can hold - `pubgrub.Provider`'s two
 closures may not fail and may not block. So the answer is published as data and
 read as a file, and the reachable subgraph is materialised before the solve, in
 exactly the shape `plan.discover` already used for path dependencies. The
@@ -2249,21 +2250,21 @@ provider stayed total; nothing about the solver changed.
 **A release records its tree hash.** This is the one that pays for itself twice.
 A *git* dependency has to be fetched during `resolve`, because only the fetched
 tree holds the manifest saying what it depends on; a registry entry already is
-that manifest data, and it carries `tree = "sha256:…"` -- the store's own key.
+that manifest data, and it carries `tree = "sha256:…"` - the store's own key.
 So resolving a registry graph fetches nothing at all, and `install`'s existing
 refusal of a tree whose digest is not the one the lockfile named
 (`main.ws`, "has changed since it was resolved") becomes an integrity check for
 free. The client ends up trusting a hash rather than a host. What makes the
 hash worth trusting is the registry's CI, which fetches every entry a pull
-request adds and hashes it before merging -- and that validator is a W# program
+request adds and hashes it before merging - and that validator is a W# program
 importing `ingot/registry`, so the format has one implementation and the thing
 enforcing it is the thing reading it.
 
 **A registry is a directory.** Fetching one over git is only how the directory
 arrives. `INGOT_REGISTRY` naming a directory is used where it lies, with no
-certificate store read and no socket opened. That was written for testability --
+certificate store read and no socket opened. That was written for testability -
 the git client speaks HTTP and no case in this suite may stand up a server, so
-without it none of this could be tested here at all -- and it turned out to be
+without it none of this could be tested here at all - and it turned out to be
 the definition of a private registry and an offline one as well. The lesson is
 the one `std/tls` and `ingot/git` already taught: separate the bytes from the
 transport and the bytes become testable.
@@ -2271,7 +2272,7 @@ transport and the bytes become testable.
 **A path or git dependency overrides the registry.** A name the graph already
 supplies from a directory is not looked up, because offering the solver
 published versions of a package somebody is editing beside their project lets it
-choose one -- which is not what a checkout beside your project means.
+choose one - which is not what a checkout beside your project means.
 
 Two smaller things fell out. `git.discover` and `ls_refs_request` had been
 written, tested against a real `git upload-pack` and called from nowhere since
@@ -2281,8 +2282,8 @@ never moves, so turning that branch into an object id is their first caller, and
 that an index is a store entry reached by a pointer file rather than by a
 lockfile, or the first collection after an update would delete the registry.
 
-The bug worth recording: `registry.package` answers null two ways -- "not in
-this registry", with no fault, and "here and unreadable", with one -- and two of
+The bug worth recording: `registry.package` answers null two ways - "not in
+this registry", with no fault, and "here and unreadable", with one - and two of
 the three callers tested `!f.ok` where they meant `f.ok`. Since `fault.fail`
 keeps the *first* failure, the effect was not a wrong message but no message at
 all: `ingot add acme/nope` exited 4 in silence. An optional that means two
@@ -2296,7 +2297,7 @@ having said so in the doc comment before writing them.
   always had, and the right trade until a registry is large enough to notice.
 - **A registry entry is verified by its publisher's CI, and by nobody else
   afterwards.** `install` checks the fetched tree against the hash the lockfile
-  names, which is the hash the registry gave — so a registry that lied at merge
+  names, which is the hash the registry gave - so a registry that lied at merge
   time is believed. The check that closes that is a signature, and a signature
   needs somebody to hold a key.
 - **`struct : pkg.Base` is not spellable.** A supertype is an `Ident` rather
@@ -2333,8 +2334,8 @@ package manager* rather than about Julia:
   because something else was fetched. `ingot add` records an
   intent, `resolve` chooses versions, `install` makes the store satisfy the
   lockfile, and `build` is a thing you asked for.
-- **`verify` answers with its exit status** -- ready, needs installing, needs
-  resolving, broken -- so a CI script can ask without parsing anything.
+- **`verify` answers with its exit status** - ready, needs installing, needs
+  resolving, broken - so a CI script can ask without parsing anything.
 - **Output is tab-separated**, so a shell can cut it up.
 - **`why` prints the dependency paths that explain an entry**, because "what
   pulled this in" is the question a lockfile never answers on its own.
@@ -2361,19 +2362,19 @@ package manager* rather than about Julia:
 - ~~**A loader that can resolve a package path**~~ Done in stage five, and it
   really was one branch. What it needed that this did not foresee is an *input*
   the loader can read without a TOML parser of its own, which is `ingot.env`.
-- ~~**Re-export**~~ Done in stage five, as `pub const x = other.x;` -- no new
+- ~~**Re-export**~~ Done in stage five, as `pub const x = other.x;` - no new
   syntax, and two more keys in tables that already existed.
 
 ### Decisions worth recording in advance
 
 - **The loader hook is one branch.** `Loader::follow` in
-  `crates/wsharp-cli/src/load.rs` has exactly two rules today -- a `std` path
+  `crates/wsharp-cli/src/load.rs` has exactly two rules today - a `std` path
   stands for itself, anything else is relative to the importing file. A package
   path is a third, and *nothing downstream changes*: a module's identity is
   already its canonical path, so sema, code generation and the parser need no
   edit at all. That is the single most encouraging fact about this item.
 - **Two versions of a package are two modules.** They live at different paths,
-  so they are distinct modules with distinct nominal struct types -- which is
+  so they are distinct modules with distinct nominal struct types - which is
   almost certainly right, and which will produce a type error saying two
   identically-named types do not match, with nothing to say why. The diagnostic
   is the work, not the semantics.
@@ -2390,7 +2391,7 @@ package manager* rather than about Julia:
   answerable from the CLI rather than assumed.
 - **Written in W#**, which is the point rather than a flourish: a resolver, a
   hash, a protocol and a file format is a broad enough program to find out
-  what the language is actually missing -- and every gap it finds is one a user
+  what the language is actually missing - and every gap it finds is one a user
   would have found instead.
 
 Kept as written, because they were right. The loader hook was one branch and
@@ -2398,7 +2399,7 @@ nothing downstream changed; two versions of a package are two modules and the
 diagnostic is indeed the work; re-export was the one thing the type checker
 needed, and deciding it early is what kept it to two keys in existing tables.
 The last one is the one to take from this item: **every gap it found is one a
-user would have found instead** -- and the gaps were not the ones a package
+user would have found instead** - and the gaps were not the ones a package
 manager suggests. They were `os.cwd`, a lockfile path that was relative, and a
 dependency edge for `for` that assumed you had imported the iterable yourself.
 
@@ -2408,20 +2409,20 @@ A package manager is judged on the day it goes wrong, which means the work is
 mostly in the failure paths: a half-written store, an interrupted fetch, a
 lockfile from a newer version, two packages that cannot agree. W# has no
 `defer`, and item 8 already left a socket leaking on an error path because of
-it -- a store is where that stops being cosmetic. Atomic rename, a temporary
+it - a store is where that stops being cosmetic. Atomic rename, a temporary
 directory per fetch, and a `verify` that can tell "not installed" from "damaged"
 are not polish here; they are the feature.
 
 ---
 
-## 12. Ahead-of-time compilation — **done**
+## 12. Ahead-of-time compilation - **done**
 
 Every item before this produced a program that ran *inside the compiler*. That
 is the right shape for testing a language and the wrong one for using it: a
 user could not hand anybody a binary, every run paid for parsing, inference,
 monomorphisation and code generation, and a machine that ran a W# program
 needed the whole of Cranelift on it. `wsharp build` is the answer, and
-`ingot` -- which had a Rust driver for exactly this reason -- is what proves it.
+`ingot` - which had a Rust driver for exactly this reason - is what proves it.
 
 | Stage | What it is | State |
 |---|---|---|
@@ -2436,18 +2437,18 @@ needed the whole of Cranelift on it. `wsharp build` is the answer, and
 
 Not code generation. Cranelift emits an object file about as readily as it
 fills memory, and `cranelift-object` is the same `Module` trait `cranelift-jit`
-implements -- stage one is a type parameter and five signatures. What was in
+implements - stage one is a type parameter and five signatures. What was in
 the way is everything the JIT never had to say out loud, because the compiler
 and the program were the same process:
 
 - **Nothing had a linker name.** There was not one `#[no_mangle]` in the
   workspace. The JIT takes the *address* of each runtime function and invents
-  the string name on the spot, so `std/str.len` was a fine symbol -- it only
+  the string name on the spot, so `std/str.len` was a fine symbol - it only
   ever had to be a `HashMap` key. Ninety-five entry points needed real names,
   and a `link:` beside each `ptr:` so the two backends cannot disagree.
 - **Two addresses were compiled into the code.** The poll flag and the
   evacuating flag are read by generated code directly, and their addresses were
-  `iconst`s -- correct in a JIT, and a wild pointer in a file another process
+  `iconst`s - correct in a JIT, and a wild pointer in a file another process
   will load. They are exported statics now, declared as imported data and
   reached with `symbol_value`, exactly as a string literal is.
 - **Three tables were handed over by calling a function.** The type registry,
@@ -2460,7 +2461,7 @@ and the program were the same process:
 
 `R_X86_64_GOTPCREL`. Declaring the flags as imported data under `is_pic=true`
 emits a GOT reference, which would put an extra dependent load in front of
-*every heap reference the program loads* -- the hottest path in the language.
+*every heap reference the program loads* - the hottest path in the language.
 The linker relaxes it to a RIP-relative `lea`, because the flag is in the same
 static link unit, and the linked binary has no GOT relocation for it at all.
 Worth knowing that the check is on the executable and not on the object: the
@@ -2469,7 +2470,7 @@ object always shows the GOT form.
 ### What it costs
 
 An installation is a *directory* now. `wsharp build` links, so it needs a C
-compiler and something to link against -- `libwsharp_start.a`, which is
+compiler and something to link against - `libwsharp_start.a`, which is
 `wsharp-runtime` bundled with the `main` a compiled program starts in. The
 standard library is still `include_str!`'d into the compiler, so the only thing
 that grew is a `lib/` beside the binary. A missing `cc` is a user-facing
@@ -2484,7 +2485,7 @@ message. It was a segfault under the JIT too.
 ### Why `ingot` is the test
 
 Its Rust driver did three things a W# program could not: `-C`, `--gc-stress`,
-and `run`. Two were easy -- `os.chdir`, and a flag that only ever belonged to
+and `run`. Two were easy - `os.chdir`, and a flag that only ever belonged to
 whatever was being run. The third was the interesting one, because `ingot run`
 compiles a program and a W# program has no compiler in it. Embedding one would
 have meant linking Cranelift into the package manager; the answer is that it
@@ -2504,7 +2505,7 @@ which is what says the stack maps survived being written to a file.
 
 ---
 
-## 13. The edge cases a real program found — **done**
+## 13. The edge cases a real program found - **done**
 
 Two lists had accumulated. One was the "Smaller follow-ups" section below, which
 opens by calling each item a deliberate limitation with a clear fix. The other
@@ -2524,7 +2525,7 @@ that one candidate cannot pin an argument for the next. That rollback also undid
 the bindings that tell a *generic* candidate which type it is being called at,
 and nothing put them back: the only re-binding afterwards covered arguments that
 still had variables in them, and abstract parameters. A candidate generic in a
-structural position -- `fn next[T](it: Iter[T]) ?T` -- called with a perfectly
+structural position - `fn next[T](it: Iter[T]) ?T` - called with a perfectly
 concrete `Iter[Row]` therefore answered `?T` with `T` open.
 
 `for` over anything that is not an array walks straight into that. It desugars
@@ -2536,7 +2537,7 @@ the second is the bad one:
   end that it could not tell which type the field belonged to.
 - `render(v)` re-entered `dispatched_call` with an open argument. `overlap`
   tests applicability with `try_unify`, which *always* succeeds against a
-  variable, so every candidate came back "applies, no test needed" -- and a
+  variable, so every candidate came back "applies, no test needed" - and a
   most-specific case needing no test is compiled as a static call. Three
   subtypes held at their supertype all printed what the most specific overload
   said.
@@ -2547,7 +2548,7 @@ the other end. A struct has nothing that does. `for_list_structs.ws` is the case
 that fails both ways without the fix.
 
 The fix is two changes in `dispatched_call`. Where an argument is already
-concrete, unify it into each surviving candidate's parameter -- safe precisely
+concrete, unify it into each surviving candidate's parameter - safe precisely
 because a concrete argument has no variables of the caller's to bind, so the
 only ones such a unification can reach are the candidate's own. And then, once
 the open arguments have been settled by the join coercion below it, ask `overlap`
@@ -2557,7 +2558,7 @@ has to choose at run time is not compiled as though it did not.
 ### Coercion composes
 
 W# widened a subtype into its supertype, and wrapped a value into a `?T` or an
-`!T`, and did not do both -- so `return Sub{ .. };` from a function returning
+`!T`, and did not do both - so `return Sub{ .. };` from a function returning
 `!Base` was a type error, and the spelling was an annotated binding per
 conversion. `std/x509.parse_spki` has three, `std/toml` has seven, and the
 driver had eleven.
@@ -2566,7 +2567,7 @@ Two wraps did not compose either, which is what made `!?T` unwritable: it parses
 and `Row` could not reach it.
 
 `coerce` is now a reporting wrapper around a `try_coerce` that may fail, and the
-wrapping step recurses through it -- so `Sub` reaches `!Base` by widening and
+wrapping step recurses through it - so `Sub` reaches `!Base` by widening and
 then wrapping, and `Row` reaches `!?Row` by wrapping twice. A failed attempt
 rolls back both the bindings and the constraints it made, so the diagnostic the
 outermost call reports is still about the type the caller actually wrote.
@@ -2582,7 +2583,7 @@ A return over the limit is written through a pointer the caller passes, placed
 immediately after the environment so that `env` stays `params[0]` everywhere.
 An ordinary parameter rather than Cranelift's `StructReturn`: W# owns both sides
 of every call, and this keeps the convention ours. All three call paths had to
-agree -- a static call, an indirect one through a closure, and a dispatched one,
+agree - a static call, an indirect one through a closure, and a dispatched one,
 where every case writes *one* shared area and the join block carries nothing.
 
 The area is not a root and does not need to be. The callee writes it in the
@@ -2596,20 +2597,20 @@ answering a `#[repr(C)]` pair, which is where the shape came from.
 **A supertype is a type expression.** `StructDecl::parent` was an `Ident`, which
 made it the one position in the language where a type could not be reached
 through the module that declares it. Aliasing already runs before parents do, so
-a facade's name for a type works as well as the original -- `struct Sub :
+a facade's name for a type works as well as the original - `struct Sub :
 pkg.Base` and `struct Sub : inner.Base` name one `StructId` and produce siblings
 rather than two lattices.
 
 **An integer literal may be an `f64`.** A literal takes the type its context
 asks for, and `f64` did not count as asking. It does now, and the node becomes a
-float literal at monomorphisation, which is where the type is finally settled --
+float literal at monomorphisation, which is where the type is finally settled -
 so a body annotated `Number` may hold one and be compiled at `f64` and at `i64`
 both. Only for a value the `f64` *is*: above 2^53 the integers are no longer all
 representable, and the check is the round trip rather than a range, because
 rounding a written constant silently is not a thing to do.
 
 **`%` on `f64`.** Cranelift has no float remainder, so it is a call to the
-runtime -- the shape `str ==` already had. Not `l - trunc(l / r) * r`, which is
+runtime - the shape `str ==` already had. Not `l - trunc(l / r) * r`, which is
 the obvious inline form and is wrong: `l / r` rounds, so a large quotient loses
 the low bits the answer is made of. `10000000000000000.0 % 3.0` is 1.0 and the
 inline form says 0.0, which is the case in `floats_rem.ws`. `Need::Integer` is
@@ -2629,7 +2630,7 @@ check is one *unsigned* compare.
 
 **`g[i][j] = v`.** The base of a place is evaluated once into a hidden local, so
 a compound assignment can read the place and write it back without the base
-appearing twice -- which is the thing the old restriction was standing in for.
+appearing twice - which is the thing the old restriction was standing in for.
 `nested_assign.ws` puts a side effect in the base and counts it.
 
 **Re-raising a caught error.** `catch |e|` bound the error and there was nowhere
@@ -2655,8 +2656,8 @@ stays a clash and has a case saying so.
 converts a value and rounds to say it; these answer what the value is made of,
 which is the only question an IEEE-754 codec can use, because a wire format
 carries the eight bytes and not the number. The driver had ninety lines of exact
-arithmetic standing in for them -- with a screen of proof about why halving and
-doubling stays exact into the subnormal range -- and its transcribed bit patterns
+arithmetic standing in for them - with a screen of proof about why halving and
+doubling stays exact into the subnormal range - and its transcribed bit patterns
 now check the builtin instead.
 
 ### What it cost, and what checked it
@@ -2664,7 +2665,7 @@ now check the builtin instead.
 No new pass and no new stage: one new HIR node (`Raise`), one new abstract type,
 three new builtin rows, one new runtime entry point, and a return convention
 that only exists above two slots. Twelve new cases in `tests/cases/`, three
-error cases, three module fixtures, and two retired -- `err_float_rem.ws` and
+error cases, three module fixtures, and two retired - `err_float_rem.ws` and
 `err_rem_on_number.ws` described rules that are no longer true.
 
 The driver is the other half of the check, because it is what found six of these.
@@ -2675,15 +2676,15 @@ the page of IEEE-754 vectors now pointed at the new builtin.
 
 ---
 
-## 14. Standard library improvements — **done**
+## 14. Standard library improvements - **done**
 
 Item 13 came out of writing a program *against* the language. This one came out
 of writing a **design** against it: Raython, an MVC framework, whose author
 settled every "can W# do this?" by running the compiler rather than from memory
 and left 28 probes behind as the record. Its repository is private, so nothing
-below can be followed to a source -- what is quoted is quoted, and every claim
+below can be followed to a source - what is quoted is quoted, and every claim
 about the compiler that it turned on is a case in `tests/cases/` now. Its design
-document ends with a section called "What Raython would like from W#" — nine
+document ends with a section called "What Raython would like from W#" - nine
 things in the order the pain was felt, and one thing that was a bug.
 
 The value of that list is that nothing on it is speculative. Each item is
@@ -2702,12 +2703,12 @@ fn main() i64 { const small: u8 = 7; print_int(twice(small)); return 0; }
 its own.
 
 A parameter annotated with an abstract type is a fresh type variable carrying
-`Constraint::Member` — a *constrained generic*, which is what lets one body be
+`Constraint::Member` - a *constrained generic*, which is what lets one body be
 compiled at each member the caller picks. `infer_convert` had a line reading "an
 unannotated argument would otherwise stay a variable for ever: nothing
 downstream of a conversion says anything about what went in", and it unified the
 operand with `i64`. Every other defaulting site in `infer.rs` guards against
-exactly that — `settle_literal_operand` says so in a comment — and this was the
+exactly that - `settle_literal_operand` says so in a comment - and this was the
 one that did not. So `twice` became monomorphic `fn(i64) i64` while its
 declaration still said `Integer`.
 
@@ -2716,7 +2717,7 @@ i64`. With two it got past inference entirely, because `overlap`'s abstract
 branch keeps a candidate on the strength of the *declared* type and then wrote
 `let _ = self.store.try_unify(arg, param);`. `Some(None)` means "this case
 always applies, no runtime test needed", which `dispatched_call` compiles as a
-**static** call — so a `u8` was handed to a body Cranelift had compiled for an
+**static** call - so a `u8` was handed to a body Cranelift had compiled for an
 `i64`.
 
 Both are fixed. The conversion records a `Numeric` constraint rather than
@@ -2733,14 +2734,14 @@ where one over `Integer` was the obvious thing to write.
 
 | | What was asked for | What it is now |
 |---|---|---|
-| 1 | a stable machine-readable emit — the CLI read `--emit=ast`, "a debugging aid, not a documented interface" | `--emit=api`: versioned, printed after type checking, every program-defined name absolute, with a golden test pinning the format |
-| 2 | a modification time in `std/fs` — "without mtime the dev watcher hashes files" | `fs.modified_at`, by `statx` on Linux, `getattrlist` on macOS and a field Windows was already fetching; `struct stat` meets this runtime in one arm and four systems, written up in `CLAUDE.md` |
-| 3 | a hash map in `std` — "association lists are right for headers and wrong for a prepared-statement cache" | `std/map`, open addressing with tombstones over `str` keys, and a `str.hash` builtin because hashing in W# is one stack walk per byte under `--gc-stress` |
-| 4 | `str.join` in linear time — "×190 slower than `bytes.Buf`… any W# program that builds output from pieces is hitting this" | measure, allocate once, copy. 150,000 pieces into 600 KB: 9.4 s to 0.08 s, compilation included. `str.repeat` was the same shape and is fixed with it |
-| 5 | `open32`/`close32` in `std/bytes` — "TLS needed 8, 16 and 24; the PostgreSQL frame header needs 32" | four widths where there were three |
-| 6 | a documented guarantee that `@spawn` returns before `init` completes — "Raython's whole process model rests on it" | stated in the README, along with its other half: the message loop is entered only once `init` has *returned*, which is what makes a call issued straight after `@spawn` queue rather than be lost |
-| 7 | `net.shutdown`, and a decision about `main` returning with workers alive — "a server written the obvious way can neither be stopped nor exit" | `net.shutdown(s, read, write)`; `os.exit`; and `main` returning ends the process. The exit path joins the workers that reached their message loop and abandons the ones that never could, which is a distinction rather than a timeout |
-| 8 | struct equality — "test assertions compare structs constantly and today must compare field by field" | `==` on a struct, field by field, recursing into struct fields, generated once per type |
+| 1 | a stable machine-readable emit - the CLI read `--emit=ast`, "a debugging aid, not a documented interface" | `--emit=api`: versioned, printed after type checking, every program-defined name absolute, with a golden test pinning the format |
+| 2 | a modification time in `std/fs` - "without mtime the dev watcher hashes files" | `fs.modified_at`, by `statx` on Linux, `getattrlist` on macOS and a field Windows was already fetching; `struct stat` meets this runtime in one arm and four systems, written up in `CLAUDE.md` |
+| 3 | a hash map in `std` - "association lists are right for headers and wrong for a prepared-statement cache" | `std/map`, open addressing with tombstones over `str` keys, and a `str.hash` builtin because hashing in W# is one stack walk per byte under `--gc-stress` |
+| 4 | `str.join` in linear time - "×190 slower than `bytes.Buf`… any W# program that builds output from pieces is hitting this" | measure, allocate once, copy. 150,000 pieces into 600 KB: 9.4 s to 0.08 s, compilation included. `str.repeat` was the same shape and is fixed with it |
+| 5 | `open32`/`close32` in `std/bytes` - "TLS needed 8, 16 and 24; the PostgreSQL frame header needs 32" | four widths where there were three |
+| 6 | a documented guarantee that `@spawn` returns before `init` completes - "Raython's whole process model rests on it" | stated in the README, along with its other half: the message loop is entered only once `init` has *returned*, which is what makes a call issued straight after `@spawn` queue rather than be lost |
+| 7 | `net.shutdown`, and a decision about `main` returning with workers alive - "a server written the obvious way can neither be stopped nor exit" | `net.shutdown(s, read, write)`; `os.exit`; and `main` returning ends the process. The exit path joins the workers that reached their message loop and abandons the ones that never could, which is a distinction rather than a timeout |
+| 8 | struct equality - "test assertions compare structs constantly and today must compare field by field" | `==` on a struct, field by field, recursing into struct fields, generated once per type |
 | 9 | `to_upper` beside `to_lower`, and a `str.replace` | both |
 
 ### What the probes said afterwards
@@ -2755,7 +2756,7 @@ changed:
   which is a program waiting on its own worker rather than anything the exit
   path can answer for. `shutdown` on a *listening* socket wakes `accept` on
   Linux and answers `ENOTCONN` on the BSDs, so it is not a thing this library
-  promises — a stoppable acceptor is a `net.poller` with a tick, which is what
+  promises - a stoppable acceptor is a `net.poller` with a tick, which is what
   §7.2 of that design concluded independently and preferred anyway.
 
 ### One thing nobody asked for
@@ -2763,7 +2764,7 @@ changed:
 Fixing item 7 uncovered a second bug in the same area. A worker's `init` runs
 with its decoded arguments pinned on the runtime's own root list, and those pins
 sit on the *thread*. A blocking call inside `init` therefore entered a safe
-region with `pinned_depth` non-zero — which a collector answers by declining the
+region with `pinned_depth` non-zero - which a collector answers by declining the
 parked worker and waiting for the syscall, the exact regression safe regions
 were written to remove, and an abort in any build with debug assertions on.
 Every acceptor is that shape, and the probes only got away with it because they
@@ -2771,7 +2772,7 @@ were run against a release build.
 
 The pins come off before generated code is entered now. `unpack` returning is
 the last moment anything can allocate, and the callee's prologue stores its
-parameters into slots its own stack maps describe before its first safepoint --
+parameters into slots its own stack maps describe before its first safepoint -
 the same "no safepoint in between" argument the return area and the runtime
 boundary already make. `worker_blocking_init.ws` is the case.
 
@@ -2783,7 +2784,7 @@ These are deliberate limitations, each with a clear fix:
 
 - **Computed top-level `const`.** Only literals and `fn` values are allowed at
   the top level; anything computed is rejected with a message saying so.
-  Supporting the general case needs global storage plus a startup initialiser —
+  Supporting the general case needs global storage plus a startup initialiser -
   and the collector would need those globals as roots.
 - **Field access needs a known type.** Structs are nominal with no row
   polymorphism, so `fn getx(p) { return p.x; }` cannot be inferred and asks for
@@ -2799,7 +2800,7 @@ These are deliberate limitations, each with a clear fix:
 
 ### Closed by item 14
 
-- **`==` is limited to the integer types, `f64`, `bool` and `str`** — structural
+- **`==` is limited to the integer types, `f64`, `bool` and `str`** - structural
   it is, field by field, recursing into struct fields. Two values of different
   concrete types are never equal, so the question "identity or structure" is
   answered without the surprising half: `x == x` is true whatever `x` holds,
@@ -2811,18 +2812,18 @@ The eight below were on this list and are not any more. Each is written up in
 item 13; they are kept here as one line apiece so that a reader who remembers
 the limitation finds out where it went.
 
-- **A supertype is a name, not a path** — `StructDecl::parent` is a `TypeExpr`
+- **A supertype is a name, not a path** - `StructDecl::parent` is a `TypeExpr`
   now, so `struct Sub : pkg.Base` resolves as every other type position does.
-- **An integer literal is never an `f64`** — it is, when the `f64` holds the
+- **An integer literal is never an `f64`** - it is, when the `f64` holds the
   value exactly.
-- **`%` is integer-only** — `f64` has one, through a call, because Cranelift
+- **`%` is integer-only** - `f64` has one, through a call, because Cranelift
   still has no instruction for it.
-- **`math.abs` and `math.sign` are `i64`/`f64` overloads** — one definition over
+- **`math.abs` and `math.sign` are `i64`/`f64` overloads** - one definition over
   a new abstract type, `Signed`, plus the `f64` one.
-- **An array index is an `i64`** — any integer type indexes.
-- **`g[i][j] = v` is rejected** — the base is evaluated once into a hidden
+- **An array index is an `i64`** - any integer type indexes.
+- **`g[i][j] = v` is rejected** - the base is evaluated once into a hidden
   local, which is what the restriction was standing in for.
-- **`wsharp check` accepts a program `wsharp run` rejects** — `check`
+- **`wsharp check` accepts a program `wsharp run` rejects** - `check`
   monomorphises.
-- **A facade cannot present one name from two files** — two re-exports of one
+- **A facade cannot present one name from two files** - two re-exports of one
   name merge into one overload set.
