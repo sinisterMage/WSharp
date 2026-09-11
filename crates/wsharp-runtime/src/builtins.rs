@@ -1400,6 +1400,8 @@ pub const OS_MODULE: &str = "std/os";
 pub const PATH_MODULE: &str = "std/path";
 /// TOML 1.0.0, which is what a manifest and a lockfile are written in.
 pub const TOML_MODULE: &str = "std/toml";
+/// JSON, which is what everything else in the world answers in.
+pub const JSON_MODULE: &str = "std/json";
 /// DEFLATE and the zlib wrapper, which a git packfile is made of.
 pub const INFLATE_MODULE: &str = "std/inflate";
 /// The two rotates, which the code generator recognises by name and lowers
@@ -1470,6 +1472,7 @@ pub fn std_module_sources() -> &'static [(&'static str, &'static str)] {
         (OS_MODULE, include_str!("std/os.ws")),
         (PATH_MODULE, include_str!("std/path.ws")),
         (TOML_MODULE, include_str!("std/toml.ws")),
+        (JSON_MODULE, include_str!("std/json.ws")),
         (BROKER_MODULE, include_str!("std/broker.ws")),
         (NET_MODULE, include_str!("std/net.ws")),
         (HTTP_MODULE, include_str!("std/http.ws")),

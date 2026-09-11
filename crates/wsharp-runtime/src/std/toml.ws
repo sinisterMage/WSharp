@@ -883,7 +883,7 @@ fn unicode(p: P, b: bytes.Buf, width: i64) void {
         fail(p, "an escaped code point must be a scalar value");
         return;
     }
-    put_utf8(b, cp);
+    bytes.put_utf8(b, cp);
     return;
 }
 
@@ -891,31 +891,6 @@ fn hex_value(c: i64) i64 {
     if (c >= 48 and c <= 57) { return c - 48; }
     if (c >= 97 and c <= 102) { return c - 87; }
     return c - 55;
-}
-
-/// One code point, encoded.
-///
-/// Here rather than in `std/bytes` because this is the only caller: a W# `str`
-/// is bytes, string literals are already UTF-8, and nothing else in the library
-/// has ever had a code point in its hand.
-fn put_utf8(b: bytes.Buf, cp: i64) void {
-    if (cp < 128) { bytes.put_u8(b, cp); return; }
-    if (cp < 2048) {
-        bytes.put_u8(b, 192 | (cp >> 6));
-        bytes.put_u8(b, 128 | (cp & 63));
-        return;
-    }
-    if (cp < 65536) {
-        bytes.put_u8(b, 224 | (cp >> 12));
-        bytes.put_u8(b, 128 | ((cp >> 6) & 63));
-        bytes.put_u8(b, 128 | (cp & 63));
-        return;
-    }
-    bytes.put_u8(b, 240 | (cp >> 18));
-    bytes.put_u8(b, 128 | ((cp >> 12) & 63));
-    bytes.put_u8(b, 128 | ((cp >> 6) & 63));
-    bytes.put_u8(b, 128 | (cp & 63));
-    return;
 }
 
 // ---- numbers ---------------------------------------------------------------

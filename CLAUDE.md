@@ -831,7 +831,9 @@ extra `sin_len` byte out of this code entirely.
   shape is an empty supertype, one subtype per case carrying its payload, and
   an overload set whose base case is the failure -- `as_int(v: Value)` returning
   `error.BadFormat` beside `as_int(v: Int)` returning the number. `std/x509`'s
-  `SigKey` is the original and `std/toml`'s `Value` is the second. Every
+  `SigKey` is the original, `std/toml`'s `Value` is the second and `std/json`'s
+  is the third -- which is the point at which it stops being a trick and is
+  simply how this language reads a tagged format. Every
   overload must state the same error set, because a dispatched call has one
   type; and a subtype only coerces into its supertype at an *annotated*
   binding, which is why each constructor is `const v: Value = Int{ .. };
@@ -839,9 +841,28 @@ extra `sin_len` byte out of this code entirely.
 - **A parser answers, it does not raise.** An error union carries a tag and
   nothing else, and `BadFormat` is not a thing to hand somebody holding a
   200-line manifest. `std/toml.parse` answers with a `Doc` that is either a
-  table or a message and a line, and everything under `ingot`'s verbs takes a
-  `Fault` and writes into it. The first failure wins in both: a recursive
-  descent reader that has lost its place invents the rest.
+  table or a message and a line, `std/json.parse` with one that is either a
+  value or a message and a line *and a byte offset* -- both, because a minified
+  document is one line and pointing at it says nothing -- and everything under
+  `ingot`'s verbs takes a `Fault` and writes into it. The first failure wins in
+  all of them: a recursive descent reader that has lost its place invents the
+  rest.
+- **A reader of something that arrives off a network is bounded; a reader of a
+  file somebody wrote is not.** `std/json` has `MAX_DEPTH`, and `std/toml` has
+  no counterpart on purpose: both are recursive descent, but a manifest is a
+  file with an author and a JSON document is bytes a stranger sent, so a few
+  hundred kilobytes of `[` would be a stack overflow -- a crash with no
+  diagnostic -- rather than a document refused with a message. `std/x509`'s
+  `MAX_CHAIN` is the same shape, and the shape is a named bound with no knob:
+  the day one is needed is the day to add the parameter.
+- **`bytes.put_utf8` is the single definition of how a code point is encoded.**
+  It was private to `std/toml`, with a comment saying it lived there because it
+  had one caller; `std/json` is the second, and which byte of a four-byte
+  sequence carries which six bits is exactly the kind of detail that is right in
+  one copy and wrong in the other. The *caller* still checks the code point,
+  because what to say about a value that is not a scalar one differs: TOML meets
+  it as `\UXXXXXXXX` naming a surrogate, and JSON meets it as half of a pair
+  that was never completed.
 - **A registry is a directory, and fetching one over git is only how the
   directory arrives.** `registry.open` takes a path; `INGOT_REGISTRY` naming an
   existing directory is used where it lies, with no certificate store read and

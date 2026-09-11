@@ -264,6 +264,37 @@ pub fn put_str(b: Buf, s: str) void {
     return;
 }
 
+/// Append one code point, encoded as UTF-8.
+///
+/// Here rather than in the module that needs it because two now do: `std/toml`
+/// decodes `\uXXXX` and `\UXXXXXXXX`, and `std/json` decodes `\uXXXX` and the
+/// surrogate pairs above it. A second copy is a second thing to be wrong, and
+/// which byte of a four-byte sequence carries which six bits is exactly the
+/// kind of detail that is wrong in one copy and right in the other.
+///
+/// The caller checks the code point: a value above 0x10FFFF or inside the
+/// surrogate range is not a scalar value, and what to *say* about one differs
+/// between the two formats that meet it.
+pub fn put_utf8(b: Buf, cp: i64) void {
+    if (cp < 128) { put_u8(b, cp); return; }
+    if (cp < 2048) {
+        put_u8(b, 192 | (cp >> 6));
+        put_u8(b, 128 | (cp & 63));
+        return;
+    }
+    if (cp < 65536) {
+        put_u8(b, 224 | (cp >> 12));
+        put_u8(b, 128 | ((cp >> 6) & 63));
+        put_u8(b, 128 | (cp & 63));
+        return;
+    }
+    put_u8(b, 240 | (cp >> 18));
+    put_u8(b, 128 | ((cp >> 12) & 63));
+    put_u8(b, 128 | ((cp >> 6) & 63));
+    put_u8(b, 128 | (cp & 63));
+    return;
+}
+
 /// Write `n` zero bytes as a placeholder for a length, and answer with where
 /// they went. `close8`, `close16`, `close24` and `close32` fill one in.
 ///

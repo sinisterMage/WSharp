@@ -2778,6 +2778,109 @@ boundary already make. `worker_blocking_init.ws` is the case.
 
 ---
 
+## 15. JSON - **done**
+
+The one format this project had named as a gap in its own documentation. The
+README said so about **sharpie**, which finds releases by reading this
+repository's tags over git's smart HTTP rather than through a forge's REST API
+"because that answers in JSON, W# has no JSON reader, and writing one would have
+stood between sharpie and its first useful act"; `--emit=api` answers in
+s-expressions and gives the same reason from the other side. Two real programs
+had routed around it.
+
+| Piece | Where |
+|---|---|
+| RFC 8259, read and written | `std/json.ws` |
+| `bytes.put_utf8`, lifted out of `std/toml` | `std/bytes.ws` |
+| The value grammar, the refusals, the objects, the round trip | `tests/cases/json_{values,reject,objects,write}.ws` |
+
+**It needed no new builtins.** That is the part worth recording, because it is
+the payoff of a decision made two items ago: `str.parse_float` went into the
+table when `std/toml` found that a number could be written and not read back,
+and it turns out to be the last thing a JSON reader was missing. Everything else
+- `str.parse_int`, `str.byte_at`, `bytes.Buf`, `list.List[T]`, `map.Map[V]` -
+was already here. The whole module is one `.ws` file and two lines of Rust.
+
+### The third use of the lattice
+
+`Value` is an empty supertype, each shape is a subtype carrying its payload, and
+`as_int` is an overload set whose base case says "this is not an integer".
+`std/x509`'s `SigKey` was the original and `std/toml`'s `Value` the second; the
+third is the point at which it stops being a trick this language can do and
+becomes how this language reads a tagged format. There is nothing to report
+about writing it, which is itself the report.
+
+One member is new. JSON has `null` and TOML does not, and the obvious move -
+answering with the bare `Value{}` that a failed parse already produces - throws
+away the difference between "the document said there is nothing here" and "there
+is no document". So `Null` is a subtype with no fields, and `is_null` is a
+two-line overload set beside it.
+
+### Three things that differ from `std/toml`, and one reason for all three
+
+A manifest is a file somebody wrote. A JSON document is bytes a stranger sent.
+
+**`Doc` carries a byte offset beside the line.** A minified response is one
+line, and telling the person holding 40 KB of it that the trouble is on line 1
+is worse than saying nothing.
+
+**There is a nesting bound.** `MAX_DEPTH` is 128, and `std/toml` has no
+counterpart on purpose. Both readers are recursive descent; only one of them can
+be handed a few hundred kilobytes of `[`, which without a bound is a stack
+overflow - a crash with no diagnostic - rather than a document refused with a
+message. `std/x509`'s `MAX_CHAIN` is the shape: a named bound and no knob.
+
+**An object indexes itself once it is worth it.** `std/toml`'s table scans two
+parallel lists and says out loud that the fix for a large one is a map rather
+than a cleverer scan, with the justification that a manifest has tens of keys.
+Nothing promises that here. So `Obj` keeps the lists, because the order members
+arrived in is the order the writer has to put them back in and a hash table's
+order is neither that nor sorted, and builds a `map.Map[i64]` beside them the
+moment it passes eight members. Lazily, rather than from the first key, because
+the common object in a parsed document is small and every allocation is a whole
+collection under `--gc-stress`: measured with `gc_live_objects()`, an object
+costs three objects a member and then fourteen more, once, at the ninth.
+
+### Two numbers, because JSON has one and W# has two
+
+A lexeme with no point and no exponent that fits an `i64` is an `Int`; anything
+else is a `Float`. This is not tidiness. An identifier out of an API is
+routinely a 64-bit number, and above 2^53 an `f64` cannot hold one - so a reader
+that answered only in floats would hand back the wrong id with nothing to catch
+it. `9007199254740993` is in `json_values.ws` for that reason, and it is one of
+exactly two places where this reader and `node` disagree about a *value*:
+JavaScript reads it back one short.
+
+The consequences are stated rather than discovered. `as_float` takes an `Int`
+too, because a caller that wants a number should not have to ask which half it
+landed in; `as_int` does *not* take a `Float`, because `1.0` is a number the
+document chose to write with a point. And a `Float` is written with its point
+even when it is whole, so that what comes back is a `Float` again.
+
+### What checking it against two other readers was worth
+
+Fifty-six documents through this reader, `node`'s `JSON.parse` and `python3`'s
+`json.loads`. Fifty-one agree exactly; the five that do not are each a decision:
+
+- **`NaN` and `Infinity`** - python takes them, node and this do not. They are
+  not in RFC 8259 and there would be nothing to write them back out as.
+- **A lone surrogate** - node and python take one, because a JavaScript or
+  Python string is UTF-16-shaped and can hold half a pair. A W# `str` is UTF-8
+  bytes and `\uD800` has no UTF-8 encoding at all, so there is nothing to hold;
+  it is refused, as `serde_json` refuses it and as `std/toml` already did.
+- **Nesting past `MAX_DEPTH`** - above.
+
+That is the check that catches what a test written from the valid side cannot:
+a reader which accepts too much passes every one of those. It is the same habit
+item 10 applied to cipher vectors, and it earns its keep the same way.
+
+The one wart, known and left: `str.from_float` is Rust's `Display`, which has no
+exponent form, so `1e300` is written as its full 301-digit decimal expansion.
+Valid, correct, round-trips, ugly. Fixing it is a new builtin row and there is
+no caller asking yet.
+
+---
+
 ## Smaller follow-ups
 
 These are deliberate limitations, each with a clear fix:

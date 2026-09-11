@@ -537,7 +537,10 @@ bits, so `chmod` succeeds there without doing anything and `is_executable` is
 keep and a lie about a file that does not exist. `std/path` is the arithmetic above both, and makes no syscall at all.
 `std/os` is what the process knows about itself - `args`, `get`, `home`,
 `temp_dir`, `cwd`, `exit`, and `target`, the triple this binary was built for.
-`std/toml` is TOML 1.0, read and written.
+`std/toml` is TOML 1.0, read and written, and `std/json` is RFC 8259 the same
+way. Both answer with a document rather than raising: an error union carries a
+tag and nothing else, and `BadFormat` is not a thing to hand somebody holding a
+file or a response they did not write.
 
 A library module is only read if something imports it, so a program that
 mentions nothing pays for nothing: `wsharp check` on a ten-line file takes
@@ -595,6 +598,8 @@ serving many connections from one worker, not for keeping the collector alive.
 | `std/der` | a strict DER reader: `read_value`, `read_seq`, `read_uint`, `read_oid`, `read_bitstring`, `read_time` (item 10) |
 | `std/x509` | `SigKey` and its three subtypes, `parse_spki`, `verify_signature`; certificates, `matches_host`, `verify_chain`, `pem_certificates`, `system_roots` (item 10) |
 | `std/tls` | TLS 1.3, both ends: `client`, `server`, `feed`, `pending`, and a blocking `Session` over a socket (item 10) |
+| `std/toml` | TOML 1.0.0, whole, read and written: `parse` answers a `Doc`, `write` renders one, and `Value` is a lattice with `kind` and `as_str`/`as_int`/… over it |
+| `std/json` | RFC 8259, read and written: `parse` `write` `write_pretty`, the same `Value` lattice with `Null` in it, and `get` `has` `len` `keys` `set` `lookup` `at`. Strict - no comments, no trailing commas, no `NaN`. A number with no point and no exponent stays an `i64`, so a 64-bit identifier survives being read |
 
 A **prelude** needs no import, because every module has it:
 
@@ -829,9 +834,17 @@ Item 14 of [ROADMAP.md](ROADMAP.md) is the write-up.
 And [**sharpie**](https://github.com/sinisterMage/sharpie), a version manager,
 the second real program written in W#. It finds releases by reading this
 repository's tags over git's smart HTTP rather than through a forge's REST API,
-because that answers in JSON, W# has no JSON reader, and writing one would have
-stood between sharpie and its first useful act. Two plain HTTP conversations, no
-new parser.
+because that answers in JSON, W# had no JSON reader at the time, and writing one
+would have stood between sharpie and its first useful act. Two plain HTTP
+conversations, no new parser.
+
+That gap is closed: `std/json` is RFC 8259, read and written, and it needed no
+new builtins - `str.parse_float`, the row `std/toml` put in the table, was the
+last thing missing. It is the third use of the value lattice, which is the point
+at which a trick becomes how this language reads a tagged format. Fifty-six
+documents were put through it, `node`'s `JSON.parse` and `python3`'s
+`json.loads`; fifty-one agree exactly and the five that do not are each a
+decision. Item 15 of [ROADMAP.md](ROADMAP.md) is the write-up.
 
 What is left, and where it plugs in, is in [ROADMAP.md](ROADMAP.md).
 Conventions and the invariants worth not breaking are in
