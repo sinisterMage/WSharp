@@ -555,6 +555,24 @@ pub fn parse_all(ders: [][]u8) list.List[Cert] {
     return out;
 }
 
+/// What a verification found, and not only that it succeeded.
+///
+/// `verify_chain` answers the question a handshake asks -- may this key be
+/// trusted -- and for a connection that is the whole of it. Something that
+/// wants to *show* the verification needs the two facts the walk knew and threw
+/// away: which anchor ended it, and how many of the certificates the peer sent
+/// were used getting there. Nothing here is a new check. It is the same walk,
+/// reporting.
+pub const Path = struct {
+    /// The leaf's public key: what `verify_chain` hands back.
+    key: SigKey,
+    /// The certificate in `roots` the walk reached.
+    anchor: Cert,
+    /// How many of the peer's intermediates sat between the leaf and the
+    /// anchor. Zero when the anchor signed the leaf itself.
+    depth: i64,
+};
+
 /// The leaf's public key, if the chain from it reaches a trusted anchor.
 ///
 /// `intermediates` are the certificates the peer sent below its leaf, and are
@@ -565,6 +583,18 @@ pub fn parse_all(ders: [][]u8) list.List[Cert] {
 /// the trust comes from it being in the store.
 pub fn verify_chain(leaf_der: []u8, intermediates: [][]u8, roots: list.List[Cert],
                     host: str, now: i64) !SigKey {
+    const found = try verify_path(leaf_der, intermediates, roots, host, now);
+    return found.key;
+}
+
+/// The same walk, saying where it ended.
+///
+/// Separate from `verify_chain` rather than replacing it, because a caller that
+/// only needs the key should not have to name a type to ignore two thirds of
+/// it -- and because one implementation of the walk is the point. `verify_chain`
+/// is this function with the answer narrowed.
+pub fn verify_path(leaf_der: []u8, intermediates: [][]u8, roots: list.List[Cert],
+                   host: str, now: i64) !Path {
     const leaf = try parse(leaf_der);
     if (now < leaf.not_before) { return error.CertificateNotYetValid; }
     if (now > leaf.not_after) { return error.CertificateExpired; }
@@ -578,7 +608,9 @@ pub fn verify_chain(leaf_der: []u8, intermediates: [][]u8, roots: list.List[Cert
     var current = leaf;
     var depth = 0;
     while (depth < MAX_CHAIN) : (depth += 1) {
-        if (issuer_in(roots, current, now, true)) |anchor| { return leaf.key; }
+        if (issuer_in(roots, current, now, true)) |anchor| {
+            return Path{ .key = leaf.key, .anchor = anchor, .depth = depth };
+        }
         const next = issuer_in(middle, current, now, true) orelse {
             return error.UnknownIssuer;
         };

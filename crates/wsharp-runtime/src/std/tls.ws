@@ -400,6 +400,19 @@ pub const Conn = struct {
 
     /// The key that must have signed the CertificateVerify.
     peer_key: ?x509.SigKey,
+    /// The certificates the peer sent, leaf first, exactly as they arrived.
+    ///
+    /// Kept because verification is a thing worth *showing* and not only worth
+    /// doing: what a client says about a certificate that was refused -- whose
+    /// it was, who issued it, when it expired -- can only come from the bytes,
+    /// and this is the one moment they exist. Recorded before the chain is
+    /// judged, so a handshake that fails still carries what it was shown.
+    ///
+    /// Raw encodings rather than parsed certificates, for two reasons: it is
+    /// what arrived, so a fingerprint of it is a fingerprint of the thing the
+    /// peer actually presented; and `x509.parse_all` is public, so nothing is
+    /// lost by leaving the parse to whoever wants one.
+    peer_chain: [][]u8,
     /// The ClientHello as sent, kept because a HelloRetryRequest is answered
     /// with the same message and one extension changed.
     hello: []u8,
@@ -426,7 +439,8 @@ fn new_conn(role: i64, cfg: Config) Conn {
         .rk = null, .wk = null,
         .tr = bytes.buf(1024), .inb = bytes.buf(2048), .hsb = bytes.buf(1024),
         .out = bytes.buf(1024), .app = bytes.buf(1024),
-        .peer_key = null, .hello = empty, .retried = false, .cookie = empty,
+        .peer_key = null, .peer_chain = [][]u8{},
+        .hello = empty, .retried = false, .cookie = empty,
         .peer_closed = false, .cert_requested = false,
     };
 }
@@ -454,6 +468,14 @@ pub fn app_data(c: Conn) []u8 {
 }
 
 pub fn peer_closed(c: Conn) bool { return c.peer_closed; }
+
+/// The certificates the peer sent, leaf first, and empty until it has.
+///
+/// Empty is the honest answer in three different situations -- the handshake
+/// has not reached the Certificate message, the peer is a client that has no
+/// certificate, or this end is the server -- and none of them is an error, so
+/// none of them raises one.
+pub fn peer_chain(c: Conn) [][]u8 { return c.peer_chain; }
 
 // ---------------------------------------------------------------------------
 // Making a key share
@@ -1114,6 +1136,7 @@ fn client_certificate(c: Conn, body: []u8) !void {
     // is still a malformed message.
     var first = bytes.new(0);
     var rest: list.List[[]u8] = list.new();
+    var all: list.List[[]u8] = list.new();
     var n = 0;
     while (!done(certs)) {
         const dn = try get_u24(certs);
@@ -1121,8 +1144,12 @@ fn client_certificate(c: Conn, body: []u8) !void {
         const en = try get_u16(certs);
         const skip = try get_sub(certs, en);
         if (n == 0) { first = cert; } else { list.push(rest, cert); }
+        list.push(all, cert);
         n += 1;
     }
+    // Before either branch below, because the interesting certificate is
+    // usually the one that was about to be refused.
+    c.peer_chain = list.to_array(all);
 
     if (c.cfg.pinned) |k| {
         // Key pinning: the chain is not consulted at all, and the connection
