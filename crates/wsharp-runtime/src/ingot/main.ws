@@ -32,6 +32,7 @@ const manifest = @import("ingot/manifest");
 const os = @import("std/os");
 const path = @import("std/path");
 const plan = @import("ingot/plan");
+const progress = @import("ingot/progress");
 const registry = @import("ingot/registry");
 const semver = @import("ingot/semver");
 const store = @import("ingot/store");
@@ -71,6 +72,24 @@ fn main() i64 {
     }
 
     if (array.len(args) == 0) { usage(); return FAILED; }
+    // A program's own arguments belong to it. Only ingot verbs consume quiet.
+    var leading_quiet = false;
+    while (array.len(args) > 0) {
+        if (!text.eq(args[0], "--quiet") and !text.eq(args[0], "-q")) { break; }
+        leading_quiet = true;
+        args = array.slice(args, 1, array.len(args));
+    }
+    if (array.len(args) == 0) { usage(); return FAILED; }
+    if (!text.eq(args[0], "run")) {
+        const quiet = leading_quiet or mentions(args, "--quiet") or mentions(args, "-q");
+        args = without(without(args, "--quiet"), "-q");
+        if (array.len(args) == 0) { usage(); return FAILED; }
+        return command(args, quiet, stress);
+    }
+    return command(args, leading_quiet, stress);
+}
+
+fn command(args: []str, quiet: bool, stress: bool) i64 {
     const verb = args[0];
     const rest = array.slice(args, 1, array.len(args));
 
@@ -79,7 +98,8 @@ fn main() i64 {
     // It becomes `wsharp run` instead, which is the same JIT by the same name.
     if (text.eq(verb, "run")) { return run_program(rest, stress); }
 
-    const f = fault.none();
+    const ui = progress.new(quiet);
+    const f = fault.reporting(fn(message: str) void { progress.status(ui, message); return; });
     var code = FAILED;
     if (text.eq(verb, "init")) { code = init(f, rest); }
     else if (text.eq(verb, "add")) { code = add(f, rest); }
@@ -97,6 +117,7 @@ fn main() i64 {
     else {
         fault.fail(f, text.concat(text.concat("no such verb: `", verb), "`"));
     }
+    progress.finish(ui, f.ok and code == OK);
     if (!f.ok) {
         // The error stream, so that a shell redirecting a verb's output still
         // sees why it got none. Every verb's *answer* is on stdout.
@@ -213,6 +234,7 @@ fn usage() void {
     print("`-C <dir>` works from somewhere else. `--gc-stress` belongs to what");
     print("is being run, so `run` passes it on and nothing else reads it.");
     print("Output is tab-separated, and WSHARP_HOME says where the store is.");
+    print("Progress goes to stderr; `--quiet` (or `-q`) hides it.");
     print("");
     print("INGOT_REGISTRY says which registry to use, as a URL or as a");
     print("directory. A directory is used where it lies and is never fetched,");
@@ -268,7 +290,7 @@ fn init(f: fault.Fault, args: []str) i64 {
         fault.fail_at(f, manifest_path(), "cannot be written");
         return FAILED;
     };
-    print(row2("wrote", manifest_path()));
+    answer(f, row2("wrote", manifest_path()));
     return OK;
 }
 
@@ -302,10 +324,10 @@ fn add(f: fault.Fault, args: []str) i64 {
     m.deps = kept;
     write_manifest(f, m);
     if (!f.ok) { return FAILED; }
-    print(row2("added", name));
+    answer(f, row2("added", name));
     // The lockfile no longer describes the manifest, and saying so here is what
     // stops `install` being run against a stale one.
-    if (io.exists(lock_path())) { print(row2("stale", lock_path())); }
+    if (io.exists(lock_path())) { answer(f, row2("stale", lock_path())); }
     return OK;
 }
 
@@ -315,6 +337,7 @@ fn add(f: fault.Fault, args: []str) i64 {
 /// as what this package *requires* is how a project ends up unable to share a
 /// dependency with anything else.
 fn newest_requirement(f: fault.Fault, name: str) ?str {
+    fault.status(f, text.concat("Looking up ", name));
     const net = plan.network();
     const ix = plan.index(f, net) orelse return null;
     const p = registry.package(f, ix, name) orelse {
@@ -390,7 +413,7 @@ fn remove(f: fault.Fault, args: []str) i64 {
     m.deps = kept;
     write_manifest(f, m);
     if (!f.ok) { return FAILED; }
-    print(row2("removed", name));
+    answer(f, row2("removed", name));
     return OK;
 }
 
@@ -410,16 +433,17 @@ fn write_manifest(f: fault.Fault, m: manifest.Manifest) void {
 /// build is a network round trip on every build. Being current is therefore a
 /// thing you ask for, and this is the asking.
 fn update(f: fault.Fault) i64 {
+    fault.status(f, "Updating registry index");
     const where = registry.location();
     // A directory is already the index. Fetching nothing and reporting a commit
     // that does not exist would be the wrong kind of success.
     if (registry.is_local(where)) {
         const ix = registry.open(f, where) orelse return FAILED;
-        print(row3("local", ix.name, where));
+        answer(f, row3("local", ix.name, where));
         return OK;
     }
     const got = plan.update_index(f, plan.network()) orelse return FAILED;
-    print(row3("updated", where, got.commit));
+    answer(f, row3("updated", where, got.commit));
     return OK;
 }
 
@@ -443,10 +467,10 @@ fn search(f: fault.Fault, args: []str) i64 {
         // row with trailing whitespace, which the case harness trims away.
         var newest = "-";
         if (registry.newest(p)) |v| { newest = semver.render(v); }
-        print(row3(name, newest, p.repo));
+        answer(f, row3(name, newest, p.repo));
         found += 1;
     }
-    print(row2("found", text.from_int(found)));
+    answer(f, row2("found", text.from_int(found)));
     return OK;
 }
 
@@ -461,13 +485,14 @@ fn search(f: fault.Fault, args: []str) i64 {
 /// manifest to change -- rather than being folded into one of ours.
 fn resolve(f: fault.Fault) i64 {
     const m = read_here(f) orelse return FAILED;
+    fault.status(f, "Resolving dependencies");
     const outcome = plan.resolve(f, plan.network(), m);
     const lock = outcome.lock orelse {
         // The solver's account of why, on the error stream with every other
         // explanation of a failure. Stdout carries what a verb *achieved* --
         // here, nothing -- and a script cutting up `resolved<TAB>n` should not
         // have to tell that apart from a page of reasoning.
-        if (text.len(outcome.report) > 0) { print_err(outcome.report); }
+        if (text.len(outcome.report) > 0) { fault.flush(f); print_err(outcome.report); }
         return FAILED;
     };
     io.write_file(lock_path(), manifest.write_lock(lock)) catch {
@@ -485,7 +510,8 @@ fn resolve(f: fault.Fault) i64 {
             return FAILED;
         };
     }
-    print(row2("resolved", text.from_int(list.len(lock.packages))));
+    fault.status(f, text.concat("Resolved packages: ", text.from_int(list.len(lock.packages))));
+    answer(f, row2("resolved", text.from_int(list.len(lock.packages))));
     return OK;
 }
 
@@ -514,10 +540,17 @@ fn install(f: fault.Fault) i64 {
     const here = project_dir(f) orelse return FAILED;
     const net = plan.network();
     var entries: list.List[manifest.Installed] = list.new();
+    const total = list.len(lock.packages);
+    var done = 0;
+    var installed = 0;
+    fault.status(f, text.concat("Installing dependencies: ", text.from_int(total)));
     for (list.to_array(lock.packages)) |p| {
+        fault.status(f, progress.package(done, total, "Checking", p.name));
         const digest = digest_of(p.tree);
         if (store.check(h, digest) != store.READY) {
+            fault.status(f, progress.package(done, total, "Installing", p.name));
             const dir = plan.source_dir(f, net, p.source) orelse return FAILED;
+            fault.status(f, progress.package(done, total, "Copying and verifying", p.name));
             const got = store.install(f, h, dir);
             if (!f.ok) { return FAILED; }
             if (!text.eq(got, digest)) {
@@ -539,7 +572,10 @@ fn install(f: fault.Fault) i64 {
                     "` has changed since it was resolved -- run `ingot resolve`"));
                 return NEEDS_RESOLVING;
             }
-            print(row3("installed", p.name, digest));
+            answer(f, row3("installed", p.name, digest));
+            installed += 1;
+        } else {
+            fault.status(f, progress.package(done, total, "Cached", p.name));
         }
         // Built for every package rather than only the ones that had to be
         // fetched: `ingot.env` describes the whole project, and a second
@@ -551,6 +587,9 @@ fn install(f: fault.Fault) i64 {
             .root = facade(f, entry, p.name),
             .deps = p.deps,
         });
+        if (!f.ok) { return FAILED; }
+        done += 1;
+        fault.status(f, progress.package(done, total, "Ready", p.name));
     }
 
     const root = manifest.Installed{
@@ -559,6 +598,7 @@ fn install(f: fault.Fault) i64 {
         .root = m.root,
         .deps = dep_names(m),
     };
+    fault.status(f, "Writing ingot.env");
     io.write_file(manifest.ENV_NAME, manifest.write_env(root, entries)) catch {
         fault.fail_at(f, manifest.ENV_NAME, "cannot be written");
         return FAILED;
@@ -569,7 +609,9 @@ fn install(f: fault.Fault) i64 {
     // another's, whose entries the next `gc` deletes.
     store.register(f, h, path.join(here, lock_path()));
     if (!f.ok) { return FAILED; }
-    print(row2("ready", text.from_int(list.len(lock.packages))));
+    fault.status(f, text.join([]str{ text.from_int(total), " packages ready (",
+        text.from_int(installed), " installed, ", text.from_int(total - installed), " cached)" }, ""));
+    answer(f, row2("ready", text.from_int(list.len(lock.packages))));
     return OK;
 }
 
@@ -619,12 +661,12 @@ fn dep_names(m: manifest.Manifest) []str {
 fn verify(f: fault.Fault) i64 {
     const m = read_here(f) orelse return BROKEN;
     if (!io.exists(lock_path())) {
-        print(row2("needs", "resolve"));
+        answer(f, row2("needs", "resolve"));
         return NEEDS_RESOLVING;
     }
     const lock = read_lock_here(f) orelse return BROKEN;
     if (!text.eq(lock.manifest, m.digest)) {
-        print(row3("stale", lock_path(), "ingot.toml has changed"));
+        answer(f, row3("stale", lock_path(), "ingot.toml has changed"));
         return NEEDS_RESOLVING;
     }
     const h = store.home() catch {
@@ -636,12 +678,12 @@ fn verify(f: fault.Fault) i64 {
         const digest = digest_of(p.tree);
         const state = store.check(h, digest);
         if (state == store.DAMAGED) {
-            print(row3("damaged", p.name, digest));
+            answer(f, row3("damaged", p.name, digest));
             worst = BROKEN;
             continue;
         }
         if (state == store.MISSING) {
-            print(row3("missing", p.name, digest));
+            answer(f, row3("missing", p.name, digest));
             if (worst < NEEDS_INSTALLING) { worst = NEEDS_INSTALLING; }
             continue;
         }
@@ -652,7 +694,7 @@ fn verify(f: fault.Fault) i64 {
             if (fs.is_dir(dir)) {
                 const now = store.tree_hash(f, dir);
                 if (f.ok and !text.eq(now, digest)) {
-                    print(row3("changed", p.name, dir));
+                    answer(f, row3("changed", p.name, dir));
                     if (worst < NEEDS_RESOLVING) { worst = NEEDS_RESOLVING; }
                 }
                 f.ok = true;
@@ -665,10 +707,10 @@ fn verify(f: fault.Fault) i64 {
     // wrong, because a project that is missing entries needs `install` anyway
     // and has already been told so.
     if (worst == OK and !io.exists(manifest.ENV_NAME)) {
-        print(row2("needs", "install"));
+        answer(f, row2("needs", "install"));
         worst = NEEDS_INSTALLING;
     }
-    if (worst == OK) { print(row2("ready", text.from_int(list.len(lock.packages)))); }
+    if (worst == OK) { answer(f, row2("ready", text.from_int(list.len(lock.packages)))); }
     return worst;
 }
 
@@ -705,7 +747,7 @@ fn local_source(p: manifest.Locked) ?str {
 fn show_list(f: fault.Fault) i64 {
     const lock = read_lock_here(f) orelse return FAILED;
     for (list.to_array(lock.packages)) |p| {
-        print(row4(p.name, p.version, p.source, p.tree));
+        answer(f, row4(p.name, p.version, p.source, p.tree));
     }
     return OK;
 }
@@ -753,7 +795,7 @@ fn why(f: fault.Fault, args: []str) i64 {
         frontier = next;
     }
     if (found == 0) {
-        print(row2("nothing", want));
+        answer(f, row2("nothing", want));
         return NEEDS_INSTALLING;
     }
     return OK;
@@ -797,8 +839,8 @@ fn gc(f: fault.Fault) i64 {
     for (store.held_indexes(h)) |digest| { list.push(keep, digest); }
     const removed = store.collect(f, h, keep);
     if (!f.ok) { return FAILED; }
-    print(row2("removed", text.from_int(removed)));
-    print(row2("kept", text.from_int(list.len(keep))));
+    answer(f, row2("removed", text.from_int(removed)));
+    answer(f, row2("kept", text.from_int(list.len(keep))));
     return OK;
 }
 
@@ -807,14 +849,14 @@ fn show_store(f: fault.Fault) i64 {
         fault.fail(f, "cannot work out where the store is");
         return FAILED;
     };
-    print(row2("home", h));
-    print(row2("objects", store.objects(h)));
+    answer(f, row2("home", h));
+    answer(f, row2("objects", store.objects(h)));
     var entries = 0;
     if (fs.is_dir(store.objects(h))) {
         entries = array.len(fs.read_dir(store.objects(h)) catch []str{});
     }
-    print(row2("entries", text.from_int(entries)));
-    print(row2("environments", text.from_int(array.len(store.registered(h)))));
+    answer(f, row2("entries", text.from_int(entries)));
+    answer(f, row2("environments", text.from_int(array.len(store.registered(h)))));
     return OK;
 }
 
@@ -823,5 +865,12 @@ fn show_store(f: fault.Fault) i64 {
 // ---------------------------------------------------------------------------
 
 fn row2(a: str, b: str) str { return text.concat(a, text.concat("\t", b)); }
+
+/// Complete transient stderr output before a TSV row reaches the terminal.
+fn answer(f: fault.Fault, message: str) void {
+    fault.flush(f);
+    print(message);
+    return;
+}
 fn row3(a: str, b: str, c: str) str { return row2(a, row2(b, c)); }
 fn row4(a: str, b: str, c: str, d: str) str { return row2(a, row3(b, c, d)); }

@@ -16,6 +16,7 @@
 //! the first of two lowerings, and the second would drift.
 
 pub mod equality;
+mod ffi;
 pub mod lower;
 pub mod repr;
 pub mod tables;
@@ -142,6 +143,7 @@ pub fn build<M: Module>(
     let layouts = collect_layouts(program, store);
 
     let mut decls = declare_all(module, program, store, builtins, call_conv, &layouts)?;
+    decls.ffi_thunks = ffi::define(module, program)?;
     // Every struct type `==` reaches, declared before any body is compiled --
     // the comparisons call each other, so declaring and defining have to be two
     // passes whatever order the types come in.
@@ -1116,6 +1118,16 @@ fn declare_all<M: Module>(
         .declare_function("ws_join", Linkage::Import, &join_sig)
         .map_err(|e| err("could not declare `ws_join`", e))?;
 
+    let mut ffi_sig = ir::Signature::new(call_conv);
+    ffi_sig.params.extend([
+        ir::AbiParam::new(ir::types::I64),
+        ir::AbiParam::new(repr::PTR),
+        ir::AbiParam::new(repr::PTR),
+    ]);
+    let ffi_call = module
+        .declare_function("ws_ffi_call", Linkage::Import, &ffi_sig)
+        .map_err(|e| err("could not declare `ws_ffi_call`", e))?;
+
     let strings = define_strings(module, program)?;
     let arrays = define_arrays(module, program, store, &layouts.instance_type_ids)?;
     let singletons = define_singletons(module, program)?;
@@ -1141,6 +1153,8 @@ fn declare_all<M: Module>(
         spawn,
         rpc_call,
         join,
+        ffi_call,
+        ffi_thunks: HashMap::new(),
     })
 }
 

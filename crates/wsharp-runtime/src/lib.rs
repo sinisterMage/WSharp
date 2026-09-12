@@ -10,6 +10,7 @@ pub mod builtins;
 pub mod bytes;
 pub mod crypto;
 pub mod evacuate;
+pub mod ffi;
 pub mod fs;
 pub mod gc;
 pub mod header;

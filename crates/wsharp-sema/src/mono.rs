@@ -21,6 +21,10 @@ use crate::ty::{Scheme, TyCon, Type, TypeStore, TypeVarId};
 /// A mapping from a function's quantified variables to concrete types.
 type Subst = HashMap<TypeVarId, Type>;
 
+fn ffi_scalar(ty: &Type) -> bool {
+    ty.as_int().is_some() || matches!(ty, Type::Con(TyCon::Bool | TyCon::F64, _))
+}
+
 /// Identifies one specialisation: the original function plus the types it was
 /// instantiated at.
 type Key = (hir::FuncId, Vec<(TypeVarId, String)>);
@@ -327,6 +331,75 @@ impl Mono<'_> {
         }
     }
 
+    /// A binding is an ordinary W# closure capturing a scalar symbol handle.
+    /// Creating it here gives it the usual layouts, roots and AOT relocations.
+    fn foreign_wrapper(&mut self, ty: &Type, span: Span) -> Option<hir::FuncId> {
+        let signature = self.store.resolve_deep(ty);
+        let valid = match &signature {
+            Type::Con(TyCon::Fn, parts) => {
+                let (ret, params) = parts.split_last().unwrap();
+                params.iter().all(ffi_scalar) && (ffi_scalar(ret) || *ret == Type::void())
+            }
+            _ => false,
+        };
+        if !valid {
+            let shown = self.store.show(ty);
+            let mut diag = Diagnostic::error(
+                span,
+                format!("FFI binding requires a C function signature, got `{shown}`"),
+            );
+            diag.help = Some("annotate as `fn(i32, u64) i32`; use integers, bool, f64, u64 pointers, or a void return; W# references, callbacks and variadic functions cannot cross this boundary".into());
+            self.diags.push(diag);
+            return None;
+        }
+        let Type::Con(TyCon::Fn, parts) = signature else {
+            unreachable!()
+        };
+        let (ret, params) = parts.split_last().unwrap();
+        let id = self.out.len() as hir::FuncId;
+        let locals: Vec<hir::LocalDef> = std::iter::once(Type::i64())
+            .chain(params.iter().cloned())
+            .enumerate()
+            .map(|(i, ty)| hir::LocalDef {
+                name: format!("arg{i}"),
+                ty,
+                mutable: false,
+                span,
+            })
+            .collect();
+        let args = locals
+            .iter()
+            .enumerate()
+            .map(|(i, local)| hir::Expr {
+                ty: local.ty.clone(),
+                span,
+                kind: hir::ExprKind::Local(i as hir::LocalId),
+            })
+            .collect();
+        self.out.push(Some(hir::FuncDef {
+            name: format!("ffi_binding_{id}"),
+            params: (1..locals.len() as u32).collect(),
+            captures: vec![0],
+            locals,
+            ret: ret.clone(),
+            body: hir::Block {
+                stmts: vec![hir::Stmt::Return(Some(hir::Expr {
+                    ty: ret.clone(),
+                    span,
+                    kind: hir::ExprKind::Call {
+                        callee: hir::Callee::Foreign,
+                        args,
+                    },
+                }))],
+            },
+            scheme: Scheme::mono(ty.clone()),
+            is_closure: true,
+            self_local: None,
+            span,
+        }));
+        Some(id)
+    }
+
     fn rewrite_expr(&mut self, expr: &mut hir::Expr, subst: &Subst) {
         expr.ty = self.apply(&expr.ty, subst);
         // An integer literal used at an `f64` *is* a float literal. It takes
@@ -379,10 +452,24 @@ impl Mono<'_> {
                         }
                     }
                     hir::Callee::Indirect(inner) => self.rewrite_expr(inner, subst),
-                    hir::Callee::Builtin(_) => {}
+                    hir::Callee::Builtin(_) | hir::Callee::Foreign => {}
                 }
-                for arg in args {
+                for arg in args.iter_mut() {
                     self.rewrite_expr(arg, subst);
+                }
+                if let hir::Callee::Builtin(id) = callee {
+                    let builtins = wsharp_runtime::builtins();
+                    let builtin = &builtins[*id as usize];
+                    if builtin.module == "std/ffi"
+                        && builtin.name == "raw_bind"
+                        && let Some(func) = self.foreign_wrapper(&expr.ty, expr.span)
+                    {
+                        expr.kind = hir::ExprKind::Closure {
+                            func,
+                            targs: Vec::new(),
+                            captures: std::mem::take(args),
+                        };
+                    }
                 }
             }
             hir::ExprKind::Closure {

@@ -104,6 +104,7 @@ pub fn offline() Network {
 fn connect(f: fault.Fault, net: Network) bool {
     if (net.tried) { return net.ready; }
     net.tried = true;
+    fault.status(f, "Loading TLS certificates");
     const roots = x509.system_roots() catch {
         fault.fail(f, "this machine has no certificate store, so nothing can be fetched");
         return false;
@@ -579,6 +580,7 @@ pub fn resolve(f: fault.Fault, net: Network, m: manifest.Manifest) Plan {
         return failed("");
     }
 
+    fault.status(f, "Choosing compatible versions");
     const answer = pubgrub.solve(provider(root, found), root.name, root.version);
     if (!answer.ok) { return failed(answer.report); }
 

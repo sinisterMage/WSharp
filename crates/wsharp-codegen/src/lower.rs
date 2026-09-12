@@ -94,6 +94,8 @@ pub struct Decls {
     pub rpc_call: FuncId,
     /// `ws_join(worker) -> tag`.
     pub join: FuncId,
+    pub ffi_call: FuncId,
+    pub ffi_thunks: HashMap<String, FuncId>,
     /// The two functions each struct type `==` reaches is compiled into. See
     /// [`crate::equality`].
     pub equality: crate::equality::Equality,
@@ -2188,6 +2190,38 @@ impl<M: Module> Trans<'_, '_, M> {
                 match area {
                     Some((slot, tys)) => self.read_ret_area(slot, &tys),
                     None => self.b.inst_results(call).iter().copied().collect(),
+                }
+            }
+
+            hir::Callee::Foreign => {
+                let handle = self.expr(&args[0])[0];
+                let count = args.len() - 1;
+                let slot = self.b.create_sized_stack_slot(ir::StackSlotData::new(
+                    ir::StackSlotKind::ExplicitSlot,
+                    ((count + 1) * 8) as u32,
+                    3,
+                ));
+                for (i, arg) in args[1..].iter().enumerate() {
+                    let value = self.expr(arg)[0];
+                    self.b.ins().stack_store(PTR, value, slot, (i * 8) as i32);
+                }
+                let thunk = self.decls.ffi_thunks[&self.func.name];
+                let thunk_ref = self.module.declare_func_in_func(thunk, self.b.func);
+                let thunk_ptr = self.b.ins().func_addr(PTR, thunk_ref);
+                let data = self.b.ins().stack_addr(PTR, slot, 0);
+                let call = self
+                    .module
+                    .declare_func_in_func(self.decls.ffi_call, self.b.func);
+                self.b.ins().call(call, &[handle, thunk_ptr, data]);
+                if *ty == Type::void() {
+                    SmallVec::new()
+                } else {
+                    smallvec![self.b.ins().stack_load(
+                        PTR,
+                        crate::ffi::scalar(ty).value_type,
+                        slot,
+                        (count * 8) as i32
+                    )]
                 }
             }
 

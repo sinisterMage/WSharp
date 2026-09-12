@@ -220,7 +220,10 @@ fn walk(expr: &hir::Expr, program: &hir::Program, store: &mut TypeStore, out: &m
             }
             // A call into a worker names no function here: the callee is
             // chosen by the worker's own service table.
-            hir::Callee::Builtin(_) | hir::Callee::Indirect(_) | hir::Callee::Rpc { .. } => {}
+            hir::Callee::Builtin(_)
+            | hir::Callee::Indirect(_)
+            | hir::Callee::Rpc { .. }
+            | hir::Callee::Foreign => {}
         }
         for a in args {
             walk(a, program, store, out);

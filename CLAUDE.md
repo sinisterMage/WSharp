@@ -127,6 +127,20 @@ extra `sin_len` byte out of this code entirely.
 
 ## Invariants
 
+- **FFI bindings become ordinary closures during monomorphisation.**
+  `std/ffi.bind` fixes `raw_bind`'s result to the annotated function type;
+  `mono::foreign_wrapper` rejects anything except C scalars and creates a
+  closure capturing a numeric symbol handle. `Callee::Foreign` is introduced
+  only there. Codegen emits a C thunk taking native scalar storage;
+  `ws_ffi_call` invokes it inside `worker::blocking`, retaining the library
+  until it returns. Never pass W# heap references to C, or call back into W#
+  from that region. Both JIT and AOT use these same closures and thunks.
+- **Ingot progress belongs to its caller.** `fault.none()` remains silent;
+  `fault.reporting` supplies a status sink for the CLI. Empty reports flush
+  a terminal line before a TSV answer or diagnostic. HTTP progress callbacks
+  count body bytes, with `-1` as the unknown total for chunked responses;
+  they must not infer a total from Git's object count or a received chunk.
+
 - **`hir::Program.funcs` is indexed by `FuncId`.** Never filter or reorder it —
   that silently renumbers every function. `Analysis::finish` discards the whole
   table rather than drop one entry.

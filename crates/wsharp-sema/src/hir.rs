@@ -375,6 +375,9 @@ pub enum Callee {
         targs: Vec<Type>,
     },
     Builtin(BuiltinId),
+    /// A native call created by monomorphisation for `std/ffi.bind`.
+    /// The first argument is a symbol handle; the rest follow the C signature.
+    Foreign,
     /// A call through a closure value.
     Indirect(Box<Expr>),
     /// `w.f(..)` -- a call into another worker's service. The arguments are

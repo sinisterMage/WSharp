@@ -136,6 +136,14 @@ const MESSAGE: BuiltinTy = BuiltinTy::Message(0);
 pub fn builtins() -> Vec<Builtin> {
     let mut table = vec![
         Builtin {
+            module: IO_MODULE,
+            name: "progress",
+            params: &[BuiltinTy::Str, BuiltinTy::Bool],
+            ret: BuiltinTy::Void,
+            link: "ws_io_progress",
+            ptr: crate::io::ws_io_progress as *const u8,
+        },
+        Builtin {
             module: PRELUDE,
             name: "print",
             params: &[BuiltinTy::Str],
@@ -289,6 +297,7 @@ pub fn builtins() -> Vec<Builtin> {
         },
     ];
     table.extend(library());
+    table.extend(crate::ffi::builtins());
     table
 }
 
@@ -1451,6 +1460,7 @@ const NET_ERRORS: &[&str] = &[
 /// touches a reference.
 pub fn std_module_sources() -> &'static [(&'static str, &'static str)] {
     &[
+        ("std/ffi", include_str!("std/ffi.ws")),
         (ARRAY_MODULE, include_str!("std/array.ws")),
         (LIST_MODULE, include_str!("std/list.ws")),
         (MAP_MODULE, include_str!("std/map.ws")),
@@ -1494,6 +1504,7 @@ pub fn std_module_sources() -> &'static [(&'static str, &'static str)] {
 /// them does not pay for them.
 pub fn ingot_module_sources() -> &'static [(&'static str, &'static str)] {
     &[
+        ("ingot/progress", include_str!("ingot/progress.ws")),
         (INGOT_FAULT_MODULE, include_str!("ingot/fault.ws")),
         (INGOT_SEMVER_MODULE, include_str!("ingot/semver.ws")),
         (INGOT_PUBGRUB_MODULE, include_str!("ingot/pubgrub.ws")),
@@ -1600,6 +1611,7 @@ pub fn abstract_types() -> &'static [(&'static str, &'static [BuiltinTy])] {
 /// callable from W# source: the allocator and the panic handler.
 pub fn runtime_symbols() -> Vec<(&'static str, *const u8)> {
     vec![
+        ("ws_ffi_call", crate::ffi::ws_ffi_call as *const u8),
         ("ws_alloc", crate::heap::ws_alloc as *const u8),
         ("ws_panic", ws_panic as *const u8),
         ("ws_panic_index", ws_panic_index as *const u8),
@@ -1854,7 +1866,7 @@ pub extern "C" fn ws_panic(code: i64) {
     report_and_exit(&reason)
 }
 
-fn report_and_exit(reason: &str) -> ! {
+pub(crate) fn report_and_exit(reason: &str) -> ! {
     eprintln!("W# panic: {reason}");
     crate::gc::report_if_asked();
     // `exit` rather than `panic!`: unwinding out of an `extern "C"` function
@@ -2001,6 +2013,7 @@ mod tests {
                 "std/bits.f64_bits",
                 "std/bits.f64_from_bits",
                 "std/array.new",
+                "std/ffi.raw_bind",
             ]
         );
     }

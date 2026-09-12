@@ -9,9 +9,25 @@
 // thing that prints.
 const text = @import("std/str");
 
-pub const Fault = struct { ok: bool, message: str };
+pub const Fault = struct { ok: bool, message: str, report: fn(str) void };
 
-pub fn none() Fault { return Fault{ .ok = true, .message = "" }; }
+fn silent(message: str) void { return; }
+
+pub fn none() Fault { return reporting(silent); }
+
+/// Libraries stay silent unless their caller supplies a progress sink.
+pub fn reporting(report: fn(str) void) Fault {
+    return Fault{ .ok = true, .message = "", .report = report };
+}
+
+pub fn status(f: Fault, message: str) void {
+    if (f.ok) { f.report(message); }
+    return;
+}
+
+/// End a transient line before stdout or a diagnostic writes a complete line.
+/// An empty report is the sink's flush signal; a silent sink ignores it.
+pub fn flush(f: Fault) void { f.report(""); return; }
 
 /// Record a failure. The first one is kept; the rest are dropped.
 pub fn fail(f: Fault, message: str) void {

@@ -232,6 +232,7 @@ fn headers(content_type: str) list.List[http.Header] {
 
 /// Ask a remote what it can do and what it holds.
 pub fn discover(f: fault.Fault, r: Remote) ?list.List[Ref] {
+    fault.status(f, text.concat("Connecting to ", r.url));
     var none: list.List[http.Header] = list.new();
     const advert = http.request_headers(
         text.concat(r.url, "/info/refs?service=git-upload-pack"),
@@ -261,10 +262,13 @@ pub fn discover(f: fault.Fault, r: Remote) ?list.List[Ref] {
 
 /// Fetch one commit and everything under it, as a packfile.
 pub fn fetch(f: fault.Fault, r: Remote, want: str) ?[]u8 {
-    const answer = http.request_headers(
+    fault.status(f, text.concat("Fetching ", r.url));
+    const state = Transfer{ .last = -65536 };
+    const answer = http.request_progress(
         text.concat(r.url, "/git-upload-pack"),
         "POST", fetch_request(want), r.cfg,
-        headers("application/x-git-upload-pack-request")) catch {
+        headers("application/x-git-upload-pack-request"),
+        fn(received: i64, total: i64) void { transfer(f, state, received, total); return; }) catch {
         fault.fail(f, text.concat("cannot fetch from ", r.url));
         return null;
     };
@@ -272,7 +276,26 @@ pub fn fetch(f: fault.Fault, r: Remote, want: str) ?[]u8 {
         fault.fail(f, text.concat(text.concat(r.url, " answered "), text.from_int(answer.code)));
         return null;
     }
+    fault.status(f, text.concat("Downloaded ", text.concat(text.from_int(text.len(answer.body)), " bytes")));
     return parse_packfile(f, answer.body);
+}
+
+const Transfer = struct { last: i64 };
+
+fn transfer(f: fault.Fault, state: Transfer, received: i64, total: i64) void {
+    // Keep redirected logs bounded, even when a server sends tiny chunks.
+    if (received - state.last < 65536 and received != total) { return; }
+    state.last = received;
+    var message = text.concat("Downloading: ", text.from_int(received));
+    if (total >= 0) {
+        message = text.concat(message, text.concat(" / ", text.from_int(total)));
+    }
+    message = text.concat(message, " bytes");
+    if (total > 0) {
+        message = text.concat(message, text.concat(" (", text.concat(text.from_int(received * 100 / total), "%)")));
+    }
+    fault.status(f, message);
+    return;
 }
 
 /// Everything a commit's tree holds, as paths and contents.
@@ -282,6 +305,7 @@ pub fn fetch(f: fault.Fault, r: Remote, want: str) ?[]u8 {
 pub const File = struct { path: str, data: []u8 };
 
 pub fn files(f: fault.Fault, pack: []u8, commit_id: str) ?list.List[File] {
+    fault.status(f, text.concat("Unpacking and verifying ", text.concat(text.from_int(array.len(pack)), " bytes")));
     const objects = packfile.read(f, pack) orelse return null;
     const commit = packfile.find(objects, commit_id) orelse {
         fault.fail(f, text.concat("the packfile does not hold ", commit_id));

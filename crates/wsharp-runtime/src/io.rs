@@ -170,3 +170,34 @@ pub unsafe extern "C" fn ws_io_exists(path: *const u8) -> bool {
     let path = unsafe { str_bytes(path) }.to_vec();
     crate::worker::blocking(|| sys::exists(&path))
 }
+/// Render a status line on stderr, replacing it only on a terminal.
+///
+/// # Safety
+/// `message` points at a W# string. No heap pointer survives the safe region.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_io_progress(message: *const u8, finished: i8) {
+    use std::io::{IsTerminal, Write};
+    unsafe { crate::gc::checkpoint() };
+    let bytes = unsafe { crate::strings::str_bytes(message) }.to_vec();
+    // Package names and URLs are external text, never terminal instructions.
+    let message: String = String::from_utf8_lossy(&bytes)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    crate::worker::blocking(|| {
+        let stderr = std::io::stderr();
+        let terminal = stderr.is_terminal() && std::env::var("TERM").as_deref() != Ok("dumb");
+        let mut out = stderr.lock();
+        if terminal {
+            if !message.is_empty() {
+                let _ = write!(out, "\r\x1b[2K{message}");
+            }
+            if finished != 0 {
+                let _ = writeln!(out);
+            }
+        } else if !message.is_empty() {
+            let _ = writeln!(out, "{message}");
+        }
+        let _ = out.flush();
+    });
+}

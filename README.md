@@ -601,6 +601,10 @@ serving many connections from one worker, not for keeping the collector alive.
 | `std/toml` | TOML 1.0.0, whole, read and written: `parse` answers a `Doc`, `write` renders one, and `Value` is a lattice with `kind` and `as_str`/`as_int`/… over it |
 | `std/json` | RFC 8259, read and written: `parse` `write` `write_pretty`, the same `Value` lattice with `Null` in it, and `get` `has` `len` `keys` `set` `lookup` `at`. Strict - no comments, no trailing commas, no `NaN`. A number with no point and no exponent stays an `i64`, so a 64-bit identifier survives being read |
 
+`std/ffi` loads native libraries and binds C functions to typed W# calls.
+It also provides stable native buffers, NUL-terminated strings, and explicit
+resource cleanup. It works with both `wsharp run` and `wsharp build`.
+
 A **prelude** needs no import, because every module has it:
 
 | | |
@@ -620,6 +624,60 @@ is worth knowing if you add to it: **a builtin may read and write bytes, and
 anything that moves a *reference* from one object into another is written in
 W#**, where the write barrier, the load barrier and the stack maps all apply by
 construction.
+
+### Calling native libraries
+
+Use `std/ffi` with a shared library (`.so`, `.dylib`, or `.dll`). The function
+annotation must match the C declaration exactly:
+
+```zig
+const ffi = @import("std/ffi");
+const os = @import("std/os");
+
+fn main() i64 {
+    const library = ffi.open(os.args()[0]) catch {
+        print_err(ffi.last_error());
+        return 1;
+    };
+    // C: int32_t answer(void);
+    const answer: fn() i32 = ffi.bind(library, "answer") catch {
+        print_err(ffi.last_error());
+        ffi.close(library);
+        return 1;
+    };
+    print_int(i64(answer()));
+    ffi.close(library);
+    return 0;
+}
+```
+
+Integer widths and signedness are preserved; `f64` is C `double`, `bool` is
+C `_Bool`, and `void` is a C void return. Native pointers use `u64` on W#'s
+64-bit targets. Use `i32` for Windows `BOOL`; C `long` and `size_t` must use
+the width of the platform's C declaration.
+
+For a C string, `ffi.c_string("hello")` returns a `Buffer`; pass
+`try ffi.address(buffer)` to a function taking a pointer, then call
+`ffi.free(buffer)` when native code has finished with it. `ffi.buffer(size)`
+allocates zeroed native memory. `ffi.read(buffer, offset, size)` and
+`ffi.write(buffer, offset, bytes)` check bounds; `ffi.read_pointer(pointer, size)`
+copies bytes from a foreign address whose validity is the caller's responsibility.
+These buffers are separate from the moving W# heap and must be freed explicitly.
+
+Bindings remain valid until `ffi.close(library)`. Closing invalidates its
+bindings; an attempted call afterwards produces a W# panic. Calls already
+running retain the library until they return. Native calls may block while
+the collector continues working. Native code must not call back into W#,
+unwind across the boundary, or access W# heap objects. Coordinate native buffer
+access and freeing when multiple threads use the same address.
+
+This first FFI supports fixed C signatures with scalar arguments and results.
+Structs by value, variadic calls, callbacks, and direct W# strings or arrays
+are unsupported. The compiler rejects unsupported W# signatures; it cannot
+verify a signature against a library's machine code. Use a small C wrapper for
+APIs needing those shapes. The real C fixture in
+[`tests/fixtures/ffi.c`](tests/fixtures/ffi.c) and its
+[`W# caller`](tests/fixtures/ffi.ws) demonstrate the supported types.
 
 ## Packages
 
@@ -645,6 +703,16 @@ exit status, and a conflict comes back as the derivation that caused it:
 Because no versions of core match >=2.0.0 <3.0.0 and util 0.3.0 depends on
 core >=2.0.0 <3.0.0, util 0.3.0 cannot be used.
 ```
+
+Progress is written to stderr while work happens: certificate loading,
+fetching, received bytes (with a percentage when the server supplies a total),
+unpacking, and copying or verifying packages. Install reports `[completed/total]`
+and finishes with installed and cached counts, including when everything is
+already installed. A terminal updates one status line; redirected stderr gets
+plain lines. `ingot install --quiet` (or `-q`) hides progress while keeping
+errors, stdout and exit statuses available to scripts. Package counts track
+completed packages; byte progress tracks the current HTTP response, whose
+total is unknown for chunked transfers.
 
 A dependency is a version, a directory or a git revision. A version comes from
 the registry - [Foundry](https://github.com/sinisterMage/Foundry), an index of

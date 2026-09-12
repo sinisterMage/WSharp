@@ -195,10 +195,21 @@ fn read_line(c: Conn) !str {
 
 /// Exactly `n` bytes of body.
 fn read_body(c: Conn, n: i64) !str {
+    return try read_body_progress(c, n, no_progress, 0, n);
+}
+
+fn no_progress(received: i64, total: i64) void { return; }
+
+fn read_body_progress(c: Conn, n: i64, progress: fn(i64, i64) void,
+                      offset: i64, total: i64) !str {
+    if (n < 0) { return error.BadFormat; }
+    progress(offset + if (text.len(c.buffered) < n) text.len(c.buffered) else n, total);
     while (text.len(c.buffered) < n) {
-        const chunk = try conn_read(c, n - text.len(c.buffered));
+        const remaining = n - text.len(c.buffered);
+        const chunk = try conn_read(c, if (remaining < 65536) remaining else 65536);
         if (text.len(chunk) == 0) { return error.EndOfFile; }
         c.buffered = text.concat(c.buffered, chunk);
+        progress(offset + text.len(c.buffered), total);
     }
     const body = text.substr(c.buffered, 0, n);
     c.buffered = text.substr(c.buffered, n, text.len(c.buffered));
@@ -245,7 +256,7 @@ fn parse_hex(s: str) !i64 {
 }
 
 /// A body sent in pieces, each announced by its length.
-fn read_chunked(c: Conn) !str {
+fn read_chunked(c: Conn, progress: fn(i64, i64) void) !str {
     var body = "";
     var more = true;
     while (more) {
@@ -259,7 +270,7 @@ fn read_chunked(c: Conn) !str {
         if (size == 0) {
             more = false;
         } else {
-            body = text.concat(body, try read_body(c, size));
+            body = text.concat(body, try read_body_progress(c, size, progress, text.len(body), -1));
             // The CRLF that follows every chunk's bytes.
             const after = try read_line(c);
         }
@@ -276,11 +287,16 @@ fn read_chunked(c: Conn) !str {
 
 /// The body a set of headers describes.
 fn read_payload(c: Conn, headers: list.List[Header]) !str {
+    return try read_payload_progress(c, headers, no_progress);
+}
+
+fn read_payload_progress(c: Conn, headers: list.List[Header], progress: fn(i64, i64) void) !str {
     const encoding = header(headers, "Transfer-Encoding") orelse "";
-    if (text.to_lower(encoding) == "chunked") { return try read_chunked(c); }
+    if (text.to_lower(encoding) == "chunked") { return try read_chunked(c, progress); }
     const declared = header(headers, "Content-Length") orelse "";
     if (text.len(declared) == 0) { return ""; }
-    return try read_body(c, try text.parse_int(declared));
+    const n = try text.parse_int(declared);
+    return try read_body_progress(c, n, progress, 0, n);
 }
 
 /// Where a URL points.
@@ -353,6 +369,11 @@ pub fn send_request_with(c: Conn, host: str, method: str, path: str, body: str,
 
 /// Read a response off a connection, once a request has been sent.
 pub fn read_response(c: Conn) !Response {
+    return try read_response_progress(c, no_progress);
+}
+
+/// Report body bytes received. `total` is -1 for chunked transfers.
+pub fn read_response_progress(c: Conn, progress: fn(i64, i64) void) !Response {
     // "HTTP/1.1 200 OK"
     const line = try read_line(c);
     const after_version = text.find(line, " ");
@@ -364,7 +385,7 @@ pub fn read_response(c: Conn) !Response {
     const code = try text.parse_int(digits);
 
     const headers = try read_headers(c);
-    const body = try read_payload(c, headers);
+    const body = try read_payload_progress(c, headers, progress);
     return Response{
         .code = code,
         .status = status_of(code),
@@ -406,15 +427,31 @@ pub fn request_with(url: str, method: str, body: str, cfg: tls.Config) !Response
 /// The same again, with headers of this caller's own.
 pub fn request_headers(url: str, method: str, body: str, cfg: tls.Config,
                        extra: list.List[Header]) !Response {
+    return try request_progress(url, method, body, cfg, extra, no_progress);
+}
+
+/// `request_headers` with a body-byte progress callback, including TLS reads.
+/// The callback runs synchronously and must not read from this connection.
+pub fn request_progress(url: str, method: str, body: str, cfg: tls.Config,
+                        extra: list.List[Header], progress: fn(i64, i64) void) !Response {
     const where = try parse_url(url);
     const socket = try net.connect(where.host, where.port);
     var c = connection(socket);
     if (where.secure) {
-        const session = try tls.connect(socket, with_host(cfg, where.host));
+        const session = tls.connect(socket, with_host(cfg, where.host)) catch |e| {
+            net.close(socket);
+            return e;
+        };
         c = tls_connection(session);
     }
-    try send_request_with(c, where.host, method, where.path, body, extra);
-    const answer = try read_response(c);
+    send_request_with(c, where.host, method, where.path, body, extra) catch |e| {
+        close(c);
+        return e;
+    };
+    const answer = read_response_progress(c, progress) catch |e| {
+        close(c);
+        return e;
+    };
     close(c);
     return answer;
 }

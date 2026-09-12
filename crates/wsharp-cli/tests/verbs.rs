@@ -209,6 +209,113 @@ impl Drop for Project {
     }
 }
 
+#[test]
+fn install_reports_progress_cache_hits_and_quiet_preserves_stdout() {
+    let project = Project::new("progress");
+    project.package("core", "1.0.0", "", "pub fn answer() i64 { return 42; }");
+    let app = project.package(
+        "app",
+        "1.0.0",
+        "core = { path = \"../core\" }\n",
+        "fn main() void { return; }",
+    );
+    project.expect(&app, &["resolve"], READY);
+    let first = project.run(&app, &["install"]);
+    assert_eq!(first.status.code(), Some(READY));
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(stderr.contains("[0/1] Installing core"), "{stderr}");
+    assert!(stderr.contains("[1/1] Ready core"), "{stderr}");
+    assert!(stderr.contains("1 installed, 0 cached"), "{stderr}");
+    assert!(
+        !stderr.contains('\x1b') && !stderr.contains('\r'),
+        "redirected progress is plain text"
+    );
+    let cached = project.run(&app, &["install"]);
+    assert_eq!(cached.status.code(), Some(READY));
+    let stderr = String::from_utf8_lossy(&cached.stderr);
+    assert!(stderr.contains("0 installed, 1 cached"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&cached.stdout), "ready\t1\n");
+    for args in [["install", "--quiet"], ["-q", "install"]] {
+        let quiet = project.run(&app, &args);
+        assert_eq!(quiet.status.code(), Some(READY));
+        assert_eq!(quiet.stdout, cached.stdout);
+        assert!(quiet.stderr.is_empty());
+    }
+    std::fs::write(
+        app.join("ingot.toml"),
+        "[package]\nname = \"changed\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+    let failed = project.run(&app, &["install", "--quiet"]);
+    assert_eq!(failed.status.code(), Some(NEEDS_RESOLVING));
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("ingot resolve"));
+    assert!(!String::from_utf8_lossy(&failed.stdout).contains("ready"));
+}
+
+#[test]
+fn empty_install_reports_zero_packages() {
+    let project = Project::new("progress-empty");
+    let app = project.package("app", "1.0.0", "", "fn main() void { return; }");
+    project.expect(&app, &["resolve"], READY);
+    let out = project.run(&app, &["install"]);
+    assert_eq!(out.status.code(), Some(READY));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ready\t0\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("0 packages ready"));
+}
+
+#[test]
+fn progress_is_flushed_before_a_registry_fetch_finishes() {
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let project = Project::new("progress-live");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let mut child = Command::new(ingot())
+        .env("WSHARP_HOME", project.store())
+        .env("INGOT_REGISTRY", url)
+        .arg("update")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            if tx.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    // The listener deliberately sends no response. Progress must arrive while
+    // the command is still waiting, not when its output buffers close at exit.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut lines = Vec::new();
+    let mut saw_fetch = false;
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        let Ok(line) = rx.recv_timeout(remaining) else {
+            break;
+        };
+        saw_fetch = line.contains("Connecting to http://127.0.0.1:");
+        lines.push(line);
+        if saw_fetch {
+            break;
+        }
+    }
+    let still_running = child.try_wait().unwrap().is_none();
+    let _ = child.kill();
+    child.wait().unwrap();
+    reader.join().unwrap();
+    assert!(
+        saw_fetch && still_running,
+        "progress before completion: {lines:?}"
+    );
+}
+
 /// One field of a tab-separated line.
 fn field(stdout: &str, row: usize, column: usize) -> String {
     stdout

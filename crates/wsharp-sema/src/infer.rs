@@ -7451,7 +7451,7 @@ fn patch_targs_expr(expr: &mut hir::Expr, targs_for: &HashMap<hir::FuncId, Vec<T
                     }
                 }
                 hir::Callee::Indirect(e) => patch_targs_expr(e, targs_for),
-                hir::Callee::Builtin(_) => {}
+                hir::Callee::Builtin(_) | hir::Callee::Foreign => {}
             }
             for arg in args {
                 patch_targs_expr(arg, targs_for);
