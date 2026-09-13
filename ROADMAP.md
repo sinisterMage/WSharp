@@ -2881,6 +2881,25 @@ no caller asking yet.
 
 ---
 
+## Process supervision — 0.1.8
+
+`std/process` now supplies child handles, argv/cwd/environment isolation,
+bounded output capture, monotonic waits, termination and cleanup. `std/os`
+adds pollable termination signals, and `std/time` adds a monotonic millisecond
+clock and GC-safe sleep. These supply the primitives needed for a native W#
+framework CLI to capture compiler declarations and supervise a development
+server. The framework CLI itself is separate work.
+
+The runtime still has no third-party dependencies. Rust's `Command` handles
+spawn/argv encoding; small native arms handle pipe readiness and signals.
+Tests exercise real W# children through JIT, AOT and GC stress, including
+compiler API capture and exit cleanup. See [the process API](docs/processes.md)
+for platform support and limits: piped stdin and Windows job-object/service
+supervision are not implemented; groups cannot be signalled after reaping their
+leader; forced exit only attempts nonblocking emergency child cleanup.
+
+---
+
 ## Smaller follow-ups
 
 These are deliberate limitations, each with a clear fix:

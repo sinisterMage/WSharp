@@ -20,11 +20,11 @@ fn native_signatures_buffers_gc_and_library_lifetime() {
     std::fs::create_dir_all(&dir).unwrap();
     // A Unicode path exercises UTF-16 loading on Windows.
     let library = dir.join(if cfg!(windows) {
-        "nativé.dll"
+        "nativé 東京 😀.dll"
     } else if cfg!(target_os = "macos") {
-        "libnativé.dylib"
+        "libnativé 東京 😀.dylib"
     } else {
-        "libnativé.so"
+        "libnativé 東京 😀.so"
     });
     let mut cc = Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()));
     cc.arg(if cfg!(target_os = "macos") {
@@ -79,6 +79,13 @@ fn native_signatures_buffers_gc_and_library_lifetime() {
                     .arg(if closed { "closed" } else { "open" })
                     .output()
                     .unwrap();
+                assert!(
+                    out.status.code() == Some(if closed { 101 } else { 0 }),
+                    "aot={aot} stress={stress} closed={closed}: {}\nstdout:\n{}\nstderr:\n{}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
                 if closed {
                     assert_eq!(
                         out.status.code(),
@@ -92,6 +99,55 @@ fn native_signatures_buffers_gc_and_library_lifetime() {
                     assert_eq!(String::from_utf8_lossy(&out.stdout), "ffi ok\n");
                 }
             }
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The DLL path failure is a startup argv bug, so exercise argument decoding
+/// separately from loading a library. Include a supplementary-plane character,
+/// empty arguments, quotes, and trailing backslashes in both backends.
+#[test]
+fn command_line_arguments_preserve_unicode_and_quoting() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let dir = std::env::temp_dir().join(format!("wsharp-argv-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = root.join("tests/fixtures/argv.ws");
+    let executable = dir.join(format!("argv{}", std::env::consts::EXE_SUFFIX));
+    let compiler = env!("CARGO_BIN_EXE_wsharp");
+    success(
+        Command::new(compiler)
+            .arg("build")
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap(),
+    );
+    let args = [
+        "",
+        "nativé.dll",
+        "東京/😀",
+        "spaces and \"quotes\"",
+        "trailing\\",
+        "back\\\"slash",
+        "",
+    ];
+    let expected = format!("{}\n", args.join("\n"));
+    for aot in [false, true] {
+        for stress in [false, true] {
+            let mut cmd = if aot {
+                Command::new(&executable)
+            } else {
+                let mut c = Command::new(compiler);
+                c.arg("run").arg(&source).arg("--");
+                c
+            };
+            if stress {
+                cmd.env("WSHARP_GC_STRESS", "1");
+            }
+            let out = success(cmd.args(args).output().unwrap());
+            assert_eq!(out.stdout, expected.as_bytes(), "aot={aot} stress={stress}");
         }
     }
     std::fs::remove_dir_all(dir).unwrap();

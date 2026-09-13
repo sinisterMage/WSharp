@@ -32,9 +32,10 @@
 //! **`main` rather than Rust's.** Defining `main` here means Rust's
 //! `lang_start` never runs. Everything this needs survives that -- panics,
 //! unwinding, `RUST_BACKTRACE`, threads, and stdout, all of which initialise
-//! lazily -- and the argument vector arrives from the C runtime directly,
-//! which is more portable than relying on the `.init_array` capture
-//! `std::env::args` uses. The one thing genuinely lost is the main thread's
+//! lazily. Unix arguments arrive from the C runtime as bytes. On Windows,
+//! `std::env::args_os` reads the wide command line even without `lang_start`,
+//! avoiding the lossy code-page conversion of the C runtime's narrow `argv`.
+//! The one thing genuinely lost is the main thread's
 //! stack guard page, so a runaway recursion in W# is a segfault rather than a
 //! message. That is what it already was under the JIT.
 
@@ -80,6 +81,8 @@ pub unsafe extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int 
 
     // Every worker still parked on its queue would keep the process alive, and
     // one in the middle of a trace would be left half way through it.
+    wsharp_runtime::process::close_all();
+    wsharp_runtime::signals::restore();
     wsharp_runtime::rpc::stop_all();
     // Sockets the program left open. The kernel would close them anyway; doing
     // it here releases a listener's port before the next process wants it.
@@ -101,6 +104,7 @@ pub unsafe extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int 
 ///
 /// # Safety
 /// `argv` must hold `argc` NUL-terminated strings.
+#[cfg(not(windows))]
 unsafe fn arguments(argc: c_int, argv: *const *const c_char) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     if argv.is_null() {
@@ -120,4 +124,26 @@ unsafe fn arguments(argc: c_int, argv: *const *const c_char) -> Vec<Vec<u8>> {
         out.push(unsafe { core::slice::from_raw_parts(p as *const u8, n) }.to_vec());
     }
     out
+}
+
+/// Windows CRT argv uses the active code page, not UTF-8. Read the wide command
+/// line through Rust's Windows argument parser, which also preserves quoting
+/// and empty arguments. Unlike Unix's implementation it needs no argv capture
+/// from Rust's main. Reject unpaired UTF-16 surrogates instead of substituting a
+/// different path for the one supplied by the caller.
+///
+/// # Safety
+/// Called at process startup; the narrow C arguments are deliberately unused.
+#[cfg(windows)]
+unsafe fn arguments(_argc: c_int, _argv: *const *const c_char) -> Vec<Vec<u8>> {
+    std::env::args_os()
+        .skip(1)
+        .map(|arg| match arg.into_string() {
+            Ok(value) => value.into_bytes(),
+            Err(_) => {
+                eprintln!("error: command-line argument is not valid Unicode");
+                std::process::exit(1);
+            }
+        })
+        .collect()
 }

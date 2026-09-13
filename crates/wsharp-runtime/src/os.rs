@@ -179,6 +179,7 @@ pub unsafe extern "C" fn ws_os_chdir(dir: *const u8) -> i64 {
 /// Called from generated code across an FFI boundary.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_os_exit(code: i64) -> ! {
+    crate::process::kill_all();
     crate::net::close_all();
     crate::gc::report_if_asked();
     std::process::exit((code & 0xff) as i32);

@@ -85,6 +85,8 @@ impl Jit {
         };
         // Every worker still parked on its queue would keep the process alive,
         // and one in the middle of a trace would be left half way through it.
+        wsharp_runtime::process::close_all();
+        wsharp_runtime::signals::restore();
         wsharp_runtime::rpc::stop_all();
         // Sockets the program left open. The kernel would close them anyway;
         // doing it here releases a listener's port before the next process

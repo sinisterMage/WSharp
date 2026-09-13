@@ -537,6 +537,11 @@ bits, so `chmod` succeeds there without doing anything and `is_executable` is
 keep and a lie about a file that does not exist. `std/path` is the arithmetic above both, and makes no syscall at all.
 `std/os` is what the process knows about itself - `args`, `get`, `home`,
 `temp_dir`, `cwd`, `exit`, and `target`, the triple this binary was built for.
+It also provides `catch_signals`/`take_signal`/`restore_signals` for main-loop
+shutdown handling. `std/process` starts and supervises child processes, with
+literal argv, child-local cwd/environment, bounded capture and timed waits.
+See [child processes and shutdown](docs/processes.md) for the ownership contract
+and platform limits (available since 0.1.8).
 `std/toml` is TOML 1.0, read and written, and `std/json` is RFC 8259 the same
 way. Both answer with a document rather than raising: an error union carries a
 tag and nothing else, and `BadFormat` is not a thing to hand somebody holding a
@@ -590,7 +595,8 @@ serving many connections from one worker, not for keeping the collector alive.
 | `std/hash` | SHA-256, SHA-384 and SHA-512, one-shot and incremental, plus `hmac` `hkdf_extract` `hkdf_expand` - written once over a `Hash` value that says a block size, a digest size and how to hash |
 | `std/cipher` | ChaCha20, Poly1305, ChaCha20-Poly1305; AES-128/256, GHASH, AES-GCM. Constant-time by construction: no table is indexed by a secret byte, so AES's S-box is computed in GF(2^8) and GHASH is 128 shifts |
 | `std/crypto` | `random` - the system's generator, which is the kernel's |
-| `std/time` | `now` - seconds since the Unix epoch |
+| `std/time` | `now` - epoch seconds; `monotonic_ms` - duration clock; `sleep_ms` - GC-safe sleep |
+| `std/process` | `command` `spawn` `poll` `wait` `collect` `run` `terminate` `interrupt` `kill` `close` `success` - child processes with bounded stdout/stderr capture |
 | `std/bignum` | fixed-width unsigned limbs and Montgomery arithmetic: `from_be` `to_be` `cmp` `add` `sub` `mont` `mont_mul` `mont_add` `mont_sub` `to_mont` `from_mont` `modexp`. A limb is 32 bits, which is what makes a 64x64 → 128 product unnecessary |
 | `std/curve25519` | `x25519` `x25519_base` - and the small-order check on the *output*, which is the one a list of bad encodings misses |
 | `std/nistec` | `p256` `p384` `derive` `ecdh` `valid` `ecdsa_verify` - the NIST prime curves, one implementation over `std/bignum` |

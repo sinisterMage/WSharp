@@ -298,6 +298,9 @@ pub fn builtins() -> Vec<Builtin> {
     ];
     table.extend(library());
     table.extend(crate::ffi::builtins());
+    table.extend(crate::process::builtins());
+    table.extend(crate::signals::builtins());
+    table.extend(crate::time::builtins());
     table
 }
 
@@ -1359,8 +1362,12 @@ pub fn builtin_errors() -> &'static [&'static str] {
         // directory -- one name, because both mean "there is something in the
         // way and it is not this call's business to move it".
         "DirectoryNotEmpty",
+        "OutputLimit",
     ]
 }
+
+/// A captured child exceeded its combined stdout/stderr budget.
+pub const ERROR_OUTPUT_LIMIT: i64 = 20;
 
 /// The error a call into a worker that has gone raises.
 pub const ERROR_WORKER_DIED: i64 = 5;
@@ -1480,6 +1487,7 @@ pub fn std_module_sources() -> &'static [(&'static str, &'static str)] {
         (MATH_MODULE, include_str!("std/math.ws")),
         (FS_MODULE, include_str!("std/fs.ws")),
         (OS_MODULE, include_str!("std/os.ws")),
+        ("std/process", include_str!("std/process.ws")),
         (PATH_MODULE, include_str!("std/path.ws")),
         (TOML_MODULE, include_str!("std/toml.ws")),
         (JSON_MODULE, include_str!("std/json.ws")),
@@ -1867,6 +1875,7 @@ pub extern "C" fn ws_panic(code: i64) {
 }
 
 pub(crate) fn report_and_exit(reason: &str) -> ! {
+    crate::process::kill_all();
     eprintln!("W# panic: {reason}");
     crate::gc::report_if_asked();
     // `exit` rather than `panic!`: unwinding out of an `extern "C"` function
@@ -1911,6 +1920,7 @@ mod tests {
             ("AlreadyExists", ERROR_ALREADY_EXISTS),
             ("NotADirectory", ERROR_NOT_A_DIRECTORY),
             ("DirectoryNotEmpty", ERROR_DIRECTORY_NOT_EMPTY),
+            ("OutputLimit", ERROR_OUTPUT_LIMIT),
         ];
         assert_eq!(
             names.len(),

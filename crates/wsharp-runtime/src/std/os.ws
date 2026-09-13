@@ -215,3 +215,19 @@ pub fn unpack(blob: str) []str {
     }
     return out;
 }
+
+/// Opt into SIGINT/SIGTERM delivery through take_signal, once per process.
+/// Windows handles console Ctrl-C/Ctrl-Break (Interrupt), not service shutdown.
+/// No W# runs in a signal handler. One main-loop consumer should poll and publish
+/// a drain message to its workers. Repeated pending signals of a kind coalesce.
+pub fn catch_signals() !{IoFailed}void { return raw_catch_signals(); }
+pub const Interrupt = 2;
+pub const Terminate = 15;
+pub fn take_signal() ?i64 {
+    const n = raw_take_signal();
+    if (n == 0) { return null; }
+    return n;
+}
+/// Restore the handlers that catch_signals replaced; clear pending events.
+/// Also performed on normal main return. Coordinate this process-wide change.
+pub fn restore_signals() void { raw_restore_signals(); return; }
