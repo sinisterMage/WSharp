@@ -34,10 +34,14 @@ on:
         description: "The existing tag to build and publish, e.g. v0.1.0"
         required: true
 
-# What `softprops/action-gh-release` needs to create the release and attach to
-# it. The token is minted for the run; there is no secret to configure.
+# Build jobs only read the repository; the publish job can write releases.
 permissions:
-  contents: write
+  contents: read
+
+# A manual retry and a tag push must not publish the same release concurrently.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -53,8 +57,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
-      # One target's failure must not cancel the others: a macOS runner having a
-      # bad day should not cost the Linux tarball.
+      # Finish every target for diagnostics, but publish only if all succeed.
       fail-fast: false
       matrix:
         include:
@@ -221,9 +224,43 @@ jobs:
           ls -l
           cat "${stage}.tar.gz.sha256"
 
-      # Creates the release at this tag if it is not there yet and attaches
-      # this target's two files. Every matrix job does the same, so the four
-      # converge on one release holding eight assets.
+      - name: Stage release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsharp-${{ matrix.triple }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish complete release
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Collect every target's assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wsharp-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify release assets
+        working-directory: dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          archives=( *.tar.gz )
+          checksums=( *.tar.gz.sha256 )
+          test "${#archives[@]}" -eq 4
+          test "${#checksums[@]}" -eq 4
+          sha256sum --check "${checksums[@]}"
+
+      # Keep the release in draft until every upload has finished successfully.
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
@@ -237,4 +274,11 @@ jobs:
           # `v0.1.0-rc1` is a pre-release and `v0.1.0` is not: the hyphen is
           # what semver already uses to say so.
           prerelease: ${{ contains(env.TAG, '-') }}
+          draft: true
           fail_on_unmatched_files: true
+
+      - name: Make the complete release public
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "$TAG" --draft=false

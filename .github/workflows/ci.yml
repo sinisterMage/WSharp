@@ -30,14 +30,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
-      # One platform's failure must not cancel the other's, and here that is
-      # more than politeness: the whole reason Windows is in this matrix is that
-      # it breaks in ways Linux cannot show, so its result is the interesting
-      # one precisely when it differs.
+      # Exercise every release platform before tagging. Platform-specific
+      # failures must not cancel the remaining jobs.
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
+            cc: cc
+          - os: macos-latest
+            cc: cc
+          - os: macos-15-intel
             cc: cc
           - os: windows-latest
             # Not `cc`: `link.rs` passes `-o`, which `cl.exe` does not
@@ -46,7 +48,7 @@ jobs:
             cc: clang
     defaults:
       run:
-        # Git Bash on Windows, so one script works on both. Every `run:` below
+        # Git Bash on Windows, so one script works on all four. Every `run:` below
         # is written for it.
         shell: bash
     env:

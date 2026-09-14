@@ -84,7 +84,7 @@ fn main() i64 {
     c.env = []p.Env{ p.Env{ .name = "PROCESS_TEST_VALUE", .value = "value with spaces" } };
     const result = p.run(c, 5000) catch return 1;
     if (result.status.code != 7 or result.status.signal != 0 or p.success(result.status)) { return 2; }
-    const want = text.concat("a b\n$(must-not-run); `literal`\nvalue with spaces\n", text.concat(a[1], "\n"));
+    const want = text.concat("a b\n$(must-not-run); `literal`\nvalue with spaces\n", text.concat(a[2], "\n"));
     if (!text.eq(result.stdout, want) or !text.eq(result.stderr, "")) { print(result.stdout); return 3; }
     var streams = p.command(a[0], []str{ "streams" });
     const full = p.run(streams, 5000) catch return 4;
@@ -141,6 +141,14 @@ fn bounded_output(mut cmd: Command) -> std::process::Output {
 #[test]
 fn capture_and_supervision_in_jit_aot_and_gc_stress() {
     let scratch = Scratch::new();
+    // Unix getcwd resolves symlinks: macOS's /var temporary directory is
+    // reported under /private/var. Still pass the original path to the child
+    // so setting cwd through a symlink remains covered. Windows reports the
+    // original spelling, without canonicalize's extended-length path prefix.
+    #[cfg(unix)]
+    let expected_cwd = scratch.0.canonicalize().unwrap();
+    #[cfg(not(unix))]
+    let expected_cwd = scratch.0.clone();
     let helper = scratch.build(&scratch.source("helper.ws", HELPER), "helper");
     let source = scratch.source("driver.ws", DRIVER);
     let driver = scratch.build(&source, "driver");
@@ -156,7 +164,7 @@ fn capture_and_supervision_in_jit_aot_and_gc_stress() {
             if stress {
                 cmd.env("WSHARP_GC_STRESS", "1");
             }
-            cmd.arg(&helper).arg(&scratch.0);
+            cmd.arg(&helper).arg(&scratch.0).arg(&expected_cwd);
             let out = bounded_output(cmd);
             assert!(
                 out.status.success(),
