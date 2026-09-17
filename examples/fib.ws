@@ -9,7 +9,7 @@ fn fib(n: i64) i64 {
 fn main() i64 {
     var i: i64 = 0;
     while (i < 10) : (i += 1) {
-        print_int(fib(i));
+        print(fib(i));
     }
     return 0;
 }

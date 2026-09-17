@@ -1,6 +1,6 @@
 // Dynamically loaded C functions. The annotation is the native ABI contract:
 //   const abs: fn(i32) i32 = try ffi.bind(lib, "abs");
-//   print_int(i64(abs(i32(-42))));
+//   print(abs(i32(-42)));
 //
 // Integers keep their widths, bool is C _Bool, f64 is C double, and u64 carries
 // a native pointer on W#'s 64-bit targets. Return void for a C void function.

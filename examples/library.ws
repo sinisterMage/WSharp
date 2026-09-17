@@ -23,21 +23,21 @@ fn main() i64 {
     // literal.
     const greeting = str.concat("hello, ", "world");
     print(greeting);
-    print_int(str.len(greeting));
-    print_bool(greeting == "hello, world");
+    print(str.len(greeting));
+    print(greeting == "hello, world");
     print(str.substr(greeting, 7, str.len(greeting)));
 
     // Splitting produces an array of strings, which `join` puts back.
     const fields = str.split("id,name,email", ",");
-    print_int(array.len(fields));
+    print(array.len(fields));
     print(str.join(fields, " | "));
 
     // Arithmetic that is not an operator. `abs` is an overload set; `min` is
     // one function over the abstract type `Number`.
-    print_int(math.abs(-7));
-    print_float(math.sqrt(2.0));
-    print_int(math.min(3, 7));
-    print_int(math.ipow(2, 10));
+    print(math.abs(-7));
+    print(math.sqrt(2.0));
+    print(math.min(3, 7));
+    print(math.ipow(2, 10));
 
     // I/O, where the library first has to fail: a fallible builtin returns a
     // `!T`, caught like any other error.

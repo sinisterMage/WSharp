@@ -368,8 +368,8 @@ const text = @import("std/str");
 
 fn main() i64 {
     const answer = http.get("https://www.google.com/") catch return 1;
-    print_int(answer.code);
-    print_int(text.len(answer.body));
+    print(answer.code);
+    print(text.len(answer.body));
     return 0;
 }
 ```
@@ -615,13 +615,16 @@ A **prelude** needs no import, because every module has it:
 
 | | |
 |---|---|
-| `print(s: str)`, `print_int(i64)`, `print_uint(u64)`, `print_float(f64)`, `print_bool(bool)` | write a line to stdout; a narrower value is written `print_int(i64(x))`, because conversions are written rather than inferred |
+| `print(value)` | write a string, integer of any width, `f64` or `bool` followed by a newline to stdout; no conversion is needed |
 | `assert(c: bool)` | panic if `c` is false |
 | `panic_index(i: i64, len: i64)` | the out-of-bounds panic, so a container written in W# reports a bad index exactly as `a[i]` does |
 | `gc_collect()` | one reference-counting collection |
 | `gc_trace()` | a whole mark trace, synchronously: cycles are reclaimed when it returns |
 | `gc_trace_start()`, `gc_trace_finish()` | the two halves of a trace, so a program can mutate the heap while the collector thread marks it |
 | `gc_live_objects()`, `gc_live_bytes()`, `gc_collections()`, `gc_traces()` | the collector's counters, for asserting on it |
+
+The older `print_int`, `print_uint`, `print_float` and `print_bool` names remain
+available for compatibility; new code can use `print` for all of them.
 
 Most of the library is written in W# rather than Rust - `std/array`, `std/list`,
 `std/math`, `std/net`, `std/http`, all of the cryptography and `str.split` are `.ws` files compiled with your program,
@@ -651,7 +654,7 @@ fn main() i64 {
         ffi.close(library);
         return 1;
     };
-    print_int(i64(answer()));
+    print(answer());
     ffi.close(library);
     return 0;
 }

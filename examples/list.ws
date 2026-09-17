@@ -38,11 +38,11 @@ fn show(xs: list.List[i64]) str {
 fn main() i64 {
     const p = path(7);
     print(show(p));
-    print_int(list.len(p));
+    print(list.len(p));
 
     // The list grew from nothing, so its capacity is the first power of two
     // past its length -- the spare tail is what makes the next push free.
-    print_int(list.capacity(p));
+    print(list.capacity(p));
 
     // Lists of references work the same way; a growth copies them through the
     // write and load barriers, which is why `std/list` is written in W#.
@@ -55,6 +55,6 @@ fn main() i64 {
     // `?T`, for the reason `a[i]` does.
     print(list.pop(words));
     print(list.remove(words, 0));
-    print_int(list.len(words));
+    print(list.len(words));
     return 0;
 }

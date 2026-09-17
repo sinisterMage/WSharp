@@ -1089,10 +1089,10 @@ nix-shell --run "cargo test --workspace"
   transmitted, the wrong nonce, the wrong key, and a truncation too short to
   hold a tag are six different paths, and a single "rejects a bad tag" check
   covers one of them.
-- **A case that prints a narrow integer converts it.** `print_int` takes an
-  `i64`, so a `u8` is written `print_int(i64(x))`; `print_uint` exists for the
-  half of `u64`'s range an `i64` cannot hold. Conversions are written and never
-  inferred, which is the same rule the language gives its users.
+- **Use `print(value)` for strings and scalars.** It accepts every integer
+  width, `f64` and `bool`, preserving signedness without a source conversion.
+  The typed print names remain available for compatibility. The compiler
+  selects the native implementation after specialisation.
 - **The whole case suite runs a third time, compiled.**
   `every_case_behaves_the_same_built_as_run` builds each case with `wsharp
   build` and runs the executable, holding it to the same header. That is the

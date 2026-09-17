@@ -22,13 +22,13 @@ fn id(x) { return x; }
 fn first(a, b) { return a; }
 
 fn main() i64 {
-    print_int(add(20, 22));
-    print_float(scale(1.5));
+    print(add(20, 22));
+    print(scale(1.5));
 
-    print_int(id(7));
-    print_bool(id(true));
+    print(id(7));
+    print(id(true));
     print(id("generic"));
 
-    print_int(first(1, "ignored"));
+    print(first(1, "ignored"));
     return 0;
 }

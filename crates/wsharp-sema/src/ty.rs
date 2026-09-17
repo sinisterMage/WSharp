@@ -273,7 +273,7 @@ impl Type {
                 let set = store.err_set(ids);
                 Type::err_union(Type::from_builtin_with(*inner, store, vars), set)
             }
-            B::Var(n) | B::Transferable(n) | B::Message(n) | B::IntVar(n) => {
+            B::Var(n) | B::Transferable(n) | B::Message(n) | B::IntVar(n) | B::PrintVar(n) => {
                 vars.entry(n).or_insert_with(|| store.fresh()).clone()
             }
             simple => Type::from_builtin(simple),
@@ -294,6 +294,7 @@ impl Type {
             | B::Var(_)
             | B::Transferable(_)
             | B::Message(_)
+            | B::PrintVar(_)
             | B::IntVar(_) => {
                 unreachable!("`{t:?}` needs a type store; use `from_builtin_with`")
             }
@@ -318,6 +319,13 @@ impl Type {
             Type::Con(TyCon::Fn, args) => args.split_last().map(|(ret, params)| (params, ret)),
             _ => None,
         }
+    }
+
+    pub fn is_printable(&self) -> bool {
+        matches!(
+            self,
+            Type::Con(TyCon::Int(_) | TyCon::F64 | TyCon::Bool | TyCon::Str, _)
+        )
     }
 
     pub fn is_numeric(&self) -> bool {

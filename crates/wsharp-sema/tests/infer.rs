@@ -47,6 +47,58 @@ fn assert_error(src: &str, needle: &str) {
 // ---- inference ----------------------------------------------------------
 
 #[test]
+fn print_accepts_scalars_without_pinning_generic_parameters() {
+    let src = r#"
+        fn show(x) void { print(x); }
+        fn forward(x) void { show(x); }
+        fn main() void {
+            forward("hello");
+            forward(i8(-128));
+            forward(u64(18446744073709551615));
+            forward(1.5);
+            forward(true);
+            const show_local = fn (x) void { print(x); };
+            show_local("local");
+            show_local(42);
+        }
+    "#;
+    assert_eq!(sig(src, "show"), "fn(T) void");
+    assert_eq!(sig(src, "forward"), "fn(T) void");
+}
+
+#[test]
+fn print_rejects_non_scalar_values_even_without_an_entry_point() {
+    for value in [
+        "[]i64{ 1 }",
+        "P{ .x = 1 }",
+        "fn () void {}",
+        "maybe",
+        "nothing()",
+    ] {
+        assert_error(
+            &format!(
+                "const P = struct {{ x: i64 }}; fn nothing() void {{}} fn f() void {{ const maybe: ?i64 = null; print({value}); }}"
+            ),
+            "`print` accepts a string, integer, float or boolean",
+        );
+    }
+    assert_error(
+        "fn show(x) void { print(x); } fn forward(x) void { show(x); } fn f() void { forward([]i64{ 1 }); }",
+        "`print` accepts a string, integer, float or boolean",
+    );
+}
+
+#[test]
+fn print_still_requires_one_argument_and_cannot_be_redeclared() {
+    assert_error("fn f() void { print(); }", "takes 1 argument");
+    assert_error("fn f() void { print(1, 2); }", "takes 1 argument");
+    assert_error(
+        "fn print(n: i64) void {}",
+        "builtin and cannot be redeclared",
+    );
+}
+
+#[test]
 fn infers_parameter_and_return_types_with_no_annotations() {
     assert_eq!(
         sig("fn add(a, b) { return a + b; }", "add"),

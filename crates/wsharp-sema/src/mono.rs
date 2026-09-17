@@ -460,6 +460,14 @@ impl Mono<'_> {
                 if let hir::Callee::Builtin(id) = callee {
                     let builtins = wsharp_runtime::builtins();
                     let builtin = &builtins[*id as usize];
+                    if matches!(builtin.params, [wsharp_runtime::BuiltinTy::PrintVar(_)])
+                        && !args[0].ty.is_printable()
+                    {
+                        let shown = self.store.show(&args[0].ty);
+                        self.diags.push(Diagnostic::error(expr.span, format!(
+                            "`print` accepts a string, integer, float or boolean, but this is `{shown}`"
+                        )));
+                    }
                     if builtin.module == "std/ffi"
                         && builtin.name == "raw_bind"
                         && let Some(func) = self.foreign_wrapper(&expr.ty, expr.span)

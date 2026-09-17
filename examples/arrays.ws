@@ -30,8 +30,8 @@ fn show(xs: []i64) str {
 fn main() i64 {
     const xs = []i64{ 3, 1, 4, 1, 5 };
     print(show(xs));
-    print_int(sum(xs));
-    print_int(first(xs));
+    print(sum(xs));
+    print(first(xs));
     print(first([]str{ "a", "b" }));
 
     // Every one of these returns a new array: the length lives in the header,

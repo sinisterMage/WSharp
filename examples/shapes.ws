@@ -34,18 +34,18 @@ fn main() i64 {
         .height = 4,
     };
 
-    print_int(area(r));
-    print_int(right_edge(r));
+    print(area(r));
+    print(right_edge(r));
 
     // Fields are mutable through a `var` binding.
     r.width += 5;
-    print_int(area(r));
+    print(area(r));
 
     // A closure capturing a local by value.
     const margin = 100;
     const pad = fn (n) { return n + margin; };
-    print_int(pad(area(r)));
+    print(pad(area(r)));
 
-    print_int(twice(pad, 0));
+    print(twice(pad, 0));
     return 0;
 }

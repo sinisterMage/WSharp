@@ -188,6 +188,9 @@ enum Constraint {
     IntLiteral { ty: Type, value: i128, span: Span },
     /// Must be a type `==` can compare.
     Equatable { ty: Type, span: Span },
+    /// A primitive value accepted by `print`; generic wrappers carry this
+    /// requirement to their callers without fixing the argument's type.
+    Printable { ty: Type, span: Span },
     /// Must be one of the concrete types an abstract type lists.
     ///
     /// Written by a parameter annotated with an abstract type, which is a
@@ -315,6 +318,7 @@ impl Constraint {
             Constraint::Numeric { ty, .. }
             | Constraint::IntLiteral { ty, .. }
             | Constraint::Equatable { ty, .. }
+            | Constraint::Printable { ty, .. }
             | Constraint::Member { ty, .. } => [ty, ty],
             Constraint::Transferable { ty, .. } => [ty, ty],
             Constraint::ErrorSetHas { set, .. } => [set, set],
@@ -609,6 +613,8 @@ struct Inferencer<'a> {
     /// met, because a generic `publish[M]` meets it before `M` is known, so it
     /// travels to every use with the type that use instantiates it at.
     fn_transferable_vars: Vec<Vec<(Type, bool, Span)>>,
+    /// Variables printed by each function, carried through generic wrappers.
+    fn_printable_vars: Vec<Vec<(Type, Span)>>,
     /// The function whose body is being inferred, so a constraint met in it
     /// can be recorded against it.
     current_fn: Option<hir::FuncId>,
@@ -697,6 +703,7 @@ impl<'a> Inferencer<'a> {
             fn_decl_params: Vec::new(),
             fn_member_vars: Vec::new(),
             fn_transferable_vars: Vec::new(),
+            fn_printable_vars: Vec::new(),
             current_fn: None,
             fn_generic_names: Vec::new(),
             fn_type_params: Vec::new(),
@@ -1834,6 +1841,7 @@ impl<'a> Inferencer<'a> {
         self.fn_decl_params.push(Vec::new());
         self.fn_member_vars.push(Vec::new());
         self.fn_transferable_vars.push(Vec::new());
+        self.fn_printable_vars.push(Vec::new());
         self.check_generic_names(generics);
         self.fn_generic_names.push(generics.to_vec());
         self.fn_type_params.push(HashMap::new());
@@ -4439,6 +4447,16 @@ impl<'a> Inferencer<'a> {
             // variable the signature recorded a constraint on.
             return;
         };
+        for (var, _) in self.fn_printable_vars[id as usize].clone() {
+            let Type::Var(v) = self.store.resolve(&var) else {
+                continue;
+            };
+            if let Some(pos) = scheme.vars.iter().position(|q| *q == v)
+                && let Some(targ) = targs.get(pos)
+            {
+                self.require_printable(targ.clone(), span);
+            }
+        }
         for (var, object, at) in self.fn_transferable_vars[id as usize].clone() {
             let Type::Var(v) = self.store.resolve(&var) else {
                 // The body pinned it, and the constraint recorded there has
@@ -4669,6 +4687,11 @@ impl<'a> Inferencer<'a> {
             .map(|t| Type::from_builtin_with(*t, &mut self.store, &mut vars))
             .collect();
         let ret = Type::from_builtin_with(b.ret, &mut self.store, &mut vars);
+        for t in b.params {
+            if let wsharp_runtime::BuiltinTy::PrintVar(n) = t {
+                self.require_printable(vars[n].clone(), span);
+            }
+        }
         // A signature may say that one of its variables has to be an integer.
         // The runtime's own type enum cannot name an abstract type, so the row
         // says `IntVar` and this turns it into the same `Member` constraint an
@@ -4725,6 +4748,16 @@ impl<'a> Inferencer<'a> {
             }
         }
         Type::func(params, ret)
+    }
+
+    fn require_printable(&mut self, ty: Type, span: Span) {
+        self.constraints.push(Constraint::Printable {
+            ty: ty.clone(),
+            span,
+        });
+        if let Some(func) = self.current_fn {
+            self.fn_printable_vars[func as usize].push((ty, span));
+        }
     }
 
     fn infer_binary(&mut self, op: BinOp, lhs: hir::Expr, rhs: hir::Expr, span: Span) -> hir::Expr {
@@ -5804,10 +5837,12 @@ impl<'a> Inferencer<'a> {
         }
         let mut owned = Vec::new();
         for constraint in &self.constraints {
-            // A `Transferable` variable is one the *caller* decides, exactly as
-            // an abstract parameter's is: the solver will never pin it, so
-            // quantifying it changes nothing it could disagree with.
-            if matches!(constraint, Constraint::Transferable { .. }) {
+            // Transferable and printable variables are decided by the caller:
+            // the solver checks them without pinning them to a default type.
+            if matches!(
+                constraint,
+                Constraint::Transferable { .. } | Constraint::Printable { .. }
+            ) {
                 continue;
             }
             for ty in constraint.types() {
@@ -6436,6 +6471,13 @@ impl<'a> Inferencer<'a> {
 
         for constraint in constraints {
             match constraint {
+                Constraint::Printable { ty, span } => {
+                    let resolved = self.store.resolve(&ty);
+                    if !matches!(resolved, Type::Var(_)) && !resolved.is_printable() {
+                        let shown = self.store.show(&resolved);
+                        self.error(span, format!("`print` accepts a string, integer, float or boolean, but this is `{shown}`"));
+                    }
+                }
                 Constraint::Transferable { ty, object, span } => {
                     if object
                         && let resolved = self.store.resolve(&ty)

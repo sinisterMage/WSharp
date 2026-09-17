@@ -13,7 +13,7 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, Variable};
-use cranelift_module::{DataId, FuncId, Module};
+use cranelift_module::{DataId, FuncId, Linkage, Module};
 use smallvec::{SmallVec, smallvec};
 use std::collections::HashMap;
 use wsharp_runtime::builtins::{
@@ -251,6 +251,7 @@ fn returns_by_pointer(ty: BuiltinTy) -> bool {
 /// here and narrowed at the call, because the C ABI has no half-register.
 fn abi_slots(ty: BuiltinTy) -> SmallVec<[AbiParam; 2]> {
     match ty {
+        BuiltinTy::PrintVar(_) => unreachable!("print is lowered at its concrete argument type"),
         BuiltinTy::Void => SmallVec::new(),
         // `IntVar` is only ever a builtin the code generator lowers inline, so
         // no call is emitted and this signature is never used -- but the row
@@ -2021,6 +2022,51 @@ impl<M: Module> Trans<'_, '_, M> {
                     Some((slot, tys)) => self.read_ret_area(slot, &tys),
                     None => self.b.inst_results(call).iter().copied().collect(),
                 }
+            }
+
+            // A generic print becomes one native call. Widening narrow
+            // integers here preserves their signedness without imposing an
+            // i64/u64 conversion on the source program's type inference.
+            hir::Callee::Builtin(id)
+                if matches!(
+                    wsharp_runtime::builtins()[*id as usize].params,
+                    [BuiltinTy::PrintVar(_)]
+                ) =>
+            {
+                let arg_ty = self.store.resolve(&args[0].ty);
+                let mut value = self.expr(&args[0])[0];
+                let (link, param) = match arg_ty {
+                    Type::Con(TyCon::Int(int), _) => {
+                        if int.bits < 64 {
+                            value = if int.signed {
+                                self.b.ins().sextend(types::I64, value)
+                            } else {
+                                self.b.ins().uextend(types::I64, value)
+                            };
+                        }
+                        (
+                            if int.signed {
+                                "ws_print_int"
+                            } else {
+                                "ws_print_uint"
+                            },
+                            AbiParam::new(types::I64),
+                        )
+                    }
+                    Type::Con(TyCon::F64, _) => ("ws_print_float", AbiParam::new(types::F64)),
+                    Type::Con(TyCon::Bool, _) => ("ws_print_bool", AbiParam::new(types::I8).uext()),
+                    Type::Con(TyCon::Str, _) => ("ws_print_str", AbiParam::new(PTR)),
+                    _ => unreachable!("print argument was checked before lowering"),
+                };
+                let mut signature = Signature::new(self.call_conv);
+                signature.params.push(param);
+                let func = self
+                    .module
+                    .declare_function(link, Linkage::Import, &signature)
+                    .expect("print implementations have consistent signatures");
+                let callee = self.module.declare_func_in_func(func, self.b.func);
+                self.b.ins().call(callee, &[value]);
+                SmallVec::new()
             }
 
             // The array constructor is lowered here rather than called: the

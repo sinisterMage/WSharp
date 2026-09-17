@@ -60,6 +60,9 @@ pub enum BuiltinTy {
     /// targets and cannot be an `extern "C"` function because a Rust one
     /// cannot be generic over the width.
     IntVar(u8),
+    /// A string, integer, float or boolean. `print` selects its native
+    /// implementation at the call site, once this variable is concrete.
+    PrintVar(u8),
     /// A type variable, numbered within one signature: every `Var(0)` in a row
     /// is the same type, and each *use* of the builtin gets its own.
     ///
@@ -87,7 +90,7 @@ pub struct Builtin {
     /// [`ptr`](Self::ptr) says the same thing to the JIT, which resolves in
     /// this process and needs no name at all. An object file has only the name,
     /// so both are written down and a test insists they agree. Not derivable
-    /// from `module` and `name`: the prelude's `print` is `ws_print_str`.
+    /// from `module` and `name`: the prelude's `print_int` is `ws_print_int`.
     pub link: &'static str,
     /// Address of the native implementation, handed to the JIT as a symbol.
     pub ptr: *const u8,
@@ -98,11 +101,10 @@ pub const PRELUDE: &str = "";
 
 /// The [`link`](Builtin::link) of a builtin the code generator lowers inline.
 ///
-/// Three rows are compiled at the call site rather than called -- `array.new`,
-/// which needs the element type, and the two rotates, which need the width --
-/// so no symbol of theirs is ever referenced. Saying that here rather than
-/// naming some unrelated function keeps a name nothing calls out of the symbol
-/// table, and lets [`Builtin::is_inline`] be the one place that knows.
+/// Some rows need the concrete argument type to be lowered: `array.new`, the
+/// bit operations, and `print`. They have no single native signature. This
+/// keeps their placeholder pointers out of the symbol table and lets
+/// [`Builtin::is_inline`] be the one place that knows.
 pub const INLINE: &str = "";
 
 impl Builtin {
@@ -146,9 +148,9 @@ pub fn builtins() -> Vec<Builtin> {
         Builtin {
             module: PRELUDE,
             name: "print",
-            params: &[BuiltinTy::Str],
+            params: &[BuiltinTy::PrintVar(0)],
             ret: BuiltinTy::Void,
-            link: "ws_print_str",
+            link: INLINE,
             ptr: ws_print_str as *const u8,
         },
         // The same, on the error stream. Every other `print*` writes stdout,
@@ -180,10 +182,9 @@ pub fn builtins() -> Vec<Builtin> {
             link: "ws_print_float",
             ptr: ws_print_float as *const u8,
         },
-        // `print_int` takes an `i64`, and a narrower value is written
-        // `print_int(i64(x))` -- conversions are written, never inferred. This
-        // is for the one value that cannot round-trip through an `i64`: a
-        // `u64` with its top bit set.
+        // The typed print names remain available for compatibility. Unified
+        // `print` selects the signed or unsigned implementation without
+        // changing the source value's type, including for narrow integers.
         Builtin {
             module: PRELUDE,
             name: "print_uint",
@@ -1615,10 +1616,11 @@ pub fn abstract_types() -> &'static [(&'static str, &'static [BuiltinTy])] {
     ]
 }
 
-/// Runtime support routines that generated code calls but that are not
-/// callable from W# source: the allocator and the panic handler.
+/// Native entry points without a directly callable builtin row, including
+/// the string implementation selected by `print`, allocation and panic.
 pub fn runtime_symbols() -> Vec<(&'static str, *const u8)> {
     vec![
+        ("ws_print_str", ws_print_str as *const u8),
         ("ws_ffi_call", crate::ffi::ws_ffi_call as *const u8),
         ("ws_alloc", crate::heap::ws_alloc as *const u8),
         ("ws_panic", ws_panic as *const u8),
@@ -2018,6 +2020,7 @@ mod tests {
         assert_eq!(
             inline,
             [
+                "print",
                 "std/bits.rotl",
                 "std/bits.rotr",
                 "std/bits.f64_bits",
