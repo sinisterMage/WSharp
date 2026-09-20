@@ -582,7 +582,7 @@ pub unsafe fn collect() -> Vec<*mut u8> {
     // name things the evacuation pause has still to read, and a freed object's
     // space can be taken by another before it gets there.
     let defer_frees = mark::tracing() || evacuating();
-    let (logged, decrements, nursery, fresh, deferred) = with_buffers(|b| {
+    let (mut logged, mut decrements, mut nursery, mut fresh, mut dead) = with_buffers(|b| {
         let logged = std::mem::take(&mut b.logged);
         // Everything the barrier logged during a trace is an object whose
         // fields the evacuation pause must look at again: the marker either
@@ -595,13 +595,25 @@ pub unsafe fn collect() -> Vec<*mut u8> {
             std::mem::take(&mut b.decrements),
             std::mem::take(&mut b.nursery),
             std::mem::take(&mut b.fresh),
-            if defer_frees {
-                Vec::new()
-            } else {
-                std::mem::take(&mut b.deferred_dead)
-            },
+            std::mem::take(&mut b.deferred_dead),
         )
     });
+
+    // Grace applies to cascading reclamation too: an older dead object's
+    // child may have been allocated this cycle. Freeing that child here and
+    // then enrolling `fresh` in the nursery would leave a dangling trace root.
+    // Keep this lookup separate from stack roots: most dead candidates are
+    // older objects outside the fresh allocation range, so reject those before
+    // searching a list that can contain thousands of objects.
+    fresh.sort_unstable();
+    let is_fresh = |p: *mut u8| {
+        fresh
+            .first()
+            .zip(fresh.last())
+            .is_some_and(|(&first, &last)| {
+                p >= first && p <= last && fresh.binary_search(&p).is_ok()
+            })
+    };
 
     // Increments first, so an object whose reference merely moved from one
     // field to another is never transiently zero.
@@ -613,7 +625,6 @@ pub unsafe fn collect() -> Vec<*mut u8> {
         unsafe { clear_flag(obj, FLAG_LOGGED) };
     }
 
-    let mut dead: Vec<*mut u8> = Vec::new();
     for &old in &decrements {
         if unsafe { rc_dec(old) } == 0 && !rooted(old) {
             dead.push(old);
@@ -623,33 +634,24 @@ pub unsafe fn collect() -> Vec<*mut u8> {
     // An object nothing on the heap points at is garbage the moment it leaves
     // the root set. One that something *does* point at now has a real count,
     // so it graduates off the list.
-    let mut survivors = Vec::with_capacity(nursery.len());
-    for &obj in &nursery {
+    nursery.retain(|&obj| {
         let rc = unsafe { rc_of(obj) };
         if rc > 0 {
-            continue;
+            return false;
         }
         if rooted(obj) {
-            survivors.push(obj);
+            true
         } else {
             dead.push(obj);
+            false
         }
-    }
-
-    if defer_frees {
-        with_buffers(|b| {
-            b.deferred_dead.extend(dead);
-            b.nursery.extend(survivors);
-            b.nursery.extend(fresh);
-        });
-        return roots;
-    }
-    dead.extend(deferred);
+    });
 
     // Freeing is iterative, never recursive: a long list is ordinary user data
     // and must not be able to overflow the collector's own stack.
     let mut freed = 0usize;
-    while let Some(obj) = dead.pop() {
+    while !defer_frees && !dead.is_empty() {
+        let obj = dead.pop().unwrap();
         if unsafe { rc_of(obj) } > 0 || rooted(obj) {
             continue;
         }
@@ -661,7 +663,10 @@ pub unsafe fn collect() -> Vec<*mut u8> {
         }
 
         for_each_reference(obj, |child| {
-            if unsafe { rc_dec(child) } == 0 && !rooted(child) {
+            // Nursery candidates, barrier snapshots and deferred deaths all
+            // predate this epoch. Only a cascading decrement can reach a
+            // fresh object; leave it for nursery enrollment below.
+            if unsafe { rc_dec(child) } == 0 && !rooted(child) && !is_fresh(child) {
                 dead.push(child);
             }
         });
@@ -673,10 +678,24 @@ pub unsafe fn collect() -> Vec<*mut u8> {
     }
     worker.stats.freed.fetch_add(freed, Ordering::Relaxed);
 
+    // Counted newcomers already have a path through the heap. Only the
+    // zero-count ones need the nursery to notice when their grace expires.
+    nursery.extend(fresh.iter().copied().filter(|&p| unsafe { rc_of(p) } == 0));
+    // A trace starting in this pause must honor the same grace period.
+    roots.extend_from_slice(&fresh);
+
+    // The mutator cannot log or allocate during this pause; the concurrent
+    // marker only drains SATB. Return the emptied buffers, keeping their
+    // capacity for the next epoch. `dead` stays populated while frees wait.
+    logged.clear();
+    decrements.clear();
+    fresh.clear();
     with_buffers(|b| {
-        b.nursery.extend(survivors);
-        // This cycle's newcomers become next cycle's candidates.
-        b.nursery.extend(fresh);
+        b.logged = logged;
+        b.decrements = decrements;
+        b.nursery = nursery;
+        b.fresh = fresh;
+        b.deferred_dead = dead;
     });
     roots
 }
@@ -720,9 +739,76 @@ pub unsafe fn checkpoint() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::header::{TYPE_ID_FIRST_USER, meta_word};
+    use crate::header::{TYPE_ID_FIRST_USER, TYPE_ID_STR, meta_word};
     use crate::heap::ws_alloc;
     use crate::test_support::SERIAL;
+
+    #[test]
+    fn fresh_children_survive_cascading_reclamation() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let node_type = TYPE_ID_FIRST_USER + 301;
+        types::register_type(
+            node_type,
+            types::TypeLayout::fixed("FreshChild", 32, vec![16]),
+        );
+        types::publish();
+
+        // Cover both block storage and large objects, whose memory is actually
+        // deallocated on free: filtering dead headers afterwards is too late.
+        for size in [32, 65536] {
+            // A separate worker gives this test an empty heap and nursery.
+            // Rust locals are not GC roots, so the parent dies at collection 2.
+            std::thread::spawn(move || unsafe {
+                let parent = ws_alloc(node_type, 32, 0);
+                collect();
+                let child = ws_alloc(TYPE_ID_STR, size, size - 16);
+                ws_log_object(parent);
+                (parent.add(16) as *mut *mut u8).write(child);
+                let roots = collect();
+
+                assert!(test_flag(parent, FLAG_DEAD));
+                assert_eq!(
+                    crate::heap::heap_stats().live_objects,
+                    1,
+                    "fresh child must get its grace cycle"
+                );
+                assert_eq!(rc_of(child), 0);
+                with_buffers(|b| assert_eq!(b.nursery, vec![child]));
+
+                // This used to seed the marker with an already-freed child.
+                mark::start_with_roots(roots);
+                mark::trace_finish();
+                collect();
+                assert_eq!(crate::heap::heap_stats().live_objects, 0);
+            })
+            .join()
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn fresh_children_with_heap_references_graduate_from_the_nursery() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let node_type = TYPE_ID_FIRST_USER + 302;
+        types::register_type(
+            node_type,
+            types::TypeLayout::fixed("CountedChild", 32, vec![16]),
+        );
+        types::publish();
+
+        std::thread::spawn(move || unsafe {
+            let parent = ws_alloc(node_type, 32, 0);
+            let child = ws_alloc(node_type, 32, 0);
+            (parent.add(16) as *mut *mut u8).write(child);
+            collect();
+            assert_eq!(rc_of(child), 1);
+            with_buffers(|b| assert_eq!(b.nursery, vec![parent]));
+            collect();
+            assert_eq!(crate::heap::heap_stats().live_objects, 0);
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn a_null_slot_is_a_legal_root() {
