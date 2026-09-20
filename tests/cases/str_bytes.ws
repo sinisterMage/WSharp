@@ -5,6 +5,8 @@
 // expect: trimmed
 // expect: 4096
 // expect: -17
+// expect: -9223372036854775808
+// expect: 9223372036854775807
 // expect: bad
 const str = @import("std/str");
 
@@ -16,6 +18,8 @@ fn main() i64 {
 
     print_int(str.parse_int("4096") catch return 1);
     print_int(str.parse_int("-17") catch return 2);
+    print_int(str.parse_int("-9223372036854775808") catch return 4);
+    print_int(str.parse_int("9223372036854775807") catch return 5);
 
     // Strict: a partial answer would be worse than no answer.
     const junk = str.parse_int("12x") catch |e| {

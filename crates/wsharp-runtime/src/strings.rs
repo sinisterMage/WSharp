@@ -247,7 +247,7 @@ pub unsafe extern "C" fn ws_str_parse_float(out: *mut crate::io::FallibleF64, s:
     unsafe { out.write(result) };
 }
 
-/// `-?[0-9]+`, and nothing else. Overflow is a failure rather than a wrap:
+/// `[+-]?[0-9]+`, and nothing else. Overflow is a failure rather than a wrap:
 /// a length header that does not fit in an `i64` is not a length.
 fn parse_decimal(bytes: &[u8]) -> Option<i64> {
     let (negative, digits) = match bytes.split_first() {
@@ -258,12 +258,17 @@ fn parse_decimal(bytes: &[u8]) -> Option<i64> {
     if digits.is_empty() {
         return None;
     }
+    // Accumulate negatively: i64::MIN has no positive i64 counterpart.
     let mut value: i64 = 0;
     for byte in digits {
         let digit = byte.checked_sub(b'0').filter(|d| *d < 10)?;
-        value = value.checked_mul(10)?.checked_add(i64::from(digit))?;
+        value = value.checked_mul(10)?.checked_sub(i64::from(digit))?;
     }
-    if negative { Some(-value) } else { Some(value) }
+    if negative {
+        Some(value)
+    } else {
+        value.checked_neg()
+    }
 }
 
 /// ASCII lowercase, byte for byte.
@@ -431,4 +436,47 @@ pub unsafe extern "C" fn ws_str_hash(s: *const u8) -> u64 {
     hash ^= hash >> 27;
     hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
     hash ^ (hash >> 31)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_decimal;
+
+    #[test]
+    fn parse_decimal_accepts_full_i64_range() {
+        for (text, expected) in [
+            ("-9223372036854775808", i64::MIN),
+            ("-9223372036854775807", i64::MIN + 1),
+            ("9223372036854775807", i64::MAX),
+            ("+9223372036854775807", i64::MAX),
+            ("-0009223372036854775808", i64::MIN),
+            ("0", 0),
+            ("-0", 0),
+            ("+0", 0),
+            ("4096", 4096),
+            ("-17", -17),
+        ] {
+            assert_eq!(parse_decimal(text.as_bytes()), Some(expected), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn parse_decimal_rejects_overflow() {
+        for text in [
+            "9223372036854775808",
+            "+9223372036854775808",
+            "-9223372036854775809",
+            "999999999999999999999999999999",
+            "-999999999999999999999999999999",
+        ] {
+            assert_eq!(parse_decimal(text.as_bytes()), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn parse_decimal_rejects_bad_format() {
+        for text in ["", "-", "+", " 1", "1 ", "12x", "1.0", "--1", "+-1", "1\0"] {
+            assert_eq!(parse_decimal(text.as_bytes()), None, "{text:?}");
+        }
+    }
 }
