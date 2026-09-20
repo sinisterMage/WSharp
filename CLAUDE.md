@@ -86,7 +86,7 @@ Things that will bite:
 | `cargo test` and the runtime archive | **`cargo test --workspace` does not build `crates/wsharp-start`.** It has no test target and nothing depends on it, so cargo leaves it out of the graph entirely -- while the case suite's AOT pass shells out to `wsharp build`, which links against whatever `libwsharp_start.a` an *earlier* `cargo build` left in `target/debug`. A cold tree fails every built case with "cannot find the runtime archive"; a warm one silently links a stale runtime, which is worse, because it passes. Adding a builtin and testing it with `cargo test` alone will report an undefined reference to a symbol that is right there in the source. Run `cargo build --workspace` first -- which is why both CI workflows have a "Build for the test suite" step before their "Test" step. |
 | `cargo build` and `ingot` | Does not produce it any more. `ingot` is `wsharp build --module ingot/main -o ingot`, and `crates/wsharp-cli/tests/verbs.rs` bootstraps one to test against. |
 | Windows | **Builds, links and passes the suite.** Everything needed to compile and link: `c_int` in `sys/windows.rs`, `-subsystem:console` (clang picks a subsystem by looking for `main` in the *objects*, and ours is in the archive), the system libraries a staticlib does not carry, and `-nodefaultlib:libcmt -defaultlib:msvcrt` (Rust links the dynamic CRT, clang defaults to the static one). What was wrong for a long time was **the collector's stack walk, not `fs.mkdir_all`** -- see the row below. The `mkdir_all` story that stood here was a misdiagnosis: that walk is fine, and `!x` on a builtin's `bool` (normalised in `lower.rs`) really did fix what it was blamed for. Note that almost nothing here can be checked locally on NixOS: no rustup, no std for the target, so not even `cargo check --target`. It needs a real Windows machine. |
-| The `rbp` chain on Win64 | **Not a chain, and this cost the platform a release.** A Win64 prologue records its frame register in the function's *unwind info* and may establish it as `lea rbp, [rsp + n]`, for which `[rbp]` is a local rather than the caller's frame; and nothing zeroes the outermost one, where SysV requires it. `-Cforce-frame-pointers=yes` does reach this target -- it is on the `rustc` command line and checkable -- and does not make the chain followable. So the collector's walk crossed about two Rust frames, reached no generated code, found **zero roots**, and then climbed off the end of the stack: the symptom was a return address of `0x6873775c67756265`, which is `"ebug\wsh"`. Every `gc_*` case died under `--gc-stress` and `ingot install` died at `0xC0000005`, while ordinary programs looked fine because without stress the collector barely runs. `stackwalk` therefore crosses the Rust frames with `RtlVirtualUnwind` here and follows `rbp` only within generated code. |
+| The `rbp` chain on Win64 | **Not a chain, and this cost the platform a release.** A Win64 prologue records its frame register in the function's *unwind info* and may establish it as `lea rbp, [rsp + n]`, for which `[rbp]` is a local rather than the caller's frame; and nothing zeroes the outermost one. Linux thread entry code can also leave a nonzero, unusable saved frame pointer; its native walk is bounded to the thread stack. `-Cforce-frame-pointers=yes` does reach this target -- it is on the `rustc` command line and checkable -- and does not make the chain followable. So the collector's walk crossed about two Rust frames, reached no generated code, found **zero roots**, and then climbed off the end of the stack: the symptom was a return address of `0x6873775c67756265`, which is `"ebug\wsh"`. Every `gc_*` case died under `--gc-stress` and `ingot install` died at `0xC0000005`, while ordinary programs looked fine because without stress the collector barely runs. `stackwalk` therefore crosses the Rust frames with `RtlVirtualUnwind` here and follows `rbp` only within generated code. |
 
 ## The operating system
 
@@ -699,7 +699,7 @@ extra `sin_len` byte out of this code entirely.
   in inference synthesises a call -- and into a *function* rather than an inline
   sequence because a type that reaches itself would otherwise expand for ever.
   Two per concrete type (`crate::equality`): a dispatching entry point that
-  answers identity, nulls and unequal type ids and then picks by the runtime
+  answers nulls and unequal type ids and then picks by the runtime
   type id within the declared type's subtree, and an exact one that compares
   that type's fields. The subtree dispatch is what makes two `Sub`s compared at
   `Base` compare `Sub`'s fields rather than only the part `Base` declares.
@@ -707,9 +707,10 @@ extra `sin_len` byte out of this code entirely.
   through the *same* `load_at`, and therefore the same load barrier and the same
   rooting, as every other field read. Both parameters are declared stack-map
   roots: they are live across `ws_str_eq` and across the recursive calls, and
-  both are safepoints. **A value that reaches itself recurses for ever**, which
-  is what derived structural equality does everywhere it exists and is said out
-  loud rather than papered over.
+  both are safepoints. Aliased values still compare their fields, preserving
+  NaN's non-reflexive equality. **Cycles are not detected:** a comparison that
+  follows a cycle recurses indefinitely, including a cyclic value compared
+  with itself.
 - **`@spawn` returns before `init` starts, and the message loop is entered only
   after `init` returns.** Both were implementation details of `ws_spawn` and are
   now promises the README states, because the exit path depends on the second:

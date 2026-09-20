@@ -147,8 +147,10 @@ unequal to itself. Two values of different concrete types are never equal, so
 two subtypes compared through their supertype compare the fields they actually
 have rather than only the part the supertype declares. A field an `==` cannot
 compare - an array, a function, an error union - makes the struct
-uncomparable, and the compiler says which field. A value that reaches itself
-recurses for ever, as derived equality does everywhere it exists.
+uncomparable, and the compiler says which field. Aliased structs still compare
+their fields, so a struct containing NaN is unequal even to itself. Cycles are
+not detected: a comparison that follows a cycle recurses indefinitely,
+including a cyclic value compared with itself.
 
 `!T` says *which* errors: the set is inferred from what a function raises and
 propagates, or written down and checked. So the `e` bound by `catch |e|` is

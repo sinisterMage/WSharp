@@ -5,7 +5,7 @@
 //! that reaches itself would otherwise inline for ever. Two per type:
 //!
 //! * **`eq$n`** is what a comparison calls. It answers the questions that are
-//!   about the pair rather than about the fields -- the same object, a null, two
+//!   about the pair rather than about the fields -- a null, two
 //!   different concrete types -- and then dispatches on the runtime type id, so
 //!   that two `Sub`s compared at `Base` compare `Sub`'s fields and not just the
 //!   part `Base` declares.
@@ -19,10 +19,9 @@
 //! references out of objects, and generated code goes through the load barrier
 //! and the stack maps by construction.
 //!
-//! **A value that reaches itself recurses for ever.** `a == a` stops at the
-//! identity test, but `a.next = a; b.next = b; a == b` does not, and nothing
-//! here detects it. That is what derived structural equality does in every
-//! language that has it, and it is said out loud rather than papered over.
+//! Aliased values still compare their fields, so NaN remains unequal to itself.
+//! **Cycles are not detected:** a comparison that follows a cycle recurses
+//! indefinitely, including `a == a` when `a` reaches itself.
 
 use std::collections::HashMap;
 

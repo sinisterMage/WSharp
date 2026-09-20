@@ -9,8 +9,8 @@
 //
 // So the base is evaluated once, into a local nothing can name, and the place
 // is built on that. Re-reading a local is free, which is what made the
-// restriction unnecessary rather than merely inconvenient. A base that is
-// already a variable or a field chain is left exactly as it was.
+// restriction unnecessary rather than merely inconvenient. Variables and field
+// chains are captured too, because the RHS can replace their values.
 // expect: 1
 // expect: 2
 // expect: 3

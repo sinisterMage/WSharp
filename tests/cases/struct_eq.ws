@@ -16,7 +16,7 @@
 // the comparison out. What `==` means here is stated rather than left to be
 // discovered:
 //
-//  * the same object is equal to itself, whatever it holds;
+//  * even the same object compares its fields, so a NaN remains unequal;
 //  * two values of *different* concrete types are never equal, so a `Circle`
 //    and a `Square` compared at `Shape` are unequal without reaching a field;
 //  * two values of the same concrete type compare **that type's** fields, so
@@ -27,9 +27,7 @@
 //    contents and an `f64` field by `fcmp` -- which is why a `NaN` field makes
 //    a value unequal to itself, exactly as a bare `f64` already does.
 //
-// A value that reaches itself recurses for ever. `a == a` stops at the identity
-// test; `a.next = a; b.next = b; a == b` does not, and nothing detects it. That
-// is what derived structural equality does everywhere it exists.
+// A comparison that follows a cycle recurses indefinitely, even for `a == a`.
 const Point = struct { x: i64, y: i64 };
 const Row = struct { name: str, at: Point, weight: f64 };
 
@@ -74,7 +72,7 @@ fn main() i64 {
 
     const nan = Row{ .name = "one", .at = a, .weight = 0.0 / 0.0 };
     const nan2 = Row{ .name = "one", .at = a, .weight = 0.0 / 0.0 };
-    if (nan != nan2) { print("NaN makes a value unequal to itself"); }
+    if (nan != nan and nan != nan2) { print("NaN makes a value unequal to itself"); }
 
     const b1 = Box{ .item = "x" };
     const b2 = Box{ .item = "x" };

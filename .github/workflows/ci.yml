@@ -5,8 +5,8 @@
 # disabled for the repository, so this is what actually runs; the Forgejo file
 # is left in place for when those runners come back.
 #
-# No container. The Forgejo jobs run in a digest-pinned image from a private
-# registry, which exists because Forgejo runs `actions/checkout` with `node`
+# The platform matrix runs on the host. The Forgejo jobs run in a digest-pinned
+# image from a private registry, because Forgejo runs `actions/checkout` with `node`
 # *inside* the job's container and the stock Rust image has none. GitHub's
 # runners have node, rustup and a C compiler already, and `rust-toolchain.toml`
 # pins 1.95.0 so the toolchain honours itself on first use.
@@ -110,6 +110,33 @@ jobs:
       # the stack maps describe. That second pass is the collector's main
       # defence, so it is the reason CI runs the whole workspace rather than
       # only the unit tests.
+      - name: Test
+        run: cargo test --workspace --locked
+
+  test-debian:
+    # glibc 2.41 leaves an outer native frame pointer that is not a readable
+    # frame chain. Keep this separate from Ubuntu to cover that boundary.
+    name: test (Debian 13 / glibc 2.41)
+    runs-on: ubuntu-latest
+    container: rust:1.95.0-trixie
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry/index
+            /usr/local/cargo/registry/cache
+            target
+          key: cargo-test-debian13-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-test-debian13-
+      - name: Versions
+        run: |
+          rustc --version
+          ldd --version
+      - name: Build for the test suite
+        run: cargo build --workspace --locked
       - name: Test
         run: cargo test --workspace --locked
 

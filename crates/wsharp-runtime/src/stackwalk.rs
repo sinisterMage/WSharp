@@ -20,7 +20,8 @@
 //! *Reaching* generated code means crossing the handful of Rust frames between
 //! the collector and the runtime function generated code called into. That is
 //! `innermost_generated_frame`, and it is the half that is per-platform: the
-//! SysV arms follow `rbp`, which is why the workspace builds with
+//! SysV arms follow `rbp` (bounded to the thread's stack on Linux), which is why
+//! the workspace builds with
 //! `-Cforce-frame-pointers=yes` (see `.cargo/config.toml`), while Windows has to
 //! use the unwind tables because a Win64 prologue is free to establish `rbp` as
 //! `lea rbp, [rsp + n]` and nothing marks the outermost frame. See
@@ -200,17 +201,63 @@ pub unsafe fn walk_roots(visit: impl FnMut(*mut *mut u8)) {
 #[cfg(not(target_os = "windows"))]
 #[inline(never)]
 pub fn innermost_generated_frame() -> Option<GeneratedFrame> {
-    let trace = crate::gc::env_flag("WSHARP_GC_TRACE");
     // This frame's own pointer. Every frame the search wants is above it.
-    let mut fp = current_frame_pointer();
+    let fp = current_frame_pointer();
+    #[cfg(target_os = "linux")]
+    let stack = {
+        thread_local! {
+            // One OS query per thread, not per allocation. Failure must not
+            // silently discard live roots by pretending there is no W# frame.
+            static BOUNDS: (usize, usize) = crate::sys::linux::current_stack_bounds()
+                .expect("cannot determine thread stack bounds for GC");
+        }
+        let (start, end) = BOUNDS.with(|bounds| *bounds);
+        assert!(
+            (start..end).contains(&fp),
+            "GC is not on the thread's stack"
+        );
+        // The current frame is already above any guard/uncommitted pages.
+        fp..end
+    };
+    #[cfg(not(target_os = "linux"))]
+    // Other SysV targets retain their existing native-chain termination.
+    let stack = fp..usize::MAX;
+    // This frame remains live until the search returns.
+    unsafe { find_generated_frame(fp, stack) }
+}
+
+/// Search a live native frame chain, rejecting records outside `stack` before
+/// reading them or returning a generated frame. Linux supplies actual thread
+/// bounds; other SysV targets retain the ABI-terminated walk. The caller keeps
+/// the frame chain alive for the whole search.
+#[cfg(not(target_os = "windows"))]
+// Keep the search in the frame it captured, including optimized builds where
+// a tail call could otherwise retire that frame before the first read.
+#[inline(always)]
+unsafe fn find_generated_frame(
+    mut fp: usize,
+    stack: std::ops::Range<usize>,
+) -> Option<GeneratedFrame> {
+    let trace = crate::gc::env_flag("WSHARP_GC_TRACE");
+    let readable = |fp: usize| {
+        fp.is_multiple_of(std::mem::align_of::<usize>())
+            && fp >= stack.start
+            && fp
+                .checked_add(2 * std::mem::size_of::<usize>())
+                .is_some_and(|end| end <= stack.end)
+    };
     for _ in 0..MAX_FRAMES {
+        if !readable(fp) {
+            return None;
+        }
         // `[fp]` is the caller's frame pointer and `[fp + 8]` the return
         // address into it, so each iteration describes the frame *above*.
         let parent_fp = unsafe { (fp as *const usize).read() };
-        if parent_fp <= fp {
+        if parent_fp <= fp || !readable(parent_fp) {
             // Stacks grow down, so a parent frame is always at a higher
-            // address. Anything else means the chain is broken -- and on the
-            // outermost frame the ABI's zero makes it so.
+            // address, but that alone does not make it readable. Native
+            // thread entry code need not leave a zero terminator: glibc 2.41
+            // can leave an out-of-stack value such as 0xfffffffffffffac0.
             return None;
         }
         let pc = unsafe { ((fp + 8) as *const usize).read() };
@@ -400,6 +447,57 @@ mod tests {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         register_code(Vec::new());
         assert!(innermost_generated_frame().is_none());
+    }
+
+    #[test]
+    fn a_new_thread_with_no_generated_code_reports_none() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        // A nonempty table models a worker starting after code registration.
+        register_code(vec![func(0x1000, 0x200, vec![])]);
+        std::thread::spawn(|| assert!(innermost_generated_frame().is_none()))
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn native_frame_search_stays_within_the_stack() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        register_code(vec![func(0x1000, 0x200, vec![])]);
+        let mut frames = [0usize; 4];
+        let start = frames.as_ptr() as usize;
+        let end = start + std::mem::size_of_val(&frames);
+        let parent = start + 2 * std::mem::size_of::<usize>();
+        let search = |frames: &[usize; 4]| unsafe {
+            find_generated_frame(frames.as_ptr() as usize, start..end)
+        };
+
+        // A complete, aligned parent may be returned as a generated frame.
+        frames[0] = parent;
+        frames[1] = 0x1010;
+        assert_eq!(search(&frames), Some((parent, 0x1010)));
+
+        // Neither an out-of-stack parent nor a partial/misaligned record may
+        // be read or returned, even with a registered return address.
+        for invalid in [
+            0,
+            start,
+            parent + 1,
+            end - 8,
+            end,
+            usize::MAX - 0x53f,
+            usize::MAX - 7,
+        ] {
+            frames[0] = invalid;
+            assert_eq!(search(&frames), None);
+        }
+        // Follow a native frame, then stop at its invalid saved pointer.
+        frames[0] = parent;
+        frames[1] = 0x9999;
+        frames[2] = usize::MAX - 0x53f;
+        assert_eq!(search(&frames), None);
+        // Reject an unreadable initial record before the first dereference.
+        assert_eq!(unsafe { find_generated_frame(end, start..end) }, None);
     }
 
     /// Walking generated frames stops at the first frame that is not one,

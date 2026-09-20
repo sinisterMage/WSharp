@@ -2535,19 +2535,16 @@ impl<M: Module> Trans<'_, '_, M> {
         let yes = self.b.create_block();
         let no = self.b.create_block();
 
-        // The same object is equal to itself whatever it holds, which is what
-        // makes `x == x` true for a value that reaches itself -- the one cyclic
-        // case this terminates on. It also settles null against null.
-        let same = self.b.ins().icmp(ir::condcodes::IntCC::Equal, a, b);
-        let both = self.b.create_block();
-        self.brif(same, yes, NO_ARGS, both, NO_ARGS);
-
-        // Only one of them null, then: a field of struct type reads as null
-        // until its initialising store has run, and the collector's rule is
-        // that a fresh object's fields do read that way.
-        self.switch(both);
+        // Null fields compare without dereferencing them. Non-null values
+        // always compare their fields, even when aliased: an f64 NaN field
+        // (possibly nested) makes a struct unequal to itself.
         let a_null = self.b.ins().icmp_imm_u(ir::condcodes::IntCC::Equal, a, 0);
         let b_null = self.b.ins().icmp_imm_u(ir::condcodes::IntCC::Equal, b, 0);
+        let both_null = self.b.ins().band(a_null, b_null);
+        let not_both_null = self.b.create_block();
+        self.brif(both_null, yes, NO_ARGS, not_both_null, NO_ARGS);
+
+        self.switch(not_both_null);
         let either = self.b.ins().bor(a_null, b_null);
         let neither = self.b.create_block();
         self.brif(either, no, NO_ARGS, neither, NO_ARGS);

@@ -2648,8 +2648,8 @@ impl<'a> Inferencer<'a> {
             }
 
             ast::Stmt::Assign(assign) => {
-                // Whatever the target's base needs evaluated first: one hidden
-                // `let` per level, so `g[i][j] += v` reads `g[i]` once.
+                // Capture the target before its value: both the array/object
+                // and the index must survive side effects in the RHS.
                 let mut prologue = Vec::new();
                 let (place, target_ty) = self.infer_place(&assign.target, &mut prologue)?;
                 let value = if let Some(op) = assign.op {
@@ -3666,29 +3666,14 @@ impl<'a> Inferencer<'a> {
         }
     }
 
-    /// Evaluate the base of a place once, into a hidden local.
+    /// Evaluate part of a place once, into a hidden local.
     ///
     /// A compound assignment is checked and lowered as `x = x <op> e`, so the
-    /// target is read and then written and its base expression appears twice.
-    /// That used to be handled by refusing any base but a variable or a field
-    /// chain, which made `g[i][j] = v` a type error -- and `var row = g[i];
-    /// row[j] = v;` the spelling, which is correct rather than merely accepted,
-    /// since an array is a reference. This does the same thing without asking:
-    /// one evaluation, into a local nothing can name, and re-reading a local is
-    /// free.
-    ///
-    /// A base that is already a variable or a field chain is left alone, so
-    /// nothing that compiled before gains a local.
-    fn hoist_place_base(
-        &mut self,
-        base: &'a ast::Expr,
-        prologue: &mut Vec<hir::Stmt>,
-    ) -> hir::Expr {
-        let value = self.infer_expr(base);
-        if is_place_base(base) {
-            return value;
-        }
-        let span = base.span();
+    /// target is read and then written. Capture its base and index so that
+    /// neither is evaluated twice. Even a local or a field chain must be
+    /// captured: the RHS can change it before the write takes place.
+    fn hoist_place_value(&mut self, value: hir::Expr, prologue: &mut Vec<hir::Stmt>) -> hir::Expr {
+        let span = value.span;
         let ty = value.ty.clone();
         // Bracketed, so it cannot collide with anything the user can write.
         let local = self.frame().add_local("[place]", ty.clone(), false, span);
@@ -3758,7 +3743,8 @@ impl<'a> Inferencer<'a> {
             ast::Expr::Field { obj, name, .. } => {
                 // A compound assignment reads the place and writes it back, so
                 // the object expression would otherwise be evaluated twice.
-                let obj = self.hoist_place_base(obj, prologue);
+                let obj = self.infer_expr(obj);
+                let obj = self.hoist_place_value(obj, prologue);
                 let (strukt, index, ty) = self.field_of(&obj.ty, name);
                 Some((
                     hir::Place::Field {
@@ -3792,8 +3778,10 @@ impl<'a> Inferencer<'a> {
                 // read the place and write it back. `g[i][j] = v` is what this
                 // makes writable.
                 let at = obj.span();
-                let arr = self.hoist_place_base(obj, prologue);
+                let arr = self.infer_expr(obj);
+                let arr = self.hoist_place_value(arr, prologue);
                 let (arr, index, elem) = self.index_into(arr, at, index);
+                let index = self.hoist_place_value(index, prologue);
                 Some((hir::Place::Index { arr, index }, elem))
             }
             other => {
@@ -7112,15 +7100,6 @@ fn place_as_expr(place: &hir::Place, ty: &Type, span: Span) -> hir::Expr {
         kind,
         ty: ty.clone(),
         span,
-    }
-}
-
-/// Whether an expression names a storage location rather than computing a value.
-fn is_place_base(expr: &ast::Expr) -> bool {
-    match expr {
-        ast::Expr::Ident(_) => true,
-        ast::Expr::Field { obj, .. } => is_place_base(obj),
-        _ => false,
     }
 }
 

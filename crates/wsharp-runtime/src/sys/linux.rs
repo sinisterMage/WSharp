@@ -97,7 +97,40 @@ mod c {
         /// the return is a `time_t`, and on every target this collector
         /// supports that is 64 bits wide.
         pub(super) fn time(out: *mut i64) -> i64;
+        pub(super) fn pthread_self() -> usize;
+        pub(super) fn pthread_getattr_np(thread: usize, attr: *mut core::ffi::c_void) -> c_int;
+        pub(super) fn pthread_attr_getstack(
+            attr: *const core::ffi::c_void,
+            address: *mut *mut core::ffi::c_void,
+            size: *mut usize,
+        ) -> c_int;
+        pub(super) fn pthread_attr_destroy(attr: *mut core::ffi::c_void) -> c_int;
     }
+}
+
+/// The calling thread's stack, with an exclusive upper bound. Query the
+/// running thread: the main thread and spawned threads need not share a size.
+pub(crate) fn current_stack_bounds() -> Result<(usize, usize), Errno> {
+    // Opaque, word-aligned storage for pthread_attr_t. On our 64-bit Linux
+    // targets it occupies 56 bytes (x86-64 glibc and musl) or 64 (aarch64
+    // glibc). Only libc accesses it; no field layout is assumed here.
+    let mut attr = std::mem::MaybeUninit::<[usize; 8]>::uninit();
+    let attr = attr.as_mut_ptr().cast();
+    let result = unsafe { c::pthread_getattr_np(c::pthread_self(), attr) };
+    if result != 0 {
+        return Err(Errno(result));
+    }
+    let mut address = core::ptr::null_mut();
+    let mut size = 0;
+    let result = unsafe { c::pthread_attr_getstack(attr, &mut address, &mut size) };
+    // Destroy even if getstack failed: getattr may allocate attribute storage.
+    unsafe { c::pthread_attr_destroy(attr) };
+    if result != 0 {
+        return Err(Errno(result));
+    }
+    let start = address as usize;
+    let end = start.checked_add(size).ok_or(Errno(22))?; // EINVAL
+    Ok((start, end))
 }
 
 const O_RDONLY: c_int = 0;

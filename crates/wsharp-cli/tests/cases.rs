@@ -24,7 +24,7 @@
 //! and the test exercises exactly what a user would run.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 
 /// What `ws_panic` exits with. Spelled out here rather than imported: the
 /// harness should see exactly what a user sees.
@@ -95,8 +95,7 @@ fn check_case_with(path: &Path, flags: &[&str]) -> Result<(), String> {
 
     verify(
         &expected,
-        output.status.code().unwrap_or(-1),
-        output.status.success(),
+        output.status,
         &String::from_utf8_lossy(&output.stdout),
         &String::from_utf8_lossy(&output.stderr),
     )
@@ -105,13 +104,19 @@ fn check_case_with(path: &Path, flags: &[&str]) -> Result<(), String> {
 /// Hold one run of a case to its header, whichever way it was run.
 fn verify(
     expected: &Expectations,
-    code: i32,
-    success: bool,
+    status: ExitStatus,
     stdout: &str,
     stderr: &str,
 ) -> Result<(), String> {
+    // A signal is not a language error or a stdout mismatch. Report the
+    // actual process outcome first, including for compile-error cases.
+    let Some(code) = status.code() else {
+        return Err(format!(
+            "process terminated: {status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        ));
+    };
     if !expected.errors.is_empty() {
-        if success {
+        if status.success() {
             return Err(format!(
                 "expected a compile error containing {:?}, but it ran",
                 expected.errors
@@ -125,6 +130,13 @@ fn verify(
             }
         }
         return Ok(());
+    }
+
+    if expected.panic.is_none() && code != expected.exit {
+        return Err(format!(
+            "expected exit status {}, got {status}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            expected.exit
+        ));
     }
 
     match &expected.panic {
@@ -155,13 +167,25 @@ fn verify(
         ));
     }
 
-    if expected.panic.is_none() && code != expected.exit {
-        return Err(format!(
-            "expected exit status {}, got {code}",
-            expected.exit
-        ));
-    }
     Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_signal_is_reported_before_output_or_expected_errors() {
+    use std::os::unix::process::ExitStatusExt;
+
+    for source in [
+        "// expect: missing",
+        "// error: type error",
+        "// panic: failure",
+    ] {
+        let expected = parse_expectations(source);
+        let message = verify(&expected, ExitStatus::from_raw(11), "", "type error")
+            .expect_err("SIGSEGV must never count as an expected language failure");
+        assert!(message.contains("signal: 11"), "{message}");
+        assert!(!message.contains("stdout mismatch"), "{message}");
+    }
 }
 
 /// Build a case into a native executable and run *that*.
@@ -190,8 +214,7 @@ fn check_case_native(path: &Path, dir: &Path, env: &[(&str, &str)]) -> Result<()
     if !expected.errors.is_empty() || !built.status.success() {
         return verify(
             &expected,
-            built.status.code().unwrap_or(-1),
-            built.status.success(),
+            built.status,
             &String::from_utf8_lossy(&built.stdout),
             &String::from_utf8_lossy(&built.stderr),
         );
@@ -208,8 +231,7 @@ fn check_case_native(path: &Path, dir: &Path, env: &[(&str, &str)]) -> Result<()
     // Removed on success only, so a failure leaves something to run by hand.
     let result = verify(
         &expected,
-        output.status.code().unwrap_or(-1),
-        output.status.success(),
+        output.status,
         &String::from_utf8_lossy(&output.stdout),
         &String::from_utf8_lossy(&output.stderr),
     );
@@ -352,17 +374,18 @@ fn every_case_behaves_the_same_built_as_run() {
 /// The stack maps are the table where a serialisation mistake is silent: the
 /// collector would read a root at the wrong stack offset and mark whatever
 /// happened to be there. Stress turns that from a rare corruption into an
-/// abort on the next allocation. Only the `gc_*` cases, because they are the
-/// ones that allocate hard enough to say anything and the whole suite twice
-/// over is a cost without a matching return.
+/// abort on the next allocation. Include worker cases as well as `gc_*`:
+/// worker initialization can collect before entering any generated frame.
 #[test]
 fn the_collector_survives_stress_in_a_built_program() {
     let dir = native_dir("stress");
     let cases: Vec<PathBuf> = case_files()
         .into_iter()
         .filter(|p| {
-            p.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("gc_"))
+            p.file_name().is_some_and(|n| {
+                let name = n.to_string_lossy();
+                name.starts_with("gc_") || name.contains("worker")
+            })
         })
         .collect();
     assert!(!cases.is_empty(), "no `gc_*` cases found");
@@ -375,7 +398,7 @@ fn the_collector_survives_stress_in_a_built_program() {
     }
     assert!(
         failures.is_empty(),
-        "{} of {} built `gc_*` cases failed under WSHARP_GC_STRESS:\n\n{}",
+        "{} of {} built GC/worker cases failed under WSHARP_GC_STRESS:\n\n{}",
         failures.len(),
         cases.len(),
         failures.join("\n\n")
