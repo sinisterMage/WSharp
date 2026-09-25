@@ -71,6 +71,13 @@ pub unsafe extern "C" fn ws_resolve(p: *mut u8) -> *mut u8 {
 /// # Safety
 /// `p` must be a live object in a block being evacuated.
 pub(crate) unsafe fn evacuate_one(p: *mut u8) -> *mut u8 {
+    // Several root slots can name the same object. The first moves it; the
+    // others must use that copy before interpreting the overwritten header
+    // as a type id or size.
+    let meta = unsafe { load_meta(p) };
+    if is_forwarded_meta(meta) {
+        return forwarding_target(meta);
+    }
     let Some(size) = (unsafe { crate::types::object_size(p) }) else {
         return p;
     };
@@ -285,5 +292,31 @@ pub(crate) unsafe fn verify_no_stale_references() {
             "W# collector: {stale} references still point into evacuated blocks after the fix-up"
         );
         std::process::abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::header::TYPE_ID_STR;
+    use crate::test_support::SERIAL;
+
+    #[test]
+    fn aliased_roots_resolve_to_the_same_evacuation_copy() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        types::publish();
+        std::thread::spawn(|| unsafe {
+            let original = heap::ws_alloc(TYPE_ID_STR, 32, 8);
+            (original.add(16) as *mut u64).write(0x5eed);
+            let first = evacuate_one(original);
+            assert_ne!(first, original);
+            // The root walk encounters the same original in another slot.
+            // Its header now holds an address, not a type or object size.
+            let second = evacuate_one(original);
+            assert_eq!(second, first);
+            assert_eq!((second.add(16) as *const u64).read(), 0x5eed);
+        })
+        .join()
+        .unwrap();
     }
 }
