@@ -116,10 +116,11 @@ fn verify(
         ));
     };
     if !expected.errors.is_empty() {
-        if status.success() {
+        // The CLI returns 1 for a diagnosed compile error. A Rust panic
+        // returns 101 and may quote the same text; it must fail this test.
+        if code != 1 {
             return Err(format!(
-                "expected a compile error containing {:?}, but it ran",
-                expected.errors
+                "expected a compile error (exit status 1), got {status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
             ));
         }
         for needle in &expected.errors {
@@ -186,6 +187,39 @@ fn a_signal_is_reported_before_output_or_expected_errors() {
         assert!(message.contains("signal: 11"), "{message}");
         assert!(!message.contains("stdout mismatch"), "{message}");
     }
+}
+
+#[test]
+fn a_compiler_panic_is_not_an_expected_compile_error() {
+    let expected = parse_expectations("// error: type error");
+    for code in [101, 2, 0] {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatus::from_raw(code << 8)
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(code)
+        };
+        assert!(
+            verify(&expected, status, "", "type error").is_err(),
+            "exit {code} must not count as an expected compile error"
+        );
+    }
+    #[cfg(unix)]
+    let status = {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(1 << 8)
+    };
+    #[cfg(windows)]
+    let status = {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(1)
+    };
+    assert!(verify(&expected, status, "", "error: type error").is_ok());
+    assert!(verify(&expected, status, "", "error: another error").is_err());
 }
 
 /// Build a case into a native executable and run *that*.
