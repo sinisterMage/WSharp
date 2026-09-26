@@ -328,9 +328,27 @@ A suite's limits belong where somebody reading its green run will see them.
   coverage feedback to steer one.
 - **The `json` and `toml` targets fuzz two parsers.** Every other `std/*` module
   is unfuzzed, and so is `ingot`.
-- **Nothing here fuzzes across a worker boundary**, drives many workers, or
-  constrains the heap size. Those modes ship, and this harness does not exercise
-  them.
+- **Nothing here fuzzes across a worker boundary.** That mode ships, and no
+  generated input crosses it.
+- **Many workers is a case, not a dimension.** `tests/cases/gc_many_workers.ws`
+  puts eight heaps and eight collectors in one process, so parity runs it in
+  three modes and the built-program stress pass runs it a fourth time — but
+  eight is a number somebody wrote down, not a knob this harness sweeps. Nothing
+  here scales the worker count looking for the point where it breaks.
+- **The heap cannot be made small.** `SPACE_BLOCKS` (64 MiB a space),
+  `TRACE_EVERY_ALLOCATIONS` and `TRACE_GROWTH_FLOOR_BYTES` are compile-time
+  constants in `wsharp-runtime`, so the only way to reach a space-exhaustion or
+  block-reuse path is to write a case big enough to reach it on a full-sized
+  heap. `--gc-stress` makes collections *frequent*, which is a different
+  question from making the heap *tight*.
+- **Optimisation level is not a dimension either, and cannot be.** Both backends
+  set Cranelift's `opt_level` to the literal `"speed"`
+  (`wsharp-codegen/src/lib.rs`, twice), and nothing reads an override. So the
+  differential criterion 5 asks for — the same corpus compiled two ways, where
+  neither has to be known-correct for a disagreement to be a defect — has no
+  switch to drive. Filed as #39; until it is answered, parity varies the backend
+  and the collector and holds the optimiser fixed, and that is three dimensions
+  where the gate list names four.
 - **`gc-pauses.sh` measures the distribution over runs, not within one.**
   `WSHARP_GC_STATS=1` reports three counters per process and there is no
   per-pause log, so a p99 over the pauses inside a single run cannot be computed
