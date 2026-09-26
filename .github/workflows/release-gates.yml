@@ -241,6 +241,9 @@ jobs:
       # This job is where the tests have to run rather than on every pull
       # request: they drive the real script against a published release, so
       # they need the network and the platform, which is what this matrix is.
+      - name: Test manifest inspection failures
+        run: bash scripts/tests/verify-install-inspection.test.sh
+
       - name: Test the verifier
         run: bash scripts/tests/verify-install.test.sh
 
