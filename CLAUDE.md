@@ -546,6 +546,24 @@ extra `sin_len` byte out of this code entirely.
   part of an *address*, which can easily name a real type id. Scanning one then
   walks a stranger's bytes with somebody else's layout. The copy is on the same
   list, and the copy is what needs fixing.
+- **A root set may name one object from several slots, so `evacuate_one` must
+  answer a forwarded object with where it went.** That is the rule above read
+  at the *other* end of the pause, and `evacuate_one` was the second place that
+  did not follow it. A struct passed down a recursion sits in every live
+  frame's parameter slot at once, plus the caller's local; the walk that moves
+  everything the roots name (`mark.rs`, `move_root`) therefore arrives at the
+  same object once per slot. It gates on `heap::is_evacuating`, which is a
+  *block-state* test on the address, so a slot still holding the old address
+  passes it however many times the object has already been forwarded. Inside,
+  `types::object_size` read a type id out of what was now an address, got an
+  unregistered one, answered `None` -- and the function handed back the address
+  it came in with. Those slots were left pointing into a block about to be
+  released, and the program's next write through one went to the abandoned copy
+  and was lost. `ws_resolve` never met this because it tests forwarding itself
+  before calling in; the root walk does not, and cannot, because the
+  duplication is what a root set *is*. The symptom was a recursive reader
+  losing its cursor increments and answering with a different number of
+  children on nearly every run (`gc_aliased_cursor.ws`, `gc_aliased_roots.ws`).
 - **Counting's frees wait until the trace's *last* pause, not its second.**
   The evacuation pause reads two lists recorded during the mark -- the slots
   the marker saw pointing into a block being emptied, and the objects the trace
