@@ -807,29 +807,59 @@ it could not wait, who granted it, and whether the clock reset.
 
 ## The state of the checks
 
-Nine gates, nine checks. Two exist; the rest are named here so that they are owed
-rather than assumed.
+Nine gates, thirteen checks — three gates take two apiece, because a gate with
+one mechanism and one artefact, or one script per repository, is two things that
+can be separately missing. Nine of the thirteen are written; four are not, and
+are named here so that they are owed rather than assumed.
+
+**Read against `main` at `41e4d70`.** This table claims which files exist, which
+is a claim that goes stale on any merge that adds one — and did, within twenty
+minutes of revision 2, on six of ten rows. So it carries the commit it was true
+at. A reader who finds `main` ahead of that commit should trust the tree over
+this table and correct it; see the note below.
 
 | Check | Gate | State | Owed by |
 |---|---|---|---|
 | the four-file test in criterion 0 | 0 | **written and run** — inline above | Johnny |
-| `scripts/soak-report.sh` | 1 | not written | Dex |
-| `scripts/freeze-check.sh` | 2 | **written**, restored on this branch | Ash to run |
-| `scripts/guard-check.sh` | 3 | not written | Ash |
-| `scripts/followups-check.sh` | 4 | not written | Ash, against Mira's decisions |
-| `tests/harness/nightly.sh` | 5 | written on PR #17, closed unmerged at `39e5a76` | Dex to restore |
-| `scripts/check-doc-examples.sh` | 6a | not written | Ash, against Johnny's prose |
-| the 6d CI job | 6d | not written | Ash, against Mira's fix |
-| `scripts/verify-install.sh`, `tests/rungs.sh` | 7 | not written | Ash |
-| `tests/harness/gc-pauses.sh` + baselines | 8 | harness written on PR #17; baselines not | Ridge |
+| `scripts/soak-report.sh`, with `scripts/soak-report-selftest.sh` | 1 | **written** (#20), and wired up as the `soak-row` job in `nightly.yml`. What is owed is 28 days of rows, not the script | Dex to run |
+| `scripts/freeze-check.sh` | 2 | **written**, on `main` | Ash to run |
+| `scripts/check-change-label.sh`, with `scripts/tests/check-change-label.test.sh` | 2 | **written** (#21), as the `change-label` job in `release-gates.yml`. Revision 2 did not list this check at all | Ash, enforcing from now |
+| `scripts/guard-check.sh` | 3 | **not written** | Ash |
+| `scripts/followups-check.sh` | 4 | **not written.** The six sections it would assert against are on `main` (`8451ee8`), so it is now writable — and until it is, criterion 4 is the one gate whose data exists and whose check does not | Ash, against Mira's decisions |
+| `tests/harness/nightly.sh` | 5 | **written** (#20), with `.github/workflows/nightly.yml` and its `parity`, `nightly` and `soak-row` jobs. What is owed is green runs on a schedule | Dex to run |
+| `scripts/check-doc-examples.sh`, with `scripts/tests/check-doc-examples.test.sh` | 6a | **written** (#21), as the `doc-examples` and `examples` jobs in `release-gates.yml`, and **green** since #33 marked the documented programs up | Ash — held |
+| the 6d CI job | 6d | **written** (#21), as `contributor-commands` in `release-gates.yml` | Ash — held |
+| `scripts/verify-install.sh` | 7 | **written** (#21), as the `verify-install` matrix job in `release-gates.yml`. What is owed is a run against a real release | Ash to run |
+| `tests/rungs.sh` | 7 | **not written.** It belongs to `sinisterMage/sharpie`, not to this repository, so nothing in this tree will ever show it arriving | Ash |
+| `tests/harness/gc-pauses.sh` | 8 | **written** (#20), and called by `nightly.sh` | Ridge — held |
+| a committed benchmark baseline per release triple | 8 | **not written.** No baseline file exists in the tree, so the 2x threshold in criterion 8 currently has nothing to measure against | Ridge |
 
 A criterion whose check is not written is a criterion nobody can fail, which is
-why this table is here rather than in somebody's head.
+why this table is here rather than in somebody's head. The four that are not
+written are gates 3, 4, 7's `rungs.sh` and 8's baselines; everything else now
+fails on evidence rather than on absence.
+
+Two rows used to be one each, and splitting them was the honest fix. Criterion 7
+as a single row said "not written" while `verify-install.sh` was finished, and
+criterion 8 as a single row would have said "written" while the baselines were
+not. One row per thing that can be separately missing is the rule, and the reason
+the table has thirteen rows for nine gates.
+
+**This table will drift again.** A hand-maintained inventory of which files exist
+is wrong the moment somebody adds one, and the fix is the trick gate 6a already
+plays on the prose: a check that reads the rows and asserts each named path
+against the tree. Until that exists, the commit stamped above is the only thing
+standing between a reader and a confident wrong answer.
 
 ## The tag checklist
 
 Every line links to the evidence that closed it. An unchecked or hand-waved line
 is not a tag.
+
+These lines state the conditions a gate passes under, not whether its check has
+been written — the table above is the single place that says which files exist,
+so that the two cannot drift apart. A line naming a script is therefore not a
+claim that the script is missing.
 
 - [ ] 0. All four governing documents on `main`; no open issue cites a path that does not resolve.
 - [ ] 1. `scripts/soak-report.sh` — 28 complete days, three subjects, zero failed rows.
@@ -850,4 +880,5 @@ is not a tag.
 | Revision | Date | What changed |
 |---|---|---|
 | 1 | 2026-09-26 | Written by Milo on PR #7. Seven criteria, three definitions, `freeze-check.sh`. Closed unmerged at `ce6b3ff`. |
+| 3 | 2026-09-26 | "The state of the checks" refreshed by Johnny against `main` at `41e4d70`. Revision 2 was accurate when it was written and wrong on six of ten rows within twenty minutes, because #20, #21 and #23 landed behind it. Now written: `soak-report.sh`, `nightly.sh` and `nightly.yml`, `check-doc-examples.sh`, the 6d job as `contributor-commands`, `verify-install.sh`, `gc-pauses.sh`. Still not: `guard-check.sh`, `followups-check.sh`, `rungs.sh` (which lives in `sinisterMage/sharpie`), and criterion 8's baselines. Criteria 7 and 8 split into one row per separately-missing thing; `check-change-label.sh` added as criterion 2's second check, which revision 2 omitted. The table now carries the commit it was read at, and says what would stop it drifting. No criterion, gate, threshold or owner changed — this revision is a correction of the document's account of itself. |
 | 2 | 2026-09-26 | Published by Johnny as the campaign's gate list. Part one preserved so existing citations still resolve — clause 3 and criterion 4 mean what #8 through #18 say they mean. Added: criterion 0 (the governing documents), criterion 8 (the numbers), gate 6d (#8), Part three (the nine open issues), Part four (the proof standard), Part five (the API and stability freeze), the platform matrix. Owners remapped from the campaign's earlier roster to its current one. Rulings recorded: clause 3 carries no exemption (#13 is a fix); 6a covers in-repo documentation only; 1.0 ships with digest sidecars and says so; rollback is `sharpie default <previous>`; criterion 1 drops two unowned soak subjects. |
