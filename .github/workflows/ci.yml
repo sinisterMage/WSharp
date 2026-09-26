@@ -113,6 +113,28 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+  # The adversarial harness's own verdict logic, on every push and every pull
+  # request. It needs no cargo, no `cc` and no W# compiler -- it drives
+  # `parity.sh` over a stub compiler whose answers are known in advance -- so it
+  # costs seconds and runs before anything is built.
+  #
+  # **The corpus is nightly; the harness is not.** `parity.sh` over
+  # `tests/cases` is hours and lives in `nightly.yml`. But a change that broke
+  # `parity.sh`'s ability to tell a divergence from agreement would survive
+  # until a nightly whose divergence list was empty for the wrong reason, and an
+  # empty list is exactly what criterion 5 reads as success. So the gate's own
+  # machinery is checked where a change to it is made.
+  harness:
+    name: harness selftest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: parity.sh reports what happened
+        run: tests/harness/selftest.sh
+      - name: soak-report.sh answers criterion 1
+        run: scripts/soak-report-selftest.sh
+
   test-debian:
     # glibc 2.41 leaves an outer native frame pointer that is not a readable
     # frame chain. Keep this separate from Ubuntu to cover that boundary.
