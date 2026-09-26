@@ -1,0 +1,14 @@
+name = "acme"
+version = "1.2.0"
+authors = ["a", "b"]
+
+[dependencies]
+json = "^1.0.0"
+
+[dependencies.http]
+git = "https://example.invalid/http"
+rev = "abc"
+
+[[bin]]
+name = "tool"
+path = "src/main.ws"

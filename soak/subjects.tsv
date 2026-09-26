@@ -1,0 +1,3 @@
+compiler	Dex	tests/harness/nightly.sh, once a day, x86_64-unknown-linux-gnu
+ecosystem	Ash	the .wsharp ecosystem check, one full run per day on all four release triples
+raython	Wren	the Raython sample application, a long-running HTTP server
