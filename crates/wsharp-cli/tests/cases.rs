@@ -643,6 +643,9 @@ fn help_documents_the_collector_environment_variables() {
     assert!(output.status.success());
     assert!(stdout.contains("WSHARP_GC_STATS"), "{stdout}");
     assert!(stdout.contains("WSHARP_GC_TRACE"), "{stdout}");
+    // The per-pause log is an instrument, and an instrument nobody can find
+    // is one nobody switches on.
+    assert!(stdout.contains("WSHARP_GC_PAUSE_LOG"), "{stdout}");
 }
 
 #[test]

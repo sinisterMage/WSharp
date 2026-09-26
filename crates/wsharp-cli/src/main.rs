@@ -15,7 +15,12 @@ use wsharp_cli::{Action, Emit, Root, drive};
 /// which a compiled program reaches without going through this driver.
 const AFTER_HELP: &str = "\
 Environment:
-  WSHARP_GC_STATS=1   print collector statistics on exit
+  WSHARP_GC_STATS=1   print collector statistics on exit, including the pause
+                      distribution and the buckets it was computed from
+  WSHARP_GC_PAUSE_LOG=<path>
+                      write one line per pause -- microseconds, which of the
+                      three pauses, which worker -- for when the histogram's
+                      25% resolution is not close enough. 4 MiB per worker
   WSHARP_GC_TRACE=1   print every frame the root walk visits
   WSHARP_GC_STRESS=1  collect at every allocation; what `run --gc-stress`
                       does, and the only way to ask a built program for it
