@@ -1,0 +1,130 @@
+name: Defect report
+description: A program the compiler accepted behaves wrongly, a valid program was rejected, or something crashed.
+title: "<one sentence saying what is wrong>"
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting. The fields below are the ones a fix actually needs;
+        an issue carrying all of them can usually be reduced to a regression case
+        without a round trip.
+
+        The single most useful thing you can do is **reduce the program**: cut it
+        down until removing one more line makes the failure go away. That reduction
+        normally *becomes* the `tests/cases` entry that guards the fix.
+
+        Severity is defined in [`docs/defects.md`](https://github.com/sinisterMage/WSharp/blob/main/docs/defects.md#severity).
+        Propose one; it is confirmed at triage.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happens, and what you expected instead. One paragraph.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: >
+        The smallest `.ws` program that still fails, the exact commands you ran,
+        the actual output, and the expected output. Paste them; do not describe them.
+      value: |
+        Save as `repro.ws`:
+
+        ```wsharp
+        fn main() void {
+        }
+        ```
+
+        Run:
+
+        ```sh
+        cargo build --workspace --locked
+        ./target/debug/wsharp run repro.ws
+        ```
+
+        **Actual output:**
+
+        ```text
+        ```
+
+        **Expected output:**
+
+        ```text
+        ```
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit SHA
+      description: >
+        The full 40-character commit this was confirmed against (`git rev-parse HEAD`).
+        If you used a published release instead, give the release tag and the archive name.
+      placeholder: 716e852e9199ef8eb9ac3f713771429154ef8a5a
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: modes
+    attributes:
+      label: Execution modes reproduced in
+      description: >
+        Tick every mode you actually ran. Leave a mode unticked if you did not try it —
+        an untried mode is not a passing mode, and saying so is useful.
+        A defect present in one mode and absent in another is itself a finding:
+        `run` and `build` share one lowering, so a divergence is always a defect.
+      options:
+        - label: "`wsharp run` (JIT)"
+        - label: "`wsharp run --gc-stress` (JIT, collecting at every allocation)"
+        - label: "`wsharp build` and run the executable (AOT)"
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: >
+        OS and version, architecture, and — on Linux — the libc and its version.
+        `uname -srm` plus `ldd --version | head -1` covers it.
+      placeholder: Linux 6.12.94 x86_64, glibc 2.41
+    validations:
+      required: true
+
+  - type: input
+    id: rustc
+    attributes:
+      label: Rust version
+      description: "`rustc --version`. The repository pins 1.95.0."
+      placeholder: rustc 1.95.0
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Proposed severity
+      description: >
+        See docs/defects.md. P1 is narrow and specific on purpose: a wrong answer
+        with no diagnostic, memory or collector unsoundness, a crash on valid input,
+        data loss, a JIT/AOT divergence, or a contradicted documented guarantee.
+      options:
+        - "P1 — wrong answer, unsoundness, crash on valid input, data loss, mode divergence, or a broken documented guarantee"
+        - "P2 — valid program rejected, documented feature does not work, supported platform fails, or a hang"
+        - "P3 — poor diagnostic, performance regression, cosmetic"
+        - "P4 — trivial"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: cause
+    attributes:
+      label: Suspected cause
+      description: >
+        Optional, and genuinely useful when you have it. Name the crate
+        (`syntax`, `sema`, `codegen`, `runtime`, `cli`, `start`) and link the lines.
+        Say plainly whether this is confirmed or a lead — a guess labelled as a guess
+        costs nothing, and one labelled as a finding costs a day.

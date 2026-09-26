@@ -925,6 +925,23 @@ documents were put through it, `node`'s `JSON.parse` and `python3`'s
 `json.loads`; fifty-one agree exactly and the five that do not are each a
 decision. Item 15 of [ROADMAP.md](ROADMAP.md) is the write-up.
 
+## Reporting a defect
+
+Open an issue at
+[sinisterMage/WSharp/issues](https://github.com/sinisterMage/WSharp/issues). The
+[defect form](.github/ISSUE_TEMPLATE/defect.yml) asks for the smallest `.ws`
+program that still fails, the commands and their actual output, the commit SHA,
+the execution mode - `run`, `run --gc-stress`, or a `build` executable - and the
+platform. Those are the fields because each one has cost a round trip.
+
+Reducing the program is the part worth the effort: cut it until removing one more
+line makes the failure go away. That reduction is usually the regression case the
+fix ships with, so a report that arrives reduced arrives half fixed.
+
+[docs/defects.md](docs/defects.md) is what happens next - what the severity
+levels mean, when issues are triaged, and the rule that no fix merges without a
+test that fails before it and passes after.
+
 What is left, and where it plugs in, is in [ROADMAP.md](ROADMAP.md).
 Conventions and the invariants worth not breaking are in
 [CLAUDE.md](CLAUDE.md). The documentation is at
