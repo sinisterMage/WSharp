@@ -609,6 +609,71 @@ claimed.
 documented limitation. `RELEASE-CRITERIA-1.0.md` states that 1.0 does not add a
 supported platform.
 
+## `wsharp build` on Windows needs clang or MSVC, not MinGW
+
+**What.** `wsharp build` links with `cc`, and on Windows the flags it passes are
+MSVC's. If the `cc` it finds is MinGW's `gcc`, the link fails:
+
+```
+> wsharp build hello.ws -o hello.exe
+error: linking failed:
+ld.exe: Error: unable to disambiguate: -subsystem:console (did you mean --subsystem:console ?)
+collect2.exe: error: ld returned 1 exit status
+```
+
+`wsharp run` is unaffected on every platform — it compiles into its own process
+and calls no linker — so this is `build` alone.
+
+The reason it is worth an entry rather than a line in the README is **who meets
+it**. `cc` on a Windows machine is whatever is first on `PATH`, and a developer
+machine with Git for Windows, MSYS2 or a MinGW toolchain installed has one there
+without having chosen it. GitHub's `windows-latest` image is exactly that
+machine, which is how this was found: criterion 7's Windows row failed on it
+while the same release built fine under clang.
+
+**Why.** The Windows flags are not decoration. `-Xlinker -subsystem:console` is
+there because clang picks a subsystem by looking for `main` in the *objects* it
+was handed, and W#'s `main` is in `libwsharp_start.a` — a library — so without
+it the MSVC linker has no entry point at all. `-nodefaultlib:libcmt
+-defaultlib:msvcrt` is there because Rust's MSVC target links the dynamic CRT
+and clang's driver defaults to the static one, and handing a Rust staticlib to
+the static CRT is not a near miss. Both are written out at
+`crates/wsharp-cli/src/link.rs:91`.
+
+Supporting GNU `ld` as well means a second set of flags, selected by detecting
+the linker flavour, and a second Windows link configuration to keep green — on
+a platform where, per the note in `CLAUDE.md`, almost nothing can be checked
+from the machines this project is developed on. The released artefact is
+`x86_64-pc-windows-msvc`, and MSVC is the toolchain that target names.
+
+**Workaround.** Use the MSVC toolchain or clang. Either install the Visual
+Studio Build Tools, or `winget install LLVM.LLVM` and point `CC` at it:
+
+```
+> set CC=clang
+> wsharp build hello.ws -o hello.exe
+```
+
+Setting `CC` explicitly is the reliable form on a machine that has both, because
+it does not depend on `PATH` order.
+
+**Disposition: documented limitation for 1.0, with a fix wanted on the
+message.** The requirement itself is the MSVC target's and is not a defect. What
+*is* a defect is the error: `unable to disambiguate: -subsystem:console` is the
+linker's complaint about a flag the user never typed, and it says nothing about
+what to install. `wsharp build` already refuses a missing `cc` with a sentence
+that names the problem, and the wrong `cc` deserves the same.
+
+**Tracked.** [#41](https://github.com/sinisterMage/WSharp/issues/41) for the
+message. The requirement is stated in `README.md`'s "`wsharp build` needs a C
+compiler".
+
+**Guarded by** criterion 7's Windows row, which runs
+`scripts/verify-install.sh` on `windows-latest` — the machine where `cc` is
+MinGW. There is deliberately no `tests/cases` entry: a case cannot assert which
+C compiler is first on `PATH` without becoming a case about the machine it ran
+on, which is `fs_chmod.ws`'s and `net.shutdown`'s discipline.
+
 ## No reproducible builds
 
 **What.** A third party cannot rebuild a release artefact and get the same
