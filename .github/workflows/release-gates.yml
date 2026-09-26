@@ -1,0 +1,164 @@
+# The v1.0 release gates that are CI jobs rather than test-suite passes.
+#
+# Separate from `ci.yml` on purpose. `ci.yml` answers "does this change work";
+# this file answers "is this repository still in a state the release criteria
+# describe", which is a different question with a different owner and a
+# different failure meaning. Keeping them apart also keeps a release gate from
+# being lost inside a 45-minute matrix.
+#
+# Each job below names the criterion it implements in RELEASE-CRITERIA-1.0.md.
+# A job with no criterion does not belong here.
+
+name: Release gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # `labeled` and `unlabeled` are what make the change-label job re-run when
+    # somebody adds the label it asked for. Without them the contributor fixes
+    # the thing and the check stays red until an unrelated push.
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  # Criterion 2's mechanism. Every pull request carries exactly one of
+  # `change:breaking`, `change:additive`, `change:fix`, `change:none`.
+  #
+  # This must be enforced from before day 0: the criterion asks "were any merges
+  # to `main` in that window labelled `change:breaking`", and a window whose
+  # merges were not labelled cannot be answered after the fact.
+  change-label:
+    name: change label (criterion 2)
+    # Only a pull request has labels. On a push to `main` there is nothing to
+    # check -- the label was checked on the way in, which is the point.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # The rule's own tests. A gate whose logic is unverified can pass
+      # everything and be believed, so the logic is checked before it is used.
+      - name: Test the rule
+        run: bash scripts/tests/check-change-label.test.sh
+
+      # Read the labels out of the event payload rather than calling the API:
+      # no token, no rate limit, and the payload is what triggered this run, so
+      # a `labeled` event cannot race a separate read.
+      - name: Check this pull request's labels
+        run: jq -r '.pull_request.labels[].name' "$GITHUB_EVENT_PATH" | bash scripts/check-change-label.sh
+
+  # Gate 6a. Every documented example is a real file, executed in CI.
+  #
+  # Red today: eight complete programs in `README.md` and `docs/processes.md`
+  # carry no marker, so nothing checks them against anything. The script names
+  # each one. Marking them up is prose work and belongs to whoever owns the
+  # prose; this job is what stops the count growing.
+  doc-examples:
+    name: documented examples (gate 6a)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test the checker
+        run: bash scripts/tests/check-doc-examples.test.sh
+      - name: Check the documentation against the files it cites
+        run: bash scripts/check-doc-examples.sh
+
+  # The other half of gate 6a: `examples/` has to actually be executed, or a
+  # marker naming a file in it vouches for nothing. Until this job existed
+  # nothing ran `examples/*.ws` at all -- not the case suite, which reads
+  # `tests/cases`, and not CI.
+  #
+  # Non-recursive on purpose: `examples/modules/` holds modules that other
+  # examples import, and a module with no `main` is not a program to run. That
+  # is the same split `tests/cases/modules/` has.
+  examples:
+    name: examples run (gate 6a)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore cargo and target caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-examples-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-examples-
+
+      # `--workspace`, not just the CLI: `wsharp build` links against
+      # `libwsharp_start.a`, which `cargo build -p wsharp-cli` does not produce.
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Run every example
+        run: |
+          set -u
+          failed=0
+          for f in examples/*.ws; do
+            if out="$(./target/debug/wsharp run "$f" 2>&1)"; then
+              echo "ok   $f"
+            else
+              echo "FAIL $f"
+              echo "$out" | head -20 | sed 's/^/       /'
+              failed=$((failed + 1))
+            fi
+          done
+          echo
+          if [ "$failed" -ne 0 ]; then
+            echo "$failed example(s) failed"
+            exit 1
+          fi
+          echo "every example ran"
+
+  # Gate 6d. Every command the repository tells a contributor to run works.
+  #
+  # The three commands are `CLAUDE.md`'s, verbatim, in its order -- the build
+  # before the test because the case suite's AOT pass links against an archive
+  # `cargo test` does not build. The third is issue #8 and fails today; this job
+  # is what turns that from an afternoon lost per contributor into a red check
+  # with an owner.
+  #
+  # No `nix-shell` wrapper: `CLAUDE.md` uses it because a bare NixOS box has no
+  # `cc`, and the GitHub runner has one already. The commands inside are what
+  # this gate is about.
+  contributor-commands:
+    name: contributor commands (gate 6d)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore cargo and target caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-gate6d-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-gate6d-
+
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      # The filtered build. `wsharp-start` declares `test = false` because it
+      # defines `main` and a test harness brings its own; a filter that reaches
+      # it anyway is #8. `--no-run` because the gate is about the command
+      # working, and the unfiltered run above already ran the tests.
+      - name: cargo test --workspace arithmetic --no-run
+        run: cargo test --workspace arithmetic --no-run
