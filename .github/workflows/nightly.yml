@@ -1,0 +1,289 @@
+# The adversarial harness, on a schedule.
+#
+# Criterion 5 of `RELEASE-CRITERIA-1.0.md`: `tests/harness/nightly.sh` green on
+# a schedule on Linux at minimum, and `tests/harness/parity.sh` on all four
+# release triples.
+#
+# ## Why this is not in `ci.yml`
+#
+# `ci.yml` runs on every push and every pull request, and it has to stay fast
+# enough that nobody turns it off -- it is about 45 minutes across the matrix
+# today. `parity.sh` alone is one to three hours per platform, because it runs
+# every case in `tests/cases` three times over, and `nightly.sh` adds a
+# half-hour fuzz campaign per target on top. Putting that on every pull request
+# would make the median change wait three hours and would spend a runner-day per
+# push. So the split is:
+#
+#   ci.yml       every push and PR     the suite, the lints, and
+#                                      `tests/harness/selftest.sh` -- seconds,
+#                                      no cargo, and it is what keeps the
+#                                      harness's own verdict logic honest
+#   nightly.yml  03:00 UTC daily       parity on four triples, the fuzz corpus,
+#                                      the pause measurements
+#
+# The decision that matters is the one in the middle: the *harness* is tested on
+# every pull request even though the *corpus* is not. A change that breaks
+# `parity.sh`'s ability to tell a divergence from agreement would otherwise
+# survive until a nightly whose divergence list is empty for the wrong reason,
+# and an empty list is exactly what this gate reads as success.
+#
+# ## Failure is the point
+#
+# A divergence between two execution modes is a P1 under criterion 5 and this
+# workflow fails when it finds one. Nothing here is `continue-on-error`: a gate
+# that reports amber is a gate nobody reads.
+
+name: Nightly
+
+on:
+  schedule:
+    # 03:00 UTC. Late enough that a day's merges are in, early enough that the
+    # result is waiting at the start of the European working day.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzz-seconds:
+        description: "Total fuzz budget, split across the four targets"
+        required: false
+        default: "1800"
+      quick:
+        description: "Skip the stress pause pass and shorten the repeats"
+        type: boolean
+        required: false
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  # One night at a time. A scheduled run that overlaps the previous one competes
+  # with it for the runner's cores, and pause times measured against a busy box
+  # are a number to re-run rather than a finding.
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  # --- criterion 5, clause 1: parity on all four release triples -------------
+  parity:
+    name: parity (${{ matrix.triple }})
+    runs-on: ${{ matrix.os }}
+    # Six hours is the hosted-runner ceiling. `parity.sh` is one to three hours
+    # on one core; the margin is for a runner slower than the last one, not for
+    # a case that hangs -- the harness bounds every run itself.
+    timeout-minutes: 330
+    strategy:
+      # A platform-specific divergence must not cancel the other three. The
+      # whole question this job asks is which platforms agree.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+            cc: cc
+          - os: macos-latest
+            triple: aarch64-apple-darwin
+            cc: cc
+          - os: macos-15-intel
+            triple: x86_64-apple-darwin
+            cc: cc
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            # Not `cc`: `link.rs` passes `-o`, which `cl.exe` does not
+            # understand. See the same note in `ci.yml`.
+            cc: clang
+    defaults:
+      run:
+        shell: bash
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Remove the link.exe that is not a linker
+        if: runner.os == 'Windows'
+        run: rm -f "/c/Program Files/Git/usr/bin/link.exe"
+
+      - name: Set up the MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # `timeout(1)` is coreutils and base macOS has neither it nor `gtimeout`.
+      # The harness refuses to start without one rather than running the corpus
+      # unbounded, so this is a dependency and not a nicety.
+      - name: Install GNU coreutils
+        if: runner.os == 'macOS'
+        run: brew install coreutils
+
+      - name: Versions
+        run: |
+          rustc --version
+          "$CC" --version | head -1
+          (timeout --version || gtimeout --version) 2>&1 | head -1
+
+      # **Before anything else, and that order is load-bearing.** `cargo test`
+      # does not build `crates/wsharp-start`, so the AOT half of parity would
+      # link whatever runtime archive was left behind -- or none. See CLAUDE.md.
+      - name: Build the compiler and the runtime archive
+        run: cargo build --workspace --locked
+
+      - name: Parity across run, run --gc-stress, and build
+        id: parity
+        run: |
+          WSHARP_HARNESS_REPORTS="$PWD/target/harness/parity" \
+            tests/harness/parity.sh --timeout 300
+
+      # `always()`: the report is the evidence, and the run that failed is the
+      # one whose report is worth keeping.
+      - name: Upload the parity report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-${{ matrix.triple }}
+          path: target/harness/parity
+          if-no-files-found: error
+
+      # Rendered into the run's summary so a divergence is legible without
+      # downloading an artifact. A gate somebody has to unzip is one nobody
+      # reads.
+      - name: Summarise
+        if: always()
+        run: cat target/harness/parity/report.md >>"$GITHUB_STEP_SUMMARY" || true
+
+  # --- criterion 5, clauses 2 and 3: the full night on Linux -----------------
+  nightly:
+    name: nightly (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Versions
+        run: |
+          rustc --version
+          cc --version | head -1
+          perl --version | sed -n 2p
+
+      - name: Build the compiler and the runtime archive
+        run: cargo build --workspace --locked
+
+      - name: The night's run
+        id: night
+        run: |
+          args=(--out "$PWD/target/harness/night")
+          args+=(--fuzz-seconds "${{ inputs.fuzz-seconds || '1800' }}")
+          # An `&&` list whose test is false returns 1, and every `run:` here is
+          # `bash -e`. Spelled as an `if` so a default-value dispatch does not
+          # fail the step before the harness has run.
+          if [ "${{ inputs.quick || 'false' }}" = "true" ]; then
+            args+=(--quick)
+          fi
+          tests/harness/nightly.sh "${args[@]}"
+
+      - name: Upload the night's reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-linux
+          path: target/harness/night
+          if-no-files-found: error
+
+      - name: Summarise
+        if: always()
+        run: cat target/harness/night/report.md >>"$GITHUB_STEP_SUMMARY" || true
+
+      # `nightly.sh` writes a report whatever happened; it does not decide
+      # whether the night passed. That decision is here, because it is the gate:
+      # any divergence, any nondeterministic case, or any fuzz finding fails.
+      - name: The gate
+        run: |
+          tsv=target/harness/night/parity/results.tsv
+          rc=0
+          if [ ! -f "$tsv" ]; then
+            echo "nightly: parity wrote no results.tsv — it did not run"
+            rc=1
+          else
+            bad=$(awk -F'\t' 'NR>1 && $2!="AGREED" {print}' "$tsv")
+            if [ -n "$bad" ]; then
+              echo "nightly: cases that did not agree across the three modes:"
+              printf '%s\n' "$bad" | awk -F'\t' '{printf("  %-40s %s  %s\n", $1, $2, $4)}'
+              rc=1
+            fi
+          fi
+          for t in check run json toml; do
+            d="target/harness/night/fuzz-$t/findings"
+            if [ -d "$d" ] && [ -n "$(ls -A "$d" 2>/dev/null)" ]; then
+              echo "nightly: fuzz target '$t' has findings:"
+              ls -1 "$d" | sed 's/^/  /'
+              rc=1
+            fi
+          done
+          if [ "$rc" -eq 0 ]; then
+            echo "nightly: no divergence, no nondeterminism, no fuzz finding"
+          fi
+          exit "$rc"
+
+  # --- criterion 1: the compiler subject's daily row -------------------------
+  #
+  # Appended after the two jobs above have said what happened, so the row
+  # records the night's actual verdict. A row is written whether the night
+  # passed or failed -- criterion 1 asks whether the subject *reported*, and a
+  # failure that went unrecorded reads as a soak that stopped.
+  soak-row:
+    name: soak row
+    needs: [parity, nightly]
+    if: always() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Written into the workspace first, from the checkout of the commit under
+      # test, so the row is produced by the same `soak-report.sh` the gate will
+      # read it with. Only then is it carried onto the log branch.
+      - name: Write the row
+        env:
+          NIGHT: ${{ needs.nightly.result }}
+          PARITY: ${{ needs.parity.result }}
+        run: |
+          verdict=fail
+          if [ "$NIGHT" = "success" ] && [ "$PARITY" = "success" ]; then
+            verdict=ok
+          fi
+          scripts/soak-report.sh --append \
+            --subject compiler --verdict "$verdict" \
+            --commit "$GITHUB_SHA" \
+            --platform x86_64-unknown-linux-gnu \
+            --detail "nightly=$NIGHT parity=$PARITY run=$GITHUB_RUN_ID"
+          cp soak/compiler.tsv "$RUNNER_TEMP/row.tsv"
+
+      # The log lives on a branch of its own. **Not `main`**: a scheduled job
+      # that pushed to the default branch every night would put a commit nobody
+      # reviewed between every pair of real ones, and would fight branch
+      # protection on exactly the branch that has it. `soak-log` is append-only
+      # raw data, which is what Form B of the proof standard asks for and what
+      # `scripts/soak-report.sh --dir` is pointed at when the window is read.
+      - name: Append it to the soak-log branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git fetch origin soak-log 2>/dev/null; then
+            git checkout -B soak-log origin/soak-log
+          else
+            # First run. An orphan branch holding nothing but the log.
+            git checkout --orphan soak-log
+            git rm -rf --cached . >/dev/null 2>&1 || true
+            rm -rf soak
+          fi
+          mkdir -p soak
+          # The whole file was copied out, not the one line, because the append
+          # runs against whatever rows the checkout had -- which on the log
+          # branch is all of them, and on `main` is none. Take the tail.
+          tail -1 "$RUNNER_TEMP/row.tsv" >>soak/compiler.tsv
+          git add soak/compiler.tsv
+          git commit -m "soak: compiler row for $(date -u +%Y-%m-%d)"
+          git push origin soak-log

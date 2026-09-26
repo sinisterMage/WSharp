@@ -1,0 +1,21 @@
+i = 42
+neg = -17
+hex = 0xdeadbeef
+oct = 0o755
+bin = 0b1011
+f = 3.14159
+e = 5e+22
+t = true
+f2 = false
+basic = "a\tb\ncé"
+literal = 'no \escapes here'
+multi = """
+one
+two
+"""
+multi_lit = '''
+raw
+'''
+arr = [1, 2, 3]
+inline = { x = 1, y = 2 }
+dotted.key = "value"
