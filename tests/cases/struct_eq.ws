@@ -27,7 +27,8 @@
 //    contents and an `f64` field by `fcmp` -- which is why a `NaN` field makes
 //    a value unequal to itself, exactly as a bare `f64` already does.
 //
-// A comparison that follows a cycle recurses indefinitely, even for `a == a`.
+// A comparison that follows a cycle recurses until a bound and then panics,
+// even for `a == a`; `eq_cycle_bounded.ws` is that case.
 const Point = struct { x: i64, y: i64 };
 const Row = struct { name: str, at: Point, weight: f64 };
 

@@ -17,7 +17,8 @@ use cranelift_module::{DataId, FuncId, Linkage, Module};
 use smallvec::{SmallVec, smallvec};
 use std::collections::HashMap;
 use wsharp_runtime::builtins::{
-    BuiltinTy, PANIC_DIVIDE_BY_ZERO, PANIC_DIVIDE_OVERFLOW, PANIC_NO_METHOD, PANIC_UNWRAP_NULL,
+    BuiltinTy, PANIC_DIVIDE_BY_ZERO, PANIC_DIVIDE_OVERFLOW, PANIC_EQ_TOO_DEEP, PANIC_NO_METHOD,
+    PANIC_UNWRAP_NULL,
 };
 use wsharp_runtime::header::{
     AUX_OFFSET, FLAG_LOGGED, FLAG_SHIFT, HEADER_SIZE, META_OFFSET, TYPE_ID_INVALID, TYPE_ID_MASK,
@@ -1374,7 +1375,10 @@ impl<M: Module> Trans<'_, '_, M> {
                         ref t => {
                             let fns = self.decls.equality_fns(self.store, t);
                             let func = self.module.declare_func_in_func(fns.dispatch, self.b.func);
-                            let call = self.b.ins().call(func, &[l, r]);
+                            // Depth zero: a `==` written in the program is the
+                            // outermost value of its own comparison.
+                            let depth = self.b.ins().iconst(types::I64, 0);
+                            let call = self.b.ins().call(func, &[l, r, depth]);
                             self.b.inst_results(call)[0]
                         }
                     };
@@ -2527,7 +2531,7 @@ impl<M: Module> Trans<'_, '_, M> {
         self.b.append_block_params_for_function_params(entry);
         self.switch(entry);
         let params: Vec<ir::Value> = self.b.block_params(entry).to_vec();
-        let (a, b) = (params[0], params[1]);
+        let (a, b, depth) = (params[0], params[1], params[2]);
         // Live across the call below, and both are heap pointers.
         self.b.declare_value_needs_stack_map(a);
         self.b.declare_value_needs_stack_map(b);
@@ -2584,7 +2588,9 @@ impl<M: Module> Trans<'_, '_, M> {
                 Some(next)
             };
             let func = self.module.declare_func_in_func(exact, self.b.func);
-            let result = self.b.ins().call(func, &[a, b]);
+            // The same depth, not one more: this hand-over is the second half
+            // of one comparison rather than a step into a nested value.
+            let result = self.b.ins().call(func, &[a, b, depth]);
             let value = self.b.inst_results(result)[0];
             self.jump_to(done, &[BlockArg::Value(value)]);
             if let Some(next) = call {
@@ -2617,10 +2623,32 @@ impl<M: Module> Trans<'_, '_, M> {
         self.b.append_block_params_for_function_params(entry);
         self.switch(entry);
         let params: Vec<ir::Value> = self.b.block_params(entry).to_vec();
-        let (a, b) = (params[0], params[1]);
+        let (a, b, depth) = (params[0], params[1], params[2]);
         // Live across every field's comparison, and both are heap pointers.
         self.b.declare_value_needs_stack_map(a);
         self.b.declare_value_needs_stack_map(b);
+
+        // The bound is tested here rather than in the dispatching entry point
+        // because this is the function that reads fields, so this is the one
+        // whose frames accumulate. A value that reaches itself would otherwise
+        // recurse until the stack ran out, which is an abort on a signal with
+        // no W# diagnostic -- see `wsharp_runtime::EQ_MAX_DEPTH`.
+        let too_deep = self.b.ins().icmp_imm_s(
+            ir::condcodes::IntCC::SignedGreaterThanOrEqual,
+            depth,
+            wsharp_runtime::EQ_MAX_DEPTH,
+        );
+        let within = self.b.create_block();
+        let refuse = self.b.create_block();
+        self.brif(too_deep, refuse, NO_ARGS, within, NO_ARGS);
+
+        self.switch(refuse);
+        self.panic_with(PANIC_EQ_TOO_DEEP);
+        // `ws_panic` never returns; the jump only gives the block a
+        // terminator, as the other panic sites do.
+        self.jump_to(within, NO_ARGS);
+
+        self.switch(within);
 
         let Type::Con(TyCon::Struct(id), _) = self.store.resolve(ty) else {
             unreachable!("only a struct type reaches the equality generator")
@@ -2636,7 +2664,7 @@ impl<M: Module> Trans<'_, '_, M> {
             self.gc_root(&field, &left);
             let right = self.load_at(b, offset, &field);
             self.gc_root(&field, &right);
-            let equal = self.slots_equal(&left, &right, &field);
+            let equal = self.slots_equal(&left, &right, &field, depth);
             let next = self.b.create_block();
             self.brif(equal, next, NO_ARGS, no, NO_ARGS);
             self.switch(next);
@@ -2658,8 +2686,10 @@ impl<M: Module> Trans<'_, '_, M> {
     /// Whether two already-loaded values of type `ty` are equal.
     ///
     /// The recursion is over *types* and terminates here; it is the generated
-    /// calls that can recurse without end, on a value that reaches itself.
-    fn slots_equal(&mut self, a: &Slots, b: &Slots, ty: &Type) -> ir::Value {
+    /// calls that can recurse on a value that reaches itself, which is what
+    /// `depth` bounds. `depth` is the level of the value these slots were read
+    /// out of, so stepping into a struct field passes one more.
+    fn slots_equal(&mut self, a: &Slots, b: &Slots, ty: &Type, depth: ir::Value) -> ir::Value {
         match self.store.resolve(ty) {
             // A tag and a payload. The tags settle it unless both say present,
             // and then the payload does, by its own rule -- rather than
@@ -2688,7 +2718,9 @@ impl<M: Module> Trans<'_, '_, M> {
                     a[1..].iter().copied().collect(),
                     b[1..].iter().copied().collect(),
                 );
-                let equal = self.slots_equal(&left, &right, &inner);
+                // The same depth: an optional's payload is more slots of the
+                // value already being compared, not a step into another one.
+                let equal = self.slots_equal(&left, &right, &inner, depth);
                 self.jump_to(done, &[BlockArg::Value(equal)]);
 
                 self.switch(done);
@@ -2698,7 +2730,10 @@ impl<M: Module> Trans<'_, '_, M> {
             ref t @ Type::Con(TyCon::Struct(_), _) => {
                 let dispatch = self.decls.equality_fns(self.store, t).dispatch;
                 let func = self.module.declare_func_in_func(dispatch, self.b.func);
-                let call = self.b.ins().call(func, &[a[0], b[0]]);
+                // One deeper: this is the step into a nested value, and so the
+                // step a cycle would repeat.
+                let deeper = self.b.ins().iadd_imm_s(depth, 1);
+                let call = self.b.ins().call(func, &[a[0], b[0], deeper]);
                 self.b.inst_results(call)[0]
             }
             Type::Con(TyCon::F64, _) => {
