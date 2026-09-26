@@ -1,3 +1,19 @@
+// **Not compiled into a test harness, and this is where that has to be said.**
+// This crate defines `main`; a test binary brings its own, and the linker
+// refuses two entry symbols. `Cargo.toml` says so with `test = false`, and
+// cargo honours that key only while the lib target is not *explicitly*
+// selected -- passing a test-name filter (`cargo test --workspace arithmetic`)
+// selects it, `test = false` stops applying, and the build fails with `entry
+// symbol main declared multiple times`, naming neither the filter nor the
+// manifest key. Reported as #8. The property belongs to the crate rather than
+// to one of cargo's two routes to it, so it is stated here too; the manifest
+// key stays, because it is still what keeps this crate out of the graph for
+// the ordinary command. The `contributor commands (gate 6d)` job in
+// `.github/workflows/release-gates.yml` is what notices if this stops holding:
+// it is the only thing in CI that passes a filter, and a filter is the only
+// way to the broken path.
+#![cfg(not(test))]
+
 //! What a compiled W# program starts and ends in.
 //!
 //! `wsharp build` emits an object file holding the program's code, its string

@@ -14,6 +14,12 @@ crate-type = ["staticlib"]
 # own -- building one asks the linker to place two, which it refuses. There is
 # nothing here to unit-test in any case: what this archive does is checked by
 # building a program with it, which `wsharp-cli`'s case suite does.
+#
+# **This key is not on its own enough**, which is #8: cargo applies it only
+# while the lib target is not explicitly selected, and a test-name filter
+# selects it. `src/lib.rs` carries `#![cfg(not(test))]` for that reason. This
+# stays because it is what keeps the crate out of the graph for the ordinary
+# command, and because it is the line somebody reads first.
 test = false
 doctest = false
 
