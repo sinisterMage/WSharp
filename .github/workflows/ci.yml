@@ -140,6 +140,14 @@ jobs:
       # every verdict and all three exit statuses.
       - name: conform.sh tells a rotted diagnostic from an intact one
         run: tests/harness/conform-selftest.sh
+      # The grammar generator is upstream of a fuzz campaign, which makes its
+      # failures the expensive kind: a generator that emits a syntax error spends
+      # a runner-hour proving that `fn` is a keyword and reports no findings.
+      # Checked from the text alone -- balance, one `main`, bounded loops,
+      # reproducibility from the seed, and that the coverage report still lists
+      # every declared production.
+      - name: generate.pl produces whole programs
+        run: tests/harness/generate-selftest.sh
       - name: soak-report.sh answers criterion 1
         run: scripts/soak-report-selftest.sh
 
