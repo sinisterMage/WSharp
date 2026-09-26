@@ -17,10 +17,8 @@
 # walk that finds no roots and so passes every root check. Those cases are driven
 # by a stub fetcher, which is what `FOLLOWUPS_FETCH` exists for.
 #
-# Every case builds a throwaway tree with its own two documents in it, so the
-# fixtures say what they test and no case depends on the real ones. The last case
-# is the real tree, and it is last so that a failure there reads as "a limitation
-# stopped being documented" rather than as "the check broke".
+# Every case builds a throwaway tree with its own two documents in it. The
+# live gate runs separately, so this selftest is deterministic and offline.
 
 set -uo pipefail
 
@@ -250,6 +248,20 @@ f="$(stub unlabelled \
   "$(row 10 closed not_planned 'wontfix' 'field access')")"
 expect "the label removed, and closed as not planned" "$d" "$f" 1 "neither of the two states"
 
+# Unknown closure metadata is not evidence of a fix.
+d="$(tree unknown_reason "9")"
+f="$(stub unknown_reason "$(row 9 closed unset '-' 'computed const')")"
+expect "unknown closure reason is not fixed" "$d" "$f" 2 "cannot confirm"
+
+# Exercise the real adapter without network, with a successful anonymous reply.
+mkdir -p "$work/bin"
+cat >"$work/bin/curl" <<'CURL'
+#!/usr/bin/env bash
+printf '%s\n' '[{"number":9,"state":"closed","state_reason":"completed","labels":[],"title":"fixed"}]' '200'
+CURL
+chmod +x "$work/bin/curl"
+PATH="$work/bin:$PATH" GITHUB_TOKEN= GH_TOKEN= expect "missing token fails closed" "$d" "" 2 "GITHUB_TOKEN or GH_TOKEN is required"
+
 # --- the fetch failing: every path must be exit 2, and none may be 0 --------
 
 d="$(tree fetchfail "9")"
@@ -306,42 +318,8 @@ expect "no RELEASE-CRITERIA-1.0.md" "$d" "$f" 2 "RELEASE-CRITERIA-1.0.md does no
 
 expect "a tree that is not there" "$work/absent" "$f" 2 "cannot read the tree"
 
-# --- the real documents, against the real repository ------------------------
-#
-# The cases above prove the logic; this proves the thing the logic is for. It
-# needs the network and, on a shared address, a token -- so it is skipped rather
-# than failed when it cannot run, and the skip is printed. A skip that is silent
-# is a case that quietly stops existing.
-#
-# It is last so that a failure here is read as "a limitation stopped being
-# documented" rather than as "the check is broken".
-
-echo
-repo_root="$(cd "$SCRIPT_DIR/../.." && pwd)"
-if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
-  echo "skip the real repository: this machine has no curl or no jq"
-elif ! curl -sS -m 10 -o /dev/null "https://api.github.com/" 2>/dev/null; then
-  echo "skip the real repository: api.github.com is not reachable from here"
-else
-  output="$(bash "$UNDER_TEST" "$repo_root" 2>&1)"
-  status=$?
-  checks=$((checks + 1))
-  case "$status" in
-    0) echo "ok   the real repository, against $repo_root" ;;
-    2)
-      # Not a failure of the criterion, and deliberately not reported as one.
-      echo "skip the real repository: the check could not ask GitHub"
-      echo "     $output"
-      checks=$((checks - 1))
-      ;;
-    *)
-      echo "FAIL the real repository: exit $status"
-      echo "     $output"
-      failures=$((failures + 1))
-      ;;
-  esac
-fi
-
+# The live gate runs separately in CI with its token. Fixture selftests are
+# offline; failed live fetches must fail that gate, never skip it.
 echo
 if [ "$failures" -gt 0 ]; then
   echo "$failures of $checks checks failed."

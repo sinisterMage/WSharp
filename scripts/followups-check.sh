@@ -53,10 +53,8 @@
 # Usage: followups-check.sh [tree-root]
 #
 # Environment:
-#   GITHUB_TOKEN / GH_TOKEN  used for the API call. Optional against a public
-#                            repository and strongly wanted in CI, where the
-#                            unauthenticated rate limit is shared with every
-#                            other job on the runner's address.
+#   GITHUB_TOKEN / GH_TOKEN  required for the API call, including public
+#                            repositories. Missing credentials fail closed.
 #   FOLLOWUPS_REPO           owner/name to ask about. Default sinisterMage/WSharp.
 #   FOLLOWUPS_FETCH          a command that answers instead of the API, for the
 #                            selftest. Called as `$cmd list` and `$cmd get N`,
@@ -139,7 +137,7 @@ api_get() {
     200) printf '%s' "$body" ;;
     401)
       printf 'GitHub answered 401 for %s: the token was refused.\n' "$path" >&2
-      printf 'An expired or mistyped GITHUB_TOKEN. Unset it to ask anonymously.\n' >&2
+      printf 'Supply a valid GITHUB_TOKEN or GH_TOKEN and rerun the gate.\n' >&2
       return 1
       ;;
     403 | 429)
@@ -288,6 +286,7 @@ check_subject() {
       note "        in which case put the label back and write its entry in $DOC."
       return
     fi
+    [ "$reason" = "completed" ] || cannot "cannot confirm #$number was fixed: closure reason is $reason"
     ok "#$number closed as fixed: \"$title\""
     return
   fi
@@ -342,6 +341,7 @@ main() {
 
   command -v jq >/dev/null 2>&1 || cannot '`jq` is not on PATH'
   if [ -z "${FOLLOWUPS_FETCH:-}" ]; then
+    [ -n "${GITHUB_TOKEN:-${GH_TOKEN:-}}" ] || cannot "GITHUB_TOKEN or GH_TOKEN is required"
     command -v curl >/dev/null 2>&1 || cannot '`curl` is not on PATH'
   fi
 
