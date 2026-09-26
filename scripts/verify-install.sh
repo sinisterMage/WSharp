@@ -286,6 +286,11 @@ profile_state > "$WORK/profiles.before"
 # strips the leading slash with a warning that is easy to miss.
 # ---------------------------------------------------------------------------
 
+# Process substitution would hide a partial/failed tar listing. Inspect the
+# complete list successfully before considering any extraction.
+if ! tar tzf "$TARBALL" > "$WORK/archive.members"; then
+  die "3. cannot inspect archive members"
+fi
 escapes=0
 while IFS= read -r member; do
   case "$member" in
@@ -293,12 +298,12 @@ while IFS= read -r member; do
     *../*) escapes=$((escapes + 1)); info "parent reference in archive: $member" ;;
     ../*)  escapes=$((escapes + 1)); info "parent reference in archive: $member" ;;
   esac
-done < <(tar tzf "$TARBALL")
+done < "$WORK/archive.members"
 
 if [ "$escapes" -eq 0 ]; then
   ok "3. every archive member is a relative path under the prefix"
 else
-  fail "3. the archive carries $escapes path(s) that would escape the prefix"
+  die "3. refusing to extract: archive carries $escapes path(s) that would escape the prefix"
 fi
 
 if tar xzf "$TARBALL" -C "$PREFIX" 2>"$WORK/tar.err"; then

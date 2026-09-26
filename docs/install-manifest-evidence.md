@@ -65,3 +65,29 @@ workspace with `bash scripts/tests/verify-install.test.sh`: four checks passed,
 exit 0, including the real symlink alias case. This is a development workspace,
 not a clean-machine installation claim. `bash -n` on both changed scripts and
 `git diff --check` passed.
+
+## Archive inspection continuation
+
+Archive listing was another incomplete-inspection path: the exit status of
+`tar tzf` inside process substitution was lost. Even a detected unsafe member
+only incremented the failure count and still reached extraction. The verifier
+now saves a successful complete listing before checking member names and stops
+with exit 3 before extraction on either error.
+
+On Debian GNU/Linux 13.7 x86_64, reproduce against the accepted `75eb501`:
+
+```sh
+git show 75eb501:scripts/verify-install.sh > /tmp/verify-install-75eb501.sh
+VERIFY_INSTALL_SCRIPT=/tmp/verify-install-75eb501.sh bash scripts/tests/verify-install-inspection.test.sh
+bash scripts/tests/verify-install-inspection.test.sh
+bash scripts/tests/verify-install.test.sh
+```
+
+The first command sequence's suite exits 1: the partial-listing case returns 0,
+and the unsafe-member case returns 1; both wrongly attempt extraction. With
+this change all ten cases pass (suite exit 0); both archive faults exit 3 and
+neither reaches extraction. The preserved published-release suite passes all
+four checks (exit 0). These fixture archives and workspace runs are not native
+clean-machine evidence. Archive member names alone do not validate symlink or
+hardlink targets; this patch does not claim complete archive containment.
+All host-attribution limitations above still apply.

@@ -33,6 +33,13 @@ exec "$REAL_FIND" "$@"
 SH
 cat > "$TEST/bin/tar" <<'SH'
 #!/usr/bin/env bash
+if [ "$1" = tzf ]; then
+  case "$FAULT" in
+    archive-list) printf 'sharpie\n'; echo 'injected partial archive inspection' >&2; exit 2;;
+    archive-path) printf '../escape\n'; exit 0;;
+  esac
+fi
+if [ "$1" = xzf ]; then : > "$FIXTURE/extracted"; fi
 if [ "$FAULT" = leak ] && [ "$1" = xzf ]; then
   : > "$HOME/outside-prefix"
 fi
@@ -48,8 +55,8 @@ SH
 done
 chmod +x "$TEST/bin/"*
 failures=0
-for fault in clean leak marker before after sort comm fetch; do
-  rm -f "$TEST/count" "$TEST/home/outside-prefix"
+for fault in clean leak marker before after sort comm fetch archive-list archive-path; do
+  rm -f "$TEST/count" "$TEST/home/outside-prefix" "$TEST/extracted"
   status=0
   env HOME="$TEST/home" TMPDIR="$TEST/tmp" PATH="$TEST/bin:$PATH" FAULT="$fault" \
     bash "$SCRIPT" 0.1.2 x86_64-unknown-linux-gnu --tool sharpie > "$TEST/out" 2>&1 || status=$?
@@ -61,7 +68,16 @@ for fault in clean leak marker before after sort comm fetch; do
     after) pattern='FATAL 5. cannot inspect filesystem after install'; expected=3;;
     sort) pattern='FATAL 5. cannot inspect filesystem before install'; expected=3;;
     comm) pattern='FATAL 5. cannot compare filesystem manifests'; expected=3;;
+    archive-list) pattern='FATAL 3. cannot inspect archive members'; expected=3;;
+    archive-path) pattern='FATAL 3. refusing to extract'; expected=3;;
     fetch) pattern='FAIL 1. could not download'; expected=1;;
+  esac
+  case "$fault" in
+    archive-list|archive-path)
+      if [ -f "$TEST/extracted" ]; then
+        echo "FAIL $fault: extraction attempted after rejected inspection"
+        failures=$((failures + 1))
+      fi;;
   esac
   if [ "$status" -eq "$expected" ] && grep -Fq "$pattern" "$TEST/out"; then
     echo "ok $fault (exit $status)"
