@@ -927,5 +927,7 @@ decision. Item 15 of [ROADMAP.md](ROADMAP.md) is the write-up.
 
 What is left, and where it plugs in, is in [ROADMAP.md](ROADMAP.md).
 Conventions and the invariants worth not breaking are in
-[CLAUDE.md](CLAUDE.md). The documentation is at
+[CLAUDE.md](CLAUDE.md). What 1.0 has to be true of, and how each of those
+things is measured, is in
+[RELEASE-CRITERIA-1.0.md](RELEASE-CRITERIA-1.0.md). The documentation is at
 [wsharp.io](https://wsharp.io).
