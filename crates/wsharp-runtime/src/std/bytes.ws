@@ -18,6 +18,29 @@
 // cipher in `std/hash` and `std/cipher` is spelled in whole words loaded from
 // and stored to a byte buffer, and which end they load from is half of what
 // distinguishes SHA-256 from ChaCha20.
+//
+// ## How a region is named
+//
+// Two spellings appear below, and which one a function uses is readable from
+// its parameter names rather than remembered:
+//
+// - `from`, `to` is the half-open range `b[from..to]`, exactly as a slice is
+//   written. `slice` and `slice_str` take it, and so does `der.over`, which is
+//   written to match.
+// - `at`, `n` is an offset and a *count*, so the region is `b[at..at+n]`.
+//   `fill`, `copy` and `put_bytes` take it; `xor` takes one offset per buffer
+//   and a single count for both; and the word accessors take the `at` alone,
+//   their count being the width their name already gives.
+//
+// Saying it once matters because the two agree for every call that starts at
+// zero, so a confusion between them works until the day something is written
+// at an offset. The other half of the rule is what happens at the end of the
+// buffer, and it differs on purpose: a *range* is clamped to the buffer, since
+// `slice(b, 0, 99)` is how "the rest of it" is spelled and a caller that knew
+// the length would not need the call. An *offset and a count* is not clamped.
+// It goes through `b[i]`, so it is bounds-checked like any other index and
+// reaching past the end panics -- which is the right answer for a cipher or a
+// hash writing a block into space it sized itself.
 const array = @import("std/array");
 const text = @import("std/str");
 
@@ -48,7 +71,9 @@ pub fn slice_str(b: []u8, from: i64, to: i64) str {
     return raw_to_str(b, from, to);
 }
 
-/// `b[from..to]` as a buffer of its own.
+/// `b[from..to]` as a buffer of its own, clamped to the buffer rather than
+/// panicking -- so `slice(b, at, 99)` is how "from here to the end" is written,
+/// and a `to` below `from` answers with nothing rather than reading backwards.
 pub fn slice(b: []u8, from: i64, to: i64) []u8 {
     var start = from;
     if (start < 0) { start = 0; }
@@ -69,7 +94,8 @@ pub fn concat(a: []u8, b: []u8) []u8 {
     return out;
 }
 
-/// Write `v` into `n` bytes of `b` from `at`.
+/// Write `v` into the `n` bytes `b[at..at+n]`. Bounds-checked, so a count that
+/// reaches past the end panics rather than stopping short.
 ///
 /// A loop rather than a builtin: HMAC's two pads are the only callers that
 /// care, and 128 bytes of loop is not worth a row in the table.
@@ -81,6 +107,10 @@ pub fn fill(b: []u8, at: i64, n: i64, v: u8) void {
 
 /// `a[at..at+n] ^= b[from..from+n]`, which is what every mode of operation and
 /// every padding step in `std/hash` is written in terms of.
+///
+/// One offset each and one count for both, so the two buffers may be read at
+/// different positions. Bounds-checked at both ends: either side reaching past
+/// its buffer panics.
 pub fn xor(a: []u8, at: i64, b: []u8, from: i64, n: i64) void {
     var i = 0;
     while (i < n) : (i += 1) { a[at + i] ^= b[from + i]; }
