@@ -395,7 +395,7 @@ the ones the machine already has.
 const http = @import("std/http");
 const text = @import("std/str");
 
-fn main() i64 {
+fn fetch() i64 {
     const answer = http.get("https://www.google.com/") catch return 1;
     print(answer.code);
     print(text.len(answer.body));
@@ -404,7 +404,9 @@ fn main() i64 {
 ```
 
 It is not in `examples/`, because the test suite runs every example and a
-network-dependent one would make CI depend on the weather. Save it and run it:
+network-dependent one would make CI depend on the weather - so what is written
+here is the function, not a program CI vouches for. Give it a `main` that calls
+`fetch`, save it and run it:
 
 ```sh
 nix-shell --run "cargo run -p wsharp-cli -- run /tmp/fetch.ws"
@@ -580,6 +582,8 @@ A library module is only read if something imports it, so a program that
 mentions nothing pays for nothing: `wsharp check` on a ten-line file takes
 about five milliseconds whatever the library grows to.
 
+<!-- from: examples/split.ws -->
+
 ```zig
 const str  = @import("std/str");
 const http = @import("std/http");
@@ -594,7 +598,7 @@ fn main() i64 {
 const net  = @import("std/net");
 const http = @import("std/http");
 
-fn main() i64 {
+fn serve() i64 {
     const l = net.listen("127.0.0.1", 8080, 16) catch return 1;
     const c = http.connection(net.accept(l) catch return 2);
     const request = http.read_request(c) catch return 3;
@@ -672,7 +676,7 @@ annotation must match the C declaration exactly:
 const ffi = @import("std/ffi");
 const os = @import("std/os");
 
-fn main() i64 {
+fn call_native() i64 {
     const library = ffi.open(os.args()[0]) catch {
         print_err(ffi.last_error());
         return 1;
@@ -785,7 +789,7 @@ After `ingot install`, a package is just a module path:
 ```zig
 const util = @import("util");
 
-fn main() i64 { return util.twice(21); }
+fn doubled() i64 { return util.twice(21); }
 ```
 
 which works under plain `wsharp run` as well as `ingot run` - `install` writes
@@ -956,3 +960,17 @@ What is left, and where it plugs in, is in [ROADMAP.md](ROADMAP.md).
 Conventions and the invariants worth not breaking are in
 [CLAUDE.md](CLAUDE.md). The documentation is at
 [wsharp.io](https://wsharp.io).
+
+### The road to 1.0
+
+Four documents govern it, and each has one job:
+
+| File | Answers |
+|---|---|
+| [RELEASE-CRITERIA-1.0.md](RELEASE-CRITERIA-1.0.md) | What 1.0 has to be true of, how each thing is measured, who owns it, and what proof closes it |
+| [COMPATIBILITY.md](COMPATIBILITY.md) | What 1.0 promises not to break, surface by surface, and for how long |
+| [LIMITATIONS.md](LIMITATIONS.md) | What W# does not do, with a workaround or the word *None* |
+| [docs/defects.md](docs/defects.md) | Where a defect lands, what severity it gets, and what happens to it after that |
+
+Severity and "breaking change" are defined once, in Part one of the release
+criteria; the other three cite it rather than restating it.
