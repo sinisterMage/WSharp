@@ -115,7 +115,8 @@ command -v tar  >/dev/null 2>&1 || die "no tar"
 # ---------------------------------------------------------------------------
 # Scratch layout. PREFIX is the documented install prefix; everything else is
 # the harness's own and is excluded from the "nothing outside the prefix"
-# manifest diff by being inside WORK, which is itself excluded.
+# manifest diff by being inside WORK, which is itself pruned from the walk.
+# Pruning WORK is not as simple as naming it -- see the manifest section.
 # ---------------------------------------------------------------------------
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/verify-install.XXXXXX")" || die "mktemp failed"
@@ -212,11 +213,40 @@ for extra in /usr/local/bin /usr/local/lib /opt; do
   [ -d "$extra" ] && MANIFEST_ROOTS+=("$extra")
 done
 
+# WORK has to be pruned from the walk -- it is the harness's own scratch, and
+# the install prefix is inside it -- and `find` does not necessarily spell it
+# the way we do. On Windows, Git bash mounts `/tmp` onto a directory under
+# `$HOME`, so `$WORK` is `/tmp/verify-install.XXXX` while a walk of `$HOME`
+# yields `/c/Users/.../AppData/Local/Temp/verify-install.XXXX`. A `-path
+# "$WORK"` prune then matches nothing at all: WORK is walked, and every file
+# the harness made -- the extracted prefix included -- is reported as a path
+# created outside the prefix. The check that exists to prove nothing escaped
+# the prefix then fails on the prefix itself. The same thing happens on any
+# system where TMPDIR reaches a manifest root through a symlink.
+#
+# So do not assume a spelling: drop a marker in WORK and ask `find` where it
+# is. Whatever directory the walk reports it in is WORK as the walk sees it.
+readonly WORK_MARKER=".verify-install-work-$$"
+: > "$WORK/$WORK_MARKER"
+
+PRUNE_PATHS=("$WORK")
+while IFS= read -r marker; do
+  [ -n "$marker" ] || continue
+  alias_path="$(dirname "$marker")"
+  [ "$alias_path" = "$WORK" ] || PRUNE_PATHS+=("$alias_path")
+done <<EOF
+$(find "${MANIFEST_ROOTS[@]}" -name "$WORK_MARKER" -type f 2>/dev/null)
+EOF
+
 take_manifest() {
-  # Exclude WORK (the harness's own scratch) and the noisiest caches. `-prune`
-  # rather than a grep, so a large cache is not walked at all.
-  find "${MANIFEST_ROOTS[@]}" \
-    \( -path "$WORK" -o -name '.cache' -o -name '.npm' -o -name '.git' \) -prune \
+  # Exclude WORK under every spelling the walk may use, and the noisiest
+  # caches. `-prune` rather than a grep, so a large cache is not walked at all.
+  local expr=() p
+  for p in "${PRUNE_PATHS[@]}"; do
+    expr+=(-path "$p" -o)
+  done
+  expr+=(-name '.cache' -o -name '.npm' -o -name '.git')
+  find "${MANIFEST_ROOTS[@]}" \( "${expr[@]}" \) -prune \
     -o -print 2>/dev/null | LC_ALL=C sort
 }
 
