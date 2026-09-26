@@ -132,6 +132,22 @@ jobs:
       - uses: actions/checkout@v4
       - name: parity.sh reports what happened
         run: tests/harness/selftest.sh
+      # Same argument one layer down. `conform.sh` compares whole rendered
+      # diagnostics against committed snapshots, so its failure mode is a
+      # comparison that has quietly stopped comparing -- a moved span, a dropped
+      # `= help:` line, or a missing snapshot read as "nothing differed". The
+      # selftest drives the real `conform.sh` over a stub compiler and asserts
+      # every verdict and all three exit statuses.
+      - name: conform.sh tells a rotted diagnostic from an intact one
+        run: tests/harness/conform-selftest.sh
+      # The grammar generator is upstream of a fuzz campaign, which makes its
+      # failures the expensive kind: a generator that emits a syntax error spends
+      # a runner-hour proving that `fn` is a keyword and reports no findings.
+      # Checked from the text alone -- balance, one `main`, bounded loops,
+      # reproducibility from the seed, and that the coverage report still lists
+      # every declared production.
+      - name: generate.pl produces whole programs
+        run: tests/harness/generate-selftest.sh
       - name: soak-report.sh answers criterion 1
         run: scripts/soak-report-selftest.sh
 
