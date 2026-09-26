@@ -332,9 +332,36 @@ directory on `PATH`. An installation is a directory rather than a single file,
 because `wsharp` looks for its runtime archive beside itself and under `../lib`,
 and `ingot` looks for `wsharp` beside itself before `PATH`.
 
-Builds exist for `x86_64-unknown-linux-gnu` and both Darwins.
-[wsharp.io/docs/install](https://wsharp.io/docs/install/) has the rest,
-including why there is no Windows one.
+Builds exist for all four release targets: `x86_64-unknown-linux-gnu`,
+`x86_64-pc-windows-msvc`, `x86_64-apple-darwin` and `aarch64-apple-darwin`.
+Every one is tier 1, which means a release does not ship if that target fails.
+`aarch64-unknown-linux-gnu` is deliberately not among them: the architecture
+works, but no triple is tested, and an untested build is not a release target.
+[wsharp.io/docs/install](https://wsharp.io/docs/install/) has the rest.
+
+Each tarball has a published `.sha256` beside it, and both installers check what
+they downloaded against it. That protects against a corrupted or truncated
+transfer and **not** against whoever can serve the tarball, because they can
+serve the sidecar too. Signing is scheduled after 1.0.
+
+### `wsharp build` needs a C compiler
+
+`wsharp run` needs nothing beyond the tarball: it compiles into its own process
+and calls no linker. **`wsharp build` does**, because it writes an object file
+and links it against the runtime archive with `cc`. So a clean machine that has
+only unpacked a release can run W# programs and cannot yet build them:
+
+```
+$ wsharp build hello.ws -o hello
+error: `wsharp build` needs a C compiler to link, and found no `cc` on PATH.
+```
+
+Install one first: `build-essential` on Debian and Ubuntu, `gcc` on Fedora, the
+Command Line Tools on macOS, and on Windows either the MSVC build tools or
+clang. Setting `$CC` to a compiler not called `cc` works too. This is the same
+requirement "Building and running" states below for building the compiler
+itself; it applies to a binary install as well, which is the part that used to go
+unsaid.
 
 ## Building and running
 
