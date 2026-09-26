@@ -20,6 +20,32 @@
 // **The constants are `const` arrays.** They live in the data section beside
 // the string literals, immortal and holding no references, so naming one costs
 // an address rather than an allocation.
+//
+// ## Calling it
+//
+// Every digest here is four names and one contract, and the contract is the
+// same for all of them:
+//
+//     const s = hash.sha256_init();
+//     hash.sha256_update(s, data, 0, array.len(data));   // as often as you like
+//     const digest = hash.sha256_final(s);               // exactly once
+//
+// `hash.sha256(data)` is those three lines when the whole message is one array.
+//
+// **`at` is a byte offset into `data` and `n` is a count of bytes**, so
+// `update(s, buf, 16, 32)` hashes `buf[16..48]`. Not a start and an end; the
+// two agree for every call that starts at zero, which is how a caller who
+// guesses wrong finds out late.
+//
+// **`final` may be called once.** It appends the padding by feeding it through
+// `update`, so the state is spent afterwards: calling it twice gives a second
+// answer that is not a digest of anything, and `update` after `final` extends
+// a padded message. A second digest is a second `init` -- which costs six
+// objects rather than one per block, for the reason above.
+//
+// `final` on a state nothing was hashed into is the digest of the empty
+// message -- `e3b0c442...` for SHA-256 -- rather than an error or zeros, which
+// is what makes hashing a possibly-empty buffer need no special case.
 const array = @import("std/array");
 const bytes = @import("std/bytes");
 const bits = @import("std/bits");
@@ -123,6 +149,7 @@ pub const Sha256 = struct {
     length: u64,
 };
 
+/// A SHA-256 state, ready for its first `sha256_update`.
 pub fn sha256_init() Sha256 {
     const h: []u32 = array.new(8);
     var i = 0;
@@ -187,6 +214,10 @@ fn sha256_block(s: Sha256, data: []u8, at: i64) void {
     return;
 }
 
+/// Hash `n` bytes of `data` starting at `at`, continuing `s`.
+///
+/// Call it once per piece the message arrives in; the state keeps whatever
+/// does not fill a block. Not after `sha256_final`.
 pub fn sha256_update(s: Sha256, data: []u8, at: i64, n: i64) void {
     s.length += u64(n);
     var taken = 0;
@@ -232,6 +263,7 @@ pub fn sha256_final(s: Sha256) []u8 {
     return out;
 }
 
+/// The SHA-256 of a whole array: `init`, one `update`, `final`.
 pub fn sha256(data: []u8) []u8 {
     const s = sha256_init();
     sha256_update(s, data, 0, array.len(data));
@@ -256,6 +288,11 @@ const H1 = []u32{
     0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0,
 };
 
+/// A SHA-1 in progress; the same five fields `Sha256` carries.
+///
+/// SHA-1 is here because git names every object by one. Nothing in
+/// `std/tls` or `std/x509` uses it, and it is not the one to reach for in
+/// anything new -- a package's integrity is `ingot/store`'s SHA-256.
 pub const Sha1 = struct {
     h: []u32,
     w: []u32,
@@ -264,6 +301,7 @@ pub const Sha1 = struct {
     length: u64,
 };
 
+/// A SHA-1 state, ready for its first `sha1_update`.
 pub fn sha1_init() Sha1 {
     const h: []u32 = array.new(5);
     var i = 0;
@@ -328,6 +366,9 @@ fn sha1_block(s: Sha1, data: []u8, at: i64) void {
     return;
 }
 
+/// Hash `n` bytes of `data` starting at `at`, continuing `s`.
+///
+/// Not after `sha1_final`.
 pub fn sha1_update(s: Sha1, data: []u8, at: i64, n: i64) void {
     s.length += u64(n);
     var taken = 0;
@@ -353,6 +394,9 @@ pub fn sha1_update(s: Sha1, data: []u8, at: i64, n: i64) void {
     return;
 }
 
+/// The twenty-byte digest, having appended the standard's padding.
+///
+/// Once per state: it pads through `sha1_update`, so `s` is spent.
 pub fn sha1_final(s: Sha1) []u8 {
     const bit_length = s.length * 8;
     const tail = bytes.new(72);
@@ -368,6 +412,7 @@ pub fn sha1_final(s: Sha1) []u8 {
     return out;
 }
 
+/// The SHA-1 of a whole array: `init`, one `update`, `final`.
 pub fn sha1(data: []u8) []u8 {
     const s = sha1_init();
     sha1_update(s, data, 0, array.len(data));
@@ -383,6 +428,11 @@ pub fn sha1(data: []u8) []u8 {
 // initial vector and the digest cut short, which is why one state type serves
 // both and carries how much of itself to hand back.
 
+/// A SHA-512 or SHA-384 in progress.
+///
+/// One state type for both, because SHA-384 is SHA-512 with a different
+/// initial vector and the digest cut short -- `out_len` is how much of it
+/// to hand back, and is all `sha512_init` and `sha384_init` differ in.
 pub const Sha512 = struct {
     h: []u64,
     w: []u64,
@@ -406,7 +456,11 @@ fn sha512_start(iv: []u64, out_len: i64) Sha512 {
     };
 }
 
+/// A SHA-512 state, whose `sha512_final` answers with 64 bytes.
 pub fn sha512_init() Sha512 { return sha512_start(H512, 64); }
+/// A SHA-384 state, whose `sha512_final` answers with 48 bytes.
+///
+/// The same `sha512_update` drives it; only the state says which it is.
 pub fn sha384_init() Sha512 { return sha512_start(H384, 48); }
 
 fn sha512_block(s: Sha512, data: []u8, at: i64) void {
@@ -459,6 +513,10 @@ fn sha512_block(s: Sha512, data: []u8, at: i64) void {
     return;
 }
 
+/// Hash `n` bytes of `data` starting at `at`, continuing `s`.
+///
+/// Drives a SHA-384 state as readily as a SHA-512 one. Not after
+/// `sha512_final`.
 pub fn sha512_update(s: Sha512, data: []u8, at: i64, n: i64) void {
     s.length += u64(n);
     var taken = 0;
@@ -503,12 +561,14 @@ pub fn sha512_final(s: Sha512) []u8 {
     return out;
 }
 
+/// The SHA-512 of a whole array: `init`, one `update`, `final`.
 pub fn sha512(data: []u8) []u8 {
     const s = sha512_init();
     sha512_update(s, data, 0, array.len(data));
     return sha512_final(s);
 }
 
+/// The SHA-384 of a whole array: `init`, one `update`, `final`.
 pub fn sha384(data: []u8) []u8 {
     const s = sha384_init();
     sha512_update(s, data, 0, array.len(data));
