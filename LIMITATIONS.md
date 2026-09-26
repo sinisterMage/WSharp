@@ -1,13 +1,19 @@
 # What W# does not do
 
 **Status: live, against `wsharp 0.2.3`.** Every limitation below was verified
-against that release and the output shown is what it printed. What is not yet
-settled, entry by entry, is whether it is a *limitation of 1.0* or something that
-gets fixed first: that call belongs to Mira (fix or document, WLA-4) and to
-Johnny (what 1.0 should promise), and the "Tracked" line on each entry is where
-it is being made. Criterion 4 of
-[RELEASE-CRITERIA-1.0.md](RELEASE-CRITERIA-1.0.md) is the gate, and the expected
-disposition for all six tracked issues is *documented limitation*.
+against that release and the output shown is what it printed.
+
+**The six tracked issues are dispositioned, and all six are documented
+limitations.** Criterion 4 of [RELEASE-CRITERIA-1.0.md](RELEASE-CRITERIA-1.0.md)
+is the gate; each entry now carries a **Disposition** line stating the call and
+the reason for it, so the decision is readable here rather than only in an issue
+thread. Not one of them was closed on a comment: each has the entry below and,
+where one can exist, a named `tests/cases` guard.
+
+A guard for a limitation is an uncomfortable-looking test — it asserts that
+something does *not* work. That is the point. A limitation nothing checks can
+stop being true, or quietly get worse, without anybody finding out, and the entry
+then describes a compiler that no longer exists.
 
 One entry is already decided against: "Comparing a value that reaches itself
 aborts" is a P1 under clause 3 and is being fixed, not documented as it stands.
@@ -17,6 +23,22 @@ when the bound lands, because a bound is itself a limitation.
 A 1.0 is allowed limitations. It is not allowed undocumented ones. This file is
 where a limitation lands so that a user meets it here rather than in their own
 program at two in the morning.
+
+## The six, and what was decided
+
+| Issue | Limitation | Disposition | Guard |
+|---|---|---|---|
+| [#9](https://github.com/sinisterMage/WSharp/issues/9) | A computed top-level `const` is rejected | Documented — the fix is global storage, a startup initialiser and a fifth collector root list | `tests/cases/err_computed_const.ws` |
+| [#10](https://github.com/sinisterMage/WSharp/issues/10) | A field access needs a type the compiler can name | Documented — inferring it needs row polymorphism, against a dispatch lattice that is nominal | `tests/cases/err_field_needs_annotation.ws` |
+| [#11](https://github.com/sinisterMage/WSharp/issues/11) | x86-64 and aarch64 only | Documented — a scope statement; 1.0 adds no platform | `stackwalk.rs`'s `compile_error!`, and CI's four-way matrix |
+| [#12](https://github.com/sinisterMage/WSharp/issues/12) | A top-level `const` array can be written through an alias | Documented — needs a read-only reference the type system cannot express; the cheap fix was rejected, see the entry | `tests/cases/const_array_alias.ws`, `tests/cases/err_assign_const_array.ws` |
+| [#14](https://github.com/sinisterMage/WSharp/issues/14) | `net.shutdown` does not stop an acceptor on the BSDs | Documented — kernel behaviour, and the API does not offer the operation | `tests/cases/err_shutdown_listener.ws`, `tests/cases/net_poller.ws` |
+| [#15](https://github.com/sinisterMage/WSharp/issues/15) | `std/tls` cannot verify a chain through a P-521 key | Documented — 521 bits is not a whole number of 32-bit limbs | `tests/cases/x509_p521.ws` |
+
+Each row's reasoning is in its entry below, under **Disposition**. Four of the
+cases named — `err_computed_const.ws`, `const_array_alias.ws`,
+`err_shutdown_listener.ws` and `x509_p521.ws` — were written for this file and did
+not exist before: a limitation nobody checked was a limitation that could drift.
 
 ## How to read an entry
 
@@ -28,7 +50,8 @@ finished:
 | **What** | The thing that does not work, stated as a user would meet it. A program where one helps. |
 | **Why** | The reason it was left. Not an apology — the constraint that makes the fix more than an afternoon. |
 | **Workaround** | What to write instead, or the word *None*. |
-| **Tracked** | The issue where fix-or-document is decided. |
+| **Disposition** | Fix or documented limitation, and why — on the entries where an issue asked the question. |
+| **Tracked** | The issue where fix-or-document was decided, and its state. |
 
 Every program shown below was run against `wsharp 0.2.3` and the output is what
 it printed. Where a `tests/cases` entry guards the behaviour mechanically — so
@@ -84,7 +107,21 @@ const K = []u32{ 0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5 };
 
 `tests/cases/const_array.ws`.
 
-**Tracked.** [#9](https://github.com/sinisterMage/WSharp/issues/9).
+**Disposition: documented limitation.** The fix is not the diagnostic, it is the
+storage: global slots, a startup initialiser ordered so that one global may be
+computed from another, and those slots in the collector's root set. That last
+part is the cost — a root list has to be added to four places at once, and
+getting one of them wrong is rare corruption rather than a failing test. Against
+that, the thing a computed global buys is a function call saved, which is what
+the workaround already is.
+
+**Guarded by** `tests/cases/err_computed_const.ws`, which pins the refusal and
+its message for both spellings a reader will try — arithmetic and a call. Written
+for this entry: the diagnostic was previously unguarded, so the text in this file
+could have drifted from the compiler's without a test noticing.
+
+**Tracked.** [#9](https://github.com/sinisterMage/WSharp/issues/9), closed as a
+documented limitation.
 
 ## A field access needs a type the compiler can name
 
@@ -120,7 +157,20 @@ which is usually the one you want: a field read compiled against a supertype
 runs unchanged on every subtype, with no adjustment and no vtable, because a
 subtype's fields are its supertype's followed by its own.
 
-**Tracked.** [#10](https://github.com/sinisterMage/WSharp/issues/10).
+**Disposition: documented limitation.** Row polymorphism is a change to the type
+system rather than an addition to it, and it has to meet a dispatch lattice that
+is nominal by construction: a row type describes a *shape*, and W#'s type ids are
+a preorder walk of a lattice of *names*, which is what makes the dispatcher's
+subtype test one subtract and one compare. There is a real design question in
+there — what a row variable means to an overload set — and it is not one to answer
+under a release date. The diagnostic already names the field and says what to
+write, so the cost is an annotation.
+
+**Guarded by** `tests/cases/err_field_needs_annotation.ws`, which pins the
+message.
+
+**Tracked.** [#10](https://github.com/sinisterMage/WSharp/issues/10), closed as a
+documented limitation.
 
 ## A top-level `const` array can be written through an alias
 
@@ -162,11 +212,45 @@ var copy = array.slice(K, 0, array.len(K));
 copy[0] = 42;
 ```
 
-**Guarded by** `tests/cases/const_array_alias.ws`, which asserts both halves —
-the alias write going through, and the copy leaving `K` alone. Written for this
-entry, so that the limitation cannot stop being true without a test saying so.
+**Disposition: documented limitation, and this one was argued rather than
+assumed.** It is the entry on the list that most looks like it deserves a fix: a
+shared table changing silently is a wrong answer, not an inconvenience.
 
-**Tracked.** [#12](https://github.com/sinisterMage/WSharp/issues/12).
+The honest fix is a read-only reference — a property carried by the *type*, so
+that it propagates through a binding, a parameter, a struct field and a return,
+and so that the check happens wherever the write is. W# has no such qualifier,
+and adding one touches unification, coercion, overload resolution and every
+signature in the standard library.
+
+The cheap fix was considered and **rejected**: refusing `var a = K;` at the
+binding closes the spelling in this entry and not the next one, because a
+function parameter is an alias too —
+
+```wsharp
+fn zero(a: []i64) void { a[0] = 0; }
+zero(K);          // still writes the shared table
+```
+
+A check that stops the first and not the second is worse than the check that is
+here, because it reads like a guarantee and is not one. The current diagnostic
+claims exactly what it enforces — this name cannot be written — and that is a
+true statement. Moving the check to the binding would make the compiler appear to
+enforce immutability it cannot see.
+
+So the limitation is documented, the guard below pins it, and the fix waits for
+the type system to be able to say the thing. **`error before miscompile` does not
+apply here**: nothing is miscompiled, the program does exactly what it says, and
+what is missing is a way to have said otherwise.
+
+**Guarded by** `tests/cases/const_array_alias.ws`, which asserts both halves —
+the alias write going through, and the copy leaving the table alone. Written for
+this entry, so that the limitation cannot stop being true without a test saying
+so; if a read-only reference ever lands, that case fails and this entry gets
+read again. `tests/cases/err_assign_const_array.ws` is the other half, on the
+write through the name.
+
+**Tracked.** [#12](https://github.com/sinisterMage/WSharp/issues/12), closed as a
+documented limitation.
 
 ## Comparing a value that reaches itself aborts
 
@@ -299,14 +383,27 @@ question and the answer is a design decision rather than an omission.
 ## `net.shutdown` does not stop an acceptor on the BSDs
 
 **What.** `net.shutdown(s, read, write)` means the same thing on every system on
-a **connected** socket. On a `Listener` it does not: Linux wakes a thread parked
-in `accept`, and the BSDs answer `ENOTCONN` and leave it parked. There is no
+a **connected** socket. On a listener it does not: Linux wakes a thread parked in
+`accept`, and the BSDs answer `ENOTCONN` and leave it parked. There is no
 `shutdown_listener`, because there is nothing to promise.
 
+The consequence to write down, because it is the one a program actually meets:
+`net.shutdown` takes a `Socket`, `net.listen` hands back a `Listener`, and the two
+are different types. So **the divergence is not reachable through the API** —
+passing a listener to `shutdown` is a type error on every platform, and the only
+way to reach the underlying `shutdown(2)` on a listening descriptor is to
+hand-construct a `Socket` around `Listener.handle`. Doing that is outside what
+this library supports, and what it gets is the platform's answer, not W#'s.
+
+```
+error: type mismatch: this argument has type `Listener`, expected `Socket`
+```
+
 **Why.** The difference is in the operating systems. Emulating the Linux
-behaviour on the BSDs needs a self-pipe or an equivalent per listener; the
-alternative is a function that silently does nothing on half the release
-targets.
+behaviour on the BSDs needs a self-pipe or an equivalent per listener — a second
+descriptor per listener, in the poller, for the whole of its life — and the
+alternative is a function that silently does nothing on half the release targets.
+Two of the four release triples are Darwin, so "half" is literal.
 
 **Workaround, and it is the shape a real server has anyway.** Drive the acceptor
 with a poller and a tick — `net.accept_nonblocking`, `net.watch_listener`,
@@ -320,13 +417,50 @@ path can answer for. A worker whose `init` never returns is abandoned at exit
 instead, and `main` returning ends the process
 (`tests/cases/worker_daemon_exit.ws`).
 
-**Tracked.** [#14](https://github.com/sinisterMage/WSharp/issues/14).
+**Disposition: documented limitation.** The behaviour is the kernels', and the
+library already refuses to offer the operation rather than offering one that means
+two things. The self-pipe would make `shutdown_listener` portable and would put a
+descriptor and a poller registration on every listener to serve an exit path the
+poller shape does not need — and that shape is the one a real server has anyway,
+which is why it is the documented answer rather than a consolation.
+
+**Guarded by** two cases, because the limitation has two halves and only one of
+them is portable. `tests/cases/err_shutdown_listener.ws` pins the half that is the
+same everywhere: the API does not offer it, and the compiler says so. If a
+`shutdown_listener` is ever added, that case fails and this entry gets read again.
+`tests/cases/net_poller.ws` is the workaround, and it runs on all four release
+platforms.
+
+There is deliberately **no case asserting the per-platform answer**, and that is
+`fs_chmod.ws`'s discipline: a case that said "Linux succeeds, the others raise"
+would be a case about the platforms it was written on, and the exact answer on a
+listening descriptor is not one fact shared by Linux, Darwin and Winsock. What can
+be asserted everywhere is asserted; the rest is stated here.
+
+**Tracked.** [#14](https://github.com/sinisterMage/WSharp/issues/14), closed as a
+documented limitation.
 
 ## `std/tls` cannot verify a chain through a P-521 key
 
-**What.** TLS verifies chains through RSA, P-256 and P-384. A chain through a
-P-521 key is **refused with a diagnostic** — not accepted, and not a crash. A
+**What.** TLS verifies chains through RSA, Ed25519, P-256 and P-384. A key on
+P-521 is **refused where it is read** — `x509.parse_spki` answers `error.BadKey`
+(`crates/wsharp-runtime/src/std/x509.ws:166`) — not accepted, and not a crash. A
 typical trust store has one such root.
+
+What that costs a user, plainly: **a service whose chain goes through a P-521 key
+cannot be reached by this client.** `net`/`std/http` over plain TCP is unaffected;
+`https://` to such a host fails the handshake with a chain that could not be
+verified, and there is nothing to configure. Everything else in a normal trust
+store still works — the one unreadable root is dropped and the rest are used — so
+the failure is per-host rather than per-machine. In practice P-521 is rare on the
+public web; it is the ordinary case in some government and defence PKIs, and if
+that is the PKI you are on, this client is not usable for it.
+
+Note that `ecdsa_secp521r1_sha512` *is* a named constant in `std/x509`
+(`ECDSA_SECP521R1_SHA512`) and `scheme_hash` answers SHA-512 for it. That is not
+an advertisement: `std/tls`'s `SCHEMES` — the `signature_algorithms` the client
+actually offers — omits it, so a server is never invited to choose a scheme this
+library cannot complete.
 
 **Why.** `std/nistec` is one curve implementation parameterised by limb count,
 coordinate size and scalar width, over `std/bignum`'s generic Montgomery
@@ -344,7 +478,25 @@ broken chain acceptable.
 **Workaround.** None within `std/tls`. A service reachable only through a P-521
 chain cannot be reached by this client.
 
-**Tracked.** [#15](https://github.com/sinisterMage/WSharp/issues/15).
+**Disposition: documented limitation.** P-256 and P-384 are the same code over
+different tables, and P-521 is not the same again: 521 bits is not a whole number
+of 32-bit limbs, so it needs either a partial top limb threaded through every
+operation in `std/bignum`'s Montgomery arithmetic — where a carry that is wrong
+once in a while is a signature verifier that accepts something it should not — or
+`bits.mulhi` and a 64-bit limb, which is a change to `std/bignum`,
+`std/nistec` and `std/curve25519` together. Neither is a table of constants, and
+neither is work to do against a release date in code whose failure mode is
+"accepts a forged chain". The refusal is safe: it is a refusal, at the point the
+key is read.
+
+**Guarded by** `tests/cases/x509_p521.ws`, which reads a real SPKI for each of
+the three curves and asserts that P-256 and P-384 are read and P-521 is not.
+Three keys rather than one, so that the boundary asserted is the curve — a case
+holding only the P-521 key would still pass if `parse_spki` stopped reading EC
+keys altogether. Written for this entry.
+
+**Tracked.** [#15](https://github.com/sinisterMage/WSharp/issues/15), closed as a
+documented limitation.
 
 ## FFI takes C scalars and nothing else
 
@@ -437,8 +589,25 @@ backend this project actually tests, not a rewrite of the walk.
 
 **Workaround.** None.
 
-**Tracked.** [#11](https://github.com/sinisterMage/WSharp/issues/11).
-`RELEASE-CRITERIA-1.0.md` states that 1.0 does not add a supported platform.
+**Disposition: documented limitation**, and of the six it is the one that is a
+*scope statement* rather than an unfinished piece. A supported platform is not a
+`cfg` arm: it is a register read, a Cranelift backend this project tests, and a CI
+job on real hardware that a release is held to. Adding one during the 1.0 campaign
+would mean shipping a platform whose collector nobody had watched fail, which is
+the opposite of what the campaign is for.
+
+**Guarded by** two mechanisms, neither of which is a `tests/cases` entry — a case
+cannot be written for an architecture that does not build. The
+`compile_error!` at `crates/wsharp-runtime/src/stackwalk.rs:46` is the guard in the
+inward direction: a fifth architecture cannot be half-added and left to fail at
+run time. `.github/workflows/ci.yml`'s four-way matrix is the guard in the
+outward direction: every release triple builds and passes the suite before
+anything is tagged, so "supported" is a thing that was observed rather than
+claimed.
+
+**Tracked.** [#11](https://github.com/sinisterMage/WSharp/issues/11), closed as a
+documented limitation. `RELEASE-CRITERIA-1.0.md` states that 1.0 does not add a
+supported platform.
 
 ## No reproducible builds
 
