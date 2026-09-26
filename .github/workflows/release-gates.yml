@@ -69,6 +69,43 @@ jobs:
       - name: Hold the state table to the tree
         run: bash scripts/gate-table-check.sh
 
+  # Criterion 4. Every tracked limitation is closed as fixed, or closed with the
+  # `v1.0-limitation` label and an entry in `LIMITATIONS.md`.
+  #
+  # The only gate here whose data is not in this tree: whether an issue is open
+  # is a question for GitHub. So this is the one job that can fail for a reason
+  # saying nothing about the criterion -- a rate limit, a dropped connection --
+  # and `followups-check.sh` exits 2 rather than 0 on every one of them. The
+  # token is what keeps it off the sixty-an-hour anonymous limit that a runner's
+  # address shares with every other job on it.
+  #
+  # `issues: read` rather than the file's default of `contents: read` alone: the
+  # issues are public, but a token narrowed to `contents` is refused when it is
+  # sent, and that refusal would read as a rate limit.
+  followups:
+    name: limitations resolved or documented (criterion 4)
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # The check's own tests, before the check. Most of them drive a stubbed
+      # fetcher, because "the gate went green because it could not ask" is the
+      # one failure mode a green CI run will never show anybody.
+      - name: Test the checker
+        run: bash scripts/tests/followups-check.test.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Hold every tracked limitation to one of its two allowed states
+        run: bash scripts/followups-check.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
   # Criterion 2's mechanism. Every pull request carries exactly one of
   # `change:breaking`, `change:additive`, `change:fix`, `change:none`.
   #
