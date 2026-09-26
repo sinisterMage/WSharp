@@ -333,9 +333,36 @@ directory on `PATH`. An installation is a directory rather than a single file,
 because `wsharp` looks for its runtime archive beside itself and under `../lib`,
 and `ingot` looks for `wsharp` beside itself before `PATH`.
 
-Builds exist for `x86_64-unknown-linux-gnu` and both Darwins.
-[wsharp.io/docs/install](https://wsharp.io/docs/install/) has the rest,
-including why there is no Windows one.
+Builds exist for all four release targets: `x86_64-unknown-linux-gnu`,
+`x86_64-pc-windows-msvc`, `x86_64-apple-darwin` and `aarch64-apple-darwin`.
+Every one is tier 1, which means a release does not ship if that target fails.
+`aarch64-unknown-linux-gnu` is deliberately not among them: the architecture
+works, but no triple is tested, and an untested build is not a release target.
+[wsharp.io/docs/install](https://wsharp.io/docs/install/) has the rest.
+
+Each tarball has a published `.sha256` beside it, and both installers check what
+they downloaded against it. That protects against a corrupted or truncated
+transfer and **not** against whoever can serve the tarball, because they can
+serve the sidecar too. Signing is scheduled after 1.0.
+
+### `wsharp build` needs a C compiler
+
+`wsharp run` needs nothing beyond the tarball: it compiles into its own process
+and calls no linker. **`wsharp build` does**, because it writes an object file
+and links it against the runtime archive with `cc`. So a clean machine that has
+only unpacked a release can run W# programs and cannot yet build them:
+
+```
+$ wsharp build hello.ws -o hello
+error: `wsharp build` needs a C compiler to link, and found no `cc` on PATH.
+```
+
+Install one first: `build-essential` on Debian and Ubuntu, `gcc` on Fedora, the
+Command Line Tools on macOS, and on Windows either the MSVC build tools or
+clang. Setting `$CC` to a compiler not called `cc` works too. This is the same
+requirement "Building and running" states below for building the compiler
+itself; it applies to a binary install as well, which is the part that used to go
+unsaid.
 
 ## Building and running
 
@@ -598,11 +625,11 @@ serving many connections from one worker, not for keeping the collector alive.
 | `std/net` | TCP: `Socket` `Listener` and `connect` `listen` `accept` `read` `write` `write_all` `read_exactly` `read_all` `set_nonblocking` `shutdown` `close`. UDP: `Datagrams` `Peer` `Datagram` and `udp` `send_to` `receive` `reply`. Readiness: `Poller` `Event` and `poller` `watch` `wait`. IPv4 or IPv6, with the family the resolver's choice |
 | `std/http` | the 27 HTTP status types, materialised on first mention, plus an HTTP/1.1 client and server: `get` `post` `request` `read_request` `respond` `header` `status_of`; and since item 10, `https://` over `std/tls` |
 | `std/broker` | `Topic[M]` `Consumer[M]` and `topic` `publish` `subscribe` `next` `commit` `seek` `len` |
-| `std/bytes` | `[]u8` as a buffer, and the bridge to and from `str`: `new` `of` `to_str` `slice` `concat` `copy` `fill` `xor` `equal`, the big- and little-endian word accessors, `to_hex` `from_hex`; and `Buf`, which grows - `put_str` `put_bytes` `taken` `reset`, with `open8`/`close8` through `open32`/`close32` for a length written before what it counts |
+| `std/bytes` | `[]u8` as a buffer, and the bridge to and from `str`: `new` `of` `to_str` `slice` `concat` `copy` `fill` `xor` `equal`, the big- and little-endian word accessors, `to_hex` `from_hex`; and `Buf`, which grows - `put_str` `put_bytes` `taken` `reset`, with `open8`/`close8` through `open32`/`close32` for a length written before what it counts. A region is named one of two ways, readable from the parameter names: `from`/`to` is the half-open range `b[from..to]` and is clamped to the buffer, `at`/`n` is an offset and a count and is bounds-checked |
 | `std/hash` | SHA-256, SHA-384 and SHA-512, one-shot and incremental, plus `hmac` `hkdf_extract` `hkdf_expand` - written once over a `Hash` value that says a block size, a digest size and how to hash |
 | `std/cipher` | ChaCha20, Poly1305, ChaCha20-Poly1305; AES-128/256, GHASH, AES-GCM. Constant-time by construction: no table is indexed by a secret byte, so AES's S-box is computed in GF(2^8) and GHASH is 128 shifts |
 | `std/crypto` | `random` - the system's generator, which is the kernel's |
-| `std/time` | `now` - epoch seconds; `monotonic_ms` - duration clock; `sleep_ms` - GC-safe sleep |
+| `std/time` | `now` - epoch seconds; `monotonic_ms` - a duration clock whose origin is unpromised and is *not* process start, so only the difference between two readings means anything; `sleep_ms` - GC-safe sleep, which raises `BadFormat` on a negative count |
 | `std/process` | `command` `spawn` `poll` `wait` `collect` `run` `terminate` `interrupt` `kill` `close` `success` - child processes with bounded stdout/stderr capture |
 | `std/bignum` | fixed-width unsigned limbs and Montgomery arithmetic: `from_be` `to_be` `cmp` `add` `sub` `mont` `mont_mul` `mont_add` `mont_sub` `to_mont` `from_mont` `modexp`. A limb is 32 bits, which is what makes a 64x64 → 128 product unnecessary |
 | `std/curve25519` | `x25519` `x25519_base` - and the small-order check on the *output*, which is the one a list of bad encodings misses |
@@ -719,6 +746,10 @@ exit status, and a conflict comes back as the derivation that caused it:
 Because no versions of core match >=2.0.0 <3.0.0 and util 0.3.0 depends on
 core >=2.0.0 <3.0.0, util 0.3.0 cannot be used.
 ```
+
+What each requirement spelling means, which version gets chosen and why, what
+the lockfile records, and every failure sentence in full, are in
+[what `ingot` promises about versions](docs/resolution.md).
 
 Progress is written to stderr while work happens: certificate loading,
 fetching, received bytes (with a percentage when the server supplies a total),
@@ -945,6 +976,7 @@ Four documents govern it, and each has one job:
 | [COMPATIBILITY.md](COMPATIBILITY.md) | What 1.0 promises not to break, surface by surface, and for how long |
 | [LIMITATIONS.md](LIMITATIONS.md) | What W# does not do, with a workaround or the word *None* |
 | [docs/defects.md](docs/defects.md) | Where a defect lands, what severity it gets, and what happens to it after that |
+| [docs/resolution.md](docs/resolution.md) | What `ingot` promises about pins, locks and ranges, and what it says when there is no answer |
 
 Severity and "breaking change" are defined once, in Part one of the release
 criteria; the other three cite it rather than restating it.
