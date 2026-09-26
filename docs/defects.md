@@ -96,6 +96,41 @@ issue and ask for the exact input, platform and mode. It stays open and keeps it
 proposed severity; "cannot reproduce" is not a resolution while the reporter can
 still reproduce it.
 
+### Not every report is a defect
+
+**`v1.0-limitation` is a triage outcome, and it is not the same as P3.** The
+severity scale grades what a defect *does*, so it presumes there is one. A
+report that describes something W# does not support — and refuses cleanly, or
+never claimed — has no defect to grade, and forcing it onto the scale would
+inflate every count with things working as designed. `P3` means a real defect
+that gates nothing; `v1.0-limitation` means there is nothing wrong.
+
+The test is what a supported program does, not how inconvenient the answer is:
+
+- A **compile error with a correct message** for a program W# never claimed to
+  accept is a limitation. P2 is "rejects a program it *should* accept", and the
+  word doing the work is *should*.
+- A **refusal at runtime**, with a diagnostic, of something outside the
+  documented domain is a limitation. Refusing too much is a limitation;
+  *accepting* too much is a defect, and in the crypto surface a P1.
+- An **absent capability** — an architecture, a curve, a syntax — is a
+  limitation whatever it costs the person who wanted it.
+
+Two rules keep this from becoming a place to hide defects:
+
+1. **It is a disposition, not a dismissal.** The issue stays open until the
+   limitation is listed in `LIMITATIONS.md`, because the release criteria check
+   that list against issue numbers. Closing one removes the thing the check
+   asserts against.
+2. **A limitation and a severity can coexist, and then the severity wins.** A
+   P2 that is not being fixed for 1.0 carries both labels: `v1.0-limitation`
+   records the decision, `P2` keeps it in the counts, and the criteria make the
+   listing mandatory rather than editorial — an open P2 that is neither fixed
+   nor listed becomes a P1, because it makes the documentation wrong.
+
+Limitation-only issues are **excluded from the weekly counts** and reported as
+their own line. Mixing them in would make "open P2" mean nothing.
+
 Labels beyond severity: `area: syntax`, `area: sema`, `area: codegen`,
 `area: runtime`, `area: cli`, `area: start`, `area: stdlib` for the crate or
 library the cause sits in, applied once the cause is known rather than guessed.
@@ -212,6 +247,7 @@ Posted weekly, on the triage pass. The format:
 
 **Untriaged:** N (target: 0)
 **Open P1:** N — *list each one, with owner and next action*
+**Tracked limitations:** N open — *not defects, counted separately*
 
 **Load this week:** what was actually exercising the compiler — driver programs,
 soak hours, platforms covered. A defect count means nothing without it.
