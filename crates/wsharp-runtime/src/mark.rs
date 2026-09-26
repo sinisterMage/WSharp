@@ -72,6 +72,7 @@ use crate::evacuate;
 use crate::gc::{self, with_buffers};
 use crate::header::{claim_mark, flip_mark_parity, is_marked, type_id_of};
 use crate::heap::{self, is_collectable};
+use crate::pause::Pause;
 use crate::types;
 use crate::worker::Worker;
 
@@ -285,7 +286,7 @@ pub(crate) unsafe fn start_with_roots(mut roots: Vec<*mut u8>) {
     me().mark.tracing.store(true, Ordering::Release);
     ensure_thread();
     set_phase(Phase::Marking);
-    gc::record_pause(me(), started);
+    gc::record_pause(me(), started, Pause::Initial);
 }
 
 /// The second pause: finish marking, then move everything the program is
@@ -351,7 +352,7 @@ unsafe fn finish_marking() {
 
     if cset.is_empty() {
         finish_without_evacuation(remembered);
-        gc::record_pause(me(), started);
+        gc::record_pause(me(), started, Pause::MarkDone);
         return;
     }
 
@@ -374,7 +375,7 @@ unsafe fn finish_marking() {
     }
     gc::clear_poll(me());
     set_phase(Phase::Evacuating);
-    gc::record_pause(me(), started);
+    gc::record_pause(me(), started, Pause::MarkDone);
 }
 
 /// A trace with nothing to evacuate skips straight to sweeping.
@@ -429,7 +430,7 @@ unsafe fn finish_evacuation_on(w: &'static Worker) {
 
     gc::clear_poll(me());
     set_phase(Phase::Sweeping);
-    gc::record_pause(me(), started);
+    gc::record_pause(me(), started, Pause::EvacDone);
 }
 
 /// Run whichever pause is wanted. The safepoints call this.
