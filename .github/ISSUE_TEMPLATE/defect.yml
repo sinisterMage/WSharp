@@ -107,14 +107,14 @@ body:
     attributes:
       label: Proposed severity
       description: >
-        See docs/defects.md. P1 is narrow and specific on purpose: a wrong answer
-        with no diagnostic, memory or collector unsoundness, a crash on valid input,
-        data loss, a JIT/AOT divergence, or a contradicted documented guarantee.
+        Propose one; a triage owner confirms it within a working day. Severity is
+        what the defect *does*, not how hard it is to hit — a silently wrong answer
+        that happens once a month is still a silently wrong answer. If it might be
+        a P1, say P1: ambiguity resolves upward.
       options:
-        - "P1 — wrong answer, unsoundness, crash on valid input, data loss, mode divergence, or a broken documented guarantee"
-        - "P2 — valid program rejected, documented feature does not work, supported platform fails, or a hang"
-        - "P3 — poor diagnostic, performance regression, cosmetic"
-        - "P4 — trivial"
+        - "P1 — a silently wrong answer, memory unsafety, a crash with no W# diagnostic, a corrupted artefact, a broken install or integrity promise, or a security defect"
+        - "P2 — wrong but reported, a platform arm failing where others pass, a large performance regression, or a documented example that does not run"
+        - "P3 — cosmetic: wording, formatting, ergonomics, a correct diagnostic that could be kinder"
         - "Not sure"
     validations:
       required: true

@@ -3,10 +3,11 @@
 How a defect gets from "this program did the wrong thing" to a merged fix with a
 test that would have caught it.
 
-This document is the definition of **severity** for this project. The release
-criteria cite it rather than restating it: two copies of a P1 definition is a gap
-between a freeze gate and a release gate, and the gap is discovered at the worst
-possible moment.
+**Severity is defined in
+[`RELEASE-CRITERIA-1.0.md`](../RELEASE-CRITERIA-1.0.md#the-severity-scale) and
+nowhere else**, including here. This document cites it. Two copies of a P1
+definition is a gap between a freeze gate and a release gate, and that gap is
+discovered at the worst possible moment.
 
 ## Where a defect lands
 
@@ -49,78 +50,42 @@ modes, and the two source ranges that disagree.
 
 ## Severity
 
-Severity answers one question — *how bad is it if this ships* — and nothing else.
-It is not urgency, not effort, and not how annoyed the reporter is. A one-line fix
-can be P1 and a month of work can be P3.
+Defined in
+[`RELEASE-CRITERIA-1.0.md`](../RELEASE-CRITERIA-1.0.md#the-severity-scale). It is
+not repeated here on purpose — a severity scale in two documents is a scale that
+disagrees with itself eventually, and the disagreement surfaces during a freeze,
+when it is most expensive.
 
-### P1 — must not ship
+What matters for intake:
 
-**A defect is P1 if it meets any one of these:**
+- The **filer proposes** a severity on the report form; the **triage owner for
+  the surface confirms or changes it**, within one working day.
+- **An unconfirmed report counts at the severity the filer proposed.** So "no
+  open P1" cannot be satisfied by leaving reports untriaged — which is the
+  property that makes the gate mean anything.
+- Ambiguity resolves **upward**. A defect that might be a silently wrong answer
+  is P1 until somebody demonstrates it is not.
+- Severity is decided by **what the defect does**, not by how hard it is to hit.
+  Rarity is not a mitigation: a silently wrong answer that happens once a month
+  is still a silently wrong answer.
 
-1. **Wrong answer with no diagnostic.** A program the compiler accepted produces
-   an incorrect observable result and says nothing. This includes choosing the
-   wrong overload, reading or writing the wrong memory location, and arithmetic
-   that disagrees with the language's stated semantics.
-2. **Memory unsafety or collector unsoundness.** A reachable object is freed,
-   moved without its references being fixed, or missed by a root walk; the heap
-   is corrupted; generated code dereferences a stale or wild pointer. A root walk
-   that finds *no* roots counts, because it makes every root check pass
-   vacuously.
-3. **Crash on valid input.** The compiler or runtime aborts, segfaults, or panics
-   on a program it should accept. A deliberate W# panic carrying a message — an
-   index out of bounds, a division by zero — is the language working, and is not
-   this. A Rust panic escaping the compiler always is.
-4. **Data loss.** A program or tool destroys or corrupts data it was meant to
-   preserve: an `ingot` store or install, a file a `std` call wrote, a lockfile.
-5. **JIT/AOT divergence.** The same program produces different observable results
-   under `wsharp run` and a `wsharp build` executable. Always a defect, even when
-   both outputs look plausible — `codegen::build` is the only place either
-   backend's code comes from, so a divergence means something below it asked
-   which backend it was in.
-6. **A documented guarantee is contradicted.** Behaviour disagrees with a promise
-   stated in the README, the language reference, `docs/`, or the compatibility
-   statement. The promise being wrong is a fix to the document, but it is this
-   severity until somebody decides which side was wrong.
+Triage owners, from the same document:
 
-**No open P1 is a release gate and a freeze gate.** That is the whole reason this
-list is written as six testable clauses rather than as a sentence about
-seriousness: a criterion that needs a judgement call is not a criterion.
+| Surface | Owner |
+|---|---|
+| Compiler, runtime, stdlib, the collector | Ada |
+| Release pipeline, install scripts, artefacts, digests, sharpie | Milo |
+| A driver program's own defect | Rex |
+| Harness, fuzzing, soak infrastructure | Vera |
 
-Ambiguity is resolved *upward*. A defect that might be a miscompile is P1 until
-someone demonstrates it is not.
-
-### P2 — major
-
-- A valid program is rejected: a type error on a program that should compile, an
-  inference failure, a spurious ambiguity between overloads.
-- A documented feature does not work at all.
-- A supported platform fails where the others pass, and the cause is not one of
-  the P1 clauses.
-- A hang, an unbounded pause, or memory growth without bound on a workload that
-  should be flat.
-
-Not P1 because the program does not *run wrongly* — it does not run, and the
-failure is in front of you rather than behind you. That distinction is the line
-between the two levels.
-
-### P3 — minor
-
-- A diagnostic that is correct but unreadable, unlocated, or misleading. A
-  compiler's diagnostics are its user interface, so these are real defects; they
-  are P3 because the rejection itself was right.
-- A performance regression that is measurable and does not break a stated bound.
-- Cosmetic output problems.
-
-### P4 — trivial
-
-Typos, dead code, cleanups, and things that would be nice.
+Disagreement about a severity goes to Johnny.
 
 ## Triage
 
 **Weekly, and nothing sits untriaged for a week.** Every open issue leaves triage
 with three things:
 
-- a **severity** label (`P1`–`P4`), replacing `needs-triage`,
+- a **severity** label (`P1`–`P3`), replacing `needs-triage`,
 - an **owner**, as the GitHub assignee,
 - a **next action**, written as a comment — not "investigate", but the actual next
   step: reduce it further, ask the reporter for the libc version, write the
@@ -238,12 +203,12 @@ Posted weekly, on the triage pass. The format:
 ```markdown
 ## Defect report — week ending YYYY-MM-DD
 
-| | P1 | P2 | P3 | P4 | Total |
-|---|---|---|---|---|---|
-| Open at start |  |  |  |  |  |
-| Opened |  |  |  |  |  |
-| Fixed |  |  |  |  |  |
-| **Open now** |  |  |  |  |  |
+| | P1 | P2 | P3 | Total |
+|---|---|---|---|---|
+| Open at start |  |  |  |  |
+| Opened |  |  |  |  |
+| Fixed |  |  |  |  |
+| **Open now** |  |  |  |  |
 
 **Untriaged:** N (target: 0)
 **Open P1:** N — *list each one, with owner and next action*
