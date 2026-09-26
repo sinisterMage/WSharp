@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: How defects are handled
+    url: https://github.com/sinisterMage/WSharp/blob/main/docs/defects.md
+    about: Where a defect lands, what the severity levels mean, and what happens after you file.
+  - name: Documentation
+    url: https://wsharp.io
+    about: Installing, the language reference, the standard library, and how the dispatcher and collector work.

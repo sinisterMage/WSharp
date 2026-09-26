@@ -14,6 +14,11 @@
 // expect: odd
 // expect: deadbeef
 // expect: beef
+// expect: beef
+// expect: de
+// expect: 0
+// expect: 0
+// expect: lo
 // expect: 12345678
 // expect: 78563412
 // expect: 0123456789abcdef
@@ -52,6 +57,17 @@ fn main() i64 {
     const d = bytes.from_hex("deadbeef") catch return 2;
     print(bytes.to_hex(d));
     print(bytes.to_hex(bytes.slice(d, 2, 4)));
+
+    // A `from`/`to` range is clamped to the buffer rather than checked, which
+    // is what makes `slice(b, at, <anything large>)` the spelling of "the rest
+    // of it". All three ways past the end answer, and a `to` below `from`
+    // answers with nothing rather than reading backwards. `bytes_region_panics`
+    // is the other half of the rule: an `at`/`n` region is checked, not clamped.
+    print(bytes.to_hex(bytes.slice(d, 2, 99)));
+    print(bytes.to_hex(bytes.slice(d, -2, 1)));
+    print_int(array.len(bytes.slice(d, 3, 1)));
+    print_int(array.len(bytes.slice(d, 99, 100)));
+    print(bytes.slice_str(bytes.of("hello"), 3, 99));
 
     // Words, both ends. The same four bytes read two ways.
     const w = bytes.from_hex("12345678") catch return 3;
