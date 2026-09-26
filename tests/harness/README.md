@@ -139,6 +139,20 @@ nothing about the thing that differs.
 
 Divergence is reported per case, with both outputs kept under `diffs/`.
 
+**A mode that hits the per-run bound is a `TIMEOUT`, not a divergence.** Each
+mode runs under `timeout`, which answers 124 (TERM) or 137 (KILL); those are the
+harness's numbers, not the program's. A mode that did not finish has not
+disagreed with anything — it has not answered — so it gets its own verdict and
+its own `diffs/<case>.timeout.txt`, which records every mode's status and says
+which bound each was given. The first scheduled nightly reported
+`gc_map_replacement` as `DIVERGED` on two triples for exactly this reason; the
+row and the diff could not be told apart from a silent miscompile. A timeout
+still fails the run (criterion 5 clause 1 makes a real divergence a P1, and a
+hang with no progress is clause 3), so this changes the *name*, not the gate.
+Separating the two is the first move before routing: a case the bound is too
+small for is corpus cost, and a mode that never finishes at a generous bound is
+a hang.
+
 **A case that disagrees with itself is a different finding.** When a difference
 shows up, each side is re-run twice before it is called a divergence; a mode that
 cannot reproduce its own output is reported as `NONDETERMINISTIC` and classified

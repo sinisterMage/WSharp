@@ -142,6 +142,25 @@ cat >"$CASES/nondet.ws" <<'EOF'
 //@build out=fixed exit=0
 EOF
 
+# A mode that did not finish inside the harness's bound. GNU `timeout` answers
+# 124 (TERM) or 137 (KILL), and those numbers are the harness's, not the
+# program's -- a mode that timed out has not disagreed with anything, it has not
+# answered. The first scheduled nightly reported `gc_map_replacement` as
+# DIVERGED for exactly this, which criterion 5 clause 1 routes to a P1; this
+# pins that it is called a timeout instead, and stays non-zero so the night is
+# still red.
+cat >"$CASES/timeout.ws" <<'EOF'
+//@run out=hello exit=0
+//@stress out= exit=124
+EOF
+
+# And the inverse, so the two are not conflated in the other direction: a real
+# exit-status difference that is not a bound (3, not 124/137) must stay DIVERGED.
+cat >"$CASES/diverge_exit_mild.ws" <<'EOF'
+//@run out=hello exit=0
+//@build out=hello exit=3
+EOF
+
 # The collector's statistics line differs between modes for reasons that are
 # not a defect, and `normalise` removes it. If that stops working, every
 # gc case in the real corpus becomes a false divergence -- so pin it here,
@@ -184,6 +203,8 @@ expect diverge_stdout DIVERGED
 expect diverge_exit   DIVERGED
 expect nondet         NONDETERMINISTIC
 expect gcstats_noise  AGREED
+expect timeout        TIMEOUT
+expect diverge_exit_mild DIVERGED
 
 # The detail column is what a reader acts on, so it is part of the contract:
 # "something diverged" without naming the mode and the stream is not a finding.
@@ -194,6 +215,20 @@ esac
 case "$(detail diverge_exit)" in
     *run-vs-stress*exit*) ok   "diverge_exit names the mode and the exit status" ;;
     *) bad "diverge_exit detail was '$(detail diverge_exit)', wanted run-vs-stress(exit status)" ;;
+esac
+
+# A timeout is named as a timeout, and names which mode ran out -- not an exit
+# status, and not the wrong pair of modes.
+case "$(detail timeout)" in
+    *did\ not\ finish*stress*) ok   "timeout names the bound and the mode that hit it" ;;
+    *) bad "timeout detail was '$(detail timeout)', wanted 'did not finish ... stress'" ;;
+esac
+
+# The two are not conflated in the other direction: a genuine exit-status
+# difference (3) stays DIVERGED and is not read as a bound.
+case "$(detail diverge_exit_mild)" in
+    *exit\ status*) ok   "a non-124 exit difference is still an exit-status divergence" ;;
+    *) bad "diverge_exit_mild detail was '$(detail diverge_exit_mild)', wanted 'exit status'" ;;
 esac
 
 # The outputs of a divergence are the evidence a defect is filed from. A report

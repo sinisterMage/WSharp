@@ -108,6 +108,20 @@ execute() {
     echo "$code" >"$WORK/$tag.code"
 }
 
+# Did the harness's own bound fire on this run, rather than the program exiting?
+#
+# Every mode here runs under `timeout`, and GNU `timeout` answers 124 when it
+# sends its TERM and 137 when it sends KILL. Those two numbers are the
+# harness's, not the program's: reporting one as an exit status makes a mode
+# that ran out of time look like a mode that disagreed, which criterion 5
+# clause 1 routes straight to a P1. It is also indistinguishable, in the row
+# and in the kept diff, from a genuine exit-status divergence -- so the two are
+# separated here, before the comparison, rather than papered over after it.
+is_timeout() {
+    local code; code="$(cat "$WORK/$1.code")"
+    [ "$code" = 124 ] || [ "$code" = 137 ]
+}
+
 # Are two recorded outcomes observably the same? Exit status, then stdout,
 # then stderr, each after `normalise`.
 same() {
@@ -132,11 +146,33 @@ record_diff() {
     } >"$OUT/diffs/$name.$what.txt"
 }
 
+# A timeout is not a divergence between two modes, so the two-mode diff above
+# would name the wrong pair: `run.a` against `stress.a` when it was `build` that
+# ran out. Record every mode's status and output instead, and say which bound
+# each was given.
+record_timeout() {
+    local name="$1" modes="$2" mode
+    {
+        echo "### $name — timeout"
+        echo
+        echo "Did not finish inside the per-run bound. The exit codes below are"
+        echo "\`timeout\`'s (124 TERM, 137 KILL), not the program's."
+        echo
+        echo "modes that timed out:$modes"
+        echo
+        for mode in run stress build; do
+            echo "--- $mode exit: $(cat "$WORK/$mode.a.code")"
+            echo "--- $mode stdout"; normalise <"$WORK/$mode.a.out" | head -20
+            echo "--- $mode stderr"; normalise <"$WORK/$mode.a.err" | head -20
+        done
+    } >"$OUT/diffs/$name.timeout.txt"
+}
+
 TSV="$OUT/results.tsv"
 printf 'case\tverdict\tseconds\tdetail\n' >"$TSV"
 
 started="$(date +%s)"
-total=0; agreed=0; diverged=0; flaky=0
+total=0; agreed=0; diverged=0; flaky=0; timedout=0
 
 # Is a mode reproducible? Run it twice more and see whether it says the same
 # thing each time. Asked only when a divergence has already been seen.
@@ -158,10 +194,25 @@ for case_file in "$CASES"/*.ws; do
         execute "$case_file" "$mode" "$mode.a"
     done
 
+    # Did any mode fail to finish inside the bound? `timeout` answers 124 (TERM)
+    # or 137 (KILL), and both are the harness's number rather than the
+    # program's: a mode that hit the bound has not disagreed with anything, it
+    # has not answered. Decided before the comparison, and before any
+    # self-consistency re-runs -- those would spend the bound twice more to
+    # answer a determinism question a timeout is not.
+    timeouts=""
+    for mode in run stress build; do
+        is_timeout "$mode.a" && timeouts="$timeouts $mode"
+    done
+    if [ -n "$timeouts" ]; then
+        record_timeout "$name" "$timeouts"
+    fi
+
     # `run` is the reference: it is the mode everything else is compared to in
     # ordinary use.
     detail=""; unstable=""
     for other in stress build; do
+        [ -n "$timeouts" ] && break
         what="$(same "run.a" "$other.a")" && continue
         # A difference. Before calling it a divergence, ask whether either side
         # even agrees with itself -- a case that prints a port number or a
@@ -182,7 +233,10 @@ for case_file in "$CASES"/*.ws; do
     done
 
     case_elapsed=$(( $(date +%s) - case_started ))
-    if [ -n "$unstable" ]; then
+    if [ -n "$timeouts" ]; then
+        timedout=$((timedout + 1))
+        printf '%s\tTIMEOUT\t%s\t%s\n' "$name" "$case_elapsed" "did not finish within ${TIMEOUT}s:${timeouts}" >>"$TSV"
+    elif [ -n "$unstable" ]; then
         flaky=$((flaky + 1))
         printf '%s\tNONDETERMINISTIC\t%s\t%s\n' "$name" "$case_elapsed" "${unstable# }" >>"$TSV"
     elif [ -n "$detail" ]; then
@@ -220,7 +274,20 @@ elapsed=$(( $(date +%s) - started ))
     echo "| agreed in all three modes | $agreed |"
     echo "| diverged between modes | $diverged |"
     echo "| nondeterministic within one mode | $flaky |"
+    echo "| timed out inside the per-run bound | $timedout |"
     echo
+    if [ "$timedout" -gt 0 ]; then
+        echo "## Timed out"
+        echo
+        echo "A mode that did not finish inside the ${TIMEOUT}s bound. This is"
+        echo "**not** a divergence: the mode did not answer, so there is nothing"
+        echo "to disagree with. Separate the two before routing -- a case the"
+        echo "bound is too small for is corpus cost, and a mode that never"
+        echo "finishes at a generous bound is a hang (criterion 5 clause 3)."
+        echo
+        awk -F'\t' '$2=="TIMEOUT" {printf("- `%s` — %s\n", $1, $4)}' "$TSV"
+        echo
+    fi
     if [ "$diverged" -gt 0 ]; then
         echo "## Divergences"
         echo
@@ -250,6 +317,6 @@ elapsed=$(( $(date +%s) - started ))
     echo "Outputs for every case above are in \`diffs/\`."
 } >"$OUT/report.md"
 
-echo "parity: $agreed agreed, $diverged diverged, $flaky nondeterministic, of $total in ${elapsed}s"
+echo "parity: $agreed agreed, $diverged diverged, $flaky nondeterministic, $timedout timed out, of $total in ${elapsed}s"
 echo "parity: $OUT/report.md"
-[ "$diverged" -eq 0 ]
+[ "$diverged" -eq 0 ] && [ "$timedout" -eq 0 ]
