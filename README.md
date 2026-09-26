@@ -307,7 +307,9 @@ High-Throughput Garbage Collection*, PLDI 2022).
 describe. The end-to-end suite runs twice, once under it, and traces start on
 the same allocation schedule in both runs so the concurrent paths are covered
 both ways. `WSHARP_GC_STATS=1` prints what the collector did on exit, including
-the number of pauses and the longest one.
+the pause distribution: p50, p90, p99 and the maximum, and beneath them the
+log-spaced buckets those percentiles were computed from, so the summary is
+never the only record of the measurement.
 
 ## Installing
 
@@ -499,6 +501,23 @@ Two flags exist for the collector: `--gc-stress` as above, and the
 `WSHARP_GC_STATS` environment variable, which prints what the collector did on
 exit. `WSHARP_GC_TRACE` prints every frame the root walk visits. Both are off
 when unset, empty or `0`.
+
+Pause times get their own instrument, because a count, a total and a maximum
+support a mean and a maximum and nothing else -- a median or a 99th percentile
+needs the individual samples, and they used to be gone by the time anything
+could read them.
+
+- **The histogram is always on**, in every build, release included. One
+  count-leading-zeros and one relaxed increment per pause, into a fixed array
+  in the worker; it allocates nothing and there is no switch to forget. Four
+  sub-buckets per octave, so a percentile read out of it is an upper bound
+  within 25%, and the bucket line beside it says which bucket it came from.
+- **`WSHARP_GC_PAUSE_LOG=<path>` writes one line per pause** -- microseconds,
+  which of the three pauses, which worker -- for when 25% is not close enough.
+  The buffer is allocated when the worker is created and the pause path only
+  claims a slot and stores a word into it, so nothing allocates and no syscall
+  happens while a pause is being timed; the file is written at exit. It costs
+  4 MiB per worker and is off unless the variable names a path.
 
 ### The standard library
 

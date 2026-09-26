@@ -282,6 +282,11 @@ pub fn collections() -> usize {
     total(|w| w.stats.collections.load(Ordering::Relaxed))
 }
 
+/// How many pauses every worker has run between them.
+pub fn pauses() -> usize {
+    total(|w| w.stats.pauses.load(Ordering::Relaxed))
+}
+
 pub(crate) fn note_trace_started(worker: &Worker) {
     worker.stats.traces.fetch_add(1, Ordering::Relaxed);
 }
@@ -309,13 +314,51 @@ pub(crate) fn set_trace_baseline(worker: &Worker, live_bytes: usize) {
         .store(live_bytes, Ordering::Relaxed);
 }
 
-/// Account for a pause that began at `started`. The maximum is the number
-/// that matters for a collector whose point is low latency.
-pub(crate) fn record_pause(worker: &Worker, started: Instant) {
+/// Account for a pause of `kind` that began at `started`.
+///
+/// The count, the total and the maximum answer "how many", "how much
+/// altogether" and "how bad at worst". They cannot answer "how bad for the
+/// 99th mutator out of a hundred", which is the number a latency collector is
+/// actually judged on, because the individual samples are gone by the time
+/// anything reads them -- issue #18. So the sample also goes into a log-spaced
+/// histogram, and, when `WSHARP_GC_PAUSE_LOG` asked for it, into an exact
+/// per-pause record. Neither allocates. See [`crate::pause`].
+///
+/// The samples are recorded *before* the count, so that a reader which catches
+/// the two mid-update sees one more sample than pause rather than one fewer --
+/// a histogram that is missing a sample it claims to have would be the
+/// misleading direction.
+pub(crate) fn record_pause(worker: &Worker, started: Instant, kind: crate::pause::Pause) {
     let us = started.elapsed().as_micros() as usize;
+    worker.stats.pause_us.record(us);
+    if let Some(log) = worker.pause_log.as_ref() {
+        log.record(us, kind);
+    }
     worker.stats.pauses.fetch_add(1, Ordering::Relaxed);
     worker.stats.total_pause_us.fetch_add(us, Ordering::Relaxed);
     worker.stats.max_pause_us.fetch_max(us, Ordering::Relaxed);
+}
+
+/// Every worker's pause samples, added together.
+///
+/// Summed rather than maximised, unlike the running maximum beside it: each
+/// pause is one sample of one mutator's wait, and the distribution is over all
+/// of them.
+pub fn pause_histogram() -> [usize; crate::pause::BUCKETS] {
+    let mut out = [0usize; crate::pause::BUCKETS];
+    crate::worker::for_each_worker(|w| w.stats.pause_us.add_into(&mut out));
+    out
+}
+
+/// How many pauses the histogram holds samples for.
+pub fn pause_samples() -> usize {
+    crate::pause::samples(&pause_histogram())
+}
+
+/// The `q`th percentile of every recorded pause, in microseconds, as an upper
+/// bound within 25%. `q` is a percentage; 100 is the maximum.
+pub fn pause_percentile_us(q: usize) -> usize {
+    crate::pause::percentile_us(&pause_histogram(), q)
 }
 
 /// Whether an environment variable is set to something other than `0` or the
@@ -386,14 +429,19 @@ pub unsafe fn validate_roots() {
     }
 }
 
-/// Print what the collector has done so far, when `WSHARP_GC_STATS` is set.
+/// The exit report: write `WSHARP_GC_PAUSE_LOG`'s file if it was asked for,
+/// and print what the collector has done so far if `WSHARP_GC_STATS` is set.
 ///
 /// The counts matter as much as the checks: a stack walk that found no roots at
 /// all would make every root check pass for the wrong reason.
 pub fn report_if_asked() {
+    // Independent of `WSHARP_GC_STATS`: the log is its own opt-in, and asking
+    // for raw samples should not also require asking for a summary.
+    crate::pause::write_log_if_asked();
     if !env_flag("WSHARP_GC_STATS") {
         return;
     }
+    let pauses = pause_histogram();
     let heap = crate::heap::total_heap_stats();
     let (funcs, safepoints) = crate::stackwalk::registered();
     eprintln!(
@@ -423,6 +471,27 @@ pub fn report_if_asked() {
         total(|w| w.stats.total_pause_us.load(Ordering::Relaxed)),
         heap.blocks,
         heap.large_objects,
+    );
+    // The distribution, on its own two lines rather than appended to the one
+    // above, because the line above is parsed -- by `tests/harness/` and by
+    // `crates/wsharp-cli/tests/cases.rs` -- and widening it would break every
+    // reader at once.
+    //
+    // The percentiles are upper bounds within 25%, and the bucket line beside
+    // them is the raw data they were computed from, so anybody can recompute
+    // them or disagree with the rounding.
+    eprintln!(
+        "W# gc pauses: {} samples, p50 {} us, p90 {} us, p99 {} us, max {} us \
+         (upper bounds, log-spaced buckets within 25%)",
+        crate::pause::samples(&pauses),
+        crate::pause::percentile_us(&pauses, 50),
+        crate::pause::percentile_us(&pauses, 90),
+        crate::pause::percentile_us(&pauses, 99),
+        crate::pause::percentile_us(&pauses, 100),
+    );
+    eprintln!(
+        "W# gc pause buckets (us): {}",
+        crate::pause::render(&pauses)
     );
 }
 

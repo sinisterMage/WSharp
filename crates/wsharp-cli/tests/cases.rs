@@ -470,6 +470,49 @@ fn a_built_program_reports_the_collector_doing_its_work() {
         number_before("safepoints") > 0,
         "no safepoints are registered:\n{line}"
     );
+
+    // The pause distribution, in a built program. A percentile needs the
+    // individual samples, and until #18 was fixed they were gone by the time
+    // anything could read them -- so this asserts the samples are here, that
+    // there are exactly as many as there were pauses, and that the line is
+    // parseable, which is the only thing a harness can rely on.
+    let pauses = stats
+        .lines()
+        .find(|l| l.starts_with("W# gc pauses:"))
+        .unwrap_or_else(|| panic!("no pause distribution; stderr was:\n{stats}"));
+    let samples: usize = pauses
+        .split_whitespace()
+        .nth(3)
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("cannot read the sample count from:\n{pauses}"));
+    assert_eq!(
+        samples,
+        number_before("pauses"),
+        "every pause must leave a sample behind:\n{line}\n{pauses}"
+    );
+    assert!(samples > 0, "no pauses were recorded at all:\n{pauses}");
+    // And the raw buckets the percentiles were computed from, so that a
+    // published figure is never the only record of the measurement.
+    let buckets = stats
+        .lines()
+        .find(|l| l.starts_with("W# gc pause buckets"))
+        .unwrap_or_else(|| panic!("no pause buckets; stderr was:\n{stats}"));
+    let counted: usize = buckets
+        .rsplit_once(": ")
+        .expect("the bucket line has no body")
+        .1
+        .split_whitespace()
+        .map(|f| {
+            f.rsplit_once(':')
+                .and_then(|(_, n)| n.parse::<usize>().ok())
+                .unwrap_or_else(|| panic!("`{f}` is not a `lo-hi:count` bucket in:\n{buckets}"))
+        })
+        .sum();
+    assert_eq!(
+        counted, samples,
+        "the buckets must account for every sample:\n{buckets}"
+    );
+
     let _ = std::fs::remove_file(&exe);
 }
 
