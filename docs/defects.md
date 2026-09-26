@@ -166,24 +166,67 @@ the one that broke is not in it, add it there in the same change.
 
 ## Verification
 
-Run the checks that prove *this* fix, not the whole suite by reflex:
+Run the checks that prove *this* fix, not the whole suite by reflex.
+
+**Always build the workspace first:**
 
 ```sh
-# The guard, and the crate the fix is in.
-cargo build --workspace            # before any test run — see below
-cargo test -p wsharp-<crate>
-cargo test --workspace case_name
-
-# Touched the runtime or the collector? Also:
-cargo test --workspace -- --ignored gc
-./target/debug/wsharp run --gc-stress tests/cases/<your case>.ws
+cargo build --workspace
 ```
 
-`cargo build --workspace` must run before `cargo test --workspace`. `cargo test`
-does not build `crates/wsharp-start`, which has no test target and which nothing
-depends on, while the case suite's AOT pass links against whatever
-`libwsharp_start.a` an earlier build left behind. A cold tree fails every built
-case; a warm one silently links a stale runtime and **passes**, which is worse.
+`cargo test` does not build `crates/wsharp-start` — it declares `test = false`
+and nothing depends on it — while the case suite's AOT pass links against
+whatever `libwsharp_start.a` an earlier build left in `target/debug`. A cold
+tree fails every built case; a warm one silently links a stale runtime and
+**passes**, which is worse.
+
+**To check one case, run it, in each mode you care about:**
+
+```sh
+./target/debug/wsharp run             tests/cases/<case>.ws
+./target/debug/wsharp run --gc-stress tests/cases/<case>.ws
+./target/debug/wsharp build tests/cases/<case>.ws -o /tmp/<case> && /tmp/<case>
+```
+
+There is **no way to run a single case through `cargo test`**, and the way that
+looks like it should work is actively dangerous:
+
+```console
+$ cargo test -p wsharp-cli --test cases arithmetic
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out
+```
+
+A test filter matches the names of *test functions*, and the case suite has no
+function per case — it has three functions that each iterate every case. So a
+case name filters everything out and reports `ok`. Green, and it ran nothing.
+This is the same trap as the stale archive above, which is why both are written
+down here.
+
+**To run the suite, filter by the harness function:**
+
+```sh
+cargo test -p wsharp-cli --test cases every_case_behaves_as_declared               # JIT
+cargo test -p wsharp-cli --test cases every_case_survives_collecting_at_every_allocation
+cargo test -p wsharp-cli --test cases every_case_behaves_the_same_built_as_run     # AOT
+cargo test -p wsharp-<crate>                                                       # unit tests
+```
+
+Touched the runtime or the collector? The `--gc-stress` pass above is the one
+that matters, plus `the_collector_survives_stress_in_a_built_program`.
+
+One more trap, because it costs a confusing five minutes: **`cargo test
+--workspace <filter>` fails to compile.** Given a filter argument, cargo builds
+`wsharp-start` with `--test` despite its `test = false`, and that crate defines
+`main`, so the linker is asked to place two and refuses:
+
+```text
+error: entry symbol `main` declared multiple times
+```
+
+Nothing is wrong with your change. Use `-p wsharp-cli --test cases` as above, or
+`--workspace --exclude wsharp-start`. Plain `cargo test --workspace`, with no
+filter, is fine and is what CI runs.
 
 Paste the commands and their output into the issue. Paraphrase loses the detail
 that turns out to matter.
