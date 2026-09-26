@@ -3,6 +3,19 @@ use crate::builtins::{Builtin, BuiltinTy as B, ERROR_BAD_FORMAT};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+/// Milliseconds on a monotonic clock, from an origin this does not promise.
+///
+/// Only the *difference* between two readings means anything, and in particular
+/// the origin is not the start of the process: it is fixed by the first call, so
+/// a program that has already run for a minute and then reads this for the first
+/// time is told nothing about the minute. That is the shape every caller wants
+/// anyway -- a deadline is `monotonic_ms() + n` and a duration is a subtraction
+/// -- and saying it is what stops a reading being mistaken for uptime.
+///
+/// Monotonic rather than civil: [`ws_time_now`](crate::crypto::ws_time_now)
+/// answers what the wall clock says and can go backwards when that clock is
+/// corrected, which is why measuring a duration with it is wrong and measuring
+/// one with this is not.
 #[unsafe(no_mangle)]
 pub extern "C" fn ws_time_monotonic_ms() -> i64 {
     unsafe { crate::gc::checkpoint() };
