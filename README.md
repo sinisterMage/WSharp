@@ -45,6 +45,16 @@ The documentation is at **[wsharp.io](https://wsharp.io)**: installing, a tour
 through the examples, the language reference, the standard library, and how the
 dispatcher and the collector actually work.
 
+Two files in this repository are worth reading before you build on W#, and
+before you hit what they describe rather than after:
+
+- **[LIMITATIONS.md](LIMITATIONS.md)** — what does not work, why it was left,
+  and what to write instead. Every entry carries a workaround or the word
+  *None*, and a tracking issue.
+- **[COMPATIBILITY.md](COMPATIBILITY.md)** — what a 1.0 release will and will
+  not break, surface by surface. Anything not listed there is not promised,
+  deliberately.
+
 ## What it's good at
 
 - **Dispatch that mostly isn't there at run time.** When inference pins the
