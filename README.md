@@ -719,6 +719,10 @@ Because no versions of core match >=2.0.0 <3.0.0 and util 0.3.0 depends on
 core >=2.0.0 <3.0.0, util 0.3.0 cannot be used.
 ```
 
+What each requirement spelling means, which version gets chosen and why, what
+the lockfile records, and every failure sentence in full, are in
+[what `ingot` promises about versions](docs/resolution.md).
+
 Progress is written to stderr while work happens: certificate loading,
 fetching, received bytes (with a percentage when the server supplies a total),
 unpacking, and copying or verifying packages. Install reports `[completed/total]`
@@ -944,6 +948,7 @@ Four documents govern it, and each has one job:
 | [COMPATIBILITY.md](COMPATIBILITY.md) | What 1.0 promises not to break, surface by surface, and for how long |
 | [LIMITATIONS.md](LIMITATIONS.md) | What W# does not do, with a workaround or the word *None* |
 | [docs/defects.md](docs/defects.md) | Where a defect lands, what severity it gets, and what happens to it after that |
+| [docs/resolution.md](docs/resolution.md) | What `ingot` promises about pins, locks and ranges, and what it says when there is no answer |
 
 Severity and "breaking change" are defined once, in Part one of the release
 criteria; the other three cite it rather than restating it.
