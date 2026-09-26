@@ -142,15 +142,23 @@ expect "the third of three jobs is missing" "$d" 1 "has no \`c\` job"
 
 d="$(fixture external_named \
   '| `tests/rungs.sh` | 7 | **not written.** It belongs to `sinisterMage/sharpie`, not to this repository | Ash |')"
-expect "an external path, whose owner is named" "$d" 0 "1 of 1 rows"
+expect "an external path, whose owner is named" "$d" 0 "cannot check its state"
 
 d="$(fixture external_unnamed \
   '| `tests/rungs.sh` | 7 | **not written** | Ash |')"
 expect "an external path, whose owner is not" "$d" 1 "and this row does not say so"
 
-d="$(fixture external_claimed \
+# Both verdicts are accepted on an external path, and neither is believed. The
+# first version of this script refused **written** here, which encoded "sharpie
+# has not written it yet" into a check about *this* tree -- and sharpie wrote it
+# the same day, so the check then stood in the way of the table being right.
+d="$(fixture external_written \
   '| `tests/rungs.sh` | 7 | **written**, in `sinisterMage/sharpie` | Ash |')"
-expect "an external path claimed as written here" "$d" 1 "cannot claim it is written"
+expect "an external path said to be written elsewhere" "$d" 0 "cannot check its state"
+
+# It must still be unchecked rather than quietly passed -- the number of rows
+# held to the tree is what says so.
+expect "an external row counts as unchecked" "$d" 0 "0 of 1 rows"
 
 # --- a row this check cannot hold to anything, reported rather than passed ---
 

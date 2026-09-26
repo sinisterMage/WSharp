@@ -26,7 +26,12 @@
 #     is, so the exemption cannot outlive its reason.
 #
 # What is not asserted: whether a written check *passes*. That is the gate's own
-# job, and the table says so.
+# job, and the table says so. Nor is the verdict on an external path: this tree
+# cannot see `sinisterMage/sharpie`, so such a row is reported as unchecked
+# whichever way it reads. The first version of this script instead refused an
+# external row that said **written**, which is a fact about the world -- that
+# `tests/rungs.sh` had not been written yet -- frozen into a check about the
+# tree. It was written the same day, and the check then forbade saying so.
 #
 # Usage: gate-table-check.sh [document] [tree-root]
 
@@ -36,9 +41,9 @@ readonly DOC_DEFAULT="RELEASE-CRITERIA-1.0.md"
 readonly TABLE_HEADER="| Check | Gate | State | Owed by |"
 
 # Paths named by the table that live in another repository. `tests/rungs.sh` is
-# sharpie's: criterion 7 requires it, and nothing in this tree will ever show it
-# arriving. One entry, and the row has to name the repository -- an exemption
-# whose justification is checked is an exemption that can be retired.
+# sharpie's: criterion 7 requires it, and nothing in this tree will ever show
+# its state either way. One entry, and the row has to name the repository -- an
+# exemption whose justification is checked is an exemption that can be retired.
 readonly EXTERNAL_PATHS=("tests/rungs.sh")
 readonly EXTERNAL_OWNER="sinisterMage/sharpie"
 
@@ -121,20 +126,23 @@ check_row() {
       ;;
   esac
 
-  local named=0 path
+  local named=0 external=0 path
   while IFS= read -r path; do
     looks_like_path "$path" || continue
-    named=$((named + 1))
 
+    # An external path is deliberately *not* counted in `named`: this tree can
+    # neither confirm nor refute it, so the row is unchecked rather than held to
+    # a verdict. All that is required is that it say whose path it is.
     if is_external "$path"; then
-      if [ "$expect" = "present" ]; then
-        problem "gate $gate: \`$path\` is not this repository's, so this row cannot claim it is written."
-      elif [[ "$state" != *"$EXTERNAL_OWNER"* ]]; then
+      external=$((external + 1))
+      if [[ "$state" != *"$EXTERNAL_OWNER"* ]]; then
         problem "gate $gate: \`$path\` belongs to $EXTERNAL_OWNER, and this row does not say so."
         echo "       A reader would otherwise look for it here and conclude the table is wrong." >&2
       fi
       continue
     fi
+
+    named=$((named + 1))
 
     if [ -e "$path" ]; then
       if [ "$expect" = "absent" ]; then
@@ -166,14 +174,20 @@ check_row() {
     fi
   done < <(claimed_jobs "$state")
 
-  # A row naming neither a path nor a job is one this check cannot hold to
-  # anything, and criterion 8's baselines are legitimately such a row: no path
-  # for them has been decided, so the table cannot name one. Reported rather
-  # than passed silently, because "12 of 13 rows are checked" is the number a
-  # reader of this output needs.
+  # A row naming nothing this tree can be asked about is one this check cannot
+  # hold to anything, and three rows are legitimately such a row: criterion 0's
+  # inline test and criterion 8's baselines name no path because none has been
+  # decided, and criterion 7's `tests/rungs.sh` names one in another repository.
+  # Reported rather than passed silently, because "11 of 14 rows are checked" is
+  # the number a reader of this output needs, and a coverage number that is
+  # printed is one that cannot quietly shrink.
   if [ "$named" -eq 0 ] && [ "$claims" -eq 0 ]; then
     unchecked_count=$((unchecked_count + 1))
-    echo "note: gate $gate: \"$check\" names no path in this tree, so only its wording is checked."
+    if [ "$external" -gt 0 ]; then
+      echo "note: gate $gate: \"$check\" is $EXTERNAL_OWNER's, so this tree cannot check its state."
+    else
+      echo "note: gate $gate: \"$check\" names no path in this tree, so only its wording is checked."
+    fi
   fi
 }
 
