@@ -708,9 +708,16 @@ extra `sin_len` byte out of this code entirely.
   rooting, as every other field read. Both parameters are declared stack-map
   roots: they are live across `ws_str_eq` and across the recursive calls, and
   both are safepoints. Aliased values still compare their fields, preserving
-  NaN's non-reflexive equality. **Cycles are not detected:** a comparison that
-  follows a cycle recurses indefinitely, including a cyclic value compared
-  with itself.
+  NaN's non-reflexive equality. **Cycles are not detected, but they are
+  bounded.** Each call carries how deep it already is -- a third parameter, zero
+  at a `==` in the program and one more at each step into a struct field -- and
+  the exact comparison panics past `wsharp_runtime::EQ_MAX_DEPTH`. Without it a
+  cyclic value ran the stack out and died on a signal, which is a crash with no
+  W# diagnostic and so a P1 however well documented it was. The bound is defined
+  in the runtime rather than in the code generator because the emitted check and
+  the message explaining it must name one number. Detecting the cycle itself
+  would need a set of the pairs in flight, hence an allocation, hence a
+  safepoint in the middle of reading two objects' fields.
 - **`@spawn` returns before `init` starts, and the message loop is entered only
   after `init` returns.** Both were implementation details of `ws_spawn` and are
   now promises the README states, because the exit path depends on the second:

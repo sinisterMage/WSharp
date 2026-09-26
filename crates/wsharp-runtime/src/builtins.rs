@@ -1839,6 +1839,7 @@ pub const PANIC_NO_METHOD: i64 = 3;
 pub const PANIC_DIVIDE_BY_ZERO: i64 = 4;
 pub const PANIC_DIVIDE_OVERFLOW: i64 = 5;
 pub const PANIC_INDEX_OUT_OF_BOUNDS: i64 = 6;
+pub const PANIC_EQ_TOO_DEEP: i64 = 7;
 
 /// The exit status of a program that panicked: the one a Rust program exits
 /// with on a panic, so it is already familiar. A signal (`abort`) would be the
@@ -1871,6 +1872,17 @@ pub extern "C" fn ws_panic(code: i64) {
         // Not "i64::MIN" any more: the check is per width, so an `i32` can
         // reach this too and naming one type would misdescribe the other.
         PANIC_DIVIDE_OVERFLOW => "integer overflow in division: MIN / -1".to_string(),
+        // Names the bound and the usual cause. `==` on a struct compares
+        // fields and recurses, and a value that reaches itself would recurse
+        // without end -- so the generated comparison counts its depth and
+        // reports this rather than running the stack out, which is an abort
+        // with no diagnostic. A legitimately deeper value hits it too, and
+        // the message says which to look for.
+        PANIC_EQ_TOO_DEEP => format!(
+            "`==` went more than {} values deep: a struct that reaches itself \
+             cannot be compared, because cycles are not detected",
+            crate::EQ_MAX_DEPTH
+        ),
         _ => format!("unknown failure (code {code})"),
     };
     report_and_exit(&reason)
