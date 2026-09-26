@@ -15,10 +15,11 @@ something does *not* work. That is the point. A limitation nothing checks can
 stop being true, or quietly get worse, without anybody finding out, and the entry
 then describes a compiler that no longer exists.
 
-One entry is already decided against: "Comparing a value that reaches itself
-aborts" is a P1 under clause 3 and is being fixed, not documented as it stands.
-It is kept because it is true of 0.2.3, and it gets rewritten — not deleted —
-when the bound lands, because a bound is itself a limitation.
+One entry was decided against and has since been fixed: "Comparing a value that
+reaches itself" was a P1 under clause 3, because it aborted. It is rewritten
+rather than deleted — a bound is itself a limitation — and it is the one entry
+here whose program no longer prints what 0.2.3 printed. The output shown is from
+the fix, on `main`.
 
 A 1.0 is allowed limitations. It is not allowed undocumented ones. This file is
 where a limitation lands so that a user meets it here rather than in their own
@@ -252,11 +253,14 @@ write through the name.
 **Tracked.** [#12](https://github.com/sinisterMage/WSharp/issues/12), closed as a
 documented limitation.
 
-## Comparing a value that reaches itself aborts
+## Comparing a value that reaches itself is refused
 
 **What.** `==` on a struct compares field by field and recurses into struct
-fields, and cycles are not detected. A cyclic value compared with anything,
-including itself, recurses until the stack is gone.
+fields, and cycles are not detected. A comparison that follows one is *bounded*
+rather than endless: past 2048 values deep it panics, naming the rule. So a
+cyclic value cannot be compared — with anything, including itself — but it is
+refused with a W# diagnostic and the runtime's panic exit status rather than
+taking the process with it.
 
 ```wsharp
 const Node = struct { next: ?Node, v: i64 };
@@ -269,42 +273,51 @@ fn main() void {
 ```
 
 ```
-thread 'main' has overflowed its stack
-fatal runtime error: stack overflow, aborting
-Aborted (core dumped)
+W# panic: `==` went more than 2048 values deep: a struct that reaches itself cannot be compared, because cycles are not detected
 ```
 
-There is no W# diagnostic and no exit status a program can act on.
+Exit status 101, the same one every W# panic exits with. A legitimately deep
+value — a chain longer than the bound, with no cycle in it — meets the same
+refusal, which is the part of this to know before nesting that deeply.
 
 **Why.** `==` on a struct is compiled into a *function* per concrete type
 (`crates/wsharp-codegen/src/equality.rs`) rather than an inline sequence,
 precisely because a type that reaches itself would otherwise expand for ever at
-compile time; the recursion moves to run time and nothing bounds it. The
-neighbouring case is caught at compile time instead: a struct with an array, a
-function or an error-union field is rejected as uncomparable with a diagnostic
-naming the field (`crates/wsharp-sema/src/infer.rs:6668`), and that reaches down
-the lattice.
+compile time; the recursion moves to run time, and what bounds it there is a
+depth carried through the generated calls against
+`wsharp_runtime::EQ_MAX_DEPTH`. Detecting the cycle itself would need a set of
+the pairs in flight, hence an allocation, hence a safepoint in the middle of
+reading two objects' fields; a counter costs one register and one compare. It is
+the shape `std/json`'s `MAX_DEPTH` and `std/x509`'s `MAX_CHAIN` already have — a
+named bound with no knob. The neighbouring case is caught at compile time
+instead: a struct with an array, a function or an error-union field is rejected
+as uncomparable with a diagnostic naming the field
+(`crates/wsharp-sema/src/infer.rs:6668`), and that reaches down the lattice.
 
-**This entry does not survive 1.0 in this form, and that is decided.** By clause
-3 of the P1 definition in `RELEASE-CRITERIA-1.0.md` — a crash with no W#
-diagnostic from a program that uses no FFI — this is a P1 rather than a
-limitation, and Johnny ruled on 2026-09-26 that clause 3 carries no exemption for
-documented behaviour: documentation changes who is surprised, not what the
-process does. The fix bounds the recursion in the generated comparison and panics
-with a W# diagnostic naming the type, in the shape of `std/json`'s `MAX_DEPTH`.
-When it lands, this entry is rewritten to describe **the bound** — comparing a
-value that reaches itself is refused with a diagnostic, at a stated depth — which
-is a limitation a user can meet and act on.
+**Disposition: fixed — and the bound is what is left, which is why this entry
+is still here.** Until the bound landed, the program above died on a signal
+with no W# diagnostic and no exit
+status a program could act on. By clause 3 of the P1 definition in
+`RELEASE-CRITERIA-1.0.md` that is a P1 whatever the documentation says — Johnny
+ruled on 2026-09-26 that clause 3 carries no exemption for documented behaviour,
+because documentation changes who is surprised, not what the process does. Form
+C says the same thing from the other side: a limitation whose behaviour is a
+crash is not documentable, so it gets bounded into a diagnostic first and the
+bound is what gets documented. This entry is that bound.
 
 **Workaround.** Do not compare values that may reach themselves; compare the
 fields you mean, or an identifier. A doubly linked list, a parent pointer and a
 graph node are all cyclic.
 
-**Tracked.** [#13](https://github.com/sinisterMage/WSharp/issues/13) — a P1,
-dispositioned **fix**, owned by Mira on WLA-3. A version of the fix exists on the
-closed PR #6 at `80efa89` (`equality.rs`, `lower.rs`,
-`tests/cases/eq_cycle_bounded.ws`); it is worth reading and still has to be held
-to Form A of the proof standard.
+**Guarded by** `tests/cases/eq_cycle_bounded.ws`, which asserts both halves —
+a 64-long chain still comparing, and answering *unequal* for two chains that
+differ only in the last node, so that a bound which refused ordinary values
+would fail the case rather than pass it; and a node whose `next` is itself
+panicking with this message.
+
+**Tracked.** [#13](https://github.com/sinisterMage/WSharp/issues/13), a P1,
+closed by the fix rather than by this entry — the entry describes what the fix
+left behind.
 
 ## A generic struct cannot have a supertype
 
