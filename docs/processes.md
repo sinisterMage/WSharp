@@ -9,11 +9,13 @@ work with both `wsharp run` and compiled executables.
 `process.run` starts a command, waits for its output, and releases the child
 process when it finishes or an error occurs.
 
+<!-- from: examples/run_command.ws -->
+
 ```wsharp
 const process = @import("std/process");
 
 fn main() i64 {
-    const cmd = process.command("wsharp", []str{ "--version" });
+    const cmd = process.command("git", []str{ "--version" });
     const output = process.run(cmd, 5000) catch return 1;
     if (!process.success(output.status)) {
         print(output.stderr);
@@ -42,7 +44,7 @@ before passing it to `run` or `spawn`:
 ```wsharp
 const process = @import("std/process");
 
-fn main() i64 {
+fn run_configured() i64 {
     var cmd = process.command("wsharp", []str{ "check", "app/main.ws", "--emit=api" });
     cmd.cwd = "/path/to/project";
     cmd.env = []process.Env{
@@ -82,7 +84,7 @@ const process = @import("std/process");
 const os = @import("std/os");
 const time = @import("std/time");
 
-fn main() i64 {
+fn supervise() i64 {
     os.catch_signals() catch return 1;
     var cmd = process.command("./app-server", []str{});
     cmd.stdout = process.Inherit;
