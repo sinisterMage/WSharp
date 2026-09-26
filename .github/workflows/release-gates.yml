@@ -20,6 +20,20 @@ on:
     # the thing and the check stays red until an unrelated push.
     types: [opened, reopened, synchronize, labeled, unlabeled]
 
+  # Criterion 7 verifies a *published* release, so it is run on request against
+  # a version that exists rather than on every pull request against the last one.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "W# version to verify, without a leading v (e.g. 0.2.3)"
+        required: true
+        type: string
+      sharpie_version:
+        description: "sharpie version to verify, or empty to skip (e.g. 0.1.2)"
+        required: false
+        default: ""
+        type: string
+
 permissions:
   contents: read
 
@@ -59,6 +73,7 @@ jobs:
   # prose; this job is what stops the count growing.
   doc-examples:
     name: documented examples (gate 6a)
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -78,6 +93,7 @@ jobs:
   # is the same split `tests/cases/modules/` has.
   examples:
     name: examples run (gate 6a)
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -133,6 +149,7 @@ jobs:
   # this gate is about.
   contributor-commands:
     name: contributor commands (gate 6d)
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -162,3 +179,66 @@ jobs:
       # working, and the unfiltered run above already ran the tests.
       - name: cargo test --workspace arithmetic --no-run
         run: cargo test --workspace arithmetic --no-run
+
+  # Criterion 7's four rows. One job per release triple, so no platform is ever
+  # claimed by inference from another platform's run -- which is what the
+  # criterion's evidence clause forbids, and the reason this is a matrix of four
+  # real machines rather than one machine and an argument.
+  #
+  # A hosted runner is a fresh VM image per job, which is the "fresh VM" half of
+  # the criterion; Linux additionally runs inside a `debian:13` container with
+  # nothing installed, because that is the closest thing here to a machine with
+  # no developer environment at all, and it is the platform where a clean image
+  # is cheap to get.
+  #
+  # Manual, with the version as an input: the gate is about a *published*
+  # release, so there is nothing to verify until one exists, and a job that ran
+  # on every pull request would be verifying the last release over and over.
+  verify-install:
+    name: clean install (criterion 7, ${{ matrix.triple }})
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      # One platform's failure must not hide the other three; the evidence is a
+      # four-row table and a cancelled job is not a row.
+      fail-fast: false
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            container: debian:13
+          - triple: x86_64-pc-windows-msvc
+            os: windows-latest
+            container: ""
+          - triple: x86_64-apple-darwin
+            os: macos-15-intel
+            container: ""
+          - triple: aarch64-apple-darwin
+            os: macos-latest
+            container: ""
+    container: ${{ matrix.container || null }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # The Debian container has neither, and the script needs both. Installed
+      # before the checkout because `actions/checkout` wants git.
+      - name: Give the clean image curl, tar and a C compiler
+        if: matrix.container != ''
+        run: |
+          apt-get update -qq
+          # gcc because `wsharp build` links with cc -- a documented prerequisite
+          # of the install rather than a convenience for this job.
+          apt-get install -y -qq --no-install-recommends \
+            ca-certificates curl tar gzip git gcc libc6-dev
+          ln -sf "$(command -v gcc)" /usr/local/bin/cc
+
+      - uses: actions/checkout@v4
+
+      - name: Verify the W# install
+        run: bash scripts/verify-install.sh "${{ inputs.version }}" "${{ matrix.triple }}"
+
+      - name: Verify the sharpie install
+        if: inputs.sharpie_version != ''
+        run: bash scripts/verify-install.sh "${{ inputs.sharpie_version }}" "${{ matrix.triple }}" --tool sharpie
