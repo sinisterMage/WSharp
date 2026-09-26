@@ -929,3 +929,17 @@ What is left, and where it plugs in, is in [ROADMAP.md](ROADMAP.md).
 Conventions and the invariants worth not breaking are in
 [CLAUDE.md](CLAUDE.md). The documentation is at
 [wsharp.io](https://wsharp.io).
+
+### The road to 1.0
+
+Four documents govern it, and each has one job:
+
+| File | Answers |
+|---|---|
+| [RELEASE-CRITERIA-1.0.md](RELEASE-CRITERIA-1.0.md) | What 1.0 has to be true of, how each thing is measured, who owns it, and what proof closes it |
+| [COMPATIBILITY.md](COMPATIBILITY.md) | What 1.0 promises not to break, surface by surface, and for how long |
+| [LIMITATIONS.md](LIMITATIONS.md) | What W# does not do, with a workaround or the word *None* |
+| [docs/defects.md](docs/defects.md) | Where a defect lands, what severity it gets, and what happens to it after that |
+
+Severity and "breaking change" are defined once, in Part one of the release
+criteria; the other three cite it rather than restating it.
