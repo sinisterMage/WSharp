@@ -1,0 +1,8 @@
+error: cannot tell what type `main` is being used at
+   --> tests/cases/err_unpinned_generic.ws:13:1
+   |
+13 | fn main() i64 {
+   | ^^^^^^^^^^^^^^^ this involves the unresolved type `[]_`
+   |
+   = help: add a type annotation at the call site so the generic function can be specialised
+exit 1

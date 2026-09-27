@@ -1,0 +1,8 @@
+error: `secret` is private to the module that declares it
+  --> tests/cases/err_reexport_private.ws:7:26
+  |
+7 | pub const secret = inner.secret;
+  |                          ^^^^^^
+  |
+  = help: everything is private unless it says otherwise; write `pub` in front of `secret` to let other modules name it
+exit 1

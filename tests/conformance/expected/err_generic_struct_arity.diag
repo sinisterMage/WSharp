@@ -1,0 +1,15 @@
+error: `Pair` takes 2 type arguments, but 1 were given
+  --> tests/cases/err_generic_struct_arity.ws:3:9
+  |
+3 | fn f(p: Pair[i64]) i64 { return p.second; }
+  |         ^^^^^^^^^
+  |
+  = help: write it as `Pair[T, U]`
+error: cannot tell which type the field `second` belongs to
+  --> tests/cases/err_generic_struct_arity.ws:3:35
+  |
+3 | fn f(p: Pair[i64]) i64 { return p.second; }
+  |                                   ^^^^^^
+  |
+  = help: W# resolves fields by the object's declared type -- annotate the parameter, e.g. `fn f(p: Point)`
+exit 1

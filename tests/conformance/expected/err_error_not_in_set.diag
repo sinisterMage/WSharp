@@ -1,0 +1,15 @@
+error: `error.Zero` is not one of `{Negative}`
+  --> tests/cases/err_error_not_in_set.ws:4:26
+  |
+4 |     if (n == 0) { return error.Zero; }
+  |                          ^^^^^^^^^^
+  |
+  = help: the error set here is written down, so it says exactly what may be raised -- add this name to it, or raise one it already has
+error: this raises `{Other}`, which this function cannot
+   --> tests/cases/err_error_not_in_set.ws:11:43
+   |
+11 | fn narrow(n: i64) !{Negative}i64 { return try raises(n); }
+   |                                           ^^^^^^^^^^^^^
+   |
+   = help: this function's error set is `{Negative}`; widen it, or catch what it does not cover
+exit 1

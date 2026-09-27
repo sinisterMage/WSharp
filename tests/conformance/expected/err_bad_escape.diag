@@ -1,0 +1,8 @@
+error: unknown escape sequence
+  --> tests/cases/err_bad_escape.ws:4:15
+  |
+4 |     print("tab/q");
+  |               ^^ not a recognised escape
+  |
+  = help: valid escapes are /n /t /r /0 // /"
+exit 1

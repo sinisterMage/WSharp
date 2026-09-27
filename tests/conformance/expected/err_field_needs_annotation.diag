@@ -1,0 +1,8 @@
+error: cannot tell which type the field `x` belongs to
+  --> tests/cases/err_field_needs_annotation.ws:3:23
+  |
+3 | fn getx(p) { return p.x; }
+  |                       ^
+  |
+  = help: W# resolves fields by the object's declared type -- annotate the parameter, e.g. `fn f(p: Point)`
+exit 1

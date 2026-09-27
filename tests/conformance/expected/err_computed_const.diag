@@ -1,0 +1,15 @@
+error: a top-level `const` must be a literal or a `fn`
+   --> tests/cases/err_computed_const.ws:20:11
+   |
+20 | const N = 2 + 3;
+   |           ^^^^^
+   |
+   = help: computed globals need a startup initialiser, which W# does not have yet -- move the computation into a function
+error: a top-level `const` must be a literal or a `fn`
+   --> tests/cases/err_computed_const.ws:21:11
+   |
+21 | const M = double(2);
+   |           ^^^^^^^^^
+   |
+   = help: computed globals need a startup initialiser, which W# does not have yet -- move the computation into a function
+exit 1

@@ -1,0 +1,15 @@
+error: a top-level `const` array may not hold `str`
+   --> tests/cases/err_const_array_bad.ws:10:15
+   |
+10 | const NAMES = []str{ "a", "b" };
+   |               ^^^^^^^^^^^^^^^^^
+   |
+   = help: it lives in the data section, which the collector never traces -- so its elements must be numbers or booleans, never anything holding a reference
+error: every element of a top-level `const` array must be a `i64` literal
+   --> tests/cases/err_const_array_bad.ws:11:25
+   |
+11 | const COMPUTED = []i64{ 1 + 1 };
+   |                         ^^^^^
+   |
+   = help: there is no startup initialiser to compute one in -- move the computation into a function
+exit 1

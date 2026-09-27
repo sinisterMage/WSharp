@@ -1,0 +1,8 @@
+error: this raises `{Two}`, which this function cannot
+   --> tests/cases/err_reraise_too_wide.ws:12:40
+   |
+12 |     return risky(n) catch |e| { return e; };
+   |                                        ^
+   |
+   = help: this function's error set is `{One}`; widen it, or catch what it does not cover
+exit 1

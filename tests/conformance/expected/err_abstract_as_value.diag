@@ -1,0 +1,15 @@
+error: `Number` is an abstract type: it classifies values for dispatch and cannot itself be one
+  --> tests/cases/err_abstract_as_value.ws:5:20
+  |
+5 | fn half(x: Number) Number {
+  |                    ^^^^^^
+  |
+  = help: write it as a whole parameter's type, as in `fn f(x: Number)`, and name a concrete type such as `i64` everywhere else
+error: `Number` is an abstract type: it classifies values for dispatch and cannot itself be one
+  --> tests/cases/err_abstract_as_value.ws:6:15
+  |
+6 |     const n = Number;
+  |               ^^^^^^
+  |
+  = help: write it as a whole parameter's type, as in `fn f(x: Number)`, and name a concrete type such as `i64` everywhere else
+exit 1

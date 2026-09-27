@@ -1,0 +1,8 @@
+error: no overload of `render` accepts (str)
+  --> tests/cases/err_no_matching_overload.ws:9:24
+  |
+9 | fn main() i64 { return render("not a status"); }
+  |                        ^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = help: `render` has 2 overloads; one of them must accept every argument
+exit 1

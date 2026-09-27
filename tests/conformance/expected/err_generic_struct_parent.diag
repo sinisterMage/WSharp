@@ -1,0 +1,8 @@
+error: a generic struct cannot have a supertype
+  --> tests/cases/err_generic_struct_parent.ws:3:25
+  |
+3 | const Sub = struct[T] : Base { value: T };
+  |                         ^^^^
+  |
+  = help: give the subtype concrete fields, or drop the type parameters
+exit 1

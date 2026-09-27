@@ -1,0 +1,15 @@
+error: `helper` is private to the module that declares it
+  --> tests/cases/err_private_name.ws:6:19
+  |
+6 |     print_int(vis.helper());
+  |                   ^^^^^^
+  |
+  = help: everything is private unless it says otherwise; write `pub` in front of `helper` to let other modules name it
+error: `STEP` is private to the module that declares it
+  --> tests/cases/err_private_name.ws:7:16
+  |
+7 |     return vis.STEP;
+  |                ^^^^
+  |
+  = help: everything is private unless it says otherwise; write `pub` in front of `STEP` to let other modules name it
+exit 1

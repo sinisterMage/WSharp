@@ -1,0 +1,8 @@
+error: `9007199254740993` is not exactly an `f64`
+  --> tests/cases/err_float_literal_inexact.ws:7:20
+  |
+7 |     const a: f64 = 9007199254740993;
+  |                    ^^^^^^^^^^^^^^^^
+  |
+  = help: an `f64` holds every integer up to 2^53 and only some above it -- write the value this rounds to if that is what you meant
+exit 1

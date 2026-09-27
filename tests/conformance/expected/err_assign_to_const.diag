@@ -1,0 +1,8 @@
+error: cannot assign to `x`, which is `const`
+  --> tests/cases/err_assign_to_const.ws:2:30
+  |
+2 | fn main() i64 { const x = 1; x = 2; return x; }
+  |                              ^
+  |
+  = help: declare it with `var` to make it mutable
+exit 1

@@ -1,0 +1,6 @@
+error: type mismatch: this return value has type `bool`, expected `i64`
+  --> tests/cases/err_type_mismatch.ws:2:24
+  |
+2 | fn main() i64 { return true; }
+  |                        ^^^^
+exit 1

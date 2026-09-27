@@ -93,28 +93,35 @@ leaving the case unblessed — and it refuses a case whose snapshot and whose
 `// error:` header no longer describe the same refusal, because that is the one
 finding a reviewer skimming a bless diff would not notice.
 
-**`expected/` is empty in this commit, and that is a stated limitation rather
-than an oversight.** Nobody on this campaign has a machine that can build W# —
-no `rustc`, no `cargo`, no `cc` — so no snapshot here would be a snapshot anyone
-had seen the compiler produce. Committing sixty-four guessed diagnostics would
-produce sixty-four failures on the first real run that looked like compiler
-defects and were typing mistakes.
+**`expected/` holds 62 snapshots, blessed from the first real `conformance`
+job's artifact, not from a local build.** Nobody on this campaign has a machine
+that can build W# — no `rustc`, no `cargo`, no `cc` — so guessed diagnostics
+would have produced failures on the first real run that looked like compiler
+defects and were typing mistakes. What happened instead: the first run of the
+`conformance` job (dispatched manually on 2026-09-27, run `36296023948`) exited
+3 and uploaded every diagnostic it *would* have pinned as
+`conformance-<triple>/diffs/*.proposed.diag`; the snapshots here are those
+bytes, normalised (see below) and committed. They came from four independent
+triples and, after normalisation, were **byte-identical on all four** — which is
+itself the first evidence that a diagnostic is a platform-independent claim.
 
-What happens instead: the nightly `conformance` job exits 3 and uploads every
-diagnostic it *would* have pinned as
-`conformance-<triple>/diffs/*.proposed.diag`. The bless commit is made from that
-artifact, reviewed like any other diff, by someone who does not need a local
-toolchain on four platforms. Until it lands, the compiler subject's soak row
-reads `fail` — see `soak/README.md` — because criterion 5 genuinely is not met
-while this gate cannot be answered.
+Two things remain un-blessed and are the gate's current red rows: the four
+`err_ffi_*` cases report `NOSPAN` (their `-->` names a line of `std/ffi`, not of
+the user's file — filed as [#37](https://github.com/sinisterMage/WSharp/issues/37)),
+and they are deliberately not blessed, because pinning a diagnostic that points
+at the wrong file would pin the defect as correct. The compiler subject's soak
+row reads `fail` while any case is `NOSPAN` — because criterion 5 genuinely is
+not met while that is true.
 
 ## What this suite does not cover
 
 Written here rather than left in anyone's head.
 
-- **Nothing is blessed yet.** See above. Today this suite proves that the
-  comparison works, not that any W# diagnostic is correct.
-- **Only the 64 cases in `tests/cases` whose header carries `// error:`.** It
+- **The four `err_ffi_*` cases are `NOSPAN` and un-blessed.** Their `-->` names
+  a line of `std/ffi`, not of the user's file, so there is no span to pin; this
+  is [#37](https://github.com/sinisterMage/WSharp/issues/37) and the gate is
+  correctly red while it stands.
+- **Only the 66 cases in `tests/cases` whose header carries `// error:`.** It
   adds no new rejection cases. The gaps in what the language refuses are still
   gaps; this pins the refusals that exist.
 - **`check` is the snapshot's subject.** `run`'s stderr is compared with
@@ -128,10 +135,15 @@ Written here rather than left in anyone's head.
 - **The `// panic:` cases are not here.** A runtime panic is not a diagnostic;
   it is stderr from a program that compiled, and `cases.rs` holds it to its
   substring. Pinning panic text is a separate piece of work.
-- **Three things are normalised away** and are therefore not checked: a
-  `W# gc:` statistics line, `/tmp/...` paths, and `\` rewritten to `/` so the
-  Windows runner compares against the same snapshot. Nothing else is normalised
-  — every caret column is compared.
+- **Four things are normalised away** and are therefore not checked: a
+  `W# gc:` statistics line, `/tmp/...` paths, `\` rewritten to `/` so the
+  Windows runner compares against the same snapshot, and the C library's
+  `strerror` words in an `(os error N)`. The errno is kept — `ENOENT` against
+  `EACCES` still differs — but the sentence in front of it is the platform's,
+  and the first real run had the four triples disagree on nothing but that
+  string (`err_import_missing_file`: Linux says "No such file or directory",
+  Windows says "The system cannot find the file specified."). Nothing else is
+  normalised — every caret column is compared.
 - **`--gc-stress` changes nothing here and is accepted anyway.** A program
   refused at compile time never allocates. The flag is plumbed through so that
   if a diagnostic ever *did* depend on it, the run that noticed would be this

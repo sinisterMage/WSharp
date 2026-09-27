@@ -1,0 +1,18 @@
+error: `Point` is declared more than once
+   --> tests/cases/err_reexport_clash.ws:12:11
+   |
+12 | pub const Point = inner.Point;
+   |           ^^^^^
+   |
+   = help: only functions may share a name, as an overload set
+error: `norm2` is declared more than once
+   --> tests/cases/err_reexport_clash.ws:15:11
+   |
+15 | pub const norm2 = inner.norm2;
+   |           ^^^^^
+   |
+14 | fn norm2(n: i64) i64 { return n; }
+   |    ^^^^^ first declared here
+   |
+   = help: only functions may share a name, as an overload set
+exit 1
