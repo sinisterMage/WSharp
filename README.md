@@ -743,19 +743,32 @@ APIs needing those shapes. The real C fixture in
 purpose: one of them has to work on a machine with no network and no store, and
 the other is the thing that fills the store.
 
+Start in an empty directory. This local example needs no registry or server;
+it creates both packages before resolving their dependency:
+
 ```sh
-ingot init myapp                    # write an ingot.toml here
-ingot add acme/json                 # record a dependency, from the registry
-ingot add util --path ../util       # or on a directory
-ingot resolve                       # choose versions and write ingot.lock
-ingot install                       # make the store satisfy it
-ingot verify                        # 0 ready, 1 install, 2 resolve, 3 broken
-ingot why core                      # the paths that pulled it in
+mkdir -p util/src myapp/src
+ingot -C util init util
+cat > util/src/util.ws <<'WS'
+pub fn twice(n: i64) i64 { return n * 2; }
+WS
+ingot -C myapp init myapp
+ingot -C myapp add util --path ../util
+ingot -C myapp resolve
+ingot -C myapp install
+ingot -C myapp verify
+cat > myapp/src/myapp.ws <<'WS'
+const util = @import("util");
+fn main() i64 { print(util.twice(21)); return 0; }
+WS
+wsharp run myapp/src/myapp.ws        # prints 42
+ingot -C myapp why util
 ```
 
 Resolving, installing and building are separate verbs: nothing compiles because
 something else was fetched. Output is tab-separated, `verify` answers with its
-exit status, and a conflict comes back as the derivation that caused it:
+exit status, and a conflict comes back as the derivation that caused it.
+The following diagnostic uses illustrative package names and versions:
 
 ```
 Because no versions of core match >=2.0.0 <3.0.0 and util 0.3.0 depends on
@@ -781,8 +794,8 @@ the registry - [Foundry](https://github.com/sinisterMage/Foundry), an index of
 plain TOML in a git repository, in the shape of Julia's General:
 
 ```sh
-ingot add acme/json          # the newest published version, as a caret
-ingot search json            # what is published
+ingot search postgres        # inspect published packages
+ingot add postgres/client   # the newest published version, as a caret
 ingot update                 # fetch the index again
 ```
 
