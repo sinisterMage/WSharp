@@ -812,7 +812,7 @@ one mechanism and one artefact, or one script per repository, is two things that
 can be separately missing. Twelve of the fourteen are written; two are not,
 and are named here so that they are owed rather than assumed.
 
-**Read against `main` at `6c0cce3`, and held to the tree by
+**Read against `main` at `4e9249a`, and held to the tree by
 `scripts/gate-table-check.sh` on every pull request.** This table claims which
 files exist, which is a claim that goes stale on any merge that adds one — and
 did, within twenty minutes of revision 2, on six of ten rows. So it carries the

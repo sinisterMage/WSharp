@@ -43,3 +43,25 @@ main documentation, before claiming criterion 4 met.
 The state table has twelve written checks and two unwritten checks. Its
 checker still validates eleven of fourteen rows: writing this gate changes
 a verdict, not the number of rows whose paths can be checked.
+
+## Passing live acceptance on 2026-09-27
+
+PR #58 merged as main `4e9249a6850f9721db13dbd61c63c57250eced11`
+after the approved head and current protected-branch check requirements were
+verified. GitHub automatically closed #47; its `v1.0-limitation` label remains.
+The merged `LIMITATIONS.md` includes its documented disposition.
+
+After integrating that main commit into PR #45, these commands passed:
+
+~~~sh
+bash scripts/tests/followups-check.test.sh # exit 0; 19 checks
+bash scripts/tests/gate-table-check.test.sh # exit 0; 18 checks
+env -u FOLLOWUPS_FETCH bash scripts/followups-check.sh # exit 0
+bash scripts/gate-table-check.sh # exit 0; 11 of 14 rows checked
+~~~
+
+The live run used managed GH_TOKEN and the unchanged main documentation. It
+reported `CRITERION 4 MET: 7 of 7 subjects resolved or documented.` This
+supersedes the historical open-#47 result above. It is criterion 4 evidence,
+not clean-install evidence. Final PR-head CI and Johnny's review remain
+separate requirements. No release or publishing action was performed.
