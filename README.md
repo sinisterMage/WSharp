@@ -149,8 +149,9 @@ have rather than only the part the supertype declares. A field an `==` cannot
 compare - an array, a function, an error union - makes the struct
 uncomparable, and the compiler says which field. Aliased structs still compare
 their fields, so a struct containing NaN is unequal even to itself. Cycles are
-not detected: a comparison that follows a cycle recurses indefinitely,
-including a cyclic value compared with itself.
+not detected, but they are bounded: a comparison that follows one recurses
+until a fixed depth and then panics, naming the rule - so a value that reaches
+itself is refused rather than running the stack out.
 
 `!T` says *which* errors: the set is inferred from what a function raises and
 propagates, or written down and checked. So the `e` bound by `catch |e|` is
