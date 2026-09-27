@@ -227,30 +227,36 @@ done
 # So do not assume a spelling: drop a marker in WORK and ask `find` where it
 # is. Whatever directory the walk reports it in is WORK as the walk sees it.
 readonly WORK_MARKER=".verify-install-work-$$"
-: > "$WORK/$WORK_MARKER"
+: > "$WORK/$WORK_MARKER" || die "5. cannot create scratch marker"
 
 PRUNE_PATHS=("$WORK")
+# Command substitution in a here-document hides find's exit status. Capture
+# it explicitly: a partial walk is not evidence of a clean install.
+if ! markers="$(find "${MANIFEST_ROOTS[@]}" -name "$WORK_MARKER" -type f)"; then
+  die "5. cannot discover scratch aliases"
+fi
 while IFS= read -r marker; do
   [ -n "$marker" ] || continue
   alias_path="$(dirname "$marker")"
   [ "$alias_path" = "$WORK" ] || PRUNE_PATHS+=("$alias_path")
 done <<EOF
-$(find "${MANIFEST_ROOTS[@]}" -name "$WORK_MARKER" -type f 2>/dev/null)
+$markers
 EOF
 
 take_manifest() {
-  # Exclude WORK under every spelling the walk may use, and the noisiest
-  # caches. `-prune` rather than a grep, so a large cache is not walked at all.
+  # Exclude only WORK under every spelling the walk may use. Directory names
+  # cannot prove who wrote a file: caches and repositories remain observable.
   local expr=() p
   for p in "${PRUNE_PATHS[@]}"; do
-    expr+=(-path "$p" -o)
+    [ "${#expr[@]}" -eq 0 ] || expr+=(-o)
+    expr+=(-path "$p")
   done
-  expr+=(-name '.cache' -o -name '.npm' -o -name '.git')
   find "${MANIFEST_ROOTS[@]}" \( "${expr[@]}" \) -prune \
-    -o -print 2>/dev/null | LC_ALL=C sort
+    -o -print | LC_ALL=C sort
 }
 
-take_manifest > "$WORK/manifest.before"
+take_manifest > "$WORK/manifest.before" \
+  || die "5. cannot inspect filesystem before install"
 ok "5. filesystem manifest taken before the install ($(wc -l <"$WORK/manifest.before" | tr -d ' ') paths)"
 
 # ---------------------------------------------------------------------------
@@ -280,6 +286,11 @@ profile_state > "$WORK/profiles.before"
 # strips the leading slash with a warning that is easy to miss.
 # ---------------------------------------------------------------------------
 
+# Process substitution would hide a partial/failed tar listing. Inspect the
+# complete list successfully before considering any extraction.
+if ! tar tzf "$TARBALL" > "$WORK/archive.members"; then
+  die "3. cannot inspect archive members"
+fi
 escapes=0
 while IFS= read -r member; do
   case "$member" in
@@ -287,12 +298,12 @@ while IFS= read -r member; do
     *../*) escapes=$((escapes + 1)); info "parent reference in archive: $member" ;;
     ../*)  escapes=$((escapes + 1)); info "parent reference in archive: $member" ;;
   esac
-done < <(tar tzf "$TARBALL")
+done < "$WORK/archive.members"
 
 if [ "$escapes" -eq 0 ]; then
   ok "3. every archive member is a relative path under the prefix"
 else
-  fail "3. the archive carries $escapes path(s) that would escape the prefix"
+  die "3. refusing to extract: archive carries $escapes path(s) that would escape the prefix"
 fi
 
 if tar xzf "$TARBALL" -C "$PREFIX" 2>"$WORK/tar.err"; then
@@ -392,10 +403,13 @@ fi
 # 5b. Nothing was created outside the prefix.
 # ---------------------------------------------------------------------------
 
-take_manifest > "$WORK/manifest.after"
+take_manifest > "$WORK/manifest.after" \
+  || die "5. cannot inspect filesystem after install"
 
-if new_paths="$(comm -13 "$WORK/manifest.before" "$WORK/manifest.after")" \
-   && [ -z "$new_paths" ]; then
+if ! new_paths="$(comm -13 "$WORK/manifest.before" "$WORK/manifest.after")"; then
+  die "5. cannot compare filesystem manifests"
+fi
+if [ -z "$new_paths" ]; then
   ok "5. nothing was created outside the prefix"
 else
   fail "5. the install created $(echo "$new_paths" | grep -c .) path(s) outside the prefix"
