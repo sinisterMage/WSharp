@@ -523,13 +523,10 @@ pub(crate) fn clear_poll(worker: &Worker) {
     set_shared(&ws_gc_poll_flag, &POLL_COUNT, &worker.mark.wanted, false);
 }
 
-/// Whether *this* worker was the one asking, clearing its request if so.
-pub(crate) fn take_safepoint_request(worker: &Worker) -> bool {
-    if !worker.mark.wanted.load(Ordering::Acquire) {
-        return false;
-    }
-    clear_poll(worker);
-    true
+/// Whether this worker has a pending pause. Observing it consumes nothing:
+/// the collector may not have published the phase that services it yet.
+pub(crate) fn wants_a_pause(worker: &Worker) -> bool {
+    worker.mark.wanted.load(Ordering::Acquire)
 }
 
 pub(crate) fn poll_wanted() -> bool {

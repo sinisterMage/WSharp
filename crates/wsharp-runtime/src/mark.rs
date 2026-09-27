@@ -621,10 +621,11 @@ fn mark_concurrently() {
         s.remembered = remembered;
     }
     if completed {
-        // Phase first, poll second: the mutator checks the phase when the poll
-        // fires, and must find the pause wanted.
-        set_phase(Phase::MarkDone);
+        // Soundness boundary: a visible pause phase must already own its poll
+        // request. Allocation and trace builtins service the phase directly;
+        // publishing it first lets them finish before the request is raised.
         gc::request_safepoint(me());
+        set_phase(Phase::MarkDone);
     }
 }
 
@@ -645,8 +646,9 @@ fn evacuate_concurrently() {
         with_buffers(|buffers| buffers.to_scan.append(&mut copies));
     }
     gc::note_moved(me(), moved);
-    set_phase(Phase::EvacDone);
+    // The same request-before-phase invariant as the marking pause.
     gc::request_safepoint(me());
+    set_phase(Phase::EvacDone);
 }
 
 /// Mark everything reachable from `work`, noting every reference into a block
