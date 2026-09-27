@@ -502,6 +502,15 @@ pub fn evacuating_flag_address() -> usize {
     &ws_gc_evacuating_flag as *const AtomicU8 as usize
 }
 
+// Test scheduler probes the future serialization boundary.
+#[cfg(test)]
+static SHARED_TRANSITION: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_SHARED_COUNT: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
 /// Raise or lower one worker's contribution to a shared flag.
 fn set_shared(flag: &AtomicU8, count: &AtomicUsize, own: &AtomicBool, on: bool) {
     if own.swap(on, Ordering::AcqRel) == on {
@@ -512,6 +521,12 @@ fn set_shared(flag: &AtomicU8, count: &AtomicUsize, own: &AtomicBool, on: bool) 
     } else {
         count.fetch_sub(1, Ordering::AcqRel) - 1
     };
+    #[cfg(test)]
+    AFTER_SHARED_COUNT.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     flag.store(u8::from(now != 0), Ordering::Release);
 }
 
@@ -664,3 +679,7 @@ mod tests {
         assert!(!poll_wanted());
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/cases/runtime_shared_aggregate.rs"]
+mod aggregate_tests;
