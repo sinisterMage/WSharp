@@ -14,12 +14,14 @@
 # would make the median change wait three hours and would spend a runner-day per
 # push. So the split is:
 #
-#   ci.yml       every push and PR     the suite, the lints, and
-#                                      `tests/harness/selftest.sh` -- seconds,
-#                                      no cargo, and it is what keeps the
+#   ci.yml       every push and PR     the suite, the lints, and the two
+#                                      harness selftests (`selftest.sh`,
+#                                      `conform-selftest.sh`) -- seconds, no
+#                                      cargo, and they are what keep the
 #                                      harness's own verdict logic honest
-#   nightly.yml  03:00 UTC daily       parity on four triples, the fuzz corpus,
-#                                      the pause measurements
+#   nightly.yml  03:00 UTC daily       parity on four triples, conformance on
+#                                      four triples, the fuzz corpus, the pause
+#                                      measurements
 #
 # The decision that matters is the one in the middle: the *harness* is tested on
 # every pull request even though the *corpus* is not. A change that breaks
@@ -150,6 +152,97 @@ jobs:
         if: always()
         run: cat target/harness/parity/report.md >>"$GITHUB_STEP_SUMMARY" || true
 
+  # --- criterion 5: what the language refuses, and in what words -------------
+  #
+  # `parity.sh` above pins what W# *accepts* -- three execution modes agreeing
+  # about stdout and exit status. This pins what it *refuses*: the whole rendered
+  # diagnostic for every case in `tests/cases` whose header says it must not
+  # compile, byte for byte, message and `-->` location and caret columns and
+  # `= help:` line. A conformance suite that only checked accepted programs
+  # would let the compiler start accepting nonsense, or start pointing at the
+  # wrong line, with nothing going red.
+  #
+  # **A job of its own rather than a step in `parity`**, at the cost of a second
+  # build per triple. Three reasons, and they are all about not masking a result:
+  # `conform.sh` exits 3 for "no snapshots committed, so this cannot be
+  # answered", which is a different sentence from parity's "the modes
+  # disagreed"; a conformance failure must not stop a three-hour parity run from
+  # starting; and the first scheduled run of this job is *expected* to fail with
+  # exit 3 until the bless commit lands, which must not take parity down with it.
+  #
+  # **All four triples, because a diagnostic is a platform-independent claim
+  # that has never been checked as one.** The rendered form is built from a byte
+  # offset and a line index, so the same program should refuse identically
+  # everywhere. If it does not, the difference is the finding.
+  conformance:
+    name: conformance (${{ matrix.triple }})
+    runs-on: ${{ matrix.os }}
+    # Minutes, not hours: `wsharp check` over the 64 rejection cases twice is
+    # seconds. The budget is the build.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+            cc: cc
+          - os: macos-latest
+            triple: aarch64-apple-darwin
+            cc: cc
+          - os: macos-15-intel
+            triple: x86_64-apple-darwin
+            cc: cc
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            cc: clang
+    defaults:
+      run:
+        shell: bash
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Remove the link.exe that is not a linker
+        if: runner.os == 'Windows'
+        run: rm -f "/c/Program Files/Git/usr/bin/link.exe"
+
+      - name: Set up the MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install GNU coreutils
+        if: runner.os == 'macOS'
+        run: brew install coreutils
+
+      - name: Build the compiler and the runtime archive
+        run: cargo build --workspace --locked
+
+      - name: Every rejection, pinned to its exact diagnostic
+        id: conform
+        run: |
+          WSHARP_HARNESS_REPORTS="$PWD/target/harness" \
+            tests/harness/conform.sh --timeout 120
+
+      # `always()`, and this is the step that makes the first night actionable
+      # rather than merely red. On exit 3 the run has printed every diagnostic
+      # it would have pinned, into `diffs/*.proposed.diag`. Uploading them means
+      # the bless commit can be made from this artifact, by someone who cannot
+      # build W# on their own machine, instead of requiring a local toolchain on
+      # four platforms.
+      - name: Upload the conformance report and any proposed snapshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-${{ matrix.triple }}
+          path: target/harness/conformance
+          if-no-files-found: error
+
+      - name: Summarise
+        if: always()
+        run: cat target/harness/conformance/report.md >>"$GITHUB_STEP_SUMMARY" || true
+
   # --- criterion 5, clauses 2 and 3: the full night on Linux -----------------
   nightly:
     name: nightly (x86_64-unknown-linux-gnu)
@@ -228,13 +321,20 @@ jobs:
 
   # --- criterion 1: the compiler subject's daily row -------------------------
   #
-  # Appended after the two jobs above have said what happened, so the row
+  # Appended after the three jobs above have said what happened, so the row
   # records the night's actual verdict. A row is written whether the night
   # passed or failed -- criterion 1 asks whether the subject *reported*, and a
   # failure that went unrecorded reads as a soak that stopped.
+  #
+  # **Conformance counts toward the verdict**, which means the compiler subject
+  # reports `fail` on every night until the conformance snapshots are blessed
+  # and committed. That is the accurate reading: criterion 5 is not met while a
+  # gate cannot be answered, and a row that said `ok` on the strength of a
+  # comparison against nothing would be the exact failure this suite is built to
+  # stop. See `tests/conformance/README.md`.
   soak-row:
     name: soak row
-    needs: [parity, nightly]
+    needs: [parity, conformance, nightly]
     if: always() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
     permissions:
@@ -249,16 +349,18 @@ jobs:
         env:
           NIGHT: ${{ needs.nightly.result }}
           PARITY: ${{ needs.parity.result }}
+          CONFORM: ${{ needs.conformance.result }}
         run: |
           verdict=fail
-          if [ "$NIGHT" = "success" ] && [ "$PARITY" = "success" ]; then
+          if [ "$NIGHT" = "success" ] && [ "$PARITY" = "success" ] &&
+             [ "$CONFORM" = "success" ]; then
             verdict=ok
           fi
           scripts/soak-report.sh --append \
             --subject compiler --verdict "$verdict" \
             --commit "$GITHUB_SHA" \
             --platform x86_64-unknown-linux-gnu \
-            --detail "nightly=$NIGHT parity=$PARITY run=$GITHUB_RUN_ID"
+            --detail "nightly=$NIGHT parity=$PARITY conformance=$CONFORM run=$GITHUB_RUN_ID"
           cp soak/compiler.tsv "$RUNNER_TEMP/row.tsv"
 
       # The log lives on a branch of its own. **Not `main`**: a scheduled job
