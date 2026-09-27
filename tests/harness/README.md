@@ -20,7 +20,7 @@ nix-shell --run "cargo build --workspace"
 | `selftest.sh` | does the harness report what actually happened? | seconds, **no compiler needed** |
 | `conform-selftest.sh` | can the conformance gate tell a rotted diagnostic from an intact one? | seconds, **no compiler needed** |
 | `parity.sh` | do the three execution modes agree, per case? | 1-3 h for the corpus on one core |
-| `conform.sh` | does every refusal still print the same diagnostic, span and help line? | seconds for the 64 rejection cases |
+| `conform.sh` | does every refusal still print the same diagnostic, span and help line? | seconds for the 66 rejection cases |
 | `fuzz.pl` | does arbitrary input crash or hang the front end or a stdlib parser? | bounded by `--max-seconds` |
 | `flake-rate.sh` | how often does one case do something different, and how long does it take when it does? | attempts × the case |
 | `gc-pauses.sh` | how long does the collector stop the program for? | ~10 min for `gc_*` at 5 repeats |
@@ -407,6 +407,6 @@ A suite's limits belong where somebody reading its green run will see them.
 - **`conform.sh` has no snapshots committed yet**, so today it proves the
   comparison works rather than that any W# diagnostic is correct: it exits 3,
   "cannot answer", until a bless commit lands. It also adds no new rejection
-  cases - it pins the 64 that exist - and does not cover warnings, `// panic:`
+  cases - it pins the 66 that exist - and does not cover warnings, `// panic:`
   text, `build`, or any multi-file diagnostic. `tests/conformance/README.md` is
   the full list.
