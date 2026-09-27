@@ -47,6 +47,14 @@ if [ "$FAULT" = leak ] && [ "$1" = xzf ]; then
 fi
 if [ "$1" = xzf ]; then
   case "$FAULT" in
+    host-write)
+      # A sibling of the verifier writes strictly between manifest snapshots.
+      printf 'write\n' > "$FIXTURE/request"
+      read -r acknowledged < "$FIXTURE/ack"
+      [ "$acknowledged" = written ] || exit 4;;
+    transient-leak)
+      # A child writes through an absolute path, then removes the file.
+      bash -c ': > "$1"; rm "$1"' _ "$HOME/outside-prefix";;
     cache-leak) : > "$HOME/.cache/outside-prefix";;
     npm-leak) : > "$HOME/.npm/outside-prefix";;
     git-leak) : > "$HOME/project/.git/outside-prefix";;
@@ -64,14 +72,38 @@ SH
 done
 chmod +x "$TEST/bin/"*
 failures=0
-for fault in clean leak cache-leak npm-leak git-leak marker before after sort comm fetch archive-list archive-path; do
+faults=(clean leak cache-leak npm-leak git-leak marker before after sort comm fetch archive-list archive-path)
+# Opt-in acceptance probe: intentionally red until attribution is implemented.
+if [ "${VERIFY_INSTALL_ATTRIBUTION_PROBE:-0}" = 1 ]; then
+  faults+=(host-write transient-leak)
+fi
+for fault in "${faults[@]}"; do
   rm -f "$TEST/count" "$TEST/home/outside-prefix" "$TEST/extracted" \
     "$TEST/home/.cache/outside-prefix" "$TEST/home/.npm/outside-prefix" \
     "$TEST/home/project/.git/outside-prefix"
+  writer_pid=
+  if [ "$fault" = host-write ]; then
+    mkfifo "$TEST/request" "$TEST/ack"
+    (
+      read -r request < "$TEST/request"
+      [ "$request" = write ] || exit 4
+      : > "$TEST/home/outside-prefix"
+      printf 'written\n' > "$TEST/ack"
+    ) &
+    writer_pid=$!
+  fi
   status=0
   env HOME="$TEST/home" TMPDIR="$TEST/tmp" PATH="$TEST/bin:$PATH" FAULT="$fault" \
     bash "$SCRIPT" 0.1.2 x86_64-unknown-linux-gnu --tool sharpie > "$TEST/out" 2>&1 || status=$?
+  if [ -n "$writer_pid" ]; then
+    # Do not leave the sibling waiting if extraction was never reached.
+    kill "$writer_pid" 2>/dev/null || true
+    wait "$writer_pid" 2>/dev/null || true
+    rm "$TEST/request" "$TEST/ack"
+  fi
   case "$fault" in
+    host-write) pattern='checks, all passed'; expected=0;;
+    transient-leak) pattern='outside the prefix'; expected=1;;
     clean) pattern='checks, all passed'; expected=0;;
     leak|cache-leak|npm-leak|git-leak) pattern='path(s) outside the prefix'; expected=1;;
     marker) pattern='FATAL 5. cannot discover scratch aliases'; expected=3;;

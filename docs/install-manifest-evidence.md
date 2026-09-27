@@ -125,3 +125,43 @@ validated isolation boundary or process-attributed write collection. That
 collector must reject startup/inspection failures and lost events, cover child
 processes and writes using original absolute paths, and retain injected escape
 regressions. Merely redirecting HOME or filtering cache names is insufficient.
+
+## Deterministic attribution probes (still failing)
+
+A new opt-in probe demonstrates why snapshot hardening alone cannot close this
+issue. It changes no release gate or verifier behavior. Run on Debian GNU/Linux
+13.7 x86_64 against verifier 3cfce784167203c11c2ee87ad76b55618b31f516:
+
+```sh
+bash scripts/tests/verify-install-inspection.test.sh
+VERIFY_INSTALL_ATTRIBUTION_PROBE=1 bash scripts/tests/verify-install-inspection.test.sh
+```
+
+The ordinary thirteen regressions pass, exit 0. The opt-in suite exits 1 with
+two expected acceptance failures:
+
+- `host-write`: a sibling process of the verifier writes a file under the
+  observed HOME. Named-pipe handshakes place this unrelated write strictly
+  between snapshots; it is not an installer descendant. The verifier exits 1
+  and wrongly attributes this file to the install. Required result: exit 0.
+- `transient-leak`: an extraction child creates then removes a file using an
+  absolute outside-prefix path. The verifier exits 0 and misses the real write.
+  Required result: rejection with an outside-prefix diagnostic.
+
+These probes assert the desired behavior and deliberately remain red; they
+are diagnostic acceptance reproducers, not a completed fix. They are opt-in so
+that existing fail-closed regression checks remain usable during implementation.
+They must pass, alongside the ordinary leak and inspection-failure tests, before
+claiming the attribution problem solved. The fixture's sidecar is locally
+computed, not a published digest; these runs provide no platform install claim.
+
+Next implementation must supply a process-tree write collector or validated OS
+isolation boundary. Before relying on a native backend, prove startup before
+extraction, child-process coverage, original absolute-path and link handling,
+transient-write detection, and fail-closed handling of permission denial,
+collector termination and lost events. A collector that merely filters a host
+snapshot by directory or redirects HOME cannot pass both probes soundly.
+Native Windows, Intel macOS and arm64 macOS experiments and full release runs
+remain required. This development environment provides none of those OS images;
+no new native image/version, observed/published digest or exit evidence exists.
+The parent retains release workflow dispatch and final main-commit verification.
