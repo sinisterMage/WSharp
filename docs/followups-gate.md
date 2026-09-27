@@ -30,3 +30,16 @@ assert section references and field markers, not the truth or completeness of
 prose. Human release review remains necessary. The script checks the supplied
 checkout; release evidence must additionally establish that LIMITATIONS.md is
 on main. Tests inject FOLLOWUPS_FETCH; release runs must leave it unset.
+
+## Live verification on 2026-09-27
+
+Against main `6c0cce3585398aa3d1f69c9d1c05c0c4c3fef22d`, the authenticated
+`bash scripts/followups-check.sh` exits 1: the original six are documented,
+but newly labelled #47 is open. This is a real criterion failure, not a fetch
+failure. PR #58 carries its documented disposition and closure; Johnny owns
+that existing review/merge workflow. Rerun this command after it lands, using
+main documentation, before claiming criterion 4 met.
+
+The state table has twelve written checks and two unwritten checks. Its
+checker still validates eleven of fourteen rows: writing this gate changes
+a verdict, not the number of rows whose paths can be checked.
