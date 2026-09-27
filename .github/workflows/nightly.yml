@@ -335,7 +335,20 @@ jobs:
   soak-row:
     name: soak row
     needs: [parity, conformance, nightly]
-    if: always() && github.event_name == 'schedule'
+    # **Not gated on `github.event_name == 'schedule'`**, which is what it read
+    # before and which suppressed the row whenever a night was dispatched by
+    # hand -- and every night that has ever run was dispatched by hand, because
+    # the 03:00 UTC cron has produced no run at all (#56). A row records whether
+    # the subject *reported*; suppressing it because of how the run was started
+    # writes a missing row for no good reason, and a missing row is the failure
+    # `soak-report.sh` exists to make loud.
+    #
+    # **Still default-branch only**, because the row is appended to the shared
+    # `soak-log` branch and `$GITHUB_SHA` must be a commit of `main`. A
+    # `workflow_dispatch` may name any ref, so the ref is checked here rather
+    # than assumed. `nightly.yml` has no `pull_request` trigger, so these are the
+    # only two events that can reach this job.
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
