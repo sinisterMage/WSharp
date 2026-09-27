@@ -153,6 +153,16 @@ Separating the two is the first move before routing: a case the bound is too
 small for is corpus cost, and a mode that never finishes at a generous bound is
 a hang.
 
+**A case whose cost is legitimately larger than the default names its own bound**
+with `// timeout: <seconds>` in its header. One global number conflates the two
+things a bound is for: a hang, which the gate must catch on every case, and a
+genuinely expensive case, which is doing its job. Raising the default to suit the
+second would let a real hang on any other case take that much longer to surface.
+`gc_map_replacement` is the first case to need one (1200s, for 1.2 M allocations
+under `--gc-stress`); the ten-slowest table at the bottom of every report is what
+tells you a case has grown into needing one. The timeout row names the number it
+was tested against, not the default.
+
 **A case that disagrees with itself is a different finding.** When a difference
 shows up, each side is re-run twice before it is called a divergence; a mode that
 cannot reproduce its own output is reported as `NONDETERMINISTIC` and classified
