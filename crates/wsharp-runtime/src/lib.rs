@@ -30,6 +30,32 @@ pub mod transfer;
 pub mod types;
 pub mod worker;
 
+/// How deep a struct `==` may recurse before it refuses.
+///
+/// `==` on a struct compares its fields and a struct field recurses, so a
+/// value that reaches itself -- a parent pointer, a doubly linked list, a
+/// graph node -- would recurse without end. It used to: the process ran its
+/// stack out and died on a signal, which is a crash with no W# diagnostic.
+/// The generated comparison counts its depth against this instead, and
+/// `PANIC_EQ_TOO_DEEP` reports it.
+///
+/// A named bound with no knob, in the shape of `std/json`'s `MAX_DEPTH` and
+/// `std/x509`'s `MAX_CHAIN`. The number has to clear two bars at once, and
+/// they pull opposite ways:
+///
+/// * **Below the smallest stack.** A worker thread gets Rust's default 2 MiB,
+///   and one level of nesting costs two generated frames -- the dispatching
+///   entry point and the exact comparison. At 2048 levels that is well under
+///   a quarter of that stack, so the bound is reached before the stack is.
+/// * **Above anything that used to work.** A comparison deeper than this
+///   already aborted, so nothing that previously answered now refuses.
+///
+/// Defined here rather than in the code generator because the generated check
+/// and the message that explains it must name one number; two would drift,
+/// and the drift would be a message stating a bound that is not the one
+/// enforced.
+pub const EQ_MAX_DEPTH: i64 = 2048;
+
 pub use builtins::{Builtin, BuiltinTy, builtins, runtime_symbols};
 pub use header::{HEADER_SIZE, TypeId};
 pub use heap::{HeapStats, heap_stats, in_heap, ws_alloc};

@@ -38,6 +38,37 @@ permissions:
   contents: read
 
 jobs:
+  # Criterion 0, on the document that lists every other gate.
+  #
+  # RELEASE-CRITERIA-1.0.md's "The state of the checks" table is what anybody
+  # reads to decide what is still owed before v1.0, and it claims which files
+  # exist. Revision 2 of it was accurate when published and wrong on six of ten
+  # rows twenty minutes later, because three pull requests landed behind it --
+  # every wrong row being either work somebody would redo or work nobody would
+  # pick up. Care does not fix that; a check does.
+  #
+  # Cheap enough to run first and on everything: no toolchain, no cache, a few
+  # seconds of `test -e`. It is the same trick the `doc-examples` job plays on
+  # the prose, aimed at the table instead.
+  gate-table:
+    name: gate state table (criterion 0)
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # The check's own tests, before the check: a gate whose logic is
+      # unverified can pass everything and be believed. The last case in this
+      # file is the real document against the real tree, so a failure reading
+      # "the table drifted" is distinguishable from one reading "the check
+      # broke".
+      - name: Test the checker
+        run: bash scripts/tests/gate-table-check.test.sh
+
+      - name: Hold the state table to the tree
+        run: bash scripts/gate-table-check.sh
+
   # Criterion 2's mechanism. Every pull request carries exactly one of
   # `change:breaking`, `change:additive`, `change:fix`, `change:none`.
   #

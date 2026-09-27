@@ -20,8 +20,14 @@
 //! and the stack maps by construction.
 //!
 //! Aliased values still compare their fields, so NaN remains unequal to itself.
-//! **Cycles are not detected:** a comparison that follows a cycle recurses
-//! indefinitely, including `a == a` when `a` reaches itself.
+//!
+//! **Cycles are not detected, but they are bounded.** A comparison that follows
+//! a cycle recurses -- including `a == a` when `a` reaches itself -- so each
+//! call carries how deep it already is, and the exact comparison refuses past
+//! [`wsharp_runtime::EQ_MAX_DEPTH`] with a W# panic. Detecting the cycle itself
+//! would need a set of the pairs already being compared, which means allocating
+//! inside a comparison, which means a safepoint in the middle of reading two
+//! objects' fields; a counter costs one register and one compare.
 
 use std::collections::HashMap;
 
@@ -311,12 +317,22 @@ fn collect_expr(expr: &hir::Expr, store: &mut TypeStore, out: &mut Vec<Type>) {
 // Declaring and defining
 // ---------------------------------------------------------------------------
 
-/// `fn(a, b) -> bool`. No environment pointer: these are the code generator's
-/// own functions rather than W#'s, and nothing calls one through a closure.
+/// `fn(a, b, depth) -> bool`. No environment pointer: these are the code
+/// generator's own functions rather than W#'s, and nothing calls one through a
+/// closure.
+///
+/// `depth` is how many values deep this comparison already is. A `==` in the
+/// program passes zero and each recursion into a struct field passes one more,
+/// so the exact comparison can refuse past [`wsharp_runtime::EQ_MAX_DEPTH`]
+/// rather than running the stack out. An argument rather than a counter in the
+/// runtime because these functions are ordinary generated code with no
+/// thread-local of their own, and because a per-call argument costs a register
+/// where a runtime counter would cost two calls at every comparison.
 pub fn signature(call_conv: cranelift_codegen::isa::CallConv) -> Signature {
     let mut sig = Signature::new(call_conv);
     sig.params.push(AbiParam::new(PTR));
     sig.params.push(AbiParam::new(PTR));
+    sig.params.push(AbiParam::new(types::I64));
     sig.returns.push(AbiParam::new(types::I8));
     sig
 }
