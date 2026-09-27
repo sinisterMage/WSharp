@@ -8,6 +8,12 @@ if [ "$#" -eq 0 ]; then
         docs/processes.md docs/resolution.md soak/README.md \
         tests/conformance/README.md tests/harness/README.md
 fi
+for file do
+    if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+        echo "Cannot read documentation file: $file" >&2
+        exit 2
+    fi
+done
 perl -ne '
     if (/\xE2\x80[\x93\x94]/) {
         print "$ARGV:$.: use ASCII hyphens instead of en/em dashes\n";
