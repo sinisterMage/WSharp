@@ -17,6 +17,8 @@ Dispatch is resolved at compile time wherever the types allow. Types are
 inferred rather than declared, and checked across the whole program before it
 builds. Values are unboxed. The collector is built for low pause times.
 
+<!-- from: examples/status_intro.ws -->
+
 ```wsharp
 // The HTTP status types come from the standard library.
 const http = @import("std/http");
@@ -45,7 +47,10 @@ Adding a special case means adding a function. Nothing existing is edited, and
 the compiler rejects a new overload that would be ambiguous with an old one
 rather than silently changing which code runs.
 
-The whole example is in [`examples/status.ws`](examples/status.ws).
+This snippet is [`examples/status_intro.ws`](examples/status_intro.ws), run by
+the examples job like every other file in `examples/`. The fuller worked example,
+with routing over five compile-time and three run-time statuses, is
+[`examples/status.ws`](examples/status.ws).
 
 The documentation is at **[wsharp.io](https://wsharp.io)**: installing, a tour
 through the examples, the language reference, the standard library, and how the
