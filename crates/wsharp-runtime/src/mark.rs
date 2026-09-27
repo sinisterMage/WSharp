@@ -170,6 +170,11 @@ fn set_phase_of(w: &'static Worker, phase: Phase) {
     let _guard = state_of(w);
     w.mark.phase.store(phase as u8, Ordering::Release);
     w.mark.changed.notify_all();
+    #[cfg(test)]
+    {
+        drop(_guard);
+        publication_tests::after_phase_store(phase);
+    }
 }
 
 fn wait_until(ready: impl Fn() -> bool) {
@@ -801,3 +806,9 @@ mod tests {
         panic!("no pause was ever run for a parked mutator: the safe region is untested");
     }
 }
+
+// Runtime protocol regressions live beside the language cases. They need
+// private phase access and therefore run as part of the runtime unit suite.
+#[cfg(test)]
+#[path = "../../../tests/cases/runtime_poll_publication.rs"]
+mod publication_tests;
