@@ -167,10 +167,26 @@ tests/harness/fuzz.pl --target toml  --replay target/harness/.../input.toml
 | `json` | `std/json.parse`, via `drivers/fuzz_json.ws` | `corpus/json/` |
 | `toml` | `std/toml.parse`, via `drivers/fuzz_toml.ws` | `corpus/toml/` |
 
-What counts as a finding: a Rust panic, a signal, no answer inside the timeout,
-and -- for the stdlib parsers only -- a W# panic, because "a parser answers, it
-does not raise" is the rule those modules are written to. A diagnostic is not a
-finding; most runs produce one and that is the intended outcome.
+What counts as a finding: a Rust panic, a signal, a *compiler* hang, and -- for
+the stdlib parsers only -- a W# panic, because "a parser answers, it does not
+raise" is the rule those modules are written to. A diagnostic is not a finding;
+most runs produce one and that is the intended outcome.
+
+**A `run` timeout is classified before it is called a hang.** The `run` target
+*executes* the program, and a valid program may legitimately never terminate --
+an infinite loop, or a blocking call nothing ever answers (`net.accept` on a
+listener with no client is the one the mutator keeps finding). Reporting that as
+a compiler hang is the false positive that made the first two nightlies red
+(#52). So on a `run` timeout the same bytes are put to two oracles: `check`,
+which must answer every input, and `build`, which compiles and links but does not
+execute. Only a clean `build` exit 0 means the whole compiler pipeline
+terminated and the program's own execution ran long -- that is `NONTERMINATING`,
+counted and reported, and it does not fail the campaign. The front end hanging,
+`check` refusing a program `run` then executed, `build` hanging, or `build`
+failing where `run` got as far as executing all stay `HANG` findings, so an
+environment problem keeps the finding rather than silencing it.
+`fuzz-selftest.sh` drives this classification over a stub compiler and needs no
+cargo.
 
 Three properties are load-bearing:
 

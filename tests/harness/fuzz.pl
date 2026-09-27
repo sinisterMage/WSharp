@@ -21,9 +21,13 @@
 # against its own signature before it is written out, so what lands in the
 # report is usually already the `tests/cases` entry that will guard the fix.
 #
-# **One finding per cause.** Findings are keyed by signature -- the panic site
-# and message, the signal, or "hang" -- so a mutation class that trips the same
-# assertion four hundred times is one directory with a count in it.
+# **One finding per cause, with one honest exception.** Findings are keyed by
+# signature -- the panic site and message, the signal, or (for a `run` timeout)
+# which oracle explained it -- so a mutation class that trips the same assertion
+# four hundred times is one directory with a count in it. A `HANG` whose cause
+# survives both oracles still collapses into one signature, because a hang has no
+# site to key on; the README says so rather than claiming a separation the key
+# cannot make.
 #
 # Usage:
 #   tests/harness/fuzz.pl --target check --seed 1 --iterations 500
@@ -305,7 +309,57 @@ sub check_input {
     # harness cannot disagree about which binary bounds a run.
     my @cmd = ($TIMEOUT_BIN, '-s', 'KILL', $timeout, $COMMAND{$target}->($f));
     my ($status, $errfile) = spawn_capture(@cmd);
-    return decide($status, $errfile);
+    my ($v, $s, $err) = decide($status, $errfile);
+
+    # The `run` target *executes* the program, and a valid program may
+    # legitimately never terminate -- an infinite loop, or a blocking call
+    # nothing ever answers (`net.accept` on a listener nobody connects to is the
+    # one the mutator keeps finding). A timeout there is not evidence about the
+    # compiler, because nothing bounds how long a program the compiler accepted
+    # may run. So a `run` timeout is classified by two oracles on the same bytes:
+    #
+    #   `check` must answer every input. If it hangs, the front end hung.
+    #   `build` compiles and links but does *not* execute. If it exits 0, the
+    #   whole compiler pipeline terminated and only the program's execution ran
+    #   long. That is the case that is not a finding.
+    #
+    # Anything else -- the front end hangs, `check` refused a program `run` then
+    # executed, `build` hangs, or `build` fails where `run` got as far as
+    # executing -- stays a finding. The classification is deliberately
+    # conservative: only a clean `build` exit 0 suppresses, so an environment
+    # problem (a missing runtime archive, a missing `cc`) keeps the finding
+    # rather than silencing it.
+    if ($v eq 'HANG' && $target eq 'run') {
+        my $cf = "$work/checkin$SUFFIX{$target}";
+        spew($cf, $bytes);
+        my ($cstatus, $cerrf) = spawn_capture(
+            $TIMEOUT_BIN, '-s', 'KILL', $timeout, $wsharp, 'check', $cf);
+        my ($cv, $cs, $cerr) = decide($cstatus, $cerrf);
+        if ($cv eq 'HANG') {
+            return ('HANG', 'hang: front end too', $err . "\n--- check ---\n" . $cerr);
+        }
+        if (!($cv eq 'OK' && ($cstatus >> 8) == 0)) {
+            return ('HANG', 'hang: run, though check refused',
+                    $err . "\n--- check ---\n" . $cerr);
+        }
+        my $bf  = "$work/buildin$SUFFIX{$target}";
+        my $bex = "$work/buildexe";
+        spew($bf, $bytes);
+        my ($bstatus, $berrf) = spawn_capture(
+            $TIMEOUT_BIN, '-s', 'KILL', $timeout, $wsharp, 'build', $bf, '-o', $bex);
+        my ($bv, $bs, $berr) = decide($bstatus, $berrf);
+        unlink $bex;
+        if ($bv eq 'HANG') {
+            return ('HANG', 'hang: build (codegen), run also hung',
+                    $err . "\n--- build ---\n" . $berr);
+        }
+        if (($bstatus >> 8) == 0) {
+            return ('NONTERMINATING', 'nonterminating', $err);
+        }
+        return ('HANG', 'hang: run, though build failed',
+                $err . "\n--- build ---\n" . $berr);
+    }
+    return ($v, $s, $err);
 }
 
 # ---------------------------------------------------------------------------
@@ -363,7 +417,7 @@ if ($replay) {
     my ($v, $s, $err) = check_input($bytes);
     print "verdict:   $v\nsignature: $s\n";
     print "stderr:\n$err\n" if $err ne '';
-    exit($v eq 'OK' ? 0 : 1);
+    exit(($v eq 'OK' || $v eq 'NONTERMINATING') ? 0 : 1);
 }
 
 # ---------------------------------------------------------------------------
@@ -372,7 +426,7 @@ if ($replay) {
 seed_rng($seed);
 my $started = time;
 my %findings;    # signature -> { count, verdict, input, iteration }
-my %verdicts = (OK => 0, PANIC => 0, SIGNAL => 0, HANG => 0);
+my %verdicts = (OK => 0, PANIC => 0, SIGNAL => 0, HANG => 0, NONTERMINATING => 0);
 my $ran = 0;
 
 for my $i (1 .. $iterations) {
@@ -381,7 +435,10 @@ for my $i (1 .. $iterations) {
     my ($v, $s) = check_input($bytes);
     $ran++;
     $verdicts{$v}++;
-    next if $v eq 'OK';
+    # NONTERMINATING is a valid program that ran long or for ever. It is
+    # behaviour, not a finding, so it is counted and not reduced, filed, or
+    # allowed to fail the campaign. See `check_input`.
+    next if $v eq 'OK' || $v eq 'NONTERMINATING';
 
     if (exists $findings{$s}) {
         $findings{$s}{count}++;
@@ -446,8 +503,25 @@ Replay one finding:
 | PANIC (Rust panic in the compiler or runtime) | $verdicts{PANIC} |
 | SIGNAL (segfault, abort, illegal instruction) | $verdicts{SIGNAL} |
 | HANG (no answer within ${timeout}s) | $verdicts{HANG} |
+| NONTERMINATING (a valid program that ran past ${timeout}s) | $verdicts{NONTERMINATING} |
 
 HEADER
+
+if ($verdicts{NONTERMINATING}) {
+    print $md <<"NONTERM";
+## Non-terminating programs (not findings)
+
+$verdicts{NONTERMINATING} accepted program(s) did not finish within ${timeout}s.
+The `run` target executes what the compiler produced, and a valid program may
+loop for ever or block on something nothing answers -- \`net.accept\` on a
+listener with no client is the one the mutator finds. Each was recompiled with
+\`check\` (which must answer) and \`build\` (which compiles but does not run); a
+clean \`build\` exit 0 means the compiler terminated and only the program's own
+execution ran long. These are behaviour, not defects, and do not fail the gate.
+A timeout that is *not* explained this way stays a HANG above.
+
+NONTERM
+}
 
 if (!%findings) {
     print $md "No finding. $ran inputs produced a diagnostic or an answer.\n";
@@ -467,8 +541,8 @@ if (!%findings) {
 }
 close $md;
 
-printf "fuzz: %s seed %d — %d inputs, %d OK, %d panic, %d signal, %d hang, %d distinct causes, %ds\n",
+printf "fuzz: %s seed %d — %d inputs, %d OK, %d panic, %d signal, %d hang, %d nonterminating, %d distinct causes, %ds\n",
     $target, $seed, $ran, $verdicts{OK}, $verdicts{PANIC}, $verdicts{SIGNAL},
-    $verdicts{HANG}, scalar(keys %findings), $elapsed;
+    $verdicts{HANG}, $verdicts{NONTERMINATING}, scalar(keys %findings), $elapsed;
 print "fuzz: $outdir/report.md\n";
 exit(%findings ? 1 : 0);
