@@ -96,8 +96,8 @@ finding a reviewer skimming a bless diff would not notice.
 **`expected/` is empty in this commit, and that is a stated limitation rather
 than an oversight.** Nobody on this campaign has a machine that can build W# -
 no `rustc`, no `cargo`, no `cc` - so no snapshot here would be a snapshot anyone
-had seen the compiler produce. Committing sixty-four guessed diagnostics would
-produce sixty-four failures on the first real run that looked like compiler
+had seen the compiler produce. Committing sixty-six guessed diagnostics would
+produce sixty-six failures on the first real run that looked like compiler
 defects and were typing mistakes.
 
 What happens instead: the nightly `conformance` job exits 3 and uploads every
@@ -114,7 +114,7 @@ Written here rather than left in anyone's head.
 
 - **Nothing is blessed yet.** See above. Today this suite proves that the
   comparison works, not that any W# diagnostic is correct.
-- **Only the 64 cases in `tests/cases` whose header carries `// error:`.** It
+- **Only the 66 cases in `tests/cases` whose header carries `// error:`.** It
   adds no new rejection cases. The gaps in what the language refuses are still
   gaps; this pins the refusals that exist.
 - **`check` is the snapshot's subject.** `run`'s stderr is compared with

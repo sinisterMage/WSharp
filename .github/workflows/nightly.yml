@@ -177,7 +177,7 @@ jobs:
   conformance:
     name: conformance (${{ matrix.triple }})
     runs-on: ${{ matrix.os }}
-    # Minutes, not hours: `wsharp check` over the 64 rejection cases twice is
+    # Minutes, not hours: `wsharp check` over the 66 rejection cases twice is
     # seconds. The budget is the build.
     timeout-minutes: 60
     strategy:
