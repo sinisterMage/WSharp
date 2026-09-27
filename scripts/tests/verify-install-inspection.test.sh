@@ -8,6 +8,8 @@ trap 'rm -rf "$TEST"' EXIT
 export FIXTURE="$TEST" REAL_FIND="$(command -v find)" REAL_TAR="$(command -v tar)"
 export REAL_SORT="$(command -v sort)" REAL_COMM="$(command -v comm)"
 mkdir -p "$TEST/bin" "$TEST/archive" "$TEST/home" "$TEST/tmp"
+# Pre-existing directories ensure only the forbidden file is new.
+mkdir -p "$TEST/home/.cache" "$TEST/home/.npm" "$TEST/home/project/.git"
 printf 'fixture only\n' > "$TEST/archive/sharpie"
 tar czf "$TEST/asset.tar.gz" -C "$TEST/archive" sharpie
 if command -v sha256sum >/dev/null; then
@@ -43,6 +45,13 @@ if [ "$1" = xzf ]; then : > "$FIXTURE/extracted"; fi
 if [ "$FAULT" = leak ] && [ "$1" = xzf ]; then
   : > "$HOME/outside-prefix"
 fi
+if [ "$1" = xzf ]; then
+  case "$FAULT" in
+    cache-leak) : > "$HOME/.cache/outside-prefix";;
+    npm-leak) : > "$HOME/.npm/outside-prefix";;
+    git-leak) : > "$HOME/project/.git/outside-prefix";;
+  esac
+fi
 exec "$REAL_TAR" "$@"
 SH
 for tool in sort comm; do
@@ -55,14 +64,16 @@ SH
 done
 chmod +x "$TEST/bin/"*
 failures=0
-for fault in clean leak marker before after sort comm fetch archive-list archive-path; do
-  rm -f "$TEST/count" "$TEST/home/outside-prefix" "$TEST/extracted"
+for fault in clean leak cache-leak npm-leak git-leak marker before after sort comm fetch archive-list archive-path; do
+  rm -f "$TEST/count" "$TEST/home/outside-prefix" "$TEST/extracted" \
+    "$TEST/home/.cache/outside-prefix" "$TEST/home/.npm/outside-prefix" \
+    "$TEST/home/project/.git/outside-prefix"
   status=0
   env HOME="$TEST/home" TMPDIR="$TEST/tmp" PATH="$TEST/bin:$PATH" FAULT="$fault" \
     bash "$SCRIPT" 0.1.2 x86_64-unknown-linux-gnu --tool sharpie > "$TEST/out" 2>&1 || status=$?
   case "$fault" in
     clean) pattern='checks, all passed'; expected=0;;
-    leak) pattern='path(s) outside the prefix'; expected=1;;
+    leak|cache-leak|npm-leak|git-leak) pattern='path(s) outside the prefix'; expected=1;;
     marker) pattern='FATAL 5. cannot discover scratch aliases'; expected=3;;
     before) pattern='FATAL 5. cannot inspect filesystem before install'; expected=3;;
     after) pattern='FATAL 5. cannot inspect filesystem after install'; expected=3;;

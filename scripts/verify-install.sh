@@ -244,13 +244,13 @@ $markers
 EOF
 
 take_manifest() {
-  # Exclude WORK under every spelling the walk may use, and the noisiest
-  # caches. `-prune` rather than a grep, so a large cache is not walked at all.
+  # Exclude only WORK under every spelling the walk may use. Directory names
+  # cannot prove who wrote a file: caches and repositories remain observable.
   local expr=() p
   for p in "${PRUNE_PATHS[@]}"; do
-    expr+=(-path "$p" -o)
+    [ "${#expr[@]}" -eq 0 ] || expr+=(-o)
+    expr+=(-path "$p")
   done
-  expr+=(-name '.cache' -o -name '.npm' -o -name '.git')
   find "${MANIFEST_ROOTS[@]}" \( "${expr[@]}" \) -prune \
     -o -print | LC_ALL=C sort
 }

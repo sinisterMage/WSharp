@@ -37,8 +37,8 @@ checks the published sharpie release and the aliased TMPDIR regression.
 
 This is fail-closed hardening, not a solution to host activity attribution.
 The gate observes new path names under HOME, /usr/local/bin, /usr/local/lib and
-/opt. Its existing .cache, .npm, .git and harness scratch exclusions remain;
-no new cache exclusions have been added. It does not detect changes to existing
+/opt. The harness scratch exclusion remains. The former name-based .cache, .npm
+and .git exclusions have been removed (see the boundary regression below). It does not detect changes to existing
 file contents (except the separately checked shell profiles), transient files
 created and removed between scans, or paths outside those roots. The scratch
 exclusion also means this is not a sandbox preventing arbitrary writes.
@@ -91,3 +91,37 @@ four checks (exit 0). These fixture archives and workspace runs are not native
 clean-machine evidence. Archive member names alone do not validate symlink or
 hardlink targets; this patch does not claim complete archive containment.
 All host-attribution limitations above still apply.
+
+## Name-based manifest blind spots
+
+Directories named .cache, .npm and .git used to be pruned without evidence
+about their writer. A real install write into any such existing directory was
+invisible. The manifest now prunes only the harness WORK paths and their
+identified aliases. It still fails closed if the larger scan is denied or
+fails; permission errors must not become a new exclusion list.
+
+On Debian GNU/Linux 13.7 x86_64 (development container, not a clean image):
+
+```sh
+git show 676f6a1:scripts/verify-install.sh > "$PAPERCLIP_RUN_SCRATCH_DIR/verify-install-before.sh"
+VERIFY_INSTALL_SCRIPT="$PAPERCLIP_RUN_SCRATCH_DIR/verify-install-before.sh" bash scripts/tests/verify-install-inspection.test.sh
+bash scripts/tests/verify-install-inspection.test.sh
+bash scripts/tests/verify-install.test.sh
+bash -n scripts/verify-install.sh scripts/tests/verify-install-inspection.test.sh
+git diff --check
+```
+
+With the current test file against 676f6a1, the suite exits 1: cache-leak,
+npm-leak and git-leak each incorrectly return 0. Each case creates a real file
+outside PREFIX, in a directory created before the initial scan. With the fix,
+all thirteen cases pass (suite exit 0); those three leaks return 1. The existing
+scan, fetch and archive fault cases retain their fail-closed results.
+
+This removes blind spots; it does not solve host-write attribution. More host
+activity may now be visible and legitimately keep the gate red. No Windows or
+macOS execution, clean OS image, or release digest evidence is claimed by this
+fixture. Before criterion 7 can pass, the execution environment still needs a
+validated isolation boundary or process-attributed write collection. That
+collector must reject startup/inspection failures and lost events, cover child
+processes and writes using original absolute paths, and retain injected escape
+regressions. Merely redirecting HOME or filtering cache names is insufficient.
