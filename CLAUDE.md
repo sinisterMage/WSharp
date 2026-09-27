@@ -1083,6 +1083,12 @@ nix-shell --run "cargo test --workspace"
   `// args: one two` is what the program sees as `os.args()`; it splits on
   whitespace, so an argument containing one cannot yet be written.
 
+  `// timeout: 1200` is read only by `tests/harness/parity.sh`, not by
+  `cases.rs`: it names a per-case wall-clock bound for a case whose cost is
+  legitimately larger than the harness default (`gc_map_replacement` is the only
+  one). It is a hint to the harness and not an expectation, so `cases.rs`
+  ignores it deliberately.
+
   The harness (`crates/wsharp-cli/tests/cases.rs`) runs the built binary as a
   subprocess, so stdout is captured for free and the test does exactly what a
   user would.

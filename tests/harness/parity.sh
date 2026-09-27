@@ -70,17 +70,21 @@ trap 'rm -rf "$WORK"' EXIT
 execute() {
     local case_file="$1" mode="$2" tag="$3"
     local args; args="$(case_args "$case_file")"
+    # A case may name its own bound; see `case_timeout` in `lib.sh` for why one
+    # global number is wrong for both a hang and an expensive case.
+    local bound; bound="$(case_timeout "$case_file")"
+    bound="${bound:-$TIMEOUT}"
     local code
     case "$mode" in
         run)
             # shellcheck disable=SC2086
-            "$TIMEOUT_BIN" "$TIMEOUT" "$WSHARP" run "$case_file" $args \
+            "$TIMEOUT_BIN" "$bound" "$WSHARP" run "$case_file" $args \
                 >"$WORK/$tag.out" 2>"$WORK/$tag.err"
             code=$?
             ;;
         stress)
             # shellcheck disable=SC2086
-            "$TIMEOUT_BIN" "$TIMEOUT" "$WSHARP" run --gc-stress "$case_file" $args \
+            "$TIMEOUT_BIN" "$bound" "$WSHARP" run --gc-stress "$case_file" $args \
                 >"$WORK/$tag.out" 2>"$WORK/$tag.err"
             code=$?
             ;;
@@ -99,7 +103,7 @@ execute() {
             # A successful build prints nothing the program did; start clean.
             : >"$WORK/$tag.out"; : >"$WORK/$tag.err"
             # shellcheck disable=SC2086
-            "$TIMEOUT_BIN" "$TIMEOUT" "$exe" $args \
+            "$TIMEOUT_BIN" "$bound" "$exe" $args \
                 >"$WORK/$tag.out" 2>"$WORK/$tag.err"
             code=$?
             rm -f "$exe"
@@ -190,6 +194,11 @@ for case_file in "$CASES"/*.ws; do
     total=$((total + 1))
     case_started="$(date +%s)"
 
+    # The bound this case actually got: its own `// timeout:` if it named one,
+    # the harness default otherwise. Recorded per case so a timeout row says the
+    # number that was tested against, not a global that may not have applied.
+    case_bound="$(case_timeout "$case_file")"; case_bound="${case_bound:-$TIMEOUT}"
+
     for mode in run stress build; do
         execute "$case_file" "$mode" "$mode.a"
     done
@@ -235,7 +244,7 @@ for case_file in "$CASES"/*.ws; do
     case_elapsed=$(( $(date +%s) - case_started ))
     if [ -n "$timeouts" ]; then
         timedout=$((timedout + 1))
-        printf '%s\tTIMEOUT\t%s\t%s\n' "$name" "$case_elapsed" "did not finish within ${TIMEOUT}s:${timeouts}" >>"$TSV"
+        printf '%s\tTIMEOUT\t%s\t%s\n' "$name" "$case_elapsed" "did not finish within ${case_bound}s:${timeouts}" >>"$TSV"
     elif [ -n "$unstable" ]; then
         flaky=$((flaky + 1))
         printf '%s\tNONDETERMINISTIC\t%s\t%s\n' "$name" "$case_elapsed" "${unstable# }" >>"$TSV"
@@ -262,7 +271,7 @@ elapsed=$(( $(date +%s) - started ))
     echo "| compiler | \`$WSHARP\` |"
     echo "| modes | \`run\`, \`run --gc-stress\`, \`build\`+exec |"
     echo "| cases | $total |"
-    echo "| per-run timeout | ${TIMEOUT}s (build ${BUILD_TIMEOUT}s) |"
+    echo "| per-run timeout | ${TIMEOUT}s default (build ${BUILD_TIMEOUT}s); a case may set its own with \`// timeout:\` |"
     echo "| duration | ${elapsed}s |"
     echo "| cores | $(nproc 2>/dev/null || echo unknown) |"
     echo "| load average at the end | $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo unknown) |"

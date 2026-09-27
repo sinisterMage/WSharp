@@ -163,6 +163,17 @@ cat >"$CASES/diverge_exit_mild.ws" <<'EOF'
 //@build out=hello exit=3
 EOF
 
+# A case that names its own bound with `// timeout:`. The row's detail must say
+# the number that was actually used (999), not the `--timeout 30` the run was
+# given -- the whole point of the per-case bound is that a timeout row reports
+# the bound it was tested against, and `gc_map_replacement` (#50) is the case
+# that needed it.
+cat >"$CASES/case_timeout.ws" <<'EOF'
+// timeout: 999
+//@run out=hello exit=0
+//@stress out= exit=124
+EOF
+
 # The collector's statistics line differs between modes for reasons that are
 # not a defect, and `normalise` removes it. If that stops working, every
 # gc case in the real corpus becomes a false divergence -- so pin it here,
@@ -231,6 +242,17 @@ esac
 case "$(detail diverge_exit_mild)" in
     *exit\ status*) ok   "a non-124 exit difference is still an exit-status divergence" ;;
     *) bad "diverge_exit_mild detail was '$(detail diverge_exit_mild)', wanted 'exit status'" ;;
+esac
+
+# The per-case `// timeout:` override is honoured and reported. The run was given
+# `--timeout 30`; this case says 999, and the row must say 999 -- the whole point
+# of a per-case bound is that the timeout row reports the number it was tested
+# against, and `gc_map_replacement` (#50) is the case that needed one.
+expect case_timeout   TIMEOUT
+case "$(detail case_timeout)" in
+    *999s*30s*) bad "case_timeout detail named both 999 and 30: '$(detail case_timeout)'" ;;
+    *999s*)     ok   "a case's own // timeout: is the bound the row reports" ;;
+    *)          bad "case_timeout detail was '$(detail case_timeout)', wanted '...999s'" ;;
 esac
 
 # The outputs of a divergence are the evidence a defect is filed from. A report
