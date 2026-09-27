@@ -502,8 +502,11 @@ pub fn evacuating_flag_address() -> usize {
     &ws_gc_evacuating_flag as *const AtomicU8 as usize
 }
 
-// Test scheduler probes the future serialization boundary.
-#[cfg(test)]
+// Serializes both aggregates' writers, including each worker's contribution.
+// At every unlock, count equals the number of true contributions and the flag
+// equals (count != 0). An atomic count alone cannot prevent a delayed flag
+// store from overwriting a later transition. Readers never take this lock.
+// No heap, mark-state or park lock may be acquired while holding this lock.
 static SHARED_TRANSITION: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
@@ -513,6 +516,7 @@ thread_local! {
 
 /// Raise or lower one worker's contribution to a shared flag.
 fn set_shared(flag: &AtomicU8, count: &AtomicUsize, own: &AtomicBool, on: bool) {
+    let _transition = SHARED_TRANSITION.lock().unwrap_or_else(|e| e.into_inner());
     if own.swap(on, Ordering::AcqRel) == on {
         return;
     }
