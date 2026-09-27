@@ -10,14 +10,14 @@ the reason for it, so the decision is readable here rather than only in an issue
 thread. Not one of them was closed on a comment: each has the entry below and,
 where one can exist, a named `tests/cases` guard.
 
-A guard for a limitation is an uncomfortable-looking test — it asserts that
+A guard for a limitation is an uncomfortable-looking test - it asserts that
 something does *not* work. That is the point. A limitation nothing checks can
 stop being true, or quietly get worse, without anybody finding out, and the entry
 then describes a compiler that no longer exists.
 
 One entry was decided against and has since been fixed: "Comparing a value that
 reaches itself" was a P1 under clause 3, because it aborted. It is rewritten
-rather than deleted — a bound is itself a limitation — and it is the one entry
+rather than deleted - a bound is itself a limitation - and it is the one entry
 here whose program no longer prints what 0.2.3 printed. The output shown is from
 the fix, on `main`.
 
@@ -29,16 +29,16 @@ program at two in the morning.
 
 | Issue | Limitation | Disposition | Guard |
 |---|---|---|---|
-| [#9](https://github.com/sinisterMage/WSharp/issues/9) | A computed top-level `const` is rejected | Documented — the fix is global storage, a startup initialiser and a fifth collector root list | `tests/cases/err_computed_const.ws` |
-| [#10](https://github.com/sinisterMage/WSharp/issues/10) | A field access needs a type the compiler can name | Documented — inferring it needs row polymorphism, against a dispatch lattice that is nominal | `tests/cases/err_field_needs_annotation.ws` |
-| [#11](https://github.com/sinisterMage/WSharp/issues/11) | x86-64 and aarch64 only | Documented — a scope statement; 1.0 adds no platform | `stackwalk.rs`'s `compile_error!`, and CI's four-way matrix |
-| [#12](https://github.com/sinisterMage/WSharp/issues/12) | A top-level `const` array can be written through an alias | Documented — needs a read-only reference the type system cannot express; the cheap fix was rejected, see the entry | `tests/cases/const_array_alias.ws`, `tests/cases/err_assign_const_array.ws` |
-| [#14](https://github.com/sinisterMage/WSharp/issues/14) | `net.shutdown` does not stop an acceptor on the BSDs | Documented — kernel behaviour, and the API does not offer the operation | `tests/cases/err_shutdown_listener.ws`, `tests/cases/net_poller.ws` |
-| [#15](https://github.com/sinisterMage/WSharp/issues/15) | `std/tls` cannot verify a chain through a P-521 key | Documented — 521 bits is not a whole number of 32-bit limbs | `tests/cases/x509_p521.ws` |
+| [#9](https://github.com/sinisterMage/WSharp/issues/9) | A computed top-level `const` is rejected | Documented - the fix is global storage, a startup initialiser and a fifth collector root list | `tests/cases/err_computed_const.ws` |
+| [#10](https://github.com/sinisterMage/WSharp/issues/10) | A field access needs a type the compiler can name | Documented - inferring it needs row polymorphism, against a dispatch lattice that is nominal | `tests/cases/err_field_needs_annotation.ws` |
+| [#11](https://github.com/sinisterMage/WSharp/issues/11) | x86-64 and aarch64 only | Documented - a scope statement; 1.0 adds no platform | `stackwalk.rs`'s `compile_error!`, and CI's four-way matrix |
+| [#12](https://github.com/sinisterMage/WSharp/issues/12) | A top-level `const` array can be written through an alias | Documented - needs a read-only reference the type system cannot express; the cheap fix was rejected, see the entry | `tests/cases/const_array_alias.ws`, `tests/cases/err_assign_const_array.ws` |
+| [#14](https://github.com/sinisterMage/WSharp/issues/14) | `net.shutdown` does not stop an acceptor on the BSDs | Documented - kernel behaviour, and the API does not offer the operation | `tests/cases/err_shutdown_listener.ws`, `tests/cases/net_poller.ws` |
+| [#15](https://github.com/sinisterMage/WSharp/issues/15) | `std/tls` cannot verify a chain through a P-521 key | Documented - 521 bits is not a whole number of 32-bit limbs | `tests/cases/x509_p521.ws` |
 
 Each row's reasoning is in its entry below, under **Disposition**. Four of the
-cases named — `err_computed_const.ws`, `const_array_alias.ws`,
-`err_shutdown_listener.ws` and `x509_p521.ws` — were written for this file and did
+cases named - `err_computed_const.ws`, `const_array_alias.ws`,
+`err_shutdown_listener.ws` and `x509_p521.ws` - were written for this file and did
 not exist before: a limitation nobody checked was a limitation that could drift.
 
 ## How to read an entry
@@ -49,14 +49,14 @@ finished:
 | Field | Means |
 |---|---|
 | **What** | The thing that does not work, stated as a user would meet it. A program where one helps. |
-| **Why** | The reason it was left. Not an apology — the constraint that makes the fix more than an afternoon. |
+| **Why** | The reason it was left. Not an apology - the constraint that makes the fix more than an afternoon. |
 | **Workaround** | What to write instead, or the word *None*. |
-| **Disposition** | Fix or documented limitation, and why — on the entries where an issue asked the question. |
+| **Disposition** | Fix or documented limitation, and why - on the entries where an issue asked the question. |
 | **Tracked** | The issue where fix-or-document was decided, and its state. |
 
 Every program shown below was run against `wsharp 0.2.3` and the output is what
-it printed. Where a `tests/cases` entry guards the behaviour mechanically — so
-that the limitation cannot quietly stop being true without a test noticing —
+it printed. Where a `tests/cases` entry guards the behaviour mechanically - so
+that the limitation cannot quietly stop being true without a test noticing -
 the entry is named. A limitation with no such guard is a limitation somebody has
 to remember, which is why the ones that can have one, do.
 
@@ -64,8 +64,8 @@ Two definitions this file deliberately does not restate, because two copies
 drift: **breaking change** and the **severity scale** are in Part one of
 [RELEASE-CRITERIA-1.0.md](RELEASE-CRITERIA-1.0.md).
 
-Nothing here is a promise that the limitation stays. The promises — what 1.0
-will not break — are in [COMPATIBILITY.md](COMPATIBILITY.md).
+Nothing here is a promise that the limitation stays. The promises - what 1.0
+will not break - are in [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ---
 
@@ -91,7 +91,7 @@ error: a top-level `const` must be a literal or a `fn`
 ```
 
 **Why.** A computed global needs storage that outlives every function and a
-startup initialiser to fill it — and the collector would need those globals in
+startup initialiser to fill it - and the collector would need those globals in
 its root set. That is a fifth root list beside the three in `gc::collect` and
 `worker::PINNED`, and every root list has to be added to four places at once
 (the collect root set, the evacuation pause's root pass,
@@ -100,7 +100,7 @@ its root set. That is a fifth root list beside the three in `gc::collect` and
 **Workaround.** Compute it in a function and call that function where the value
 is needed. For a table of scalars there is a second answer that costs nothing:
 a `const` array literal is emitted as immortal data with no initialiser at all,
-which is why it is allowed to be a literal —
+which is why it is allowed to be a literal -
 
 ```wsharp
 const K = []u32{ 0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5 };
@@ -111,13 +111,13 @@ const K = []u32{ 0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5 };
 **Disposition: documented limitation.** The fix is not the diagnostic, it is the
 storage: global slots, a startup initialiser ordered so that one global may be
 computed from another, and those slots in the collector's root set. That last
-part is the cost — a root list has to be added to four places at once, and
+part is the cost - a root list has to be added to four places at once, and
 getting one of them wrong is rare corruption rather than a failing test. Against
 that, the thing a computed global buys is a function call saved, which is what
 the workaround already is.
 
 **Guarded by** `tests/cases/err_computed_const.ws`, which pins the refusal and
-its message for both spellings a reader will try — arithmetic and a call. Written
+its message for both spellings a reader will try - arithmetic and a call. Written
 for this entry: the diagnostic was previously unguarded, so the text in this file
 could have drifted from the compiler's without a test noticing.
 
@@ -148,7 +148,7 @@ This is the one place where W#'s "annotations are optional everywhere" is
 qualified. Everything else infers; a field access does not.
 
 **Why.** `HasField` is a deferred constraint (`crates/wsharp-sema/src/infer.rs`)
-— it can be discharged once the type is known and is reported when it never
+- it can be discharged once the type is known and is reported when it never
 becomes known. Inferring it instead needs row polymorphism or an equivalent
 structural mechanism, which changes the type system rather than adding to it,
 and interacts with a dispatch lattice that is nominal by construction.
@@ -163,7 +163,7 @@ system rather than an addition to it, and it has to meet a dispatch lattice that
 is nominal by construction: a row type describes a *shape*, and W#'s type ids are
 a preorder walk of a lattice of *names*, which is what makes the dispatcher's
 subtype test one subtract and one compare. There is a real design question in
-there — what a row variable means to an overload set — and it is not one to answer
+there - what a row variable means to an overload set - and it is not one to answer
 under a release date. The diagnostic already names the field and says what to
 write, so the cost is an annotation.
 
@@ -198,12 +198,12 @@ error: `K` is a top-level `const` array, which cannot be written
 
 **Why.** The check is syntactic, on the name at the assignment, and W# has no
 way to say that a reference is read-only. The data is emitted **writable** on
-purpose (`crates/wsharp-codegen/src/lib.rs` — `define_arrays`): a read-only page
+purpose (`crates/wsharp-codegen/src/lib.rs` - `define_arrays`): a read-only page
 would turn this mistake into a fault with no message, which is worse than a
 shared table quietly changing.
 
 A top-level `const` array is one object shared by every worker in the process,
-and W# has no mutable globals — the workers' design rests on that, since a
+and W# has no mutable globals - the workers' design rests on that, since a
 worker's state is an explicit value passed in and out.
 
 **Workaround.** Copy before mutating, and change the copy:
@@ -217,7 +217,7 @@ copy[0] = 42;
 assumed.** It is the entry on the list that most looks like it deserves a fix: a
 shared table changing silently is a wrong answer, not an inconvenience.
 
-The honest fix is a read-only reference — a property carried by the *type*, so
+The honest fix is a read-only reference - a property carried by the *type*, so
 that it propagates through a binding, a parameter, a struct field and a return,
 and so that the check happens wherever the write is. W# has no such qualifier,
 and adding one touches unification, coercion, overload resolution and every
@@ -225,7 +225,7 @@ signature in the standard library.
 
 The cheap fix was considered and **rejected**: refusing `var a = K;` at the
 binding closes the spelling in this entry and not the next one, because a
-function parameter is an alias too —
+function parameter is an alias too -
 
 ```wsharp
 fn zero(a: []i64) void { a[0] = 0; }
@@ -234,7 +234,7 @@ zero(K);          // still writes the shared table
 
 A check that stops the first and not the second is worse than the check that is
 here, because it reads like a guarantee and is not one. The current diagnostic
-claims exactly what it enforces — this name cannot be written — and that is a
+claims exactly what it enforces - this name cannot be written - and that is a
 true statement. Moving the check to the binding would make the compiler appear to
 enforce immutability it cannot see.
 
@@ -243,7 +243,7 @@ the type system to be able to say the thing. **`error before miscompile` does no
 apply here**: nothing is miscompiled, the program does exactly what it says, and
 what is missing is a way to have said otherwise.
 
-**Guarded by** `tests/cases/const_array_alias.ws`, which asserts both halves —
+**Guarded by** `tests/cases/const_array_alias.ws`, which asserts both halves -
 the alias write going through, and the copy leaving the table alone. Written for
 this entry, so that the limitation cannot stop being true without a test saying
 so; if a read-only reference ever lands, that case fails and this entry gets
@@ -258,7 +258,7 @@ documented limitation.
 **What.** `==` on a struct compares field by field and recurses into struct
 fields, and cycles are not detected. A comparison that follows one is *bounded*
 rather than endless: past 2048 values deep it panics, naming the rule. So a
-cyclic value cannot be compared — with anything, including itself — but it is
+cyclic value cannot be compared - with anything, including itself - but it is
 refused with a W# diagnostic and the runtime's panic exit status rather than
 taking the process with it.
 
@@ -277,7 +277,7 @@ W# panic: `==` went more than 2048 values deep: a struct that reaches itself can
 ```
 
 Exit status 101, the same one every W# panic exits with. A legitimately deep
-value — a chain longer than the bound, with no cycle in it — meets the same
+value - a chain longer than the bound, with no cycle in it - meets the same
 refusal, which is the part of this to know before nesting that deeply.
 
 **Why.** `==` on a struct is compiled into a *function* per concrete type
@@ -288,17 +288,17 @@ depth carried through the generated calls against
 `wsharp_runtime::EQ_MAX_DEPTH`. Detecting the cycle itself would need a set of
 the pairs in flight, hence an allocation, hence a safepoint in the middle of
 reading two objects' fields; a counter costs one register and one compare. It is
-the shape `std/json`'s `MAX_DEPTH` and `std/x509`'s `MAX_CHAIN` already have — a
+the shape `std/json`'s `MAX_DEPTH` and `std/x509`'s `MAX_CHAIN` already have - a
 named bound with no knob. The neighbouring case is caught at compile time
 instead: a struct with an array, a function or an error-union field is rejected
 as uncomparable with a diagnostic naming the field
 (`crates/wsharp-sema/src/infer.rs:6668`), and that reaches down the lattice.
 
-**Disposition: fixed — and the bound is what is left, which is why this entry
+**Disposition: fixed - and the bound is what is left, which is why this entry
 is still here.** Until the bound landed, the program above died on a signal
 with no W# diagnostic and no exit
 status a program could act on. By clause 3 of the P1 definition in
-`RELEASE-CRITERIA-1.0.md` that is a P1 whatever the documentation says — Johnny
+`RELEASE-CRITERIA-1.0.md` that is a P1 whatever the documentation says - Johnny
 ruled on 2026-09-26 that clause 3 carries no exemption for documented behaviour,
 because documentation changes who is surprised, not what the process does. Form
 C says the same thing from the other side: a limitation whose behaviour is a
@@ -309,14 +309,14 @@ bound is what gets documented. This entry is that bound.
 fields you mean, or an identifier. A doubly linked list, a parent pointer and a
 graph node are all cyclic.
 
-**Guarded by** `tests/cases/eq_cycle_bounded.ws`, which asserts both halves —
+**Guarded by** `tests/cases/eq_cycle_bounded.ws`, which asserts both halves -
 a 64-long chain still comparing, and answering *unequal* for two chains that
 differ only in the last node, so that a bound which refused ordinary values
 would fail the case rather than pass it; and a node whose `next` is itself
 panicking with this message.
 
 **Tracked.** [#13](https://github.com/sinisterMage/WSharp/issues/13), a P1,
-closed by the fix rather than by this entry — the entry describes what the fix
+closed by the fix rather than by this entry - the entry describes what the fix
 left behind.
 
 ## A generic struct cannot have a supertype
@@ -333,27 +333,27 @@ error: a generic struct cannot have a supertype
   = help: give the subtype concrete fields, or drop the type parameters
 ```
 
-**Why.** Struct type ids are a preorder walk of the dispatch lattice — every
+**Why.** Struct type ids are a preorder walk of the dispatch lattice - every
 type's subtypes occupy `type_id .. type_id + subtree_len`, which is what makes
 the dispatcher's subtype test one subtract and one compare. Numbering runs
 before monomorphisation, and a generic struct's instantiations are not known
 until after it. So an instantiation takes an id from a block *above* the
-lattice, where it can disturb no range test — and a type in that block cannot
+lattice, where it can disturb no range test - and a type in that block cannot
 also be inside somebody's subtree.
 
-**Workaround.** Make the subtype concrete — `const IntBox = struct : Base { v: i64 };`,
-one per instantiation you actually dispatch on — or express the shape with a
+**Workaround.** Make the subtype concrete - `const IntBox = struct : Base { v: i64 };`,
+one per instantiation you actually dispatch on - or express the shape with a
 generic struct that *holds* a lattice value rather than being one.
 
 **Tracked.** No issue; this is a consequence of the dispatch design rather than
 an unfinished piece, and changing it means changing how type ids are assigned.
-Raise one if you meet it in real code — that would be the evidence for
+Raise one if you meet it in real code - that would be the evidence for
 revisiting it.
 
 ## Every overload of a dispatched call must share one return type, error set included
 
 **What.** A call that has to choose at run time has one type, so the overloads
-it chooses between must all return the same thing — and an error set is part of
+it chooses between must all return the same thing - and an error set is part of
 a function's type here, so they must all raise the same set.
 
 **Why.** A dispatched call compiles to one join point with one result. That is
@@ -364,7 +364,7 @@ to write the same two-dozen-name set out twice.
 
 **Workaround.** An optional field and an `if`, which is what `std/http` does.
 The lattice is right when the members agree about failure and wrong when they do
-not — that is the design test, not a workaround for a missing feature.
+not - that is the design test, not a workaround for a missing feature.
 
 **Tracked.** No issue; deliberate, and stated here because it is the constraint
 people meet when they first reach for subtyping across a transport boundary.
@@ -377,12 +377,12 @@ that releases it.
 **Why.** The collector reclaims memory; a socket, a file handle or a library
 handle is not memory, and W# has no finaliser to hang one on. Adding `defer`
 means deciding what runs on a panic, which means deciding what a panic is
-allowed to unwind through — and generated code's roots are stack maps rather
+allowed to unwind through - and generated code's roots are stack maps rather
 than an unwind table.
 
 **Workaround.** The shape the standard library uses everywhere: build under a
 temporary name and `rename` into place in one step, so an interruption leaves
-rubbish rather than a half-written thing (`ingot/store.ws` — `install`). For a
+rubbish rather than a half-written thing (`ingot/store.ws` - `install`). For a
 handle, close it on every path, and prefer an API that takes the caller's buffer
 over one that hands back a resource (`net.read_into`).
 
@@ -402,7 +402,7 @@ a **connected** socket. On a listener it does not: Linux wakes a thread parked i
 
 The consequence to write down, because it is the one a program actually meets:
 `net.shutdown` takes a `Socket`, `net.listen` hands back a `Listener`, and the two
-are different types. So **the divergence is not reachable through the API** —
+are different types. So **the divergence is not reachable through the API** -
 passing a listener to `shutdown` is a type error on every platform, and the only
 way to reach the underlying `shutdown(2)` on a listening descriptor is to
 hand-construct a `Socket` around `Listener.handle`. Doing that is outside what
@@ -413,14 +413,14 @@ error: type mismatch: this argument has type `Listener`, expected `Socket`
 ```
 
 **Why.** The difference is in the operating systems. Emulating the Linux
-behaviour on the BSDs needs a self-pipe or an equivalent per listener — a second
-descriptor per listener, in the poller, for the whole of its life — and the
+behaviour on the BSDs needs a self-pipe or an equivalent per listener - a second
+descriptor per listener, in the poller, for the whole of its life - and the
 alternative is a function that silently does nothing on half the release targets.
 Two of the four release triples are Darwin, so "half" is literal.
 
 **Workaround, and it is the shape a real server has anyway.** Drive the acceptor
-with a poller and a tick — `net.accept_nonblocking`, `net.watch_listener`,
-`net.wait(p, ms)` — and take the stop signal from whatever the program already
+with a poller and a tick - `net.accept_nonblocking`, `net.watch_listener`,
+`net.wait(p, ms)` - and take the stop signal from whatever the program already
 has, usually a `std/broker` topic, because that crosses heaps.
 `tests/cases/net_poller.ws` is the worked shape.
 
@@ -434,7 +434,7 @@ instead, and `main` returning ends the process
 library already refuses to offer the operation rather than offering one that means
 two things. The self-pipe would make `shutdown_listener` portable and would put a
 descriptor and a poller registration on every listener to serve an exit path the
-poller shape does not need — and that shape is the one a real server has anyway,
+poller shape does not need - and that shape is the one a real server has anyway,
 which is why it is the documented answer rather than a consolation.
 
 **Guarded by** two cases, because the limitation has two halves and only one of
@@ -456,35 +456,35 @@ documented limitation.
 ## `std/tls` cannot verify a chain through a P-521 key
 
 **What.** TLS verifies chains through RSA, Ed25519, P-256 and P-384. A key on
-P-521 is **refused where it is read** — `x509.parse_spki` answers `error.BadKey`
-(`crates/wsharp-runtime/src/std/x509.ws:166`) — not accepted, and not a crash. A
+P-521 is **refused where it is read** - `x509.parse_spki` answers `error.BadKey`
+(`crates/wsharp-runtime/src/std/x509.ws:166`) - not accepted, and not a crash. A
 typical trust store has one such root.
 
 What that costs a user, plainly: **a service whose chain goes through a P-521 key
 cannot be reached by this client.** `net`/`std/http` over plain TCP is unaffected;
 `https://` to such a host fails the handshake with a chain that could not be
 verified, and there is nothing to configure. Everything else in a normal trust
-store still works — the one unreadable root is dropped and the rest are used — so
+store still works - the one unreadable root is dropped and the rest are used - so
 the failure is per-host rather than per-machine. In practice P-521 is rare on the
 public web; it is the ordinary case in some government and defence PKIs, and if
 that is the PKI you are on, this client is not usable for it.
 
 Note that `ecdsa_secp521r1_sha512` *is* a named constant in `std/x509`
 (`ECDSA_SECP521R1_SHA512`) and `scheme_hash` answers SHA-512 for it. That is not
-an advertisement: `std/tls`'s `SCHEMES` — the `signature_algorithms` the client
-actually offers — omits it, so a server is never invited to choose a scheme this
+an advertisement: `std/tls`'s `SCHEMES` - the `signature_algorithms` the client
+actually offers - omits it, so a server is never invited to choose a scheme this
 library cannot complete.
 
 **Why.** `std/nistec` is one curve implementation parameterised by limb count,
 coordinate size and scalar width, over `std/bignum`'s generic Montgomery
-multiplication — which is what made P-384 a table of constants rather than a
+multiplication - which is what made P-384 a table of constants rather than a
 second implementation. P-521 is not the same again: 521 bits is not a whole
 number of 32-bit limbs, and a limb is 32 bits because there is no 64x64 -> 128
 product to build a wider one from (`bits.mulhi` does not exist). So it needs
 either a partial top limb threaded through the arithmetic, or the wide multiply.
 
 A root in the *store* that this library cannot read is dropped and the rest are
-used; one in a *chain* is a refusal. That asymmetry is deliberate — answering
+used; one in a *chain* is a refusal. That asymmetry is deliberate - answering
 both the same way either makes a machine with one odd root unusable, or makes a
 broken chain acceptable.
 
@@ -494,8 +494,8 @@ chain cannot be reached by this client.
 **Disposition: documented limitation.** P-256 and P-384 are the same code over
 different tables, and P-521 is not the same again: 521 bits is not a whole number
 of 32-bit limbs, so it needs either a partial top limb threaded through every
-operation in `std/bignum`'s Montgomery arithmetic — where a carry that is wrong
-once in a while is a signature verifier that accepts something it should not — or
+operation in `std/bignum`'s Montgomery arithmetic - where a carry that is wrong
+once in a while is a signature verifier that accepts something it should not - or
 `bits.mulhi` and a 64-bit limb, which is a change to `std/bignum`,
 `std/nistec` and `std/curve25519` together. Neither is a table of constants, and
 neither is work to do against a release date in code whose failure mode is
@@ -504,7 +504,7 @@ key is read.
 
 **Guarded by** `tests/cases/x509_p521.ws`, which reads a real SPKI for each of
 the three curves and asserts that P-256 and P-384 are read and P-521 is not.
-Three keys rather than one, so that the boundary asserted is the curve — a case
+Three keys rather than one, so that the boundary asserted is the curve - a case
 holding only the P-521 key would still pass if `parse_spki` stopped reading EC
 keys altogether. Written for this entry.
 
@@ -535,7 +535,7 @@ W# where getting it wrong is undefined behaviour rather than an error message.
 
 ## `str.hash` is neither keyed nor cryptographic
 
-**What.** `std/map` hashes keys with `str.hash` — FNV-1a followed by the
+**What.** `std/map` hashes keys with `str.hash` - FNV-1a followed by the
 SplitMix64 finaliser (`crates/wsharp-runtime/src/strings.rs:427`). A table built
 from attacker-chosen keys can be made to collide.
 
@@ -544,7 +544,7 @@ call is a stack walk under `--gc-stress`, so a hash over a key would be one
 stack walk per byte. The builtin is what makes `std/map` usable under the
 collector's own test suite.
 
-**Workaround.** Reach for `std/hash` when the keys come from outside —
+**Workaround.** Reach for `std/hash` when the keys come from outside -
 SHA-256 or HMAC, and hash into a fixed-width key yourself.
 
 **Tracked.** No issue. Stated because "is the map's hash safe against a hostile
@@ -597,7 +597,7 @@ The four release triples are `x86_64-unknown-linux-gnu`,
 **Why.** The collector's root walk reads the frame pointer with inline assembly,
 per architecture. `walk_generated` is then the same everywhere, because
 Cranelift's prologue establishes the frame pointer whatever the calling
-convention — so a third architecture needs the register read and a Cranelift
+convention - so a third architecture needs the register read and a Cranelift
 backend this project actually tests, not a rewrite of the walk.
 
 **Workaround.** None.
@@ -609,7 +609,7 @@ job on real hardware that a release is held to. Adding one during the 1.0 campai
 would mean shipping a platform whose collector nobody had watched fail, which is
 the opposite of what the campaign is for.
 
-**Guarded by** two mechanisms, neither of which is a `tests/cases` entry — a case
+**Guarded by** two mechanisms, neither of which is a `tests/cases` entry - a case
 cannot be written for an architecture that does not build. The
 `compile_error!` at `crates/wsharp-runtime/src/stackwalk.rs:46` is the guard in the
 inward direction: a fifth architecture cannot be half-added and left to fail at
@@ -652,7 +652,7 @@ interface.
 # Where limitations that closed went
 
 `ROADMAP.md` keeps every limitation that was closed as one line apiece, under
-"Closed by item 13", "Closed by item 14" and the development log itself — so a
+"Closed by item 13", "Closed by item 14" and the development log itself - so a
 reader who remembers a limitation finds out where it went rather than wondering
 whether they misremembered it. Ten stood on the wsharp.io limitations page at
 `0.1.1` and do not now.

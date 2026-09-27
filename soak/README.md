@@ -35,7 +35,7 @@ the full commit SHA, a target triple or `-`, and free-text detail. The subject
 field is checked against the file's name, so a row appended to the wrong file is
 caught rather than credited to the wrong owner.
 
-Several rows for one subject on one day are expected — a subject run on four
+Several rows for one subject on one day are expected - a subject run on four
 triples writes four. The day counts as reported when at least one row exists,
 and fails when **any** row for it failed: a batch that passed on three platforms
 and failed on the fourth did not pass.
@@ -47,10 +47,10 @@ the script.
 
 | Subject | Owner | What it is |
 |---|---|---|
-| `compiler` | Dex | `tests/harness/nightly.sh` once a day — parity across the three execution modes, the fuzz corpus, the pause measurements |
+| `compiler` | Dex | `tests/harness/nightly.sh` once a day - parity across the three execution modes, the fuzz corpus, the pause measurements |
 | `ecosystem` | Ash | the `.wsharp` ecosystem check, one full run per day on all four release triples |
 | `raython` | Wren | the Raython sample application, a long-running HTTP server |
 
-A subject with no rows is not a subject that is doing fine — it is a `?` for
+A subject with no rows is not a subject that is doing fine - it is a `?` for
 every day and it fails the gate. That is the intended reading while `raython`
 does not exist yet.

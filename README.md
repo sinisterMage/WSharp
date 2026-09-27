@@ -18,8 +18,9 @@ inferred rather than declared, and checked across the whole program before it
 builds. Values are unboxed. The collector is built for low pause times.
 
 ```wsharp
-// The status types come from the standard library; nothing is declared here.
+// The HTTP status types come from the standard library.
 const http = @import("std/http");
+const Request = struct { path: str };
 
 fn render(r: Request, s: http.Status)      str { return "HTTP/1.1 500 Internal Server Error"; }
 fn render(r: Request, s: http.Status2xx)   str { return "HTTP/1.1 200 OK"; }
@@ -27,8 +28,13 @@ fn render(r: Request, s: http.Status4xx)   str { return "HTTP/1.1 400 Bad Reques
 fn render(r: Request, s: http.NotFound404) str { return "HTTP/1.1 404 Not Found"; }
 fn render(r: Request, s: http.Teapot418)   str { return "HTTP/1.1 418 I'm a teapot"; }
 
-// Resolved at compile time: the argument's type is exactly what it says.
-print(render(req, http.NotFound404));
+fn main() i64 {
+    const req = Request{ .path = "/" };
+    // Resolved at compile time: the status type is known here.
+    print(render(req, http.NotFound404));
+    serve(req, http.Teapot418);
+    return 0;
+}
 
 // Resolved at run time, from the type id in the object's header, because
 // `s` could be any status by the time this runs.
@@ -347,9 +353,12 @@ serve the sidecar too. Signing is scheduled after 1.0.
 
 ### `wsharp build` needs a C compiler
 
+`wsharp build hello.ws --emit=obj -o hello.o` only writes an object file and
+does not link. Producing an executable requires the linker described below.
+
 `wsharp run` needs nothing beyond the tarball: it compiles into its own process
-and calls no linker. **`wsharp build` does**, because it writes an object file
-and links it against the runtime archive with `cc`. So a clean machine that has
+and calls no linker. **`wsharp build` normally does**, because it writes an
+object file and links it against the runtime archive with `cc`. So a clean machine that has
 only unpacked a release can run W# programs and cannot yet build them:
 
 ```
@@ -358,8 +367,10 @@ error: `wsharp build` needs a C compiler to link, and found no `cc` on PATH.
 ```
 
 Install one first: `build-essential` on Debian and Ubuntu, `gcc` on Fedora, the
-Command Line Tools on macOS, and on Windows either the MSVC build tools or
-clang. Setting `$CC` to a compiler not called `cc` works too. This is the same
+Command Line Tools on macOS, and on Windows the MSVC build tools with clang
+available in the developer environment. Set `CC=clang` on Windows: the linker
+driver passes GCC-style arguments such as `-o`, which `cl.exe` does not accept.
+Setting `$CC` to a compatible compiler not called `cc` works too. This is the same
 requirement "Building and running" states below for building the compiler
 itself; it applies to a binary install as well, which is the part that used to go
 unsaid.
@@ -381,7 +392,11 @@ Or without entering the shell:
 nix-shell --run "cargo run -p wsharp-cli -- run examples/status.ws"
 ```
 
-Outside Nix, any environment with `cc` and Rust 1.95+ works with plain `cargo`.
+Install Rust 1.95.0, the version pinned in `rust-toolchain.toml`, and a C
+toolchain before running these commands. The Nix shell supplies the C toolchain;
+it expects Rust and Cargo to already be available. With rustup, the repository
+pin selects Rust 1.95.0. Outside Nix, run the same `cargo` commands directly
+from the repository root with that toolchain and a compatible C compiler.
 Note that `.cargo/config.toml` sets `-Cforce-frame-pointers=yes`: the collector
 walks the frame-pointer chain out of the runtime to find its roots, and the
 chain has to be unbroken through the Rust frames as well as the generated ones.

@@ -19,7 +19,7 @@ nix-shell --run "cargo build --workspace"
 |---|---|---|
 | `selftest.sh` | does the harness report what actually happened? | seconds, **no compiler needed** |
 | `conform-selftest.sh` | can the conformance gate tell a rotted diagnostic from an intact one? | seconds, **no compiler needed** |
-| `parity.sh` | do the three execution modes agree, per case? | 1–3 h for the corpus on one core |
+| `parity.sh` | do the three execution modes agree, per case? | 1-3 h for the corpus on one core |
 | `conform.sh` | does every refusal still print the same diagnostic, span and help line? | seconds for the 64 rejection cases |
 | `fuzz.pl` | does arbitrary input crash or hang the front end or a stdlib parser? | bounded by `--max-seconds` |
 | `flake-rate.sh` | how often does one case do something different, and how long does it take when it does? | attempts × the case |
@@ -34,7 +34,7 @@ can always be compared. Override with `WSHARP_HARNESS_REPORTS`.
 Two dependencies past a shell and perl, both resolved in `lib.sh` and both
 refused up front rather than per case:
 
-- **`timeout(1)`**, which is coreutils and is *not in base macOS* — two of the
+- **`timeout(1)`**, which is coreutils and is *not in base macOS* - two of the
   four release triples. `gtimeout` is accepted, which is what Homebrew's
   coreutils installs. Without one, the harness exits 2 instead of running the
   corpus unbounded and turning a hang into a runner that dies hours later with
@@ -62,7 +62,7 @@ harness lies:
   about the older code. Check the two SHAs the report prints against each other
   before believing a result about a recent fix.
 
-## `selftest.sh` — is the gate itself working?
+## `selftest.sh` - is the gate itself working?
 
 ```sh
 tests/harness/selftest.sh
@@ -72,8 +72,8 @@ tests/harness/selftest.sh
 passing for the wrong reason: a comparison that stopped detecting divergence
 reports an empty divergence list, which is exactly what success looks like.
 
-So `selftest.sh` builds a **stub compiler** — a shell script that answers from
-directives in a case file — and runs the real `parity.sh` over a corpus whose
+So `selftest.sh` builds a **stub compiler** - a shell script that answers from
+directives in a case file - and runs the real `parity.sh` over a corpus whose
 verdicts are known in advance: three modes agreeing, two disagreeing about
 stdout, two disagreeing about exit status, one mode disagreeing with itself, and
 one where the only difference is noise `normalise` is supposed to remove. Then
@@ -92,12 +92,12 @@ can tell a divergence from agreement, not that there are none.
 on every pull request. Its stub compiler prints diagnostics dictated by the case
 file, so a corpus can contain a diagnostic whose span has moved by four columns,
 one whose `= help:` line has vanished, one `check` and `run` refuse differently,
-and one with no snapshot at all — and the selftest asserts the verdict for each,
+and one with no snapshot at all - and the selftest asserts the verdict for each,
 that the kept diff names both the old and the new column, that `--bless` then
 verify round-trips, and that an unsnapshotted corpus exits **3** rather than 0.
 Twenty-four assertions, no cargo.
 
-## `conform.sh` — what the language refuses, and in what words
+## `conform.sh` - what the language refuses, and in what words
 
 ```sh
 tests/harness/conform.sh              # verify against the committed snapshots
@@ -106,14 +106,14 @@ tests/harness/conform.sh --bless      # rewrite them from the compiler under tes
 
 `parity.sh` pins what W# *accepts*. This pins what it *refuses*: for every case
 in `tests/cases` whose header carries `// error:`, the whole rendered diagnostic
-compared byte for byte against `tests/conformance/expected/<case>.diag` —
+compared byte for byte against `tests/conformance/expected/<case>.diag` -
 message, `-->` location, quoted source line, caret columns, secondary labels and
-help line — plus a `check`-versus-`run` differential on every one of them.
+help line - plus a `check`-versus-`run` differential on every one of them.
 
 Three regressions the existing substring checks cannot see, and this one can: a
 span that rots to `1:1`, a `= help:` line that disappears (nothing in
 `tests/cases` expects one today, and `wsharp-sema` sets over forty), and `check`
-accepting a program `run` refuses — which has happened, and is what
+accepting a program `run` refuses - which has happened, and is what
 `err_unpinned_generic.ws` documents.
 
 Verdicts are `PINNED`, `CHANGED`, `ACCEPTED`, `NOSPAN`, `CHECKRUN` and
@@ -122,7 +122,7 @@ cannot-be-answered**, which is what an empty snapshot set gets rather than a
 green run. The full description, the bless procedure and the suite's limits are
 in `tests/conformance/README.md`.
 
-## `parity.sh` — differential testing across the three modes
+## `parity.sh` - differential testing across the three modes
 
 ```sh
 tests/harness/parity.sh                      # the whole corpus
@@ -142,7 +142,7 @@ Divergence is reported per case, with both outputs kept under `diffs/`.
 **A mode that hits the per-run bound is a `TIMEOUT`, not a divergence.** Each
 mode runs under `timeout`, which answers 124 (TERM) or 137 (KILL); those are the
 harness's numbers, not the program's. A mode that did not finish has not
-disagreed with anything — it has not answered — so it gets its own verdict and
+disagreed with anything - it has not answered - so it gets its own verdict and
 its own `diffs/<case>.timeout.txt`, which records every mode's status and says
 which bound each was given. The first scheduled nightly reported
 `gc_map_replacement` as `DIVERGED` on two triples for exactly this reason; the
@@ -176,7 +176,7 @@ the collector's statistics line, temporary paths, and hexadecimal addresses. Tha
 list is in `lib.sh` and is deliberately short -- everything on it is something
 this harness cannot check.
 
-## `fuzz.pl` — mutation fuzzing with reduction
+## `fuzz.pl` - mutation fuzzing with reduction
 
 ```sh
 tests/harness/fuzz.pl --target check --seed 1 --iterations 500
@@ -186,8 +186,8 @@ tests/harness/fuzz.pl --target toml  --replay target/harness/.../input.toml
 
 | target | what runs | seed corpus |
 |---|---|---|
-| `check` | `wsharp check` — parser and type checker | `tests/cases/*.ws`, `examples/*.ws` |
-| `run` | `wsharp run` — adds lowering, codegen and the runtime | the same |
+| `check` | `wsharp check` - parser and type checker | `tests/cases/*.ws`, `examples/*.ws` |
+| `run` | `wsharp run` - adds lowering, codegen and the runtime | the same |
 | `json` | `std/json.parse`, via `drivers/fuzz_json.ws` | `corpus/json/` |
 | `toml` | `std/toml.parse`, via `drivers/fuzz_toml.ws` | `corpus/toml/` |
 
@@ -217,7 +217,7 @@ milliseconds, so recompiling per iteration spends the whole budget on the
 compiler while claiming to fuzz the parser; building once took 60 inputs from
 157 seconds to under 10.
 
-## `gc-pauses.sh` — pause times, and the counts that say they mean anything
+## `gc-pauses.sh` - pause times, and the counts that say they mean anything
 
 ```sh
 tests/harness/gc-pauses.sh --only gc_ --repeats 5
@@ -241,7 +241,7 @@ number to reproduce on a quiet one, not a defect.
 pass for the wrong reason, so any sample reporting zero collections, zero roots
 or zero pauses is called out rather than counted as a quiet success.
 
-## `soak.sh` — the long windows
+## `soak.sh` - the long windows
 
 ```sh
 tests/harness/soak.sh \
@@ -296,7 +296,7 @@ and come back.
    and so should the summary: *what ran, and for how long*. A window that was cut
    short is not a clean window.
 
-## `flake-rate.sh` — a rate, not an adjective
+## `flake-rate.sh` - a rate, not an adjective
 
 ```sh
 tests/harness/flake-rate.sh --case tests/cases/https_loopback.ws --attempts 40
@@ -307,8 +307,8 @@ tests/harness/flake-rate.sh --case tests/cases/gc_moving.ws --mode stress
 and "it is flaky" is not something an owner can act on. This runs one case many
 times and records **every attempt's duration** beside its verdict, because that
 is what separates the two explanations a single timeout has: a long tail on a
-busy machine is slowness, and a second mode far from the first — an attempt
-taking several times the p99 and then hitting the timeout — is a stall, which is
+busy machine is slowness, and a second mode far from the first - an attempt
+taking several times the p99 and then hitting the timeout - is a stall, which is
 a defect whatever the load was.
 
 The report gives the rate per exit status, the p50/p90/p99/max duration, and the
@@ -321,13 +321,13 @@ campaign per target, into one directory with one `report.md`. The seed is the
 date, so one number replays the night.
 
 The matrix is fanned out and collected by `.github/workflows/nightly.yml`. The
-*script* does not know it is in CI on purpose — that would be a second place the
-matrix is defined — but the split between the two workflows is a decision worth
+*script* does not know it is in CI on purpose - that would be a second place the
+matrix is defined - but the split between the two workflows is a decision worth
 writing down here as well as there:
 
 | workflow | when | what |
 |---|---|---|
-| `ci.yml` | every push and pull request | the suite, the lints, and both selftests (`selftest.sh`, `conform-selftest.sh`) — seconds, no cargo |
+| `ci.yml` | every push and pull request | the suite, the lints, and both selftests (`selftest.sh`, `conform-selftest.sh`) - seconds, no cargo |
 | `nightly.yml` | 03:00 UTC daily, and on demand | `parity.sh` and `conform.sh` on all four release triples, `nightly.sh` on Linux |
 
 `parity.sh` is one to three hours per platform, so putting it on every pull
@@ -369,7 +369,7 @@ A suite's limits belong where somebody reading its green run will see them.
   suite subsumes the other.
 - **The corpus is `tests/cases`.** Parity's coverage is exactly what somebody
   wrote a case for. A construct with no case is not tested by this harness in
-  any mode, and nothing here measures which constructs those are — grammar
+  any mode, and nothing here measures which constructs those are - grammar
   coverage is not computed.
 - **`normalise` is a list of things that cannot be checked.** The collector's
   statistics line, temporary paths and hexadecimal addresses are stripped before
@@ -397,7 +397,7 @@ A suite's limits belong where somebody reading its green run will see them.
   from outside the runtime at all (#18). The report says which distribution it is
   reporting, every time.
 - **Timing numbers here are not published numbers.** Pause and duration figures
-  are for triage — is this a stall or a busy box — and anything quoted as a
+  are for triage - is this a stall or a busy box - and anything quoted as a
   result goes through Ridge's harness under Form B of the proof standard.
 - **CI covers four triples and one older-glibc container.** A platform not in
   that matrix has no evidence, and a pass on one triple is evidence about one
@@ -407,6 +407,6 @@ A suite's limits belong where somebody reading its green run will see them.
 - **`conform.sh` has no snapshots committed yet**, so today it proves the
   comparison works rather than that any W# diagnostic is correct: it exits 3,
   "cannot answer", until a bless commit lands. It also adds no new rejection
-  cases — it pins the 64 that exist — and does not cover warnings, `// panic:`
+  cases - it pins the 64 that exist - and does not cover warnings, `// panic:`
   text, `build`, or any multi-file diagnostic. `tests/conformance/README.md` is
   the full list.
