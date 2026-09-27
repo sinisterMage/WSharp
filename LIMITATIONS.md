@@ -124,6 +124,64 @@ could have drifted from the compiler's without a test noticing.
 **Tracked.** [#9](https://github.com/sinisterMage/WSharp/issues/9), closed as a
 documented limitation.
 
+## A top-level `const` array cannot hold strings
+
+**What.** Top-level array literals accept only integer, `f64` and `bool`
+elements. Reference elements, including `str`, are rejected even when every
+element is a literal. This is separate from the computed-initializer restriction
+above: making the elements literal does not make a string array legal.
+
+```wsharp
+const suffixes = []str{ ".json" };
+```
+
+The diagnostic is ``a top-level `const` array may not hold `str` ``. Its
+source span covers the array initializer, and its `help:` explains that the data
+section is not collector-traced and elements must be numbers or booleans.
+
+**Why.** Static arrays are immortal objects outside the traced heap. String
+literals are also immortal, so their initial addresses alone are not the whole
+problem: an array can be written through a local alias (see the limitation
+below). A later write could put a heap-allocated string into an untraced static
+array, hiding a live reference from collection and relocation. Merely allowing
+`str` in the scalar check would violate the invariant that static arrays contain
+no references. This is a storage and collector boundary, not a language rule
+imposed by Cranelift.
+
+**Workaround.** Construct the array inside a function, where it is an ordinary
+heap array whose references the collector can trace:
+
+<!-- from: tests/cases/local_string_array.ws -->
+```wsharp
+// #47 workaround: a function-local array can hold traced references.
+// expect: .json
+fn main() void {
+    const suffixes = []str{ ".json" };
+    for (suffixes) |suffix| { print(suffix); }
+}
+```
+
+**Disposition: documented limitation.** Retain the refusal for the v1.0
+assessment. Supporting global reference arrays needs either traced global
+storage integrated with collection and relocation, or an enforced immutable
+reference-array representation that cannot acquire heap references through an
+alias. Computed initializers additionally need startup initialization. A literal
+string-array special case without one of those guarantees would be unsound.
+This records the existing restriction; it does not add a release promise.
+
+**Guarded by** `tests/cases/err_const_string_array.ws`, which isolates the
+refusal, source location and help text, and `tests/cases/local_string_array.ws`,
+which prints `.json` using the workaround. The existing
+`tests/cases/err_const_array_bad.ws` also checks the distinction between reference
+elements and computed scalar elements. These are limitation guards, not evidence
+of a compiler fix: the rejection is expected both before and after this docs
+change.
+
+**Tracked.** [#47](https://github.com/sinisterMage/WSharp/issues/47), the string
+array capability request; related to the storage boundary in
+[#9](https://github.com/sinisterMage/WSharp/issues/9) and the aliasing limitation in
+[#12](https://github.com/sinisterMage/WSharp/issues/12).
+
 ## A field access needs a type the compiler can name
 
 **What.** Structs are nominal and there is no row polymorphism, so a parameter
