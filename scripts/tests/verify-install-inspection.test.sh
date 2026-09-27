@@ -6,10 +6,12 @@ SCRIPT="${VERIFY_INSTALL_SCRIPT:-$ROOT/scripts/verify-install.sh}"
 TEST="$(mktemp -d "${TMPDIR:-/tmp}/verify-inspection.XXXXXX")"
 trap 'rm -rf "$TEST"' EXIT
 export FIXTURE="$TEST" REAL_FIND="$(command -v find)" REAL_TAR="$(command -v tar)"
+export REAL_SHA256SUM="$(command -v sha256sum || true)" REAL_SHASUM="$(command -v shasum || true)"
 export REAL_SORT="$(command -v sort)" REAL_COMM="$(command -v comm)"
 mkdir -p "$TEST/bin" "$TEST/archive" "$TEST/home" "$TEST/tmp"
 # Pre-existing directories ensure only the forbidden file is new.
 mkdir -p "$TEST/home/.cache" "$TEST/home/.npm" "$TEST/home/project/.git"
+printf 'profile fixture\n' > "$TEST/home/.profile"
 printf 'fixture only\n' > "$TEST/archive/sharpie"
 tar czf "$TEST/asset.tar.gz" -C "$TEST/archive" sharpie
 if command -v sha256sum >/dev/null; then
@@ -21,6 +23,7 @@ cat > "$TEST/bin/curl" <<'SH'
 #!/usr/bin/env bash
 [ "$FAULT" != fetch ] || { echo 'injected fetch/auth/network failure' >&2; exit 22; }
 while [ "$1" != -o ]; do shift; done
+if [ "$FAULT" = empty-sidecar ] && [[ "$3" = *.sha256 ]]; then : > "$2"; exit 0; fi
 case "$3" in *.sha256) cp "$FIXTURE/asset.sha256" "$2";; *) cp "$FIXTURE/asset.tar.gz" "$2";; esac
 SH
 cat > "$TEST/bin/find" <<'SH'
@@ -62,6 +65,27 @@ if [ "$1" = xzf ]; then
 fi
 exec "$REAL_TAR" "$@"
 SH
+for tool in sha256sum shasum; do
+  case "$tool" in
+    sha256sum) [ -n "$REAL_SHA256SUM" ] || continue;;
+    shasum) [ -n "$REAL_SHASUM" ] || continue;;
+  esac
+  cat > "$TEST/bin/$tool" <<'SH'
+#!/usr/bin/env bash
+case "${0##*/}" in
+  sha256sum) "$REAL_SHA256SUM" "$@";;
+  shasum) "$REAL_SHASUM" "$@";;
+esac
+status=$?
+[ "$status" -eq 0 ] || exit "$status"
+case "$FAULT" in
+  digest-error) exit 1;;
+  profile-digest) [[ " $*" != *'/.profile'* ]] || exit 1;;
+  damaged-digest) [[ " $*" != *'/truncated.tar.gz'* ]] || exit 1;;
+esac
+exit 0
+SH
+done
 for tool in sort comm; do
   cat > "$TEST/bin/$tool" <<'SH'
 #!/usr/bin/env bash
@@ -72,7 +96,7 @@ SH
 done
 chmod +x "$TEST/bin/"*
 failures=0
-faults=(clean leak cache-leak npm-leak git-leak marker before after sort comm fetch archive-list archive-path)
+faults=(clean leak cache-leak npm-leak git-leak marker before after sort comm fetch archive-list archive-path empty-sidecar digest-error profile-digest damaged-digest)
 # Opt-in acceptance probe: intentionally red until attribution is implemented.
 if [ "${VERIFY_INSTALL_ATTRIBUTION_PROBE:-0}" = 1 ]; then
   faults+=(host-write transient-leak)
@@ -113,10 +137,14 @@ for fault in "${faults[@]}"; do
     comm) pattern='FATAL 5. cannot compare filesystem manifests'; expected=3;;
     archive-list) pattern='FATAL 3. cannot inspect archive members'; expected=3;;
     archive-path) pattern='FATAL 3. refusing to extract'; expected=3;;
+    empty-sidecar) pattern='FATAL 2. the sidecar carried no digest'; expected=3;;
+    digest-error) pattern='FATAL 2. cannot compute archive digest'; expected=3;;
+    profile-digest) pattern='FATAL 6. cannot inspect shell profiles before install'; expected=3;;
+    damaged-digest) pattern='FATAL 7. cannot compute candidate digest'; expected=3;;
     fetch) pattern='FAIL 1. could not download'; expected=1;;
   esac
   case "$fault" in
-    archive-list|archive-path)
+    archive-list|archive-path|empty-sidecar|digest-error|profile-digest)
       if [ -f "$TEST/extracted" ]; then
         echo "FAIL $fault: extraction attempted after rejected inspection"
         failures=$((failures + 1))

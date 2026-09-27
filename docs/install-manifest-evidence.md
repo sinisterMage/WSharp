@@ -165,3 +165,52 @@ Native Windows, Intel macOS and arm64 macOS experiments and full release runs
 remain required. This development environment provides none of those OS images;
 no new native image/version, observed/published digest or exit evidence exists.
 The parent retains release workflow dispatch and final main-commit verification.
+
+## Digest inspection must also fail closed
+
+An empty sidecar previously recorded a failure but still extracted the archive.
+A digest process that printed the correct digest and then failed was accepted;
+profile digest failures were hidden by `echo`, and a failed digest of the damaged
+candidate could count as a successful rejection. These paths now stop with
+exit 3. No extraction occurs after an empty sidecar, failed archive digest or
+failed initial profile digest. A damaged-candidate inspection error is a fatal
+gate error, not evidence that integrity verification rejected the candidate.
+
+Reproduction on Debian GNU/Linux 13.7 x86_64, development container (2026-09-27):
+
+```sh
+git show 0f83baf:scripts/verify-install.sh > "$PAPERCLIP_RUN_SCRATCH_DIR/verify-install-before.sh"
+VERIFY_INSTALL_SCRIPT="$PAPERCLIP_RUN_SCRATCH_DIR/verify-install-before.sh" bash scripts/tests/verify-install-inspection.test.sh
+bash scripts/tests/verify-install-inspection.test.sh
+bash scripts/tests/verify-install.test.sh
+bash -n scripts/verify-install.sh scripts/tests/verify-install-inspection.test.sh
+git diff --check
+```
+
+Before: suite exit 1; all four new cases fail. Empty-sidecar exits 1 but extracts;
+archive/profile digest errors exit 0 and extract; damaged-candidate digest error
+exits 0. After: all seventeen cases pass, suite exit 0, and all four added cases
+exit 3. The preserved published-release/alias suite passes four checks, exit 0.
+Syntax and whitespace checks exit 0. The fault wrapper emits the real digest
+before failing, so these tests prove exit-status propagation rather than merely
+checking that empty output mismatches a sidecar.
+
+This patch does not resolve the two attribution probes, link-target containment,
+transient writes, existing-file changes or writes outside the monitored roots.
+It adds no runtime dependencies, name exclusions or weaker acceptance rule.
+There is no new clean-machine result: Windows, Intel macOS and arm64 macOS image
+versions, observed/published release digests and install exits are unavailable
+for this patch. Live run 36268568557 remains Linux success and three native
+failures. The prior PR-head CI also has a contributor-commands gate failure;
+ordinary compiler CI success is not installation acceptance.
+
+Native isolation validation requires an execution path on each actual OS. This
+heartbeat environment is Linux only and its namespace sandbox fails before a
+command starts (`No permissions to create a new namespace`). A shell environment
+rewrite is therefore not validated isolation. Johnny must coordinate authorized
+native diagnostic execution or access; Rowan must then implement and validate
+process-tree collection or containment before requesting final parent-owned
+release dispatch. Required probes remain child/absolute/transient writes,
+unrelated sibling writes, link escapes, denied inspection, startup failure,
+collector death and event loss. Neither accepting this hardening patch nor
+providing diagnostic access authorizes merge, release or publication.

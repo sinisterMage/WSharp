@@ -167,8 +167,10 @@ fi
 
 # The sidecar is `<digest>  <filename>`. Take the first field only, so a
 # sidecar naming a path rather than a bare name still compares.
-PUBLISHED="$(awk 'NR==1 {print $1}' "$SIDECAR")"
-OBSERVED="$(digest_of "$TARBALL")"
+PUBLISHED="$(awk 'NR==1 {print $1}' "$SIDECAR")" \
+  || die "2. cannot inspect published digest"
+OBSERVED="$(digest_of "$TARBALL")" \
+  || die "2. cannot compute archive digest"
 
 echo "     digest published  $PUBLISHED"
 echo "     digest observed   $OBSERVED"
@@ -182,7 +184,7 @@ echo "     digest observed   $OBSERVED"
 # ---------------------------------------------------------------------------
 
 if [ -z "$PUBLISHED" ]; then
-  fail "2. the sidecar carried no digest"
+  die "2. the sidecar carried no digest"
 elif [ "$OBSERVED" = "$PUBLISHED" ]; then
   ok "2. digest verified before extracting"
 else
@@ -269,13 +271,19 @@ readonly PROFILES=(
 )
 
 profile_state() {
-  local p
+  local p digest
   for p in "${PROFILES[@]}"; do
-    if [ -f "$p" ]; then echo "$p $(digest_of "$p")"; else echo "$p absent"; fi
+    if [ -f "$p" ]; then
+      digest="$(digest_of "$p")" || return 1
+      echo "$p $digest" || return 1
+    else
+      echo "$p absent" || return 1
+    fi
   done
 }
 
-profile_state > "$WORK/profiles.before"
+profile_state > "$WORK/profiles.before" \
+  || die "6. cannot inspect shell profiles before install"
 
 # ---------------------------------------------------------------------------
 # 3. Extract into the documented prefix and nowhere else.
@@ -420,7 +428,8 @@ fi
 # 6b. The shell profile was not edited.
 # ---------------------------------------------------------------------------
 
-profile_state > "$WORK/profiles.after"
+profile_state > "$WORK/profiles.after" \
+  || die "6. cannot inspect shell profiles after install"
 
 if diff -q "$WORK/profiles.before" "$WORK/profiles.after" >/dev/null 2>&1; then
   ok "6. the shell profile was not edited"
@@ -445,7 +454,7 @@ fi
 # print a refusal. Extracts only on a match, into its own empty directory.
 verify_and_extract() {
   local candidate="$1" dest="$2" observed
-  observed="$(digest_of "$candidate")"
+  observed="$(digest_of "$candidate")" || return 3
   if [ "$observed" != "$PUBLISHED" ]; then
     echo "refusing: digest mismatch for $(basename "$candidate")"
     echo "  published $PUBLISHED"
@@ -462,6 +471,7 @@ check_damaged() {
   mkdir -p "$dest"
   out="$(verify_and_extract "$candidate" "$dest" 2>&1)"
   status=$?
+  [ "$status" -ne 3 ] || die "7. cannot compute candidate digest"
 
   if [ "$status" -eq 0 ]; then
     fail "7. a $name download was accepted"
@@ -496,7 +506,8 @@ cp "$TARBALL" "$CORRUPT"
 # Flip a byte in the middle of the compressed stream.
 printf '\xff' | dd of="$CORRUPT" bs=1 seek="$(( full_size / 2 ))" count=1 \
   conv=notrunc status=none 2>/dev/null
-if [ "$(digest_of "$CORRUPT")" = "$PUBLISHED" ]; then
+corrupt_digest="$(digest_of "$CORRUPT")" || die "7. cannot compute corrupted digest"
+if [ "$corrupt_digest" = "$PUBLISHED" ]; then
   # A one-byte flip that lands on the value already there changes nothing.
   printf '\x00' | dd of="$CORRUPT" bs=1 seek="$(( full_size / 2 ))" count=1 \
     conv=notrunc status=none 2>/dev/null
