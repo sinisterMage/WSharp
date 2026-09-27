@@ -195,7 +195,9 @@ pub extern "C" fn ws_gc_poll() {
     // us here. Idempotent either way: a worker that was not asked for a pause
     // simply goes back to what it was doing.
     let worker = Worker::current();
-    if !crate::worker::take_safepoint_request(worker) {
+    // The request precedes phase publication. An early poll must leave it
+    // pending: only the pause (or abandonment) may clear the request.
+    if !crate::worker::wants_a_pause(worker) {
         return;
     }
     unsafe { mark::safepoint() };
