@@ -7,7 +7,7 @@ version = "0.2.3"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
-repository = "https://forgejo-hagc.srv1954822.hstgr.cloud/ofekbickel/WSharp"
+repository = "https://github.com/sinisterMage/WSharp"
 
 [workspace.dependencies]
 # Pinned to 0.134.3: this exact version is present in the local registry cache,
