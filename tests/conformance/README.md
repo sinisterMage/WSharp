@@ -93,17 +93,20 @@ leaving the case unblessed — and it refuses a case whose snapshot and whose
 `// error:` header no longer describe the same refusal, because that is the one
 finding a reviewer skimming a bless diff would not notice.
 
-**`expected/` holds 62 snapshots, blessed from the first real `conformance`
-job's artifact, not from a local build.** Nobody on this campaign has a machine
-that can build W# — no `rustc`, no `cargo`, no `cc` — so guessed diagnostics
-would have produced failures on the first real run that looked like compiler
-defects and were typing mistakes. What happened instead: the first run of the
-`conformance` job (dispatched manually on 2026-09-27, run `36296023948`) exited
-3 and uploaded every diagnostic it *would* have pinned as
+**`expected/` holds 63 snapshots, blessed from a real `conformance` job's
+artifact, not from a local build.** Nobody on this campaign has a machine that
+can build W# — no `rustc`, no `cargo`, no `cc` — so guessed diagnostics would
+have produced failures on the first real run that looked like compiler defects
+and were typing mistakes. What happened instead: the run of the `conformance`
+job (dispatched manually on 2026-09-27, run `36296023948`) exited 3 and uploaded
+every diagnostic it *would* have pinned as
 `conformance-<triple>/diffs/*.proposed.diag`; the snapshots here are those
 bytes, normalised (see below) and committed. They came from four independent
 triples and, after normalisation, were **byte-identical on all four** — which is
 itself the first evidence that a diagnostic is a platform-independent claim.
+The sixty-third (`err_const_string_array`) was added when `main` gained that
+case (#58) while the bless PR was open; the scheduled run `36306746001`
+proposed it and re-confirmed the other sixty-two with zero mismatches.
 
 Two things remain un-blessed and are the gate's current red rows: the four
 `err_ffi_*` cases report `NOSPAN` (their `-->` names a line of `std/ffi`, not of
