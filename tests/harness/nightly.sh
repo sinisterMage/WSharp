@@ -80,8 +80,15 @@ if [ "$QUICK" -eq 0 ]; then
         --only gc_ --repeats 3 --stress >"$OUT/gc-pauses-stress.log" 2>&1 || true
 fi
 
-per_target=$(( FUZZ_SECONDS / 4 ))
-for target in check run json toml; do
+# Six targets now, not four. `grammar` and `grammar-run` construct their input
+# from the grammar rather than mutating a seed program, which is the only way this
+# campaign reaches a construct combination nobody wrote a case for -- see
+# `tests/harness/generate.pl`. The budget is split evenly rather than weighted:
+# nothing yet says which of the six finds more per second, and inventing a
+# weighting before there is data would be a number this harness cannot defend.
+FUZZ_TARGETS="check run json toml grammar grammar-run"
+per_target=$(( FUZZ_SECONDS / 6 ))
+for target in $FUZZ_TARGETS; do
     echo "nightly: fuzzing $target for ${per_target}s"
     if "$(dirname "${BASH_SOURCE[0]}")/fuzz.pl" --target "$target" --seed "$SEED" \
             --iterations 100000 --max-seconds "$per_target" --timeout 25 \
@@ -117,7 +124,7 @@ summarise_parity() {
     echo "|---|---|"
     echo "| JIT/AOT/stress parity | $(summarise_parity) |"
     echo "| collector pauses | $status_pauses |"
-    for target in check run json toml; do
+    for target in $FUZZ_TARGETS; do
         echo "| fuzz \`$target\` | ${status_fuzz[$target]} |"
     done
     echo

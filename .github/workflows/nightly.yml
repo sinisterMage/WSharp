@@ -14,9 +14,10 @@
 # would make the median change wait three hours and would spend a runner-day per
 # push. So the split is:
 #
-#   ci.yml       every push and PR     the suite, the lints, and the two
+#   ci.yml       every push and PR     the suite, the lints, and the three
 #                                      harness selftests (`selftest.sh`,
-#                                      `conform-selftest.sh`) -- seconds, no
+#                                      `conform-selftest.sh`,
+#                                      `generate-selftest.sh`) -- seconds, no
 #                                      cargo, and they are what keep the
 #                                      harness's own verdict logic honest
 #   nightly.yml  03:00 UTC daily       parity on four triples, conformance on
@@ -45,7 +46,7 @@ on:
   workflow_dispatch:
     inputs:
       fuzz-seconds:
-        description: "Total fuzz budget, split across the four targets"
+        description: "Total fuzz budget, split across the six fuzz targets"
         required: false
         default: "1800"
       quick:
@@ -306,7 +307,7 @@ jobs:
               rc=1
             fi
           fi
-          for t in check run json toml; do
+          for t in check run json toml grammar grammar-run; do
             d="target/harness/night/fuzz-$t/findings"
             if [ -d "$d" ] && [ -n "$(ls -A "$d" 2>/dev/null)" ]; then
               echo "nightly: fuzz target '$t' has findings:"

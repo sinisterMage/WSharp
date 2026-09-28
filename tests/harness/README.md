@@ -19,6 +19,8 @@ nix-shell --run "cargo build --workspace"
 |---|---|---|
 | `selftest.sh` | does the harness report what actually happened? | seconds, **no compiler needed** |
 | `conform-selftest.sh` | can the conformance gate tell a rotted diagnostic from an intact one? | seconds, **no compiler needed** |
+| `generate-selftest.sh` | does the grammar generator produce whole programs, reproducibly? | seconds, **no compiler needed** |
+| `generate.pl` | build W# programs from the grammar, and report which constructs were covered | milliseconds per program |
 | `parity.sh` | do the three execution modes agree, per case? | 1–3 h for the corpus on one core |
 | `conform.sh` | does every refusal still print the same diagnostic, span and help line? | seconds for the 64 rejection cases |
 | `fuzz.pl` | does arbitrary input crash or hang the front end or a stdlib parser? | bounded by `--max-seconds` |
@@ -166,6 +168,49 @@ tests/harness/fuzz.pl --target toml  --replay target/harness/.../input.toml
 | `run` | `wsharp run` — adds lowering, codegen and the runtime | the same |
 | `json` | `std/json.parse`, via `drivers/fuzz_json.ws` | `corpus/json/` |
 | `toml` | `std/toml.parse`, via `drivers/fuzz_toml.ws` | `corpus/toml/` |
+| `grammar` | `wsharp check` over a **generated** program | none — `generate.pl` builds it |
+| `grammar-run` | `wsharp run` over a generated program | none |
+
+## `generate.pl` — grammar-aware generation, and grammar coverage
+
+```sh
+tests/harness/generate.pl --seed 7 --print                          # one program
+tests/harness/generate.pl --seed 1 --count 200 --out DIR --coverage # a corpus
+tests/harness/fuzz.pl --target grammar --seed 1 --max-seconds 600   # a campaign
+```
+
+A mutator cannot do two things, and both of them matter here. It cannot
+**construct a program the corpus does not resemble** — a `while` inside a closure
+inside a struct-returning function is not two bit flips away from anything
+committed, so no budget finds it. And it cannot **say what it covered**, because
+it does not know what it built.
+
+So `generate.pl` builds programs from a grammar and records, for every
+production, how many times it was used and which production it was nested
+*inside*. `--coverage` writes both tables. The nesting one is the interesting
+half: a construct in isolation usually has a case in `tests/cases`, and a
+construct inside another usually does not.
+
+Three properties, each verified by `generate-selftest.sh` rather than asserted
+here:
+
+- **A program is a pure function of its seed**, using the same 31-bit LCG
+  `fuzz.pl` uses, so a finding travels as one number. `fuzz.pl --target grammar
+  --seed S` feeds iteration *i* the seed `S + i`, which means any input from a
+  campaign is reproducible outside the fuzzer entirely:
+  `generate.pl --seed <S+i> --print`. That equality is checked, not assumed.
+- **Recursion is cut at `--max-depth`, and the cut is a terminal production**
+  rather than a truncation, so a program is never half-written. Every generated
+  loop carries its own increment for the same reason: a hang the generator caused
+  is not a finding about W#.
+- **A run that generated nothing exits 2.** `--count 0` is a mistyped argument,
+  not a clean campaign — the same lesson `conform.sh` learned by reporting a met
+  gate over an empty case set.
+
+The generated programs are *intended to be valid*, which is what makes this
+different from mutation: what is being looked for is not a parse error but the
+outcomes that are not a diagnostic at all, reached through construct
+combinations nobody wrote a case for.
 
 What counts as a finding: a Rust panic, a signal, no answer inside the timeout,
 and -- for the stdlib parsers only -- a W# panic, because "a parser answers, it
@@ -303,7 +348,7 @@ writing down here as well as there:
 
 | workflow | when | what |
 |---|---|---|
-| `ci.yml` | every push and pull request | the suite, the lints, and both selftests (`selftest.sh`, `conform-selftest.sh`) — seconds, no cargo |
+| `ci.yml` | every push and pull request | the suite, the lints, and all three selftests (`selftest.sh`, `conform-selftest.sh`, `generate-selftest.sh`) — seconds, no cargo |
 | `nightly.yml` | 03:00 UTC daily, and on demand | `parity.sh` and `conform.sh` on all four release triples, `nightly.sh` on Linux |
 
 `parity.sh` is one to three hours per platform, so putting it on every pull
@@ -357,11 +402,24 @@ A suite's limits belong where somebody reading its green run will see them.
   to agree across the three modes it ran in is recorded as `AGREED`;
   `flake-rate.sh` is what answers the question properly, and it is run by hand
   against a named case rather than across the corpus.
-- **Fuzzing is mutation-based, not grammar-aware.** `fuzz.pl` mutates a seed
-  corpus with a dictionary. It reaches deep parser states by starting from real
-  programs, and it will not construct a valid-but-unusual program the corpus does
-  not already resemble. There is no generator that knows the grammar, and no
-  coverage feedback to steer one.
+- **Fuzzing is now both mutation-based and grammar-aware, and there is still no
+  coverage feedback.** The four original `fuzz.pl` targets mutate a seed corpus
+  with a dictionary, so they reach deep parser states cheaply and will not
+  construct a valid-but-unusual program the corpus does not resemble. The two
+  `grammar` targets build programs from `generate.pl`'s grammar instead, which
+  closes that half. What is still missing is **steering**: nothing measures which
+  construct a run reached and biases the next one toward what it did not, so
+  `generate.pl`'s coverage numbers are a report and not a feedback loop.
+- **The grammar is a subset of W#, and `generate.pl` says which subset.** Its
+  coverage report lists every declared production including the ones it never
+  reached, and today a 120-program sample reaches **27 of 39** — `for`, `try`,
+  `catch`, `@spawn`, worker calls, field access, array literals, dispatch over
+  an overload set and generic closures are declared and unreachable. That is a
+  known gap with a number on it rather than an unknown one.
+- **A generated program has no oracle beyond "the compiler behaved".** Nothing
+  predicts what W# *should* print for a generated program, so the verdicts are
+  only panic, signal, hang and OK. A generated program that compiles and prints
+  the wrong number is recorded as OK.
 - **The `json` and `toml` targets fuzz two parsers.** Every other `std/*` module
   is unfuzzed, and so is `ingot`.
 - **Nothing here fuzzes across a worker boundary**, drives many workers, or

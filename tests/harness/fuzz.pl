@@ -97,8 +97,28 @@ while (@ARGV) {
 }
 die "fuzz: no compiler at $wsharp\n" unless -x $wsharp;
 
-my %SUFFIX = (check => '.ws', run => '.ws', json => '.json', toml => '.toml');
+my %SUFFIX = (
+    check         => '.ws',
+    run           => '.ws',
+    json          => '.json',
+    toml          => '.toml',
+    # Grammar-aware targets. The input is *built* rather than mutated, so the
+    # campaign reaches construct combinations no seed program resembles -- see
+    # `tests/harness/generate.pl`. `grammar` stops at `wsharp check` and so
+    # fuzzes the parser and inference; `grammar-run` adds lowering, codegen and
+    # the runtime.
+    grammar       => '.ws',
+    'grammar-run' => '.ws',
+);
 die "fuzz: unknown target $target\n" unless exists $SUFFIX{$target};
+
+# Loaded only for the grammar targets, so the four original ones are unaffected
+# by it and a broken generator cannot stop a mutation campaign.
+my $GRAMMAR = 0;
+if ($target =~ /^grammar/) {
+    require "$root/tests/harness/generate.pl";
+    $GRAMMAR = 1;
+}
 
 $outdir ||= "$root/target/harness/fuzz-$target-$seed";
 make_path("$outdir/findings");
@@ -115,13 +135,18 @@ sub slurp { local $/; open my $fh, '<:raw', $_[0] or return undef; return <$fh>;
 sub spew  { open my $fh, '>:raw', $_[0] or die "fuzz: cannot write $_[0]: $!\n"; print $fh $_[1]; close $fh; }
 
 my @corpus_paths;
-if ($target eq 'check' || $target eq 'run') {
+if ($GRAMMAR) {
+    # No seed corpus: a grammar target constructs its input. Kept as an explicit
+    # branch rather than letting the glob come back empty, so the `empty seed
+    # corpus` guard below stays a real check for the targets that need one.
+    @corpus_paths = ();
+} elsif ($target eq 'check' || $target eq 'run') {
     @corpus_paths = (sort glob("$root/tests/cases/*.ws"), sort glob("$root/examples/*.ws"));
 } else {
     @corpus_paths = sort glob("$root/tests/harness/corpus/$target/*");
 }
 my @corpus = grep { defined } map { slurp($_) } @corpus_paths;
-die "fuzz: empty seed corpus for $target\n" unless @corpus;
+die "fuzz: empty seed corpus for $target\n" unless @corpus || $GRAMMAR;
 
 # Tokens worth inserting whole. A bit flip inside an identifier explores very
 # little; dropping a `try` or an extra `}` in explores the grammar.
@@ -194,6 +219,14 @@ sub mutate {
 
 sub generate {
     my ($s) = @_;
+    # A grammar target's input is a pure function of the iteration's seed, with
+    # no corpus in it at all -- which is what makes a finding replayable from a
+    # single number rather than from a number plus the state of `tests/cases`.
+    if ($GRAMMAR) {
+        die "fuzz: generate() needs an iteration seed for a grammar target\n"
+            unless defined $s;
+        return ws_generate($s, $ENV{WSHARP_FUZZ_MAX_DEPTH} || 4);
+    }
     my $base = $corpus[rnd(scalar @corpus)];
     my $rounds = 1 + rnd(6);
     $base = mutate($base) for 1 .. $rounds;
@@ -228,6 +261,8 @@ my %COMMAND = (
     run   => sub { my $f = shift; return ($wsharp, 'run', $f) },
     json  => sub { my $f = shift; return ($driver, $f) },
     toml  => sub { my $f = shift; return ($driver, $f) },
+    grammar       => sub { my $f = shift; return ($wsharp, 'check', $f) },
+    'grammar-run' => sub { my $f = shift; return ($wsharp, 'run', $f) },
 );
 
 # fork/exec, with stdout discarded and stderr captured to a file. No shell is
@@ -377,7 +412,12 @@ my $ran = 0;
 
 for my $i (1 .. $iterations) {
     last if $maxseconds && (time - $started) >= $maxseconds;
-    my $bytes = generate();
+    # The grammar targets take the iteration as part of the seed, so a program
+    # is named by two numbers a reader already has -- `--seed S` and iteration
+    # `i` -- and is reproducible outside the fuzzer entirely with
+    # `generate.pl --seed <S+i> --print`. The mutation targets keep drawing from
+    # the shared RNG, which is what makes their inputs depend on the corpus.
+    my $bytes = generate($seed + $i);
     my ($v, $s) = check_input($bytes);
     $ran++;
     $verdicts{$v}++;
