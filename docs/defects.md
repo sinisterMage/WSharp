@@ -12,7 +12,7 @@ discovered at the worst possible moment.
 ## Where a defect lands
 
 **GitHub issues on [`sinisterMage/WSharp`](https://github.com/sinisterMage/WSharp/issues)
-are the record.** Every defect gets one, whoever found it — a user, a driver
+are the record.** Every defect gets one, whoever found it - a user, a driver
 program, the soak harness, or release verification.
 
 The repository is the record rather than any internal tracker for one reason: a
@@ -52,7 +52,7 @@ modes, and the two source ranges that disagree.
 
 Defined in
 [`RELEASE-CRITERIA-1.0.md`](../RELEASE-CRITERIA-1.0.md#the-severity-scale). It is
-not repeated here on purpose — a severity scale in two documents is a scale that
+not repeated here on purpose - a severity scale in two documents is a scale that
 disagrees with itself eventually, and the disagreement surfaces during a freeze,
 when it is most expensive.
 
@@ -61,7 +61,7 @@ What matters for intake:
 - The **filer proposes** a severity on the report form; the **triage owner for
   the surface confirms or changes it**, within one working day.
 - **An unconfirmed report counts at the severity the filer proposed.** So "no
-  open P1" cannot be satisfied by leaving reports untriaged — which is the
+  open P1" cannot be satisfied by leaving reports untriaged - which is the
   property that makes the gate mean anything.
 - Ambiguity resolves **upward**. A defect that might be a silently wrong answer
   is P1 until somebody demonstrates it is not.
@@ -86,9 +86,9 @@ Disagreement about a severity goes to Johnny.
 **Weekly, and nothing sits untriaged for a week.** Every open issue leaves triage
 with three things:
 
-- a **severity** label (`P1`–`P3`), replacing `needs-triage`,
+- a **severity** label (`P1`-`P3`), replacing `needs-triage`,
 - an **owner**, as the GitHub assignee,
-- a **next action**, written as a comment — not "investigate", but the actual next
+- a **next action**, written as a comment - not "investigate", but the actual next
   step: reduce it further, ask the reporter for the libc version, write the
   failing case, bisect between two named commits.
 
@@ -101,8 +101,8 @@ still reproduce it.
 
 **`v1.0-limitation` is a triage outcome, and it is not the same as P3.** The
 severity scale grades what a defect *does*, so it presumes there is one. A
-report that describes something W# does not support — and refuses cleanly, or
-never claimed — has no defect to grade, and forcing it onto the scale would
+report that describes something W# does not support - and refuses cleanly, or
+never claimed - has no defect to grade, and forcing it onto the scale would
 inflate every count with things working as designed. `P3` means a real defect
 that gates nothing; `v1.0-limitation` means there is nothing wrong.
 
@@ -114,7 +114,7 @@ The test is what a supported program does, not how inconvenient the answer is:
 - A **refusal at runtime**, with a diagnostic, of something outside the
   documented domain is a limitation. Refusing too much is a limitation;
   *accepting* too much is a defect, and in the crypto surface a P1.
-- An **absent capability** — an architecture, a curve, a syntax — is a
+- An **absent capability** - an architecture, a curve, a syntax - is a
   limitation whatever it costs the person who wanted it.
 
 Two rules keep this from becoming a place to hide defects:
@@ -126,7 +126,7 @@ Two rules keep this from becoming a place to hide defects:
 2. **A limitation and a severity can coexist, and then the severity wins.** A
    P2 that is not being fixed for 1.0 carries both labels: `v1.0-limitation`
    records the decision, `P2` keeps it in the counts, and the criteria make the
-   listing mandatory rather than editorial — an open P2 that is neither fixed
+   listing mandatory rather than editorial - an open P2 that is neither fixed
    nor listed becomes a P1, because it makes the documentation wrong.
 
 Limitation-only issues are **excluded from the weekly counts** and reported as
@@ -143,7 +143,7 @@ This is not a preference. A fix without a guard is a fix that comes back, and th
 second occurrence is always more expensive than the first because everyone has
 forgotten the reasoning.
 
-Usually the guard is a `.ws` file in `tests/cases/` — the reduction from the
+Usually the guard is a `.ws` file in `tests/cases/` - the reduction from the
 issue, with its expectations in a header comment. `tests/cases` is the right home
 for anything observable from a W# program, because the harness runs each case
 three ways: JIT, JIT under `--gc-stress`, and compiled with `wsharp build`. One
@@ -151,14 +151,14 @@ file therefore guards all three execution modes, which is exactly the coverage a
 miscompile or a collector defect needs.
 
 A crate test is right instead when the defect is not observable from a W# program
-— a serialisation round trip, a platform arm, a parser dump.
+- a serialisation round trip, a platform arm, a parser dump.
 
 Name it for the defect rather than for the feature: the next person to read it
 needs to know what it is protecting.
 
 **Write the guard before the fix, and watch it fail.** A guard that has never
 failed has not been shown to guard anything, and one written afterwards
-frequently does not — it is easy to write a case that passes for a reason
+frequently does not - it is easy to write a case that passes for a reason
 unrelated to the bug.
 
 The fix itself names, in the issue, which crate was wrong and which invariant it
@@ -175,8 +175,8 @@ Run the checks that prove *this* fix, not the whole suite by reflex.
 cargo build --workspace
 ```
 
-`cargo test` does not build `crates/wsharp-start` — it declares `test = false`
-and nothing depends on it — while the case suite's AOT pass links against
+`cargo test` does not build `crates/wsharp-start` - it declares `test = false`
+and nothing depends on it - while the case suite's AOT pass links against
 whatever `libwsharp_start.a` an earlier build left in `target/debug`. A cold
 tree fails every built case; a warm one silently links a stale runtime and
 **passes**, which is worse.
@@ -199,7 +199,7 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out
 ```
 
 A test filter matches the names of *test functions*, and the case suite has no
-function per case — it has three functions that each iterate every case. So a
+function per case - it has three functions that each iterate every case. So a
 case name filters everything out and reports `ok`. Green, and it ran nothing.
 This is the same trap as the stale archive above, which is why both are written
 down here.
@@ -237,7 +237,7 @@ that turns out to matter.
 Posted weekly, on the triage pass. The format:
 
 ```markdown
-## Defect report — week ending YYYY-MM-DD
+## Defect report - week ending YYYY-MM-DD
 
 | | P1 | P2 | P3 | Total |
 |---|---|---|---|---|
@@ -247,10 +247,10 @@ Posted weekly, on the triage pass. The format:
 | **Open now** |  |  |  |  |
 
 **Untriaged:** N (target: 0)
-**Open P1:** N — *list each one, with owner and next action*
-**Tracked limitations:** N open — *not defects, counted separately*
+**Open P1:** N - *list each one, with owner and next action*
+**Tracked limitations:** N open - *not defects, counted separately*
 
-**Load this week:** what was actually exercising the compiler — driver programs,
+**Load this week:** what was actually exercising the compiler - driver programs,
 soak hours, platforms covered. A defect count means nothing without it.
 
 **Trend:** is the defect rate falling under constant or rising load?

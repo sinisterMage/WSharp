@@ -96,12 +96,8 @@ jobs:
       - name: Check this pull request's labels
         run: jq -r '.pull_request.labels[].name' "$GITHUB_EVENT_PATH" | bash scripts/check-change-label.sh
 
-  # Gate 6a. Every documented example is a real file, executed in CI.
-  #
-  # Red today: eight complete programs in `README.md` and `docs/processes.md`
-  # carry no marker, so nothing checks them against anything. The script names
-  # each one. Marking them up is prose work and belongs to whoever owns the
-  # prose; this job is what stops the count growing.
+  # Gate 6a. Every documented example is a real file, executed in CI, and the
+  # public prose uses only ASCII hyphens.
   doc-examples:
     name: documented examples (gate 6a)
     if: github.event_name != 'workflow_dispatch'
@@ -113,6 +109,12 @@ jobs:
         run: bash scripts/tests/check-doc-examples.test.sh
       - name: Check the documentation against the files it cites
         run: bash scripts/check-doc-examples.sh
+      # The other half of the documentation rule: no en-dashes or em-dashes in
+      # the public Markdown. The script checks the same files this job does,
+      # plus the harness and soak landing pages, so a dash cannot enter the
+      # prose with nothing going red.
+      - name: Check the public prose for non-ASCII dashes
+        run: bash scripts/check-docs-hyphens.sh
 
   # The other half of gate 6a: `examples/` has to actually be executed, or a
   # marker naming a file in it vouches for nothing. Until this job existed

@@ -41,8 +41,8 @@ Two consequences worth stating out loud:
 ### Pre-releases
 
 **A pre-release is never chosen unless a requirement asked for one.** The
-ordering stays honest — `1.3.0-rc.1` really is below `1.3.0` and really is
-inside `^1.0.0` — but the *choice* is a policy on top of the set algebra, and
+ordering stays honest - `1.3.0-rc.1` really is below `1.3.0` and really is
+inside `^1.0.0` - but the *choice* is a policy on top of the set algebra, and
 it is per package: asking for `a >=1.3.0-rc.1` says nothing about `b`.
 
 ```
@@ -56,7 +56,7 @@ a published at 1.0.0, 1.2.0, 1.3.0-rc.1
 
 `ingot resolve` runs [PubGrub](https://nex3.medium.com/pubgrub-2fb6470504f)
 over the requirements of the whole project, and chooses **one version per
-package** — not one per dependent. Within what is allowed it takes the
+package** - not one per dependent. Within what is allowed it takes the
 **newest**, and it **backtracks**: if the newest `a` needs a `b` that nothing
 supplies, the solver takes an older `a` rather than reporting a conflict a
 different choice would have avoided.
@@ -80,7 +80,7 @@ Three things stand outside the solver:
 ## When there is no answer
 
 `ingot resolve` exits **4** and writes the solver's account to **stderr**,
-unprefixed. Stdout carries what a verb achieved — here, nothing — so a script
+unprefixed. Stdout carries what a verb achieved - here, nothing - so a script
 cutting up `resolved<TAB>n` never has to tell that apart from a page of
 reasoning.
 
@@ -119,7 +119,7 @@ Two failures that are *not* the solver's, and say so differently:
 
 The first is a dependency with no source at all; the second is a registry that
 does not hold the name. Both exit 4. Both are on stderr under the `ingot: `
-prefix, which is also what progress uses — `ingot --quiet` leaves the message
+prefix, which is also what progress uses - `ingot --quiet` leaves the message
 and drops the progress.
 
 ## The lockfile
@@ -159,7 +159,7 @@ moves it. `ingot update` re-fetches the registry index; it is `resolve` that
 then acts on it.
 
 **`resolve` removes `ingot.env`.** That file names store directories, and a new
-resolution names new ones — while the old entries are still there holding what
+resolution names new ones - while the old entries are still there holding what
 they always did, so a compiler reading a stale environment would build against
 the previous versions and say nothing. It is removed rather than rewritten,
 because where things land is `install`'s answer.
@@ -181,7 +181,7 @@ So a script can ask without reading a word of output.
 | 3 | broken | no manifest, or something unreadable |
 
 `resolve`, `install` and every other verb exit **4** when they could not be
-carried out at all — distinct from `verify`'s answers, which are about a
+carried out at all - distinct from `verify`'s answers, which are about a
 project rather than about a mistake.
 
 ## What is not promised

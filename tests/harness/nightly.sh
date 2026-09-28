@@ -97,7 +97,7 @@ elapsed=$(( $(date +%s) - started ))
 summarise_parity() {
     local tsv="$OUT/parity/results.tsv"
     [ -f "$tsv" ] || { echo "not run"; return; }
-    awk -F'\t' 'NR>1 {n[$2]++} END {printf("%d agreed, %d diverged, %d nondeterministic", n["AGREED"], n["DIVERGED"], n["NONDETERMINISTIC"])}' "$tsv"
+    awk -F'\t' 'NR>1 {n[$2]++} END {printf("%d agreed, %d diverged, %d nondeterministic, %d timed out", n["AGREED"], n["DIVERGED"], n["NONDETERMINISTIC"], n["TIMEOUT"])}' "$tsv"
 }
 
 {

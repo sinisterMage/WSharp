@@ -17,9 +17,12 @@ Dispatch is resolved at compile time wherever the types allow. Types are
 inferred rather than declared, and checked across the whole program before it
 builds. Values are unboxed. The collector is built for low pause times.
 
+<!-- from: examples/status_intro.ws -->
+
 ```wsharp
-// The status types come from the standard library; nothing is declared here.
+// The HTTP status types come from the standard library.
 const http = @import("std/http");
+const Request = struct { path: str };
 
 fn render(r: Request, s: http.Status)      str { return "HTTP/1.1 500 Internal Server Error"; }
 fn render(r: Request, s: http.Status2xx)   str { return "HTTP/1.1 200 OK"; }
@@ -27,8 +30,13 @@ fn render(r: Request, s: http.Status4xx)   str { return "HTTP/1.1 400 Bad Reques
 fn render(r: Request, s: http.NotFound404) str { return "HTTP/1.1 404 Not Found"; }
 fn render(r: Request, s: http.Teapot418)   str { return "HTTP/1.1 418 I'm a teapot"; }
 
-// Resolved at compile time: the argument's type is exactly what it says.
-print(render(req, http.NotFound404));
+fn main() i64 {
+    const req = Request{ .path = "/" };
+    // Resolved at compile time: the status type is known here.
+    print(render(req, http.NotFound404));
+    serve(req, http.Teapot418);
+    return 0;
+}
 
 // Resolved at run time, from the type id in the object's header, because
 // `s` could be any status by the time this runs.
@@ -39,7 +47,10 @@ Adding a special case means adding a function. Nothing existing is edited, and
 the compiler rejects a new overload that would be ambiguous with an old one
 rather than silently changing which code runs.
 
-The whole example is in [`examples/status.ws`](examples/status.ws).
+This snippet is [`examples/status_intro.ws`](examples/status_intro.ws), run by
+the examples job like every other file in `examples/`. The fuller worked example,
+with routing over five compile-time and three run-time statuses, is
+[`examples/status.ws`](examples/status.ws).
 
 The documentation is at **[wsharp.io](https://wsharp.io)**: installing, a tour
 through the examples, the language reference, the standard library, and how the
@@ -347,9 +358,12 @@ serve the sidecar too. Signing is scheduled after 1.0.
 
 ### `wsharp build` needs a C compiler
 
+`wsharp build hello.ws --emit=obj -o hello.o` only writes an object file and
+does not link. Producing an executable requires the linker described below.
+
 `wsharp run` needs nothing beyond the tarball: it compiles into its own process
-and calls no linker. **`wsharp build` does**, because it writes an object file
-and links it against the runtime archive with `cc`. So a clean machine that has
+and calls no linker. **`wsharp build` normally does**, because it writes an
+object file and links it against the runtime archive with `cc`. So a clean machine that has
 only unpacked a release can run W# programs and cannot yet build them:
 
 ```
@@ -358,8 +372,10 @@ error: `wsharp build` needs a C compiler to link, and found no `cc` on PATH.
 ```
 
 Install one first: `build-essential` on Debian and Ubuntu, `gcc` on Fedora, the
-Command Line Tools on macOS, and on Windows either the MSVC build tools or
-clang. Setting `$CC` to a compiler not called `cc` works too. This is the same
+Command Line Tools on macOS, and on Windows the MSVC build tools with clang
+available in the developer environment. Set `CC=clang` on Windows: the linker
+driver passes GCC-style arguments such as `-o`, which `cl.exe` does not accept.
+Setting `$CC` to a compatible compiler not called `cc` works too. This is the same
 requirement "Building and running" states below for building the compiler
 itself; it applies to a binary install as well, which is the part that used to go
 unsaid.
@@ -381,7 +397,11 @@ Or without entering the shell:
 nix-shell --run "cargo run -p wsharp-cli -- run examples/status.ws"
 ```
 
-Outside Nix, any environment with `cc` and Rust 1.95+ works with plain `cargo`.
+Install Rust 1.95.0, the version pinned in `rust-toolchain.toml`, and a C
+toolchain before running these commands. The Nix shell supplies the C toolchain;
+it expects Rust and Cargo to already be available. With rustup, the repository
+pin selects Rust 1.95.0. Outside Nix, run the same `cargo` commands directly
+from the repository root with that toolchain and a compatible C compiler.
 Note that `.cargo/config.toml` sets `-Cforce-frame-pointers=yes`: the collector
 walks the frame-pointer chain out of the runtime to find its roots, and the
 chain has to be unbroken through the Rust frames as well as the generated ones.
@@ -728,19 +748,32 @@ APIs needing those shapes. The real C fixture in
 purpose: one of them has to work on a machine with no network and no store, and
 the other is the thing that fills the store.
 
+Start in an empty directory. This local example needs no registry or server;
+it creates both packages before resolving their dependency:
+
 ```sh
-ingot init myapp                    # write an ingot.toml here
-ingot add acme/json                 # record a dependency, from the registry
-ingot add util --path ../util       # or on a directory
-ingot resolve                       # choose versions and write ingot.lock
-ingot install                       # make the store satisfy it
-ingot verify                        # 0 ready, 1 install, 2 resolve, 3 broken
-ingot why core                      # the paths that pulled it in
+mkdir -p util/src myapp/src
+ingot -C util init util
+cat > util/src/util.ws <<'WS'
+pub fn twice(n: i64) i64 { return n * 2; }
+WS
+ingot -C myapp init myapp
+ingot -C myapp add util --path ../util
+ingot -C myapp resolve
+ingot -C myapp install
+ingot -C myapp verify
+cat > myapp/src/myapp.ws <<'WS'
+const util = @import("util");
+fn main() i64 { print(util.twice(21)); return 0; }
+WS
+wsharp run myapp/src/myapp.ws        # prints 42
+ingot -C myapp why util
 ```
 
 Resolving, installing and building are separate verbs: nothing compiles because
 something else was fetched. Output is tab-separated, `verify` answers with its
-exit status, and a conflict comes back as the derivation that caused it:
+exit status, and a conflict comes back as the derivation that caused it.
+The following diagnostic uses illustrative package names and versions:
 
 ```
 Because no versions of core match >=2.0.0 <3.0.0 and util 0.3.0 depends on
@@ -766,8 +799,8 @@ the registry - [Foundry](https://github.com/sinisterMage/Foundry), an index of
 plain TOML in a git repository, in the shape of Julia's General:
 
 ```sh
-ingot add acme/json          # the newest published version, as a caret
-ingot search json            # what is published
+ingot search postgres        # inspect published packages
+ingot add postgres/client   # the newest published version, as a caret
 ingot update                 # fetch the index again
 ```
 

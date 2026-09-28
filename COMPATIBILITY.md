@@ -1,13 +1,13 @@
 # What W# 1.0 promises
 
-**Status: in force for the v1.0 campaign.** The terms — which surfaces are
-frozen, and for how long — are fixed in
+**Status: in force for the v1.0 campaign.** The terms - which surfaces are
+frozen, and for how long - are fixed in
 [Part five of RELEASE-CRITERIA-1.0.md](RELEASE-CRITERIA-1.0.md#part-five-the-api-and-stability-freeze).
 This file states the same promise to users, surface by surface. If the two ever
 disagree, Part five is the one that is right and this file gets fixed.
 
 This document states the promise. [RELEASE-CRITERIA-1.0.md](RELEASE-CRITERIA-1.0.md)
-defines the bar the release has to clear, including — in Part one — the
+defines the bar the release has to clear, including - in Part one - the
 definition of a **breaking change** and the **severity scale**. This file does
 not restate either. Two copies of a definition drift, and that one is a gate on
 the freeze, so its drift is expensive. Where this document says *breaking*, it
@@ -23,7 +23,7 @@ Two things follow from that sentence, and they are the whole reason this file is
 short.
 
 **Anything not listed below is not promised.** Not "probably fine", not "we will
-try" — not promised. That is deliberate. A promise is a thing that cannot be
+try" - not promised. That is deliberate. A promise is a thing that cannot be
 withdrawn without a major version, so the set of them is chosen rather than
 inherited from whatever happened to be observable. If something you depend on is
 not here and you think it should be, that is a conversation worth having before
@@ -87,8 +87,8 @@ group, and a `fn` literal bound to a `const` is a definition rather than a value
 ## `std/*` and `ingot/*`
 
 **Promised.** For every `pub` name in the modules listed below: the name, the
-module it lives in, its parameter list and order, its return type, and — for a
-fallible function — its **declared error set**. An error set is part of a
+module it lives in, its parameter list and order, its return type, and - for a
+fallible function - its **declared error set**. An error set is part of a
 function's type here, so widening one is as breaking as narrowing one.
 
 The modules: `std/array`, `std/bignum`, `std/broker`, `std/bytes`,
@@ -109,7 +109,7 @@ reordering a field or moving a type in the lattice is breaking.
 
 - A name that is not `pub`. `pub` is the surface; everything else is the
   implementation, and W#'s module system enforces that rather than asking.
-- A **test hook** — a `pub` function that exists so a test can reach a primitive
+- A **test hook** - a `pub` function that exists so a test can reach a primitive
   a whole operation would hide, and says so in its doc comment.
   `curve25519.field_mul`, `cipher.aes_sub_byte` and `tls.client_replay` are the
   three. They are `pub` for the test harness, not for callers.
@@ -135,7 +135,7 @@ when a `1.x` adds a convenience.
 flags `--emit`, `--gc-stress`, `-o`/`--out`, `--module`, `-h`/`--help`,
 `-V`/`--version`; and the `--emit` value names `tokens`, `ast`, `api`, `types`,
 `hir`, `clif`, `obj`. `wsharp run` exits with `main`'s return value, as a C
-program does. Everything after the file — or after `--` — is the program's
+program does. Everything after the file - or after `--` - is the program's
 `os.args()` and nothing is interpreted on the way through.
 
 The environment variables `WSHARP_GC_STATS`, `WSHARP_GC_TRACE`,
@@ -159,11 +159,11 @@ The exit statuses, which are the interface a script uses
 
 | Status | Means |
 |---|---|
-| `0` | `OK` — and, from `verify`, "ready" |
+| `0` | `OK` - and, from `verify`, "ready" |
 | `1` | `NEEDS_INSTALLING` |
 | `2` | `NEEDS_RESOLVING` |
 | `3` | `BROKEN` |
-| `4` | `FAILED` — the verb could not be carried out at all, which is a mistake rather than an answer about a project |
+| `4` | `FAILED` - the verb could not be carried out at all, which is a mistake rather than an answer about a project |
 
 The output discipline: **stdout carries what a verb achieved, stderr carries
 why it got none**, progress goes to stderr, and a verb's answer is
@@ -186,7 +186,7 @@ command; `SHARPIE_TOOLCHAIN`; and the `wsharp-toolchain.toml` file name and the
 upward walk that finds it. `sharpie show` names the rung that answered, because
 that is the first question when the answer surprises somebody.
 
-**Not promised.** That the rung *set* stays closed — a `1.x` may add a
+**Not promised.** That the rung *set* stays closed - a `1.x` may add a
 resolution rung, which is additive as long as it sits below every existing one
 in precedence. The precedence order of the existing rungs is promised.
 
@@ -197,8 +197,8 @@ that a change of layout is a version bump rather than a silent reinterpretation.
 
 | Format | Where it is defined | The guard |
 |---|---|---|
-| The three emitted tables — type registry, stack maps, services | `crates/wsharp-runtime/src/aot.rs`, written by `crates/wsharp-codegen/src/tables.rs` | `MAGIC` (`WS#T`) and `VERSION`, checked at startup. A program built by one compiler and linked against another's runtime is refused with a message, not miscompiled. |
-| `ingot.env` | written by `ingot install`, read by `Loader::follow` | Derived, absolute, and never committed. Unreadable and malformed get the same answer — `run ingot install` — because writing it again is the fix for both. |
+| The three emitted tables - type registry, stack maps, services | `crates/wsharp-runtime/src/aot.rs`, written by `crates/wsharp-codegen/src/tables.rs` | `MAGIC` (`WS#T`) and `VERSION`, checked at startup. A program built by one compiler and linked against another's runtime is refused with a message, not miscompiled. |
+| `ingot.env` | written by `ingot install`, read by `Loader::follow` | Derived, absolute, and never committed. Unreadable and malformed get the same answer - `run ingot install` - because writing it again is the fix for both. |
 | `ingot.lock` | `ingot resolve` | Promised readable across `1.x`. A lockfile written on one machine is readable on another: the path separator is `/` on every platform, Windows included. |
 | The store tree hash | defined in `ingot/store.ws` and nowhere else | SHA-256 over each entry sorted by name: `"f" name 0 <decimal size> 0 <contents>` for a file, `"d" name 0 <hex of the subtree's hash> 0` for a directory. Permissions and timestamps are deliberately not in it. **Changing this is breaking**, because a key two versions compute differently is a store that silently splits in half. |
 
@@ -279,7 +279,7 @@ Collected so that the answer is one place rather than seven.
 - **Timing, pause lengths, allocation counts, and the collector's schedule.**
   `gc_live_objects()` and `WSHARP_GC_STATS` are instruments, not contracts.
 - **Which documentation the promise covers.** 1.0's documentation promise covers
-  what is in this repository — `README.md`, `docs/*.md`, `LIMITATIONS.md`, this
+  what is in this repository - `README.md`, `docs/*.md`, `LIMITATIONS.md`, this
   file. The language reference and standard-library pages at
   [wsharp.io](https://wsharp.io), whose source is the public repository
   `sinisterMage/wsharp.io`, are **outside** it for 1.0, because nothing checks
@@ -289,8 +289,8 @@ Collected so that the answer is one place rather than seven.
 
 The documentation site's source lives in `sinisterMage/wsharp.io`, a public
 repository with one workflow (`deploy.yml`) that publishes and does not check.
-Gate 6a of `RELEASE-CRITERIA-1.0.md` — every documented example is a real file
-executed in CI — therefore does not reach it as things stand.
+Gate 6a of `RELEASE-CRITERIA-1.0.md` - every documented example is a real file
+executed in CI - therefore does not reach it as things stand.
 
 **This is fixable rather than a reason to narrow the promise**, and the proposal
 is a check workflow in that repository which clones `sinisterMage/WSharp` at the
