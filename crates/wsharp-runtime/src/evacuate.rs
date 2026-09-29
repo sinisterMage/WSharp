@@ -88,13 +88,16 @@ pub(crate) unsafe fn evacuate_one(p: *mut u8) -> *mut u8 {
     if is_forwarded_meta(meta) {
         return forwarding_target(meta);
     }
-    let Some(size) = (unsafe { crate::types::object_size(p) }) else {
-        return p;
+    // The type and size come from the header word just tested, not from a
+    // second read of it: during `Evacuating` the collector thread may forward
+    // `p` between two reads, and a size taken from an address is noise.
+    let type_id = crate::header::type_id_of_meta(meta);
+    let Some(size) = (unsafe { crate::types::object_size_as(p, type_id) }) else {
+        return unsafe { where_it_is(p) };
     };
-    let type_id = unsafe { type_id_of(p) };
     let copy = heap::alloc_copy_shared(type_id, size);
     if copy.is_null() {
-        return p;
+        return unsafe { where_it_is(p) };
     }
     // The header goes with it: the copy keeps the original's mark bit, its
     // reference count and its flags, and only its address is different.
@@ -113,6 +116,22 @@ pub(crate) unsafe fn evacuate_one(p: *mut u8) -> *mut u8 {
             unsafe { heap::free_object(copy, size) };
             existing
         }
+    }
+}
+
+/// `p`, or its copy if somebody else has moved it since it was last looked at.
+///
+/// What `evacuate_one` answers when it cannot make a copy of its own: `p` is
+/// still the right answer then only if nobody else made one in the meantime.
+///
+/// # Safety
+/// `p` must point at an object with a readable header.
+unsafe fn where_it_is(p: *mut u8) -> *mut u8 {
+    let meta = unsafe { load_meta(p) };
+    if is_forwarded_meta(meta) {
+        forwarding_target(meta)
+    } else {
+        p
     }
 }
 
@@ -326,7 +345,7 @@ mod tests {
     fn evacuating_an_object_twice_answers_with_the_copy() {
         // The type registry is process-wide.
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let id = TYPE_ID_FIRST_USER + 401;
+        let id = TYPE_ID_FIRST_USER + 405;
         types::register_type(id, types::TypeLayout::fixed("Aliased", 32, vec![16]));
         types::publish();
 
