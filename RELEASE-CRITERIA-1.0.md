@@ -850,7 +850,7 @@ once.
 | `scripts/verify-install.sh` | 7 | **written** (#21), as `verify-install` in `.github/workflows/release-gates.yml`, a matrix job. What is owed is a run against a real release | Ash to run |
 | `tests/rungs.sh` | 7 | **written**, in [`sinisterMage/sharpie`](https://github.com/sinisterMage/sharpie) (its PR #2, merged at `6af434d`), not in this repository — so no check here can see its state either way, and this row is one of the three the gate-table check reports as unchecked. What is owed is green runs on four triples | Ash to run |
 | `tests/harness/gc-pauses.sh` | 8 | **written** (#20), and called by `tests/harness/nightly.sh` | Ridge — held |
-| a committed benchmark baseline per release triple | 8 | **not written.** No baseline file exists in the tree, so the 2x threshold in criterion 8 currently has nothing to measure against | Ridge |
+| a committed benchmark baseline per release triple | 8 | **not written** for three of the four. `tests/harness/bench.sh --record` writes `benchmarks/baselines/<triple>.tsv` with every sample and the Form B fields, and `--compare` is the 2x check; `x86_64-unknown-linux-gnu.tsv` is committed. The `bench` job in `.github/workflows/nightly.yml` records the other three on their runners as artifacts, to be reviewed and committed, and holds a triple that has one to 2x of it | Ridge |
 
 A criterion whose check is not written is a criterion nobody can fail, which is
 why this table is here rather than in somebody's head. The one that is not

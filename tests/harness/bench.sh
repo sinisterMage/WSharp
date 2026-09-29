@@ -128,6 +128,11 @@ median() {
         awk '{ v[++n] = $1 } END { if (n == 0) { print "-" } else { print v[int((n + 1) / 2)] } }'
 }
 
+# Pinned at the start: a run takes the better part of an hour, the working tree
+# can move under it, and a baseline naming the commit it *finished* at names
+# source the compiler was not built from.
+COMMIT_AT_START="$(source_sha)"
+COMPILER_AT_START="$(compiler_source_sha)"
 LOAD_START="$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || uptime | sed 's/.*averages*: //')"
 RESULTS="$WORK/results.tsv"
 : >"$RESULTS"
@@ -164,8 +169,8 @@ if [ "$MODE" = record ]; then
     {
         echo "# W# benchmark baseline, criterion 8.3 of RELEASE-CRITERIA-1.0.md"
         echo "# harness   tests/harness/bench.sh --record --repeats $REPEATS"
-        echo "# commit    $(source_sha)"
-        echo "# compiler  built from $(compiler_source_sha)"
+        echo "# commit    $COMMIT_AT_START"
+        echo "# compiler  built from $COMPILER_AT_START"
         echo "# profile   $PROFILE"
         echo "# triple    $TRIPLE"
         echo "# platform  $(platform_line | tr -d '\n'); $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo '?') cores"
