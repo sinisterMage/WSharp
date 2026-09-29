@@ -427,6 +427,56 @@ not — that is the design test, not a workaround for a missing feature.
 **Tracked.** No issue; deliberate, and stated here because it is the constraint
 people meet when they first reach for subtyping across a transport boundary.
 
+## A tail `return f()` fixes an inferred error set to `f`'s
+
+**What.** In a function whose error set is inferred, `return f()` -- returning
+another fallible call's result as it stands -- makes the function's error set
+*equal* to `f`'s, where a `try` anywhere else only adds to it. So an earlier
+`try` of something that raises more is refused, and the diagnostic points at
+that `try` rather than at the `return` that decided the set:
+
+```
+fn first() !i64 { return error.First; }
+fn last() !i64 { return error.Last; }
+fn combine() !i64 {
+    const value = try first();
+    return last();
+}
+```
+
+```
+error: this raises `{First}`, which this function cannot
+  --> probe.ws:4:19
+  |
+4 |     const value = try first();
+  |                   ^^^^^^^^^^^
+  |
+  = help: this function's error set is `{Last}`; widen it, or catch what it does not cover
+```
+
+**Why.** A `return` of an error union unifies the whole type with the
+function's own, error set included, while `try` contributes a subset edge. Making
+a tail call contribute a subset edge too is a change to inference, and in a group
+of mutually recursive functions it would *narrow* sets that are inferred today --
+so a caller comparing an error against a name no longer in the set would stop
+compiling, which Part one of `RELEASE-CRITERIA-1.0.md` counts as breaking. That
+is a language decision, not one to slip in under a freeze.
+
+**Workaround.** `return try last();` -- one word, and it widens the set as a
+`try` does anywhere: both `First` and `Last` then reach the caller. Or write the
+error set down, `!{First, Last}i64`.
+
+**Disposition: documented limitation for 1.0, pending the language owner's
+confirmation on #62.** The rule is also stated in `CLAUDE.md` ("`return f(x)`
+unifies two error sets; `try f(x); return;` widens one"), which is where
+`std/tls`'s dispatchers learnt to be written the second way.
+
+**Guarded by** `tests/cases/err_tail_call_error_set.ws`, the refusal, and
+`tests/cases/tail_call_error_set_try.ws`, the workaround reaching both errors.
+
+**Tracked.** [#62](https://github.com/sinisterMage/WSharp/issues/62), open for
+that decision.
+
 ## There is no `defer`
 
 **What.** No `defer`, no destructor, no RAII. A resource is released by the code

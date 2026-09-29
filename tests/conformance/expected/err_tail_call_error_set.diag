@@ -1,0 +1,8 @@
+error: this raises `{First}`, which this function cannot
+   --> tests/cases/err_tail_call_error_set.ws:10:19
+   |
+10 |     const value = try first();
+   |                   ^^^^^^^^^^^
+   |
+   = help: this function's error set is `{Last}`; widen it, or catch what it does not cover
+exit 1
