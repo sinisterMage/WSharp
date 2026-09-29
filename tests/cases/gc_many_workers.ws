@@ -20,9 +20,13 @@
 //   * the space directory, which the load barrier asks about an arbitrary
 //     address and which eight allocating heaps are writing into.
 //
-// Under `--gc-stress` every one of those 1600 allocations is a full collection
-// with a stack walk, in eight threads that are not synchronised with each
-// other, which is the state this case exists to put the runtime in. It is named
+// The allocating happens in each worker's `init`, which is what makes it
+// concurrent: `@spawn` returns before `init` starts, so the eight run at once.
+// (A method call would not do: it waits for its answer, so eight calls in a
+// row are eight turns.) Under `--gc-stress` every one of those 1600
+// allocations is a full collection with a stack walk, in eight threads that
+// are not synchronised with each other, which is the state this case exists to
+// put the runtime in. It is named
 // `gc_*` so `the_collector_survives_stress_in_a_built_program` runs it as a
 // built program under stress as well -- the pass where a stack-map
 // serialisation mistake shows up.
@@ -32,7 +36,7 @@
 // expect: 8
 // expect: 8
 // expect: 1
-const heaps = @import("./modules/heaps.ws");
+const heaps = @import("./modules/busyheaps.ws");
 
 /// 1 when a worker answered with a live heap of its own, 0 when it raised or
 /// found nothing. Summed, so the printed number names how many worked.
@@ -49,29 +53,30 @@ fn under(n: i64, limit: i64) i64 {
 fn main() i64 {
     const mine_before = gc_live_objects();
 
-    const a = @spawn(heaps) catch return 1;
-    const b = @spawn(heaps) catch return 1;
-    const c = @spawn(heaps) catch return 1;
-    const d = @spawn(heaps) catch return 1;
-    const e = @spawn(heaps) catch return 1;
-    const f = @spawn(heaps) catch return 1;
-    const g = @spawn(heaps) catch return 1;
-    const h = @spawn(heaps) catch return 1;
+    const a = @spawn(heaps, 200) catch return 1;
+    const b = @spawn(heaps, 200) catch return 1;
+    const c = @spawn(heaps, 200) catch return 1;
+    const d = @spawn(heaps, 200) catch return 1;
+    const e = @spawn(heaps, 200) catch return 1;
+    const f = @spawn(heaps, 200) catch return 1;
+    const g = @spawn(heaps, 200) catch return 1;
+    const h = @spawn(heaps, 200) catch return 1;
 
     // 200 each rather than `worker_heaps`'s 3000, because this runs eight times
     // over and the whole suite runs again under stress, where every allocation
     // is a collection. 1600 stressed allocations across eight unsynchronised
     // heaps is the interesting part; making each heap individually large is
-    // `worker_heaps`'s job.
+    // `worker_heaps`'s job. Each was made by that worker's `init`, already
+    // running by now; asking waits for it to finish.
     var churned = 0;
-    churned += reported(a.churn(200) catch -1);
-    churned += reported(b.churn(200) catch -1);
-    churned += reported(c.churn(200) catch -1);
-    churned += reported(d.churn(200) catch -1);
-    churned += reported(e.churn(200) catch -1);
-    churned += reported(f.churn(200) catch -1);
-    churned += reported(g.churn(200) catch -1);
-    churned += reported(h.churn(200) catch -1);
+    churned += reported(a.churned() catch -1);
+    churned += reported(b.churned() catch -1);
+    churned += reported(c.churned() catch -1);
+    churned += reported(d.churned() catch -1);
+    churned += reported(e.churned() catch -1);
+    churned += reported(f.churned() catch -1);
+    churned += reported(g.churned() catch -1);
+    churned += reported(h.churned() catch -1);
     print_int(churned);
 
     // A collection of *that* worker's heap, eight times, each on its own
