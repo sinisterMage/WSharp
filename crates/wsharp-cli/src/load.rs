@@ -55,8 +55,9 @@ pub fn load(root: &Path) -> Result<Program, String> {
     // Found from the root *file* rather than from the process's directory,
     // because `wsharp run app/src/main.ws` has no `-C` and need not be run
     // inside the project it is compiling.
-    loader.packages = Packages::found_from(root.parent().unwrap_or(Path::new(".")));
-    loader.root_dir = Some(canonical(root.parent().unwrap_or(Path::new("."))));
+    let dir = directory_of(root);
+    loader.packages = Packages::found_from(dir);
+    loader.root_dir = Some(canonical(dir));
     loader.add(root, "main".into(), text);
     loader.add_library(&libraries());
     Ok(loader.finish())
@@ -537,6 +538,22 @@ impl Loader {
 /// A path in a form two spellings of the same file agree on.
 fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The directory a file is in, as something that can be canonicalised.
+///
+/// `Path::parent` answers a bare `main.ws` with the *empty* path rather than
+/// with `None`, so `unwrap_or(".")` never fires for the one spelling that most
+/// needs it. The empty path then fails to canonicalise and has no parent of
+/// its own: the walk up to `ingot.toml` stopped before it started, so `wsharp
+/// run main.ws` inside a project's `src/` could not find its packages, and
+/// `--emit=api` had no directory to name the other modules from and printed
+/// them absolute again.
+fn directory_of(file: &Path) -> &Path {
+    match file.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
 }
 
 /// What a file module is called where two machines have to agree: in

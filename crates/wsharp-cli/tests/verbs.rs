@@ -836,6 +836,22 @@ fn a_program_imports_a_package_through_its_facade() {
         "stderr was:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // And from inside `src/`, naming the file bare. Its parent is the empty
+    // path rather than none, and the walk up to `ingot.toml` used to start
+    // from there -- which has no parent to climb to, so the project was never
+    // found and the import was reported as a file that does not exist.
+    let out = Command::new(env!("CARGO_BIN_EXE_wsharp"))
+        .env("WSHARP_HOME", project.store())
+        .current_dir(app.join("src"))
+        .args(["run", "myapp.ws"])
+        .output()
+        .expect("wsharp runs");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "14\n",
+        "a bare file name finds its project; stderr was:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // What the facade does not rename cannot be reached, because nothing can
     // name the file it is in: a package is one module.

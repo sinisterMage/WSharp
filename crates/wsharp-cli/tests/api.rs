@@ -107,6 +107,22 @@ fn main() i64 { return 0; }
     (ret "fw.ws".Response)))
 "#;
     assert_eq!(emit(&dir, "app.ws"), expected);
+    // And the same bytes for the root named as a bare file in the working
+    // directory, which is how a generator that writes its own root and then
+    // runs `wsharp check --emit=api root.ws` beside it calls this. Its parent
+    // is the *empty* path rather than none, which used to leave no directory
+    // to name the others from, so every module came out absolute again.
+    let out = Command::new(env!("CARGO_BIN_EXE_wsharp"))
+        .current_dir(&dir)
+        .args(["check", "app.ws", "--emit=api"])
+        .output()
+        .expect("wsharp runs");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        expected,
+        "stderr was:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
