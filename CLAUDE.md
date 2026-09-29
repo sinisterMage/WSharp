@@ -585,11 +585,11 @@ extra `sin_len` byte out of this code entirely.
   marker takes only the buffers lock (to drain `satb`) and answers its heap
   questions from the lock-free directory; the sweeper takes only the heap lock,
   per block; the phase is an atomic so safepoint checks take no lock at all.
-  Two process-wide locks are leaves, taken with nothing else held and taking
-  nothing: `worker::SHARED_TRANSITION` around a flag word's update, and
-  `heap::PUBLISHING` around the space directory's one writer -- which used to be
-  "the heap lock", and stopped being one writer when every worker got a heap
-  (#44).
+  Two process-wide locks are leaves -- nothing else is taken while one is held,
+  though a caller may already hold another: `worker::SHARED_TRANSITION` around a
+  flag word's update (see `docs/runtime-shared-flags.md`), and `heap::PUBLISHING`
+  around the space directory's one writer -- which used to be "the heap lock",
+  and stopped being one writer when every worker got a heap (#44).
 - **A pause request is raised before its phase is published, and only a pause
   consumes it.** The collector sets its worker's poll request and then publishes
   `MarkDone` or `EvacDone` with a release store, so a mutator that acquires the
