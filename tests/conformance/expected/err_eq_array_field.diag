@@ -1,0 +1,8 @@
+error: `Holder` values cannot be compared with `==`: `Bag.xs` is `[]i64`
+   --> tests/cases/err_eq_array_field.ws:18:9
+   |
+18 |     if (a == a) { print("never"); }
+   |         ^^^^^^
+   |
+   = help: `==` on a struct compares its fields, so every field must be comparable: an array, a function or an error union is not
+exit 1

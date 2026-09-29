@@ -1,0 +1,8 @@
+error: missing field `y` in `Point`
+  --> tests/cases/err_missing_field.ws:3:27
+  |
+3 | fn main() i64 { const p = Point{ .x = 1 }; return p.x; }
+  |                           ^^^^^^^^^^^^^^^
+  |
+  = help: `Point` requires a value for every field
+exit 1

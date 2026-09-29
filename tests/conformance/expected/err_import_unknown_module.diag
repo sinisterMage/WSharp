@@ -1,0 +1,8 @@
+error: cannot find module `std/nope`
+  --> tests/cases/err_import_unknown_module.ws:2:14
+  |
+2 | const nope = @import("std/nope");
+  |              ^^^^^^^^^^^^^^^^^^^
+  |
+  = help: a path is a file next to this one, such as `@import("./util.ws")`, one of the standard library's, such as `@import("std/http")`, or a package this project depends on, such as `@import("acme/json")`
+exit 1

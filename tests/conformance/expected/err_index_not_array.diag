@@ -1,0 +1,8 @@
+error: `i64` cannot be indexed
+  --> tests/cases/err_index_not_array.ws:4:12
+  |
+4 |     return n[0];
+  |            ^
+  |
+  = help: only an array `[]T` can be indexed
+exit 1

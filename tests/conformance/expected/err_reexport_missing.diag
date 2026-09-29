@@ -1,0 +1,15 @@
+error: a top-level `const` must be a literal or a `fn`
+   --> tests/cases/err_reexport_missing.ws:12:19
+   |
+12 | pub const TWICE = inner.SCALE * 2;
+   |                   ^^^^^^^^^^^^^^^
+   |
+   = help: computed globals need a startup initialiser, which W# does not have yet -- move the computation into a function
+error: `inner` has nothing called `norm3`
+   --> tests/cases/err_reexport_missing.ws:11:25
+   |
+11 | pub const norm3 = inner.norm3;
+   |                         ^^^^^
+   |
+   = help: a top-level `const` may be a second name for something another module declares, which is how a package of several files presents one of them
+exit 1

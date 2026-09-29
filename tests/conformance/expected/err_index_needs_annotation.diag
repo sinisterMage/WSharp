@@ -1,0 +1,8 @@
+error: cannot tell what is being indexed
+  --> tests/cases/err_index_needs_annotation.ws:2:21
+  |
+2 | fn head(a) { return a[0]; }
+  |                     ^
+  |
+  = help: annotate the value being indexed, e.g. `fn f(a: []i64)`
+exit 1

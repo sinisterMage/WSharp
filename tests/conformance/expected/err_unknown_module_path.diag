@@ -1,0 +1,13 @@
+error: cannot find `nope` in this scope
+  --> tests/cases/err_unknown_module_path.ws:4:24
+  |
+4 | fn main() i64 { return nope.thing(); }
+  |                        ^^^^
+error: cannot tell which type the field `thing` belongs to
+  --> tests/cases/err_unknown_module_path.ws:4:29
+  |
+4 | fn main() i64 { return nope.thing(); }
+  |                             ^^^^^
+  |
+  = help: W# resolves fields by the object's declared type -- annotate the parameter, e.g. `fn f(p: Point)`
+exit 1

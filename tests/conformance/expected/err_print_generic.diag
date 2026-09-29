@@ -1,0 +1,6 @@
+error: `print` accepts a string, integer, float or boolean, but this is `[]i64`
+  --> tests/cases/err_print_generic.ws:6:18
+  |
+6 | fn main() void { forward([]i64{ 1, 2 }); }
+  |                  ^^^^^^^^^^^^^^^^^^^^^^
+exit 1

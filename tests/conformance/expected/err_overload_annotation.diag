@@ -1,0 +1,8 @@
+error: no overload of `size` has type `fn(Base) str`
+   --> tests/cases/err_overload_annotation.ws:11:1
+   |
+11 | const bad: fn(Base) str = size;
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: the annotation must be one member's signature exactly; `size` has `fn(Base) i64`, `fn(Sub) i64`
+exit 1

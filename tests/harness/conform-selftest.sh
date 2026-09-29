@@ -175,6 +175,34 @@ cat >"$CASES/unblessed.ws" <<'EOF'
 //>   |    ^
 EOF
 
+# The platform's `strerror` text around the same errno. Linux says "No such file
+# or directory"; Windows says "The system cannot find the file specified." Both
+# are the same fact -- errno 2 -- and the first real conformance run had these
+# four triples disagree on nothing but this string. The stub here plays Linux,
+# the snapshot below plays Windows, and the case must come out PINNED: the words
+# are the C library's, not W#'s.
+cat >"$CASES/oserror.ws" <<'EOF'
+// error: cannot read `./no_such_file.ws`
+//> error: cannot read `./no_such_file.ws`: No such file or directory (os error 2)
+//>   --> cases/oserror.ws:2:14
+//>   |
+//> 2 | const gone = @import("./no_such_file.ws");
+//>   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+EOF
+
+# And the other direction, so the normalisation cannot swallow the errno itself:
+# the same message for a *different* reason (EACCES, 13) must stay CHANGED. A
+# normaliser that erased the whole `(os error N)` would make these two refusals
+# identical, and a case that fails for the wrong reason would read as pinned.
+cat >"$CASES/oserror_wrong.ws" <<'EOF'
+// error: cannot read `./no_such_file.ws`
+//> error: cannot read `./no_such_file.ws`: Permission denied (os error 13)
+//>   --> cases/oserror_wrong.ws:2:14
+//>   |
+//> 2 | const gone = @import("./no_such_file.ws");
+//>   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+EOF
+
 # The snapshot and the case header no longer describe the same refusal: the
 # compiler now says something else entirely and someone blessed it without
 # reading the case. The header is the case's stated intent and outranks the
@@ -230,6 +258,30 @@ error: unknown supertype `Shape`
 exit 1
 EOF
 
+# `oserror` is snapshotted in the *normalised* form, which is what `--bless`
+# writes: the errno survives and the platform's words are gone. The stub plays
+# Linux above, so this pins that the two wordings compare equal.
+cat >"$SNAPS/oserror.diag" <<'EOF'
+error: cannot read `./no_such_file.ws`: (os error 2)
+  --> cases/oserror.ws:2:14
+  |
+2 | const gone = @import("./no_such_file.ws");
+  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+exit 1
+EOF
+
+# The snapshot says ENOENT and the stub prints EACCES. Same message, same span,
+# different reason -- and it must NOT read as pinned, or a case that fails for
+# the wrong reason would be blessed.
+cat >"$SNAPS/oserror_wrong.diag" <<'EOF'
+error: cannot read `./no_such_file.ws`: (os error 2)
+  --> cases/oserror_wrong.ws:2:14
+  |
+2 | const gone = @import("./no_such_file.ws");
+  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+exit 1
+EOF
+
 # --- run the real conform.sh over it --------------------------------------
 REPORT="$WORK/report"
 run_conform() {
@@ -269,6 +321,8 @@ expect span_past_eof NOSPAN
 expect checkrun      CHECKRUN
 expect unblessed     UNBLESSED
 expect header_drift  CHANGED
+expect oserror       PINNED
+expect oserror_wrong CHANGED
 
 # An accepted program is not this gate's business, and a row for it would make
 # the corpus count wrong in both reports.

@@ -1,0 +1,15 @@
+error: `-` needs a signed number, but this is `u8`
+  --> tests/cases/err_neg_unsigned.ws:7:28
+  |
+7 | fn flip(x: u8) u8 { return -x; }
+  |                            ^^
+  |
+  = help: an unsigned type has no negatives; `~x + 1` is the wrapping form
+error: `-` needs a signed number, but `Number` includes `u8`
+  --> tests/cases/err_neg_unsigned.ws:8:31
+  |
+8 | fn negate(n: Number) { return -n; }
+  |                               ^^
+  |
+  = help: a parameter annotated `Number` must work for every type `Number` lists
+exit 1

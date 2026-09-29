@@ -1,0 +1,8 @@
+error: `&` needs an integer, but this is `f64`
+  --> tests/cases/err_bitand_float.ws:4:15
+  |
+4 |     const x = 1.5 & 2.0;
+  |               ^^^^^^^^^
+  |
+  = help: the bit operators work on the integer types
+exit 1

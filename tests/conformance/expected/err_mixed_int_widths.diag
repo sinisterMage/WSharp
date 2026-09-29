@@ -1,0 +1,11 @@
+error: type mismatch: the right operand has type `u32`, expected `u8`
+  --> tests/cases/err_mixed_int_widths.ws:4:40
+  |
+4 | fn add(a: u8, b: u32) u32 { return a + b; }
+  |                                        ^
+error: type mismatch: this return value has type `u8`, expected `u32`
+  --> tests/cases/err_mixed_int_widths.ws:4:36
+  |
+4 | fn add(a: u8, b: u32) u32 { return a + b; }
+  |                                    ^^^^^
+exit 1

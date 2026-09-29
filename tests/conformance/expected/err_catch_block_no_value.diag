@@ -1,0 +1,8 @@
+error: this block never produces a value
+  --> tests/cases/err_catch_block_no_value.ws:4:27
+  |
+4 |     return risky(1) catch { print("oh"); };
+  |                           ^^^^^^^^^^^^^^^^
+  |
+  = help: end it with an expression and no `;`, or leave with `return`, `break` or `continue`
+exit 1

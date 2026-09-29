@@ -1,0 +1,8 @@
+error: `i64` is a primitive type
+  --> tests/cases/err_generic_shadows_type.ws:2:6
+  |
+2 | fn f[i64](x: i64) i64 { return x; }
+  |      ^^^
+  |
+  = help: a type parameter needs a name of its own, such as `T`
+exit 1

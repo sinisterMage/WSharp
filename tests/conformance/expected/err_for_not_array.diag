@@ -1,0 +1,8 @@
+error: `i64` cannot be indexed
+  --> tests/cases/err_for_not_array.ws:3:10
+  |
+3 |     for (5) |x| { print_int(x); }
+  |          ^
+  |
+  = help: only an array `[]T` can be indexed
+exit 1

@@ -1,0 +1,8 @@
+error: `K` is a top-level `const` array, which cannot be written
+   --> tests/cases/err_assign_const_array.ws:10:5
+   |
+10 |     K[0] = 9;
+   |     ^
+   |
+   = help: it lives in the data section and is shared by every worker -- copy it first, with `array.slice(..)`, if you need one to change
+exit 1

@@ -1,0 +1,14 @@
+error: this call to `pick` is ambiguous: `(Sub, Base)` and `(Base, Sub)` are equally specific
+   --> tests/cases/err_ambiguous_dispatch.ws:13:40
+   |
+13 | fn call(a: Base, b: Base) i64 { return pick(a, b); }
+   |                                        ^^^^^^^^^^
+   |
+10 | fn pick(a: Sub, b: Base) i64 { return 1; }
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this overload
+   |
+11 | fn pick(a: Base, b: Sub) i64 { return 2; }
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this overload
+   |
+   = help: one overload must be at least as specific as the other in every argument -- add one that is
+exit 1

@@ -1,0 +1,22 @@
+error: `geometry` is not a service
+  --> tests/cases/err_spawn_not_a_service.ws:9:15
+  |
+9 |     const a = @spawn(geometry) catch return 1;
+  |               ^^^^^^^^^^^^^^^^
+  |
+  = help: a service is a module with an `init` that makes its state, and functions taking that state as their first parameter
+error: `counter` has no method `nope`
+   --> tests/cases/err_spawn_not_a_service.ws:12:17
+   |
+12 |     const n = w.nope() catch 0;
+   |                 ^^^^
+   |
+   = help: a method is a function taking the service's state first; this one has `add`, `describe`, `total`
+error: `fn(i64) i64` cannot be sent to another worker
+   --> tests/cases/err_spawn_not_a_service.ws:10:15
+   |
+10 |     const b = @spawn(bad, twice) catch return 1;
+   |               ^^^^^^^^^^^^^^^^^^
+   |
+   = help: a worker has a heap of its own, so a value is copied to reach it -- and a function value captures an environment that belongs to the heap it was made in
+exit 1

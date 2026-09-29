@@ -1,0 +1,8 @@
+error: `P` cannot be iterated
+  --> tests/cases/err_for_not_iterable.ws:5:10
+  |
+5 |     for (P{ .x = 1 }) |v| { print_int(v.x); }
+  |          ^^^^^^^^^^^
+  |
+  = help: a `for` over a struct calls `iter` and `next` from the module that declares it; `P` has no `iter`
+exit 1

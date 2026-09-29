@@ -1,0 +1,8 @@
+error: a top-level `const` array may not hold `str`
+  --> tests/cases/err_const_string_array.ws:5:18
+  |
+5 | const suffixes = []str{ ".json" };
+  |                  ^^^^^^^^^^^^^^^^
+  |
+  = help: it lives in the data section, which the collector never traces -- so its elements must be numbers or booleans, never anything holding a reference
+exit 1

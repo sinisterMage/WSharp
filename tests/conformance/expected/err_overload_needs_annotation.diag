@@ -1,0 +1,8 @@
+error: `s` needs a type: `size` is an overload set
+  --> tests/cases/err_overload_needs_annotation.ws:7:9
+  |
+7 | fn size(s) i64 { return 0; }
+  |         ^
+  |
+  = help: every parameter of an overloaded function must be annotated
+exit 1
