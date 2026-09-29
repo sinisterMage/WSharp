@@ -111,6 +111,23 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
+  # Criterion 1's ecosystem subject. The run itself is `ecosystem.yml`, daily and
+  # on four triples, because it reaches the network for every package; what a
+  # pull request can break without any of that is the script's own logic -- a
+  # step that should fail printing `ok` -- so its offline selftest runs here,
+  # against stubs, in about a minute.
+  ecosystem-selftest:
+    name: the ecosystem check fails when it should (criterion 1)
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test the ecosystem check
+        run: bash scripts/tests/ecosystem-check.test.sh </dev/null
+
   # Criterion 3. Asks GitHub which defects closed in the freeze window and what
   # closed them, so -- like `followups` -- it exits 2 rather than 0 when it
   # cannot ask. The window starts at `.github/freeze-start`; until Day 0 is

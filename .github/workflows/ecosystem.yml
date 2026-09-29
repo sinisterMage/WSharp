@@ -1,0 +1,359 @@
+# The `.wsharp` ecosystem check, once a day, on the four release triples.
+#
+# Criterion 1 of `RELEASE-CRITERIA-1.0.md` names three soak subjects, and this
+# is the second: "one full run per day for every day of the window, all exiting
+# 0, on all four release triples", owned by Ash (WLA-7). What a run *is* lives
+# in `scripts/ecosystem-check.sh` -- sharpie built and tested, Foundry's own
+# check, and every published release installed, compiled against and tested,
+# plainly and under stress -- so that it means the same on a laptop as here.
+# This file is the "every day" and the "four triples", and the row each triple
+# appends to the soak log.
+#
+# ## Why a workflow of its own
+#
+# `nightly.yml` is the compiler under its own harness: hours per platform, and
+# about W#'s corpus. This is about other people's programs, it reaches the
+# network for all of them, and its failure means something different -- a
+# package or sharpie broke, or GitHub could not be reached -- so it gets its own
+# red run and its own row rather than a fourth job in somebody else's verdict.
+#
+# ## Failure is the point
+#
+# Nothing here is `continue-on-error` except the one download that is allowed
+# to find nothing, and it is followed by a step that turns "nothing" into a
+# failing row. A triple whose job never reported is a `fail` row, not a missing
+# one: a soak that stopped reporting is a soak that stopped.
+
+name: Ecosystem
+
+on:
+  schedule:
+    # 03:23 UTC: after the nightly's 03:00 has claimed its runners, and off the
+    # hour, where GitHub's cron queue is deepest and schedules fire late (#56).
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+    inputs:
+      record:
+        description: "Append this run's rows to the soak log (only honoured on main)"
+        type: boolean
+        required: false
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  # One day's run at a time. Two runs would both append a row per triple, and a
+  # soak log with two verdicts for one day fails that day if either failed.
+  group: ecosystem
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # --- one full run per triple -----------------------------------------------
+  #
+  # The matrix is `release-gates.yml`'s `verify-install` one: the four release
+  # triples on the four runner images, so no platform is claimed by inference
+  # from another's run. Unlike that job, the Linux leg runs on the host rather
+  # than in `debian:13`: this builds the compiler from source, which needs the
+  # runner's rustup, and the question here is not "is the machine clean".
+  ecosystem:
+    name: ecosystem (${{ matrix.triple }})
+    runs-on: ${{ matrix.os }}
+    # The build is up to half an hour on the slow images and the check up to
+    # two and a half hours; the check step's own bound is below this one so the
+    # verdict and the logs are still uploaded when it trips.
+    timeout-minutes: 210
+    strategy:
+      # One platform's failure must not hide the other three; the soak log
+      # wants a row per triple and a cancelled job is not a row.
+      fail-fast: false
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cc: cc
+            exe: ""
+          - triple: x86_64-pc-windows-msvc
+            os: windows-latest
+            # Not `cc`: `link.rs` passes `-o`, which `cl.exe` does not
+            # understand. See the same note in `ci.yml`.
+            cc: clang
+            exe: ".exe"
+          - triple: x86_64-apple-darwin
+            os: macos-15-intel
+            cc: cc
+            exe: ""
+          - triple: aarch64-apple-darwin
+            os: macos-latest
+            cc: cc
+            exe: ""
+    defaults:
+      run:
+        # Git Bash on Windows, so one script works on all four.
+        shell: bash
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      # **First, before anything that can fail.** Each step below says where
+      # it has got to, and the last step turns "the check never wrote a
+      # verdict" into a failing one that names the stage it died in -- so a
+      # build that does not compile is a row that says so, rather than a
+      # triple the soak row has to guess about.
+      - name: Start the verdict
+        run: |
+          tmp="$RUNNER_TEMP"
+          if command -v cygpath >/dev/null 2>&1; then tmp="$(cygpath -u "$RUNNER_TEMP")"; fi
+          echo "ECO_TMP=$tmp" >>"$GITHUB_ENV"
+          mkdir -p "$tmp/ecosystem-verdict"
+          date -u +%Y-%m-%d >"$tmp/ecosystem-verdict/date"
+          echo "setup" >"$tmp/ecosystem-verdict/stage"
+
+      - uses: actions/checkout@v4
+
+      # **Git Bash ships a coreutils `link`, and it comes before MSVC's on
+      # `PATH`.** See `ci.yml`.
+      - name: Remove the link.exe that is not a linker
+        if: runner.os == 'Windows'
+        run: rm -f "/c/Program Files/Git/usr/bin/link.exe"
+
+      # `LIB` and `INCLUDE`, without which `wsharp build` cannot resolve
+      # `kernel32` -- and this job links a consumer per release and sharpie.
+      - name: Set up the MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # `timeout(1)` is coreutils, and base macOS has neither it nor
+      # `gtimeout`. The check refuses to start without one rather than run
+      # other people's test suites unbounded.
+      - name: Install GNU coreutils
+        if: runner.os == 'macOS'
+        run: brew install coreutils
+
+      # SurrealDB's client drives its protocol tests from `tests/run.py`, with
+      # a Python fixture playing the server. Pinned to a 3 so that `python` is
+      # the same thing on all four images.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Restore cargo and target caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-ecosystem-${{ matrix.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-ecosystem-${{ matrix.os }}-
+
+      - name: Versions
+        run: |
+          rustc --version
+          cargo --version
+          "$CC" --version | head -1
+          git --version
+          (python3 --version || python --version) 2>&1
+          (timeout --version || gtimeout --version) 2>&1 | head -1
+
+      # The check's own tests, before the check: stub compilers, no network, a
+      # few seconds. A gate whose verdict logic is unverified can pass anything
+      # and be believed, and running them here rather than only on Linux is
+      # what says the script's bash 3.2 and Git Bash claims are true on the
+      # machines that make them.
+      - name: Test the check
+        run: |
+          echo "selftest" >"$ECO_TMP/ecosystem-verdict/stage"
+          bash scripts/tests/ecosystem-check.test.sh
+
+      # `--workspace`, because `wsharp build` links against the runtime
+      # archive `crates/wsharp-start` produces and nothing else builds it.
+      - name: Build the compiler and the runtime archive
+        run: |
+          echo "build" >"$ECO_TMP/ecosystem-verdict/stage"
+          cargo build --release --workspace --locked
+
+      # `ingot` is a W# program; cargo does not produce it. The same bootstrap
+      # `release.yml` does, so what is checked is what would ship.
+      - name: Bootstrap ingot
+        run: |
+          echo "bootstrap" >"$ECO_TMP/ecosystem-verdict/stage"
+          ./target/release/wsharp${{ matrix.exe }} build --module ingot/main \
+            -o "target/release/ingot${{ matrix.exe }}"
+          ./target/release/ingot${{ matrix.exe }} help >/dev/null
+
+      - name: The ecosystem check
+        timeout-minutes: 150
+        run: |
+          echo "check" >"$ECO_TMP/ecosystem-verdict/stage"
+          out="$ECO_TMP/ecosystem-verdict"
+          # `-e` and `pipefail` are the runner's defaults; the exit status is
+          # the check's to give, after the verdict is written.
+          set +e
+          WSHARP="$PWD/target/release/wsharp${{ matrix.exe }}" \
+          INGOT="$PWD/target/release/ingot${{ matrix.exe }}" \
+            bash scripts/ecosystem-check.sh --work "$ECO_TMP/ecosystem-work" \
+              --triple "${{ matrix.triple }}" | tee "$out/results.tsv"
+          rc=${PIPESTATUS[0]}
+          set -e
+          summary="$(grep "^summary$(printf '\t')" "$out/results.tsv" | tail -n 1)"
+          verdict="$(printf '%s' "$summary" | cut -f2)"
+          detail="$(printf '%s' "$summary" | cut -f3)"
+          if [ "$rc" -ne 0 ] || [ "$verdict" != ok ]; then
+            verdict=fail
+            [ -n "$detail" ] || detail="the check exited $rc and printed no summary"
+          fi
+          printf '%s\t%s\n' "$verdict" "$detail" >"$out/verdict"
+          exit "$rc"
+
+      # `always()`: a job that died before the check wrote its verdict still
+      # has one, saying where it died.
+      - name: Settle the verdict
+        if: always()
+        run: |
+          d="$ECO_TMP/ecosystem-verdict"
+          mkdir -p "$d"
+          if [ ! -f "$d/verdict" ]; then
+            stage="$(cat "$d/stage" 2>/dev/null || echo setup)"
+            printf 'fail\tthe job stopped during %s, before the check reported (%s)\n' \
+              "$stage" "${{ job.status }}" >"$d/verdict"
+          fi
+          echo "${{ matrix.triple }}" >"$d/triple"
+          cat "$d/verdict"
+
+      - name: Upload the verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecosystem-verdict-${{ matrix.triple }}
+          path: ${{ runner.temp }}/ecosystem-verdict
+          if-no-files-found: error
+
+      # The evidence: every step's log and the result lines, kept whether the
+      # run passed or not -- the run that failed is the one worth reading.
+      - name: Upload the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecosystem-logs-${{ matrix.triple }}
+          path: |
+            ${{ runner.temp }}/ecosystem-work/results.tsv
+            ${{ runner.temp }}/ecosystem-work/logs
+          if-no-files-found: warn
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### ecosystem, ${{ matrix.triple }}"
+            echo
+            echo '| step | verdict | detail |'
+            echo '|---|---|---|'
+            awk -F'\t' '{gsub(/\|/, "\\|", $3); printf("| `%s` | %s | %s |\n", $1, $2, $3)}' \
+              "$ECO_TMP/ecosystem-verdict/results.tsv" 2>/dev/null
+            echo
+            cat "$ECO_TMP/ecosystem-verdict/verdict" 2>/dev/null
+          } >>"$GITHUB_STEP_SUMMARY" || true
+
+  # --- criterion 1: the ecosystem subject's daily rows ------------------------
+  #
+  # One row per release triple, from that triple's own verdict -- never the
+  # matrix's aggregate `needs.ecosystem.result`, which is one word for four jobs
+  # and would credit or fail all four together. A triple with no verdict (its
+  # job was cancelled, or never got a runner) is a `fail` row naming why, so
+  # the day fails rather than passing on three triples' word.
+  soak-row:
+    name: soak rows
+    needs: [ecosystem]
+    # A scheduled run, or one dispatched on `main` that asked to be recorded.
+    # Dispatched runs count for the reason nightly.yml's do: the cron has fired
+    # late or not at all (#56). `record: false` is for somebody debugging the
+    # workflow, whose run must not fail a day permanently in an append-only log.
+    # Default branch only, because `$GITHUB_SHA` has to be a commit of `main`.
+    if: >-
+      always() && (github.event_name == 'schedule' ||
+        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
+         inputs.record))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Allowed to find nothing -- every leg cancelled -- because the next step
+      # turns each missing verdict into a failing row. This is the only
+      # `continue-on-error` in the file, and it cannot hide a failure.
+      - name: Collect each triple's verdict
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ecosystem-verdict-*
+          path: ${{ runner.temp }}/verdicts
+
+      # Written with the `soak-report.sh` of the commit under test, into
+      # `$RUNNER_TEMP` and **not** into `soak/`: a row left in the working tree
+      # makes the checkout of the log branch below refuse to overwrite it, which
+      # is how nightly.yml's log once stopped at one row.
+      - name: Write the rows
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -u
+          v="$RUNNER_TEMP/verdicts"
+          # The day the run *covered*: when its legs started, not when the last
+          # one finished, so a run that crosses midnight is one day's row.
+          day="$(cat "$v"/ecosystem-verdict-*/date 2>/dev/null | sort | head -n 1)"
+          [ -n "$day" ] || day="$(date -u +%Y-%m-%d)"
+          for triple in x86_64-unknown-linux-gnu x86_64-pc-windows-msvc \
+                        x86_64-apple-darwin aarch64-apple-darwin; do
+            f="$v/ecosystem-verdict-$triple/verdict"
+            if [ -f "$f" ]; then
+              verdict="$(cut -f1 "$f")"
+              detail="$(cut -f2- "$f")"
+            else
+              verdict=fail
+              detail="no verdict: the job was cancelled or never ran"
+            fi
+            case "$verdict" in ok | fail) ;; *) verdict=fail ;; esac
+            scripts/soak-report.sh --append --dir "$RUNNER_TEMP/soak" \
+              --subject ecosystem --verdict "$verdict" \
+              --commit "$GITHUB_SHA" --platform "$triple" --date "$day" \
+              --detail "$detail; event=$EVENT run=$GITHUB_RUN_ID"
+          done
+          cat "$RUNNER_TEMP/soak/ecosystem.tsv"
+          test "$(wc -l <"$RUNNER_TEMP/soak/ecosystem.tsv")" -eq 4
+          test -z "$(git status --porcelain)"
+
+      # The same branch, and the same loop, as nightly.yml's compiler rows. Not
+      # `main`: see that file.
+      - name: Append them to the soak-log branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git fetch origin soak-log 2>/dev/null; then
+            git checkout -B soak-log origin/soak-log
+          else
+            # First run. An orphan branch holding nothing but the log.
+            git checkout --orphan soak-log
+            git rm -rf --cached . >/dev/null 2>&1 || true
+            rm -rf soak
+          fi
+          mkdir -p soak
+          cat "$RUNNER_TEMP/soak/ecosystem.tsv" >>soak/ecosystem.tsv
+          git add soak/ecosystem.tsv
+          git commit -m "soak: ecosystem rows, run $GITHUB_RUN_ID"
+          # Other subjects append to the same branch, so a push can lose a race.
+          # Rebasing is safe: every commit here appends to a file of its own.
+          for attempt in 1 2 3 4; do
+            git push origin soak-log && exit 0
+            sleep $((attempt * 5))
+            git fetch origin soak-log && git rebase origin/soak-log
+          done
+          echo "could not push the soak rows" >&2
+          exit 1

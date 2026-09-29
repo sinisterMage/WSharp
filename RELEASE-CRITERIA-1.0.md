@@ -807,9 +807,9 @@ it could not wait, who granted it, and whether the clock reset.
 
 ## The state of the checks
 
-Nine gates, fourteen checks — three gates take two apiece, because a gate with
+Nine gates, fifteen checks — several gates take two apiece, because a gate with
 one mechanism and one artefact, or one script per repository, is two things that
-can be separately missing. Thirteen of the fourteen are written; one is not,
+can be separately missing. Fourteen of the fifteen are written; one is not,
 and is named here so that it is owed rather than assumed.
 
 **Read against `main` at `4e9249a`, and held to the tree by
@@ -818,7 +818,7 @@ files exist, which is a claim that goes stale on any merge that adds one — and
 did, within twenty minutes of revision 2, on six of ten rows. So it carries the
 commit it was read at, and a check now reads every row: a row saying "written"
 whose file is missing, and a row saying "not written" whose file somebody has
-since written, both turn CI red. Twelve of the fourteen rows are checked that
+since written, both turn CI red. Thirteen of the fifteen rows are checked that
 way, and the script names the other two out loud on every run — criterion 0's
 inline test, which names no path, and criterion 7's `tests/rungs.sh`, which
 names one in another repository. (Criterion 8's baselines named no path until
@@ -841,6 +841,7 @@ once.
 | the four-file test in criterion 0 | 0 | **written and run** — inline above | Johnny |
 | `scripts/gate-table-check.sh`, with `scripts/tests/gate-table-check.test.sh` | 0 | **written**, as `gate-table` in `.github/workflows/release-gates.yml`. It reads this table, so the table describes itself and drifting from the tree is now a red CI run | Johnny |
 | `scripts/soak-report.sh`, with `scripts/soak-report-selftest.sh` | 1 | **written** (#20), and wired up as `soak-row` in `.github/workflows/nightly.yml`. What is owed is 28 days of rows, not the script | Dex to run |
+| `scripts/ecosystem-check.sh`, with `scripts/tests/ecosystem-check.test.sh` | 1 | **written**, as `ecosystem` and `soak-row` in `.github/workflows/ecosystem.yml`. One run is sharpie built and tested (plainly, under stress, and its rungs), Foundry's own check fetching every release against its tree hash, and every published release installed, checked, built, run and tested plainly and under stress. The workflow writes one row per release triple, and `soak/subjects.tsv` names all four, so `soak-report.sh` fails a day any one of them did not report. What is owed is 28 days of rows | Ash to run |
 | `scripts/freeze-check.sh` | 2 | **written**, on `main` | Ash to run |
 | `scripts/check-change-label.sh`, with `scripts/tests/check-change-label.test.sh` | 2 | **written** (#21), as `change-label` in `.github/workflows/release-gates.yml`. Revision 2 did not list this check at all | Ash, enforcing from now |
 | `scripts/guard-check.sh`, with `scripts/tests/guard-check.test.sh` | 3 | **written**, as `guards` in `.github/workflows/release-gates.yml`. Asks GitHub which defects closed after the freeze start and what closed them, so, like criterion 4's, it exits 2 when it cannot ask. The live run waits for `.github/freeze-start`; before Day 0, `--since` runs it over any window | Ash |
@@ -862,12 +863,12 @@ Two rows used to be one each, and splitting them was the honest fix. Criterion 7
 as a single row said "not written" while `verify-install.sh` was finished, and
 criterion 8 as a single row would have said "written" while the baselines were
 not. One row per thing that can be separately missing is the rule, and the reason
-the table has fourteen rows for nine gates.
+the table has fifteen rows for nine gates.
 
 **Two rows name nothing this tree can be asked about, and the check says so on
 every run rather than passing them silently.** Criterion 0's four-file test is
 inline above, and criterion 7's `tests/rungs.sh` is another repository's, which
-no check here can stat. "Twelve of fourteen rows were held to the tree" is the
+no check here can stat. "Thirteen of fifteen rows were held to the tree" is the
 number each run prints, because a check that reports its own coverage cannot
 quietly lose it — and the two it does not cover are exactly where this table
 has to be read rather than trusted.
