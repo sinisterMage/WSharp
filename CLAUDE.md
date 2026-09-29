@@ -389,6 +389,15 @@ extra `sin_len` byte out of this code entirely.
   inside it is a safepoint that can run a whole collection, and until `aux`
   holds the count an array claims to be a bare header, so a heap walk would
   step into the middle of it.
+- **A heap space is reserved, not touched.** Its 64 MiB is asked of the
+  allocator zeroed at *ordinary* alignment, one block larger than it needs,
+  and `base` is rounded up to a block by hand. Asking for block alignment
+  directly is what the index arithmetic seems to want, and the system allocator
+  answers a zeroed request above its own alignment with a `memset` of the whole
+  thing: every worker's first allocation made 64 MiB resident, and a leak
+  smaller than a space could not show in the resident set. `calloc` hands back
+  fresh pages it knows are zero and touches none; `gc_space_resident.ws` holds
+  eight workers to half a space each.
 - **The object-start bitmap is what makes the heap walkable.** Objects are not
   laid end to end -- a refilled hole puts new ones among the corpses of old
   ones, and an allocation buffer leaves an unused tail -- so a walk that

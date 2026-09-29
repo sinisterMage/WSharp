@@ -519,25 +519,40 @@ struct Bump {
 
 struct Space {
     meta: Box<SpaceMeta>,
+    /// What the allocator handed back, which `base` is rounded up from.
+    raw: usize,
     layout: Layout,
 }
 
 impl Space {
     fn new() -> Space {
-        // Aligning the whole reservation to the block size is what makes
-        // `(addr - base) >> BLOCK_BITS` a valid block index.
-        let layout =
-            Layout::from_size_align(SPACE_BYTES, BLOCK_BYTES).expect("valid heap space layout");
         // Zeroed so a partially initialised object's fields read as null,
         // which keeps it safe to trace at any moment. Holes are zeroed again
         // when they are refilled, for the same reason.
+        //
+        // **One block more than a space, at the allocator's ordinary
+        // alignment, and rounded up by hand** -- rather than a space aligned
+        // to a block, which is what `(addr - base) >> BLOCK_BITS` needs. The
+        // system allocator answers a zeroed request above its own alignment
+        // with an aligned allocation and a `memset` of the whole of it, so
+        // every worker's first allocation made 64 MiB resident: eight
+        // acceptors were half a gigabyte, and a leak smaller than a space could
+        // not show in the resident set at all. At ordinary alignment the same
+        // request is `calloc`, which hands back fresh pages it knows are zero
+        // and touches none of them (`gc_space_resident.ws`).
+        let layout = Layout::from_size_align(SPACE_BYTES + BLOCK_BYTES, 16)
+            .expect("valid heap space layout");
         let ptr = unsafe { alloc_zeroed(layout) };
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
+        let raw = ptr as usize;
+        let base = (raw + BLOCK_BYTES - 1) & !(BLOCK_BYTES - 1);
         Space {
+            raw,
+            layout,
             meta: Box::new(SpaceMeta {
-                base: ptr as usize,
+                base,
                 states: (0..SPACE_BLOCKS)
                     .map(|_| AtomicU8::new(BlockState::Free as u8))
                     .collect(),
@@ -549,14 +564,13 @@ impl Space {
                     .map(|_| AtomicU64::new(0))
                     .collect(),
             }),
-            layout,
         }
     }
 }
 
 impl Drop for Space {
     fn drop(&mut self) {
-        unsafe { dealloc(self.meta.base as *mut u8, self.layout) };
+        unsafe { dealloc(self.raw as *mut u8, self.layout) };
     }
 }
 
