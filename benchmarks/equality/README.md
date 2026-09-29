@@ -7,7 +7,8 @@ crate access and enough disk space, run:
 python3 benchmarks/equality/run.py --output /absolute/path/to/new-results
 ```
 
-The command clones and builds exact historical arms `41e4d70` and `24ecb24`
+The command clones and builds exact historical arms `f2f2b40` and `de3c792` --
+consecutive commits on `main` that differ by exactly the depth bound (#29) --
 with `cargo +1.95.0 build --release --locked`. To reuse clean, detached checkouts
 named by full SHA, add `--arms-root /absolute/path/to/arms`. Both release builds
 are still verified. Source and output paths must be outside the harness checkout

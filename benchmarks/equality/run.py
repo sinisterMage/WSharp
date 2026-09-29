@@ -5,8 +5,11 @@ import statistics as st
 import subprocess as sp
 import time
 
-ARMS = {'baseline': '41e4d70c5fade7d600b7fba21849b7319ec9a946',
-        'bounded': '24ecb2440d0201dbbd56c7eb7c29ce3a0746dbbb'}
+# Consecutive commits on main that differ by exactly the depth bound (#29):
+# de3c792 is its squash and f2f2b40 its parent. The branch commits this was
+# first written against would not have survived the branch being deleted.
+ARMS = {'baseline': 'f2f2b40cb501dcefbdb1f69ec5735fba92513a5e',
+        'bounded': 'de3c792ad74827c79c76f6ebde32add65be9ea19'}
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 def command(args, cwd=None):
@@ -155,7 +158,8 @@ def main():
     quiet=[]
     for i in range(args.quiet_seconds):
         a=ticks(); time.sleep(1); quiet.append(activity(a,ticks()))
-    gate=all(x['busy_pct']<5 and x['iowait_pct']<1 and x['steal_pct']<1 for x in quiet)
+    # A second in which no tick moved says nothing about load, so it fails the gate.
+    gate=all(x is not None and x['busy_pct']<5 and x['iowait_pct']<1 and x['steal_pct']<1 for x in quiet)
     (out/'quiet.json').write_text(json.dumps({'passed':gate,'samples':quiet},indent=2)+'\n')
     if not gate and not args.smoke: raise RuntimeError('quiet gate failed; retain this attempt and rerun in a new output directory')
     rows=[]
