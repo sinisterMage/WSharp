@@ -869,14 +869,13 @@ extra `sin_len` byte out of this code entirely.
   `ingot`'s verbs takes a `Fault` and writes into it. The first failure wins in
   all of them: a recursive descent reader that has lost its place invents the
   rest.
-- **A reader of something that arrives off a network is bounded; a reader of a
-  file somebody wrote is not.** `std/json` has `MAX_DEPTH`, and `std/toml` has
-  no counterpart on purpose: both are recursive descent, but a manifest is a
-  file with an author and a JSON document is bytes a stranger sent, so a few
-  hundred kilobytes of `[` would be a stack overflow -- a crash with no
-  diagnostic -- rather than a document refused with a message. `std/x509`'s
-  `MAX_CHAIN` is the same shape, and the shape is a named bound with no knob:
-  the day one is needed is the day to add the parameter.
+- **A recursive reader is bounded.** `std/json` and `std/toml` both have
+  `MAX_DEPTH`, 128, and refuse a document nested deeper with a message. `std/toml`
+  used to have none, on the argument that a manifest is a file with an author;
+  the fuzzer answered that `parse` is handed whatever its caller has, and a few
+  thousand `[` took most of a minute to refuse (#49). `std/x509`'s `MAX_CHAIN`
+  is the same shape, and the shape is a named bound with no knob: the day one is
+  needed is the day to add the parameter.
 - **`bytes.put_utf8` is the single definition of how a code point is encoded.**
   It was private to `std/toml`, with a comment saying it lived there because it
   had one caller; `std/json` is the second, and which byte of a four-byte

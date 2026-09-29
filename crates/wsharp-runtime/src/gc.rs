@@ -438,6 +438,23 @@ pub fn quiesce() {
 /// and the interesting cost is the buffer processing.
 const COLLECT_EVERY: usize = 4096;
 
+/// Whether a collection is due, with `fresh` objects allocated since the last
+/// one and `nursery` left over from it.
+///
+/// Every `COLLECT_EVERY` objects, counting the nursery as already spent -- it
+/// is work the last collection could not settle -- but never after fewer new
+/// objects than the nursery holds. A nursery object is one only the stack
+/// refers to, so a deep recursion keeps thousands of them alive at once, and
+/// with the nursery simply added to the count a nursery past `COLLECT_EVERY`
+/// made *every* allocation a collection, each walking the whole deep stack: a
+/// 5,000-deep TOML array took 25 seconds to refuse instead of a fifth of one
+/// (#49). A collection costs in proportion to the nursery and the stack, so
+/// waiting for as many allocations as the nursery holds keeps that cost
+/// amortised, at the price of dead nursery objects waiting that much longer.
+fn collection_due(fresh: usize, nursery: usize) -> bool {
+    fresh >= COLLECT_EVERY.saturating_sub(nursery).max(nursery)
+}
+
 /// Start a mark trace every this many allocations, whatever the heap looks
 /// like: counting cannot reclaim a cycle, and a program can make them steadily
 /// without ever growing much. A count of allocations rather than of
@@ -484,7 +501,7 @@ pub unsafe fn on_allocation(object: *mut u8) {
         if has_references {
             b.logged.push(object);
         }
-        b.fresh.len() + b.nursery.len() >= COLLECT_EVERY
+        collection_due(b.fresh.len(), b.nursery.len())
     });
     let allocations = worker.stats.allocations.fetch_add(1, Ordering::Relaxed) + 1;
     if !(stress() || due) {
@@ -742,6 +759,34 @@ mod tests {
     use crate::header::{TYPE_ID_FIRST_USER, TYPE_ID_STR, meta_word};
     use crate::heap::ws_alloc;
     use crate::test_support::SERIAL;
+
+    /// The trigger waits for `COLLECT_EVERY` objects, less a small nursery,
+    /// and never for fewer than a large nursery holds -- so a deep stack
+    /// full of live, stack-only objects does not make every allocation a
+    /// collection (#49). The last three rows were all due under the rule
+    /// this replaced, `fresh + nursery >= COLLECT_EVERY`.
+    #[test]
+    fn a_large_nursery_does_not_make_every_allocation_a_collection() {
+        let c = COLLECT_EVERY;
+        for (fresh, nursery, due) in [
+            (0, 0, false),
+            (c - 1, 0, false),
+            (c, 0, true),
+            (c / 2 - 1, c / 2 + 1, false),
+            (c / 2 + 1, c / 2 - 1, true),
+            (c / 2, c / 2, true),
+            (1, c, false),
+            (c - 1, c, false),
+            (1, 5 * c, false),
+        ] {
+            assert_eq!(
+                collection_due(fresh, nursery),
+                due,
+                "fresh {fresh}, nursery {nursery}"
+            );
+        }
+        assert!(collection_due(5 * c, 5 * c));
+    }
 
     #[test]
     fn fresh_children_survive_cascading_reclamation() {
