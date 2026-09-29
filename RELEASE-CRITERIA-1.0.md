@@ -1,33 +1,32 @@
 # What v1.0 means
 
-**Status: in force for the v1.0 campaign, revision 2, 2026-09-26.** Published by
-Johnny as the single release-blocking gate list. Every other v1.0 task is
-measured against this file; where a task and this file disagree, this file is
-either right or gets amended here, never worked around locally. Amendments are
-recorded in "Revision history" at the end.
+**The release gates for W# 1.0; amendments are listed at the end**, in
+[Revision history](#revision-history). Where another document and this one
+disagree about what 1.0 requires, this one is either right or gets amended here,
+never worked around locally.
 
 W# is at **0.2.3**. Every numbered item in [ROADMAP.md](ROADMAP.md) is marked
 done, so the gap between here and a credible 1.0 is not features. It is
 *sustained real use*, the defects that only sustained real use finds, and
 evidence that anyone can re-run. This document is therefore a stability and
 evidence bar rather than a feature checklist: it says what has to be true, how
-each thing is measured, who owns it, and what artefact closes it.
+each thing is measured, and what artefact closes it.
 
 A criterion that needs a judgement call is not a criterion. Each of the eight
 below is written so that a script, or a person reading a script's output, can
 answer yes or no without arguing. Where a criterion still contains a judgement,
-that judgement is named and given an owner rather than left implicit.
+that judgement is named and recorded as a dated decision rather than left
+implicit.
 
 ## How to read a criterion
 
-Each one carries four fields:
+Each one carries these fields:
 
 | Field | Means |
 |---|---|
 | **Gate** | The yes/no question. Where a command answers it, the command is given. |
-| **Owner** | One name and one task. The person who makes the gate answer yes. |
 | **Evidence** | The artefact that closes it — a run, a file, a table. Not an assertion. |
-| **Depends on** | Work owned by somebody else that the gate cannot pass without. |
+| **Depends on** | Work elsewhere that the gate cannot pass without, where there is any. |
 
 "Verified" in this document means a script ran and its output was recorded. A
 thing checked by hand once is a thing that regresses silently, so a manual check
@@ -39,7 +38,7 @@ and every criterion points there.
 
 | If you want | Read |
 |---|---|
-| Your own task's gate | [Part two](#part-two-the-eight-criteria), then [the issue map](#part-three-the-nine-open-issues) |
+| A criterion's gate | [Part two](#part-two-the-eight-criteria), then [the issue map](#part-three-the-issue-map) |
 | What you must produce to close it | [Part four: the proof standard](#part-four-the-proof-standard) |
 | Whether a change is allowed during the freeze | [Part one](#part-one-definitions) |
 | What 1.0 promises users | [Part five](#part-five-the-api-and-stability-freeze), then [COMPATIBILITY.md](COMPATIBILITY.md) |
@@ -139,13 +138,13 @@ Any one of the following:
 8. **A credential in a workflow file, a commit, or a published artefact.**
 
 **Clause 3 carries no exemption for documented behaviour.** This was asked
-directly on [#13](https://github.com/sinisterMage/WSharp/issues/13) and the
-answer is no, ruled by Johnny on 2026-09-26. A crash is a crash whether or not a
+directly on [#13](https://github.com/sinisterMage/WSharp/issues/13).
+**Decision (2026-09-26): no.** A crash is a crash whether or not a
 file says it will happen; documentation changes who is surprised, not what the
 process does. A limitation may be *refused with a diagnostic* and documented —
 that is a limitation. A limitation that aborts the process is a P1 and gets
 bounded. The consequence for #13 is recorded in
-[Part three](#part-three-the-nine-open-issues).
+[Part three](#part-three-the-issue-map).
 
 ### P2 — does not block the tag on its own; must be fixed or documented
 
@@ -172,28 +171,23 @@ line in a CI job.
 
 ### Who decides
 
-The filer proposes a severity; the triage owner for the surface confirms or
-changes it within one working day:
+The filer proposes a severity; a maintainer confirms or changes it at triage,
+within one working day. The `area:` labels in [docs/defects.md](docs/defects.md)
+name the surface a report belongs to.
 
-| Surface | Triage owner |
-|---|---|
-| Compiler, runtime, stdlib, the collector | Mira (WLA-3, WLA-4) |
-| Harness, conformance, fuzzing, differential testing | Dex (WLA-6) |
-| Benchmarks, collector measurement, published numbers | Ridge (WLA-5) |
-| Release pipeline, install, artefacts, digests, sharpie, `.wsharp` ecosystem | Ash (WLA-7) |
-| Raython and its sample application | Wren (WLA-8) |
-
-Disagreement about a severity goes to Johnny and is settled within one working
-day. **An unconfirmed report counts at the severity the filer proposed** until it
-is triaged, so "no open P1" cannot be satisfied by leaving reports untriaged.
+Disagreement about a severity goes to the repository owner and is settled within
+one working day. **An unconfirmed report counts at the severity the filer
+proposed** until it is triaged, so "no open P1" cannot be satisfied by leaving
+reports untriaged.
 
 ## The freeze clock
 
 The freeze is a **window of 28 consecutive days** ending at the tag, during which
 no breaking change lands and no P1 is open.
 
-- **Day 0** is the commit on `main` declared as the freeze start. It is recorded
-  in this file, under "Freeze record", by the person who declares it (Johnny).
+- **Day 0** is the commit on `main` declared as the freeze start. The repository
+  owner declares it, and records it in this file under "Freeze record" and in
+  `.github/freeze-start`, which `scripts/freeze-check.sh` reads.
 - The clock **resets to day 0** on either of: a merge to `main` labelled
   `change:breaking`, or the confirmation of a P1 in the compiler, runtime,
   stdlib, release pipeline, install scripts or sharpie. On a P1 the clock
@@ -203,10 +197,10 @@ no breaking change lands and no P1 is open.
   addition, a CI or workflow change, or a P1 confined to a driver program that is
   not itself shipped as an artefact. A driver-program P1 resets *that program's*
   soak counter under criterion 1 instead.
-- Only Johnny may grant an exception, only in writing on the campaign thread, and
-  every exception is recorded in the "Exception log" below with what changed, why
-  it could not wait, and what the clock does. Granting an exception means
-  deciding the clock question explicitly; silence is a reset.
+- Only the repository owner may grant an exception, only in writing on a GitHub
+  issue, and every exception is recorded in the "Exception log" below with what
+  changed, why it could not wait, and what the clock does. Granting an exception
+  means deciding the clock question explicitly; silence is a reset.
 
 The consequence worth saying out loud before anyone is surprised by it: **a P1
 confirmed on day 27 costs four weeks.** That is the intended cost. If it is the
@@ -222,25 +216,17 @@ buys nothing: any of those landing during the window would reset it.
 
 # Part two: the eight criteria
 
-The draft of this document had seven. Criterion 8 is new, because
-[#18](https://github.com/sinisterMage/WSharp/issues/18) established that the
-numbers three of the other criteria imply cannot currently be obtained at all,
-and an unobtainable number is a gate nobody can pass. Criterion 0 is also new,
-and exists because the documents this file cites were not in the tree when it was
-written.
-
 ## 0. The governing documents are in the tree
 
-Four documents govern the campaign. Until they are on `main`, every criterion
-that cites one is citing a file that does not exist — which is the state this
-revision was written to end.
+Four documents govern the release, and every criterion that cites one needs it
+to exist on `main`.
 
-| File | What it is | Recovered from |
-|---|---|---|
-| `RELEASE-CRITERIA-1.0.md` | This file: the bar | PR #7 (`ce6b3ff`), revised |
-| `LIMITATIONS.md` | What W# does not do, per entry | PR #16 (`1119247`) |
-| `COMPATIBILITY.md` | What 1.0 promises not to break | PR #16 (`1119247`) |
-| `docs/defects.md` | Intake, triage, verification | PR #6 (`80efa89`) |
+| File | What it is |
+|---|---|
+| `RELEASE-CRITERIA-1.0.md` | This file: the bar |
+| `LIMITATIONS.md` | What W# does not do, per entry |
+| `COMPATIBILITY.md` | What 1.0 promises not to break |
+| `docs/defects.md` | Intake, triage, verification |
 
 **Gate.** All four files exist on `main`, and no open issue cites a path that
 does not resolve. Checkable in one line:
@@ -251,19 +237,8 @@ for f in RELEASE-CRITERIA-1.0.md LIMITATIONS.md COMPATIBILITY.md docs/defects.md
 done
 ```
 
-**Owner.** Johnny.
-
-**Evidence.** The merge commit, and a comment on each of the nine open issues
-confirming the path it cites now resolves.
-
-**Why this was needed.** The drafts were written on four branches (PRs #6, #7,
-#16, #17); all four were closed unmerged on 2026-09-26 and their branches
-deleted, so nine open issues cite clause numbers in files that are not on `main`.
-The content survives at the commits above and is restored here rather than
-rewritten, because the issues cite it by clause and a rewrite would silently
-renumber what they point at. `tests/harness/` (PR #17, `39e5a76`) is restored
-separately under criterion 5, because it is Dex's and Ridge's to run rather than
-mine to land.
+**Evidence.** The merge commit, and a comment on each open issue that cites one
+of these files confirming the path it cites now resolves.
 
 ## 1. Real programs, soaked
 
@@ -271,30 +246,23 @@ Programs written in W#, each doing something this project actually wants done,
 each exercised continuously for the freeze window. "Continuously" cannot mean the
 same thing for all of them, so each gets the form of soak that fits it.
 
-The draft named four subjects, two of which (a docs site generator, a CI
-log/metrics pipeline) no task owns. An unowned soak subject is not a gate, so
-this revision names **three**, each against the task that owns it:
+There are **three** subjects:
 
-| Subject | What it is | Soak gate | Owner |
-|---|---|---|---|
-| Raython sample application | A long-running HTTP server | Up for the whole window with no unplanned restart, no crash, no OOM kill. Resident set at the end within 2x of the resident set at hour 24. Zero 5xx responses attributable to the runtime or the collector. | Wren, WLA-8 |
-| The `.wsharp` ecosystem check | A batch program run daily | One full run per day for every day of the window, all exiting 0, on all four release triples. | Ash, WLA-7 |
-| The compiler under its own harness | A nightly batch | `tests/harness/nightly.sh` once a day for every day of the window: parity across the three execution modes, the fuzz corpus, and the soak driver, zero failures. | Dex, WLA-6 |
+| Subject | What it is | Soak gate |
+|---|---|---|
+| Raython sample application | A long-running HTTP server | Up for the whole window with no unplanned restart, no crash, no OOM kill. Resident set at the end within 2x of the resident set at hour 24. Zero 5xx responses attributable to the runtime or the collector. |
+| The `.wsharp` ecosystem check | A batch program run daily | One full run per day for every day of the window, all exiting 0, on all four release triples. |
+| The compiler under its own harness | A nightly batch | `tests/harness/nightly.sh` once a day for every day of the window: parity across the three execution modes, the fuzz corpus, and the soak driver, zero failures. |
 
 **Gate.** `scripts/soak-report.sh` prints one row per subject per day and exits
 non-zero if any day is missing or any row failed. Each subject appends its own
 daily TSV row; a missing row is a failure, because a soak that stopped reporting
 is a soak that stopped.
 
-**Owner.** Dex owns `soak-report.sh` and the collection; Wren and Ash own their
-own rows.
-
 **Evidence.** The soak log, and one `scripts/soak-report.sh` run showing 28
 complete days for all three subjects.
 
-**Depends on.** The Raython sample application does not exist yet (WLA-8). This
-is the longest pole in the campaign and the criterion is honest about it rather
-than discovering it in week three.
+**Depends on.** The Raython sample application being deployed.
 
 ## 2. A stability freeze
 
@@ -308,15 +276,16 @@ mechanically:
 
 Its output is the evidence. Every term in it is defined in Part one.
 
-**Owner.** Ash runs the script and owns the `change:*` label CI job; Johnny
-declares day 0 and grants any exception.
+The `change:*` label rule is enforced by the `change-label` job in
+`.github/workflows/release-gates.yml`. The repository owner declares day 0 and
+grants any exception; see [the freeze clock](#the-freeze-clock).
 
 **Evidence.** A `freeze-check.sh` run dated within 24 hours of the tag, exiting
 0, pasted into the release checklist.
 
-**Depends on.** The `change:*` label rule being enforced by CI from day 0, and
-#13 being fixed (it is an open P1 under clause 3, so question 3 cannot pass while
-it is open).
+**Depends on.** The `change:*` label rule being enforced by CI from day 0, and no
+P1 being open. #13, a P1 under clause 3 when this criterion was written, has
+since been fixed.
 
 ## 3. Every defect gets a regression guard
 
@@ -338,9 +307,6 @@ closed it touches at least one path under that surface's guard directory. A fix
 with no guard is listed by name. What the guard itself must show is
 [Form A of the proof standard](#form-a--a-fix).
 
-**Owner.** Mira for compiler, runtime and stdlib defects; Ash for release,
-install and sharpie defects; Dex for anything his harness found.
-
 **Evidence.** A `guard-check.sh` run listing zero unguarded fixes.
 
 ## 4. Every remaining limitation is resolved or documented
@@ -355,8 +321,7 @@ stating what does not work, why it is not fixed for 1.0, and what would fix it.
 number, and exits non-zero on one that is neither. An issue left open is a
 failure; so is a closed one with no `LIMITATIONS.md` section.
 
-**Owner.** Mira (WLA-4) decides fix-or-document and writes the prose; Johnny
-signs off on what the promise in `COMPATIBILITY.md` then says.
+What `COMPATIBILITY.md` then promises is signed off by the repository owner.
 
 **Evidence.** `followups-check.sh` exiting 0, plus `LIMITATIONS.md` on `main`
 with a section per documented limitation, each carrying
@@ -368,9 +333,8 @@ the collector must root; row polymorphism or an equivalent), one is an
 architecture list, one needs a read-only reference the type system has no way to
 express, and two are a BSD kernel behaviour and a curve whose 521 bits are not a
 whole number of 32-bit limbs. That is a legitimate way to close this criterion;
-it is written here so that it is a decision rather than a discovery. Mira may
-convert any of the six to a fix by landing one under Form A; she may not leave
-one undecided.
+it is written here so that it is a decision rather than a discovery. Any of the
+six may still become a fix under Form A; none may be left undecided.
 
 ## 5. Conformance, parity and adversarial input, in CI
 
@@ -392,9 +356,6 @@ four release triples. Specifically:
    filed under `docs/defects.md`, not a line in a log.
 3. **Flake rate.** `tests/harness/flake-rate.sh` reports zero non-deterministic
    cases over its repeat count. A flaky gate cannot gate.
-
-**Owner.** Dex (WLA-6). `tests/harness/` was written on PR #17 and closed
-unmerged at `39e5a76`; restoring it is the first step of WLA-6 and not a rewrite.
 
 **Evidence.** A green scheduled CI run, plus one `parity.sh` table per release
 triple.
@@ -440,20 +401,19 @@ nix-shell --run "cargo test --workspace"
 nix-shell --run "cargo test --workspace arithmetic --no-run"
 ```
 
-The third is [#8](https://github.com/sinisterMage/WSharp/issues/8) and fails
-today. A documented command that does not work is a P2 under the scale, and the
-reason it gets a gate of its own rather than a line in the limitations list is
-that `CLAUDE.md` tells every contributor to run a filtered test and the failure
-reads as "my change broke the build".
-
-**Owner.** Johnny owns `COMPATIBILITY.md` and the prose (6b); Ash owns the CI
-jobs for 6a and 6d; Mira owns the fix behind 6d and the pin at 6c.
+The third is the regression guard for
+[#8](https://github.com/sinisterMage/WSharp/issues/8), which is fixed: a
+test-name filter used to pull `crates/wsharp-start`, which defines `main`, into a
+test harness, and the link failed. A documented command that does not work is a
+P2 under the scale, and the reason it gets a gate of its own rather than a line
+in the limitations list is that a contributor running a filtered test reads that
+failure as "my change broke the build".
 
 **Evidence.** A `check-doc-examples.sh` run exiting 0; `COMPATIBILITY.md` on
 `main` with every surface covered; a green `api.rs`; a green 6d job.
 
 **Depends on.** The documentation at wsharp.io is outside this repository.
-**Decision, Johnny, 2026-09-26: gate 6a covers the in-repo documentation only.**
+**Decision (2026-09-26): gate 6a covers the in-repo documentation only.**
 wsharp.io is checked by whatever gates its own repository has, and the release
 notes say which documentation the compatibility promise covers. Extending 6a
 across repositories is post-1.0 work; pretending it is covered would be worse
@@ -491,8 +451,6 @@ previous toolchain working. Each rung also asserts that `sharpie show` names the
 rung that answered, since that is the first question when the answer surprises
 somebody.
 
-**Owner.** Ash (WLA-7).
-
 **Evidence.** A four-row table — one per release triple — each row carrying the
 OS image, the version installed, the digest observed, the digest published, and
 the exit status; plus four `rungs.sh` runs. A platform claimed by inference from
@@ -503,7 +461,7 @@ another platform's run is not a row.
 - **Signing.** Today the release publishes a per-target `.sha256` sidecar and
   both installers check what they downloaded against it. That protects against a
   corrupted or truncated transfer and not against whoever can serve the tarball,
-  because they can serve the sidecar too. **Decision, Johnny, 2026-09-26: 1.0
+  because they can serve the sidecar too. **Decision (2026-09-26): 1.0
   ships with the digest sidecar and the release notes state plainly that 1.0
   promises integrity against transport corruption and not against a compromised
   distribution point.** Signing (minisign or cosign, public key in the installer,
@@ -540,8 +498,6 @@ are gone by the time anything can read them.
    of more than 2x on any case in `tests/cases`" is a comparison rather than an
    impression, and a re-run command that reproduces it.
 
-**Owner.** Ridge (WLA-5).
-
 **Evidence.** The three artefacts above, each under Form B, with raw data
 committed rather than summarised.
 
@@ -553,55 +509,33 @@ Form B.
 
 ---
 
-# Part three: the nine open issues
+# Part three: the issue map
 
-Every open issue in `sinisterMage/WSharp` as of 2026-09-26, each mapped to
-exactly one gate, one disposition and one owner. An issue appears once. A tenth
-issue filed tomorrow gets a row here before it gets work.
+Revision 2 mapped every issue then open in `sinisterMage/WSharp` — nine, on
+2026-09-26 — to one gate and one disposition. **All nine are now closed.**
+[#13](https://github.com/sinisterMage/WSharp/issues/13), the P1 under clause 3,
+was fixed by bounding the comparison into a W# diagnostic, and the bound is
+documented in `LIMITATIONS.md` as "Comparing a value that reaches itself is
+refused". [#8](https://github.com/sinisterMage/WSharp/issues/8) was fixed and is
+guarded by gate 6d. [#18](https://github.com/sinisterMage/WSharp/issues/18) was
+closed by the per-pause data criterion 8 requires.
+[#9](https://github.com/sinisterMage/WSharp/issues/9),
+[#10](https://github.com/sinisterMage/WSharp/issues/10),
+[#11](https://github.com/sinisterMage/WSharp/issues/11),
+[#12](https://github.com/sinisterMage/WSharp/issues/12),
+[#14](https://github.com/sinisterMage/WSharp/issues/14) and
+[#15](https://github.com/sinisterMage/WSharp/issues/15) were closed as documented
+limitations, each with its entry in `LIMITATIONS.md`. The issues themselves carry
+the detail.
 
-| Issue | What it is | Gate | Disposition | Owner / task |
-|---|---|---|---|---|
-| [#13](https://github.com/sinisterMage/WSharp/issues/13) | Comparing a cyclic struct value aborts with no W# diagnostic (P1) | 2 | **Fix** | Mira, WLA-3 |
-| [#8](https://github.com/sinisterMage/WSharp/issues/8) | `cargo test --workspace <filter>` fails: two mains in `wsharp-start` (P3) | 6d | **Fix** | Mira, WLA-3 |
-| [#18](https://github.com/sinisterMage/WSharp/issues/18) | No per-pause data, so a pause p99 cannot be measured | 8 | **Measurement** | Ridge, WLA-5 |
-| [#9](https://github.com/sinisterMage/WSharp/issues/9) | Computed top-level `const` is rejected | 4 | **Documented limitation** | Mira, WLA-4 |
-| [#10](https://github.com/sinisterMage/WSharp/issues/10) | Field access needs a known type | 4 | **Documented limitation** | Mira, WLA-4 |
-| [#11](https://github.com/sinisterMage/WSharp/issues/11) | x86-64 and aarch64 only | 4 | **Documented limitation** | Mira, WLA-4 |
-| [#12](https://github.com/sinisterMage/WSharp/issues/12) | A top-level `const` array can be written through an alias | 4 | **Documented limitation** | Mira, WLA-4 |
-| [#14](https://github.com/sinisterMage/WSharp/issues/14) | `net.shutdown` does not stop an acceptor on the BSDs | 4 | **Documented limitation** | Mira, WLA-4 |
-| [#15](https://github.com/sinisterMage/WSharp/issues/15) | `std/tls` cannot verify a chain through a P-521 key | 4 | **Documented limitation** | Mira, WLA-4 |
-
-## #13 in detail, because it needed a ruling
-
-#13 asked whether the severity scale should carry an exemption for a documented
-crash. **It should not, and does not** — see the note under clause 3. The
-disposition is therefore a fix, and it is the shape #13 itself proposed as option
-1: bound the recursion in the generated exact-comparison function and panic with
-a W# diagnostic naming the type, in the shape of `std/json`'s `MAX_DEPTH` and
-`std/x509`'s `MAX_CHAIN` — a named bound with no knob. That converts an abort into
-a reported error, which is a documentable limitation; an abort is not.
-
-Two things for whoever picks this up. A version of this fix already exists,
-written on PR #6 and closed unmerged at `80efa89`: it touches
-`crates/wsharp-codegen/src/equality.rs` and `lower.rs`, adds
-`tests/cases/eq_cycle_bounded.ws`, and changes `tests/cases/struct_eq.ws`. Read it
-before writing a second one, and hold it to Form A anyway — recovered work is not
-verified work. And `LIMITATIONS.md`'s entry "Comparing a value that reaches itself
-aborts" is true of 0.2.3 and must be rewritten, not deleted, when the fix lands:
-the bound is itself a limitation, and a user who meets it deserves to find it
-documented.
-
-## What the map does not contain
-
-Nothing about closed issues #1–#7, #16 and #17. Four of those are pull requests
-closed unmerged, and what happens to their content is criterion 0 (for the three
-documents) and criterion 5 (for `tests/harness/`).
+A new issue gets a gate and a disposition before it gets work;
+[docs/defects.md](docs/defects.md) is the intake.
 
 ---
 
 # Part four: the proof standard
 
-The owner's constraint, in one place: **every bug fix and every benchmark carries
+The rule, in one place: **every bug fix and every benchmark carries
 concrete, re-runnable proof.** Three forms, one per kind of claim. A claim in any
 other shape is not closed, whoever makes it and however confident they are.
 
@@ -618,7 +552,7 @@ A fix is proved by a **committed test that fails before it and passes after it**
 4. A fix whose test cannot fail before it is not proved. If the defect needs
    `--gc-stress`, a specific platform or a repeat count to reproduce, the test
    carries that condition and the PR says which pass exercises it.
-5. A defect found on a platform this machine cannot run is proved on that
+5. A defect found on a platform you cannot run locally is proved on that
    platform, in CI or on real hardware, and the run is linked. "It should work
    there" is not Form A.
 
@@ -699,7 +633,7 @@ breaking change for the life of the 1.x line:
 
 ## For how long
 
-**Decision, Johnny, 2026-09-26.**
+**Decision (2026-09-26).**
 
 - **The 1.x line is source-compatible with 1.0.** A program that compiles and
   behaves correctly on 1.0 does so on every later 1.x, for every frozen surface
@@ -744,15 +678,15 @@ it. Consequences worth stating before somebody assumes otherwise:
 
 - **`aarch64-unknown-linux-gnu` is not a 1.0 release target.** The architecture is
   supported by the collector — it is half of what #11 allows — but no triple
-  ships, because nothing in this campaign builds, tests or installs on it.
-  Adding it post-1.0 is additive.
+  ships, because nothing in the release pipeline builds, tests or installs on
+  it. Adding it post-1.0 is additive.
 - **The BSDs are not release targets.** `crates/wsharp-runtime/src/sys/bsd.rs`
-  exists and is checked but not run here, and
+  exists, but no CI job builds or runs it, and
   [#14](https://github.com/sinisterMage/WSharp/issues/14) is a BSD-specific
   limitation. A BSD build may work; 1.0 promises nothing about it.
 - **A platform's result is that platform's run.** Claimed-by-inference is not a
   row, in criterion 7 or anywhere else. The four `struct stat` offsets in
-  `sys/bsd.rs` that no machine here can check are exactly why this rule exists.
+  `sys/bsd.rs`, which no CI job checks, are exactly why this rule exists.
 - **32-bit is not supported and will not be.** A limb is 32 bits, a slot is a
   machine word, and the collector reads a frame pointer per architecture; this is
   an architecture list, not an oversight.
@@ -761,35 +695,11 @@ it. Consequences worth stating before somebody assumes otherwise:
 
 # Part six: the shared parts
 
-## Who owns what
-
-This document is a contract between six people, not one person's opinion.
-
-| Owner | Task | Owes |
-|---|---|---|
-| Mira | WLA-3, WLA-4 | The two open compiler defects with guards (#13, #8); fix-or-document for the six limitation issues and the `LIMITATIONS.md` prose; the `--emit=api` pin (6c); triage for compiler, runtime, stdlib, the collector |
-| Ridge | WLA-5 | Per-pause data and the published distribution (#18); the benchmark baselines the 2x threshold is measured against; every number under Form B |
-| Dex | WLA-6 | `tests/harness/` restored and in CI; parity across the three execution modes on four triples; fuzzing; the flake rate; `soak-report.sh` and the daily collection |
-| Ash | WLA-7 | The release pipeline and published digests; clean-machine install verification; sharpie and its rung matrix; the `.wsharp` ecosystem check; the `change:*` label CI job; the 6a and 6d CI jobs |
-| Wren | WLA-8 | Raython and the deployed sample application, and its soak row for the whole window |
-| Johnny | WLA-2 | This document and `COMPATIBILITY.md`; declares day 0; grants or refuses exceptions; settles severity disagreements; **decides the release date** |
-
-A criterion whose owner is not on this list is a criterion nobody owns, which is
-the state criterion 0 was written to end.
-
 ## What this will cost in calendar time
 
-Worth saying once, plainly, because it is the number a release date is built
-from. Criterion 1 requires three subjects soaking for 28 days, and one of them —
-the Raython sample application — is not written. So the earliest possible tag is:
-
-> (time for Wren to build and deploy Raython's sample app) + (time for Dex to
-> stand up the harness and the daily report) + 28 days, **assuming no P1 and no
-> breaking change in those 28 days**.
-
-Every confirmed P1 in the window adds up to 28 more days. The freeze window is
-the one number in this document that is a policy choice rather than a
-measurement, and it is the one to argue about if the date comes out wrong.
+The earliest possible tag is 28 days after the Raython sample application is
+deployed and the harness is reporting daily, **assuming no P1 and no breaking
+change in those 28 days**.
 
 ## Freeze record
 
@@ -798,7 +708,7 @@ measurement, and it is the one to argue about if the date comes out wrong.
 | Day 0 commit | *not declared* |
 | Day 0 date | *not declared* |
 | Window | 28 days |
-| Declared by | *pending — Johnny, once gates 0, 2, 3, 4, 6d and 8 are closed* |
+| Declared by | *pending — the repository owner, once gates 0, 2, 3, 4, 6d and 8 are closed* |
 
 ## Exception log
 
@@ -807,71 +717,44 @@ it could not wait, who granted it, and whether the clock reset.
 
 ## The state of the checks
 
-Nine gates, fifteen checks — several gates take two apiece, because a gate with
-one mechanism and one artefact, or one script per repository, is two things that
-can be separately missing. Fourteen of the fifteen are written; one is not,
-and is named here so that it is owed rather than assumed.
+One row per check a gate needs: fifteen checks for the nine criteria, because a
+gate with both a mechanism and an artefact, or a script in each of two
+repositories, has two things that can be separately missing. The State column
+says whether each check exists; whether it *passes* is the gate's own question.
 
 **Read against `main` at `4e9249a`, and held to the tree by
-`scripts/gate-table-check.sh` on every pull request.** This table claims which
-files exist, which is a claim that goes stale on any merge that adds one — and
-did, within twenty minutes of revision 2, on six of ten rows. So it carries the
-commit it was read at, and a check now reads every row: a row saying "written"
-whose file is missing, and a row saying "not written" whose file somebody has
-since written, both turn CI red. Thirteen of the fifteen rows are checked that
-way, and the script names the other two out loud on every run — criterion 0's
-inline test, which names no path, and criterion 7's `tests/rungs.sh`, which
-names one in another repository. (Criterion 8's baselines named no path until
-`benchmarks/baselines/` was decided; the row now names the three still owed, so
-the check will say so the day they land.) **An unchecked row is where this table can still be wrong**, and
-`rungs.sh` is the proof: it was merged into sharpie twenty-one minutes before
-this revision was first drafted saying it was not written, and no check in this
-tree could have noticed. It was caught by reading sharpie, which is the only way
-an unchecked row ever will be.
+`scripts/gate-table-check.sh` on every pull request.** A row saying "written"
+whose file is missing, or "not written" whose file exists, turns CI red. Two
+rows name nothing this tree can check — criterion 0's inline test, and
+criterion 7's `tests/rungs.sh`, which lives in another repository — and the
+script reports them as unchecked on every run.
 
-**The State column is read by that script, so two spellings are load-bearing.** A
-verdict is the bold run `**written**` or `**not written**` at the start of the
-cell, and a CI job is claimed as ``as `a`, `b` and `c` in
-`.github/workflows/file.yml` ``. Writing either differently does not make a row
-false; it makes it unchecked, which is the failure this table has already had
-once.
+**Two spellings in the State column are load-bearing**, because the script reads
+them. A verdict is the bold run `**written**` or `**not written**` at the start
+of the cell, and a CI job is claimed as ``as `a`, `b` and `c` in
+`.github/workflows/file.yml` ``. A cell that does not begin with a verdict fails
+the check; a job named any other way is simply not checked.
 
 | Check | Gate | State | Owed by |
 |---|---|---|---|
-| the four-file test in criterion 0 | 0 | **written and run** — inline above | Johnny |
-| `scripts/gate-table-check.sh`, with `scripts/tests/gate-table-check.test.sh` | 0 | **written**, as `gate-table` in `.github/workflows/release-gates.yml`. It reads this table, so the table describes itself and drifting from the tree is now a red CI run | Johnny |
-| `scripts/soak-report.sh`, with `scripts/soak-report-selftest.sh` | 1 | **written** (#20), and wired up as `soak-row` in `.github/workflows/nightly.yml`. What is owed is 28 days of rows, not the script | Dex to run |
-| `scripts/ecosystem-check.sh`, with `scripts/tests/ecosystem-check.test.sh` | 1 | **written**, as `ecosystem` and `soak-row` in `.github/workflows/ecosystem.yml`. One run is sharpie built and tested (plainly, under stress, and its rungs), Foundry's own check fetching every release against its tree hash, and every published release installed, checked, built, run and tested plainly and under stress. The workflow writes one row per release triple, and `soak/subjects.tsv` names all four, so `soak-report.sh` fails a day any one of them did not report. What is owed is 28 days of rows | Ash to run |
-| `scripts/freeze-check.sh` | 2 | **written**, on `main` | Ash to run |
-| `scripts/check-change-label.sh`, with `scripts/tests/check-change-label.test.sh` | 2 | **written** (#21), as `change-label` in `.github/workflows/release-gates.yml`. Revision 2 did not list this check at all | Ash, enforcing from now |
-| `scripts/guard-check.sh`, with `scripts/tests/guard-check.test.sh` | 3 | **written**, as `guards` in `.github/workflows/release-gates.yml`. Asks GitHub which defects closed after the freeze start and what closed them, so, like criterion 4's, it exits 2 when it cannot ask. The live run waits for `.github/freeze-start`; before Day 0, `--since` runs it over any window | Ash |
-| `scripts/followups-check.sh`, with `scripts/tests/followups-check.test.sh` | 4 | **written** (#45), as `followups` in `.github/workflows/release-gates.yml`. The only check in this table that asks GitHub rather than the tree, so it exits 2 — never 0 — when it cannot ask | Ash, against Mira's decisions |
-| `tests/harness/nightly.sh` | 5 | **written** (#20), as `parity`, `nightly` and `soak-row` in `.github/workflows/nightly.yml`. What is owed is green runs on a schedule | Dex to run |
-| `scripts/check-doc-examples.sh`, with `scripts/tests/check-doc-examples.test.sh` | 6a | **written** (#21), as `doc-examples` and `examples` in `.github/workflows/release-gates.yml`, and **green** since #33 marked the documented programs up | Ash — held |
-| the 6d CI job | 6d | **written** (#21), as `contributor-commands` in `.github/workflows/release-gates.yml` | Ash — held |
-| `scripts/verify-install.sh` | 7 | **written** (#21), as `verify-install` in `.github/workflows/release-gates.yml`, a matrix job. What is owed is a run against a real release | Ash to run |
-| `tests/rungs.sh` | 7 | **written**, in [`sinisterMage/sharpie`](https://github.com/sinisterMage/sharpie) (its PR #2, merged at `6af434d`), not in this repository — so no check here can see its state either way, and this row is one of the two the gate-table check reports as unchecked. What is owed is green runs on four triples | Ash to run |
-| `tests/harness/gc-pauses.sh` | 8 | **written** (#20), and called by `tests/harness/nightly.sh` | Ridge — held |
-| a committed benchmark baseline per release triple | 8 | **not written** for three of the four: `benchmarks/baselines/x86_64-pc-windows-msvc.tsv`, `benchmarks/baselines/x86_64-apple-darwin.tsv` and `benchmarks/baselines/aarch64-apple-darwin.tsv` are owed. The x86-64 Linux baseline is committed beside where they go, written by the harness's bench.sh with `--record`, which keeps every sample and the Form B fields; `--compare` is the 2x check. The nightly's bench job records the other three on their runners as artifacts, to be reviewed and committed | Ridge |
+| the four-file test in criterion 0 | 0 | **written and run** — inline above | maintainers |
+| `scripts/gate-table-check.sh`, with `scripts/tests/gate-table-check.test.sh` | 0 | **written**, as `gate-table` in `.github/workflows/release-gates.yml`. It reads this table, so the table describes itself and drifting from the tree is now a red CI run | CI, on every pull request |
+| `scripts/soak-report.sh`, with `scripts/soak-report-selftest.sh` | 1 | **written** (#20), and wired up as `soak-row` in `.github/workflows/nightly.yml`. What is owed is 28 days of rows, not the script | `nightly.yml`, daily |
+| `scripts/ecosystem-check.sh`, with `scripts/tests/ecosystem-check.test.sh` | 1 | **written**, as `ecosystem` and `soak-row` in `.github/workflows/ecosystem.yml`. One run is sharpie built and tested (plainly, under stress, and its rungs), Foundry's own check fetching every release against its tree hash, and every published release installed, checked, built, run and tested plainly and under stress. The workflow writes one row per release triple, and `soak/subjects.tsv` names all four, so `soak-report.sh` fails a day any one of them did not report. What is owed is 28 days of rows | `ecosystem.yml`, daily |
+| `scripts/freeze-check.sh` | 2 | **written**, on `main` | maintainers, within 24 hours of the tag |
+| `scripts/check-change-label.sh`, with `scripts/tests/check-change-label.test.sh` | 2 | **written** (#21), as `change-label` in `.github/workflows/release-gates.yml` | CI, on every pull request |
+| `scripts/guard-check.sh`, with `scripts/tests/guard-check.test.sh` | 3 | **written**, as `guards` in `.github/workflows/release-gates.yml`. Asks GitHub which defects closed after the freeze start and what closed them, so, like criterion 4's, it exits 2 when it cannot ask. The live run waits for `.github/freeze-start`; before Day 0, `--since` runs it over any window | CI |
+| `scripts/followups-check.sh`, with `scripts/tests/followups-check.test.sh` | 4 | **written** (#45), as `followups` in `.github/workflows/release-gates.yml`. The only check in this table that asks GitHub rather than the tree, so it exits 2 — never 0 — when it cannot ask | CI |
+| `tests/harness/nightly.sh` | 5 | **written** (#20), as `parity`, `nightly` and `soak-row` in `.github/workflows/nightly.yml`. What is owed is green runs on a schedule | `nightly.yml`, on its schedule |
+| `scripts/check-doc-examples.sh`, with `scripts/tests/check-doc-examples.test.sh` | 6a | **written** (#21), as `doc-examples` and `examples` in `.github/workflows/release-gates.yml`, and **green** since #33 marked the documented programs up | CI — held |
+| the 6d CI job | 6d | **written** (#21), as `contributor-commands` in `.github/workflows/release-gates.yml` | CI — held |
+| `scripts/verify-install.sh` | 7 | **written** (#21), as `verify-install` in `.github/workflows/release-gates.yml`, a matrix job. What is owed is a run against a real release | maintainers, against a real release |
+| `tests/rungs.sh` | 7 | **written**, in [`sinisterMage/sharpie`](https://github.com/sinisterMage/sharpie) (its PR #2, merged at `6af434d`), not in this repository — so no check here can see its state either way, and this row is one of the two the gate-table check reports as unchecked. What is owed is green runs on four triples | sharpie's CI, on four triples |
+| `tests/harness/gc-pauses.sh` | 8 | **written** (#20), and called by `tests/harness/nightly.sh` | `nightly.yml` — held |
+| a committed benchmark baseline per release triple | 8 | **not written** for three of the four: `benchmarks/baselines/x86_64-pc-windows-msvc.tsv`, `benchmarks/baselines/x86_64-apple-darwin.tsv` and `benchmarks/baselines/aarch64-apple-darwin.tsv` are owed. The x86-64 Linux baseline is committed beside where they go, written by the harness's bench.sh with `--record`, which keeps every sample and the Form B fields; `--compare` is the 2x check. The nightly's bench job records the other three on their runners as artifacts, to be reviewed and committed | maintainers, from the nightly bench artifacts |
 
-A criterion whose check is not written is a criterion nobody can fail, which is
-why this table is here rather than in somebody's head. The one that is not
-written is gate 8's baselines; everything else now fails on evidence rather than
-on absence.
-
-Two rows used to be one each, and splitting them was the honest fix. Criterion 7
-as a single row said "not written" while `verify-install.sh` was finished, and
-criterion 8 as a single row would have said "written" while the baselines were
-not. One row per thing that can be separately missing is the rule, and the reason
-the table has fifteen rows for nine gates.
-
-**Two rows name nothing this tree can be asked about, and the check says so on
-every run rather than passing them silently.** Criterion 0's four-file test is
-inline above, and criterion 7's `tests/rungs.sh` is another repository's, which
-no check here can stat. "Thirteen of fifteen rows were held to the tree" is the
-number each run prints, because a check that reports its own coverage cannot
-quietly lose it — and the two it does not cover are exactly where this table
-has to be read rather than trusted.
+The one check not yet written is gate 8's baselines for the three triples other
+than x86-64 Linux.
 
 ## The tag checklist
 
@@ -895,12 +778,13 @@ claim that the script is missing.
 - [ ] Every fix in the window carries Form A; every number carries Form B; every limitation carries Form C.
 - [ ] The rollback path for the tag itself is written down: how to un-ship it, and who does.
 - [ ] No credential appears in any workflow file, commit, or published artefact.
-- [ ] Johnny has authorised the tag in writing.
+- [ ] The repository owner has authorised the tag in writing.
 
 ## Revision history
 
 | Revision | Date | What changed |
 |---|---|---|
-| 1 | 2026-09-26 | Written by Milo on PR #7. Seven criteria, three definitions, `freeze-check.sh`. Closed unmerged at `ce6b3ff`. |
-| 3 | 2026-09-26 | "The state of the checks" refreshed by Johnny against `main` at `f2f2b40`. Revision 2 was accurate when it was written and wrong on six of ten rows within twenty minutes, because #20, #21 and #23 landed behind it. Now written: `soak-report.sh`, `nightly.sh` and `nightly.yml`, `check-doc-examples.sh`, the 6d job as `contributor-commands`, `verify-install.sh`, `gc-pauses.sh`. Also written, in `sinisterMage/sharpie` rather than here: `tests/rungs.sh` (its PR #2, at `6af434d`), which was merged twenty-one minutes before this revision was first drafted saying it was not — the one row no check in this tree can see, found by reading that repository. Still not written: `guard-check.sh`, `followups-check.sh`, and criterion 8's baselines. Criteria 7 and 8 split into one row per separately-missing thing; `check-change-label.sh` added as criterion 2's second check, which revision 2 omitted. The table now carries the commit it was read at. Added `scripts/gate-table-check.sh` and its tests, run as the `gate-table` job, which holds eleven of the fourteen rows to the tree on every pull request and names the other three out loud — so this table cannot drift again without turning CI red, and the State column's two spellings are now read by a script and documented as such. No criterion, gate, threshold or owner changed — this revision is a correction of the document's account of itself, plus the check that keeps it correct. |
-| 2 | 2026-09-26 | Published by Johnny as the campaign's gate list. Part one preserved so existing citations still resolve — clause 3 and criterion 4 mean what #8 through #18 say they mean. Added: criterion 0 (the governing documents), criterion 8 (the numbers), gate 6d (#8), Part three (the nine open issues), Part four (the proof standard), Part five (the API and stability freeze), the platform matrix. Owners remapped from the campaign's earlier roster to its current one. Rulings recorded: clause 3 carries no exemption (#13 is a fix); 6a covers in-repo documentation only; 1.0 ships with digest sidecars and says so; rollback is `sharpie default <previous>`; criterion 1 drops two unowned soak subjects. |
+| 1 | 2026-09-26 | First draft, on PR #7: seven criteria, three definitions, `freeze-check.sh`. Closed unmerged at `ce6b3ff`. |
+| 2 | 2026-09-26 | Published as the release gate list. Part one preserved so existing citations still resolve — clause 3 and criterion 4 mean what #8 through #18 say they mean. Added: criterion 0 (the governing documents), criterion 8 (the numbers), gate 6d (#8), Part three (the issue map), Part four (the proof standard), Part five (the API and stability freeze), the platform matrix. Decisions recorded: clause 3 carries no exemption (#13 is a fix); 6a covers in-repo documentation only; 1.0 ships with digest sidecars and says so; rollback is `sharpie default <previous>`; criterion 1 names three soak subjects rather than four. |
+| 3 | 2026-09-26 | "The state of the checks" re-read against `main` at `f2f2b40`, after #20, #21 and #23 landed behind revision 2. Criteria 7 and 8 split into one row per separately-missing check; `check-change-label.sh` added as criterion 2's second check. The table now carries the commit it was read at, and `scripts/gate-table-check.sh` holds it to the tree as the `gate-table` job. No criterion, gate or threshold changed. |
+| 4 | 2026-09-29 | Rewritten for users and contributors: per-person ownership removed, Part three condensed now that all nine issues are closed, and the gate 6d note corrected now that #8 is fixed. No criterion, gate, threshold, severity definition, promise or decision changed. |

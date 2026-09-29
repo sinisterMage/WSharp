@@ -2,7 +2,7 @@
 #
 # Criterion 1 of `RELEASE-CRITERIA-1.0.md` names three soak subjects, and this
 # is the second: "one full run per day for every day of the window, all exiting
-# 0, on all four release triples", owned by Ash (WLA-7). What a run *is* lives
+# 0, on all four release triples". What a run *is* lives
 # in `scripts/ecosystem-check.sh` -- sharpie built and tested, Foundry's own
 # check, and every published release installed, compiled against and tested,
 # plainly and under stress -- so that it means the same on a laptop as here.

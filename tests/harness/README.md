@@ -20,7 +20,7 @@ nix-shell --run "cargo build --workspace"
 | `selftest.sh` | does the harness report what actually happened? | seconds, **no compiler needed** |
 | `conform-selftest.sh` | can the conformance gate tell a rotted diagnostic from an intact one? | seconds, **no compiler needed** |
 | `parity.sh` | do the three execution modes agree, per case? | 1–3 h for the corpus on one core |
-| `conform.sh` | does every refusal still print the same diagnostic, span and help line? | seconds for the 64 rejection cases |
+| `conform.sh` | does every refusal still print the same diagnostic, span and help line? | seconds for the 68 rejection cases |
 | `fuzz.pl` | does arbitrary input crash or hang the front end or a stdlib parser? | bounded by `--max-seconds` |
 | `flake-rate.sh` | how often does one case do something different, and how long does it take when it does? | attempts × the case |
 | `gc-pauses.sh` | how long does the collector stop the program for? | ~10 min for `gc_*` at 5 repeats |
@@ -287,11 +287,12 @@ resident size that climbs anyway is the collector's.
 
 ### The soak procedure
 
-A soak is a job, not a heartbeat. Start it, write down where its output lands,
-and come back.
+A soak window runs for days, so start it detached and check on it rather than
+holding a terminal open.
 
 1. **Start the window.** Give it `--label` and a real `--duration` (a week is
-   `604800`). Use `setsid nohup` so it outlives the shell:
+   `604800`). Run it under `nohup` and `setsid` so it outlives the shell that
+   started it:
 
    ```sh
    nohup setsid tests/harness/soak.sh --label foundryd-w1 \
@@ -300,12 +301,13 @@ and come back.
        --out target/harness/soak-foundryd-w1 >/dev/null 2>&1 &
    ```
 
-2. **Record in the task**: the output directory, the command, the probe, the
-   window's intended length, the commit, and the platform. A later heartbeat
-   resumes from that, and nothing else.
+2. **Note what you started**: the output directory, the command, the probe, the
+   window's intended length, the commit, and the platform. The report records
+   them as well, but only once it is written; a note taken at the start is what
+   lets anybody find the run and read it while it is still going.
 
-3. **Check in without waiting.** `tail counters.tsv` says whether it is still
-   sampling. Do not sit in a loop watching it.
+3. **Check progress** with `tail` on the output directory's `counters.tsv`. A new
+   row every `--interval` seconds means it is still sampling.
 
 4. **Close the window** by reading `report.md`, then compare against the previous
    one:
@@ -315,8 +317,8 @@ and come back.
    ```
 
 5. **Say what actually ran.** If the window did not elapse, the report says so
-   and so should the summary: *what ran, and for how long*. A window that was cut
-   short is not a clean window.
+   and so should any summary of it: *what ran, and for how long*. A window that
+   was cut short is not a clean window.
 
 ## `flake-rate.sh` — a rate, not an adjective
 
@@ -437,7 +439,8 @@ A suite's limits belong where somebody reading its green run will see them.
   that pauses more says `TRUNCATED` in its trailer and `gc-pauses.sh` reports it.
 - **Timing numbers here are not published numbers.** Pause and duration figures
   are for triage — is this a stall or a busy box — and anything quoted as a
-  result goes through Ridge's harness under Form B of the proof standard.
+  result is measured with `tests/harness/bench.sh` or `gc-pauses.sh` and
+  published under Form B of the proof standard.
 - **CI covers four triples and one older-glibc container.** A platform not in
   that matrix has no evidence, and a pass on one triple is evidence about one
   triple. 32-bit and non-x86-64/aarch64 targets are out of scope (#11).

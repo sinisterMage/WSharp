@@ -256,11 +256,12 @@ jobs:
 
   # Gate 6d. Every command the repository tells a contributor to run works.
   #
-  # The three commands are `CLAUDE.md`'s, verbatim, in its order -- the build
-  # before the test because the case suite's AOT pass links against an archive
-  # `cargo test` does not build. The third is issue #8 and fails today; this job
-  # is what turns that from an afternoon lost per contributor into a red check
-  # with an owner.
+  # The first two are `CLAUDE.md`'s, verbatim, in its order -- the build before
+  # the test because the case suite's AOT pass links against an archive `cargo
+  # test` does not build. The third, a filtered build, is the regression guard
+  # for issue #8 (fixed): a test-name filter used to pull `wsharp-start`, which
+  # defines `main`, into a test harness and fail to link. This job keeps that
+  # from coming back as an afternoon lost per contributor.
   #
   # No `nix-shell` wrapper: `CLAUDE.md` uses it because a bare NixOS box has no
   # `cc`, and the GitHub runner has one already. The commands inside are what

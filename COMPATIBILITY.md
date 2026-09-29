@@ -1,7 +1,7 @@
 # What W# 1.0 promises
 
-**Status: in force for the v1.0 campaign.** The terms — which surfaces are
-frozen, and for how long — are fixed in
+**Applies from v1.0.0.** The terms — which surfaces are frozen, and for how long
+— are fixed in
 [Part five of RELEASE-CRITERIA-1.0.md](RELEASE-CRITERIA-1.0.md#part-five-the-api-and-stability-freeze).
 This file states the same promise to users, surface by surface. If the two ever
 disagree, Part five is the one that is right and this file gets fixed.
@@ -261,11 +261,12 @@ extracting anything.**
 
 **Not promised:** that the digest is *signed*. A sidecar protects against a
 corrupted or truncated transfer and not against whoever can serve the tarball,
-because they can serve the sidecar too. `RELEASE-CRITERIA-1.0.md` criterion 5
-puts the signing question to Johnny before the tag; **whichever way it is
-decided, this section states the answer plainly rather than leaving it to be
-inferred.** Until it is decided, the honest reading of this paragraph is the
-weaker one.
+because they can serve the sidecar too. **1.0 ships with the digest sidecar, and
+the integrity it promises is against transport corruption, not against a
+compromised distribution point** (decided 2026-09-26; criterion 7 of
+`RELEASE-CRITERIA-1.0.md`). Signing — minisign or cosign, with the public key in
+the installer and the signature verified before the digest — is scheduled for
+1.1.
 
 **Not promised.** Reproducible builds. A third party cannot rebuild an artefact
 and get the same bytes; see `LIMITATIONS.md`.
@@ -298,12 +299,9 @@ repository with one workflow (`deploy.yml`) that publishes and does not check.
 Gate 6a of `RELEASE-CRITERIA-1.0.md` — every documented example is a real file
 executed in CI — therefore does not reach it as things stand.
 
-**This is fixable rather than a reason to narrow the promise**, and the proposal
-is a check workflow in that repository which clones `sinisterMage/WSharp` at the
-tag and runs `scripts/check-doc-examples.sh` over `content/docs/**`, using the
-same `<!-- from: examples/fib.ws -->` marker convention. That makes the site's
-examples the same files the case suite runs.
-
-Until that job exists and is green, **the 1.0 documentation promise covers the
-in-repository documentation**, and the release notes say so. This sentence is
-the one to delete once the job lands.
+**The 1.0 documentation promise covers the in-repository documentation**, and
+the release notes say so. Extending it to the site needs a check workflow in that
+repository which clones `sinisterMage/WSharp` at the tag and runs
+`scripts/check-doc-examples.sh` over `content/docs/**`, using the same
+`<!-- from: examples/fib.ws -->` marker convention, so that the site's examples
+are the same files the case suite runs.

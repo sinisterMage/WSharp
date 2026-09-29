@@ -52,10 +52,10 @@ identically.
 One row per rejection case in `target/harness/conformance/results.tsv`, and a
 report beside it naming the compiler, the commit, the platform and the totals.
 
-| Verdict | Means | Who owns it |
+| Verdict | Means | What it calls for |
 |---|---|---|
-| `PINNED` | stderr matched the snapshot; `check` and `run` agreed | nobody, this is the gate met |
-| `CHANGED` | stderr differs from the snapshot | read the diff: either a diagnostic regressed (a defect for Mira) or it improved (a bless commit) |
+| `PINNED` | stderr matched the snapshot; `check` and `run` agreed | nothing: this is the gate met |
+| `CHANGED` | stderr differs from the snapshot | read the diff: either a diagnostic regressed (a defect to file) or it improved (a bless commit) |
 | `ACCEPTED` | the case says `// error:` and the compiler compiled it | a defect, and a severe one: the compiler started accepting something the language refuses |
 | `NOSPAN` | no `--> file:line:col`, or it names a line the case does not have | a defect |
 | `CHECKRUN` | `check` and `run` refused it differently | a defect, and the `err_unpinned_generic` class |
@@ -93,38 +93,29 @@ leaving the case unblessed — and it refuses a case whose snapshot and whose
 `// error:` header no longer describe the same refusal, because that is the one
 finding a reviewer skimming a bless diff would not notice.
 
-**`expected/` holds 63 snapshots, blessed from a real `conformance` job's
-artifact, not from a local build.** Nobody on this campaign has a machine that
-can build W# — no `rustc`, no `cargo`, no `cc` — so guessed diagnostics would
-have produced failures on the first real run that looked like compiler defects
-and were typing mistakes. What happened instead: the run of the `conformance`
-job (dispatched manually on 2026-09-27, run `36296023948`) exited 3 and uploaded
+**`expected/` holds one snapshot per rejection case — 68 of them.** They are
+blessed from the `conformance` CI job's artifact rather than written by hand or
+from one local build. A run that finds a case `UNBLESSED` exits 3 and uploads
 every diagnostic it *would* have pinned as
-`conformance-<triple>/diffs/*.proposed.diag`; the snapshots here are those
-bytes, normalised (see below) and committed. They came from four independent
-triples and, after normalisation, were **byte-identical on all four** — which is
-itself the first evidence that a diagnostic is a platform-independent claim.
-The sixty-third (`err_const_string_array`) was added when `main` gained that
-case (#58) while the bless PR was open; the scheduled run `36306746001`
-proposed it and re-confirmed the other sixty-two with zero mismatches.
+`conformance-<triple>/diffs/*.proposed.diag`; the snapshots are those bytes,
+normalised (see below) and committed. The job runs on all four release triples,
+and the proposals are matched across them before they are committed: after
+normalisation they are byte-identical, which is the evidence that a diagnostic
+is a platform-independent claim.
 
-The four `err_ffi_*` cases were left un-blessed while they reported `NOSPAN`
-(their `-->` named a line of `std/ffi`, not of the user's file --
-[#37](https://github.com/sinisterMage/WSharp/issues/37)), deliberately, because
-pinning a diagnostic that points at the wrong file would pin the defect as
-correct. They were blessed with the fix that points them at the program's own
-`ffi.bind` call, so every rejection case is now pinned. The compiler subject's
-soak row reads `fail` on any night a case is `NOSPAN` again -- because criterion
-5 genuinely is not met while that is true.
+A case reported as `NOSPAN`, `ACCEPTED` or `CHECKRUN` stays un-blessed until its
+defect is fixed, because pinning it would pin the defect as correct. The four
+`err_ffi_*` cases were held back this way while their `-->` named a line of
+`std/ffi` rather than the user's file
+([#37](https://github.com/sinisterMage/WSharp/issues/37)), and were blessed with
+the fix that points them at the program's own `ffi.bind` call. Every rejection
+case is now pinned. The compiler subject's soak row reads `fail` on any night a
+case is `NOSPAN` again, because criterion 5 is not met while that is true.
 
 ## What this suite does not cover
 
 Written here rather than left in anyone's head.
 
-- **The four `err_ffi_*` cases are `NOSPAN` and un-blessed.** Their `-->` names
-  a line of `std/ffi`, not of the user's file, so there is no span to pin; this
-  is [#37](https://github.com/sinisterMage/WSharp/issues/37) and the gate is
-  correctly red while it stands.
 - **Only the 68 cases in `tests/cases` whose header carries `// error:`.** It
   adds no new rejection cases. The gaps in what the language refuses are still
   gaps; this pins the refusals that exist.
@@ -144,9 +135,9 @@ Written here rather than left in anyone's head.
   Windows runner compares against the same snapshot, and the C library's
   `strerror` words in an `(os error N)`. The errno is kept — `ENOENT` against
   `EACCES` still differs — but the sentence in front of it is the platform's,
-  and the first real run had the four triples disagree on nothing but that
-  string (`err_import_missing_file`: Linux says "No such file or directory",
-  Windows says "The system cannot find the file specified."). Nothing else is
+  and without this the four triples disagree on nothing but that string
+  (`err_import_missing_file`: Linux says "No such file or directory", Windows
+  says "The system cannot find the file specified."). Nothing else is
   normalised — every caret column is compared.
 - **`--gc-stress` changes nothing here and is accepted anyway.** A program
   refused at compile time never allocates. The flag is plumbed through so that
