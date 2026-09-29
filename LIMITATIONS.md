@@ -717,8 +717,10 @@ a platform where, per the note in `CLAUDE.md`, almost nothing can be checked
 from the machines this project is developed on. The released artefact is
 `x86_64-pc-windows-msvc`, and MSVC is the toolchain that target names.
 
-**Workaround.** Use the MSVC toolchain or clang. Either install the Visual
-Studio Build Tools, or `winget install LLVM.LLVM` and point `CC` at it:
+**Workaround.** Use clang, which drives the MSVC linker and libraries: install
+the Visual Studio Build Tools for those, `winget install LLVM.LLVM` for clang,
+and point `CC` at it (`$env:CC = "clang"` in PowerShell). MSVC's `cl.exe` itself
+cannot be `CC`: it takes neither `-o` nor `-Xlinker`.
 
 ```
 > set CC=clang
@@ -728,22 +730,23 @@ Studio Build Tools, or `winget install LLVM.LLVM` and point `CC` at it:
 Setting `CC` explicitly is the reliable form on a machine that has both, because
 it does not depend on `PATH` order.
 
-**Disposition: documented limitation for 1.0, with a fix wanted on the
-message.** The requirement itself is the MSVC target's and is not a defect. What
-*is* a defect is the error: `unable to disambiguate: -subsystem:console` is the
-linker's complaint about a flag the user never typed, and it says nothing about
-what to install. `wsharp build` already refuses a missing `cc` with a sentence
-that names the problem, and the wrong `cc` deserves the same.
+**Disposition: documented limitation for 1.0.** The requirement itself is the
+MSVC target's and is not a defect. The error was: `unable to disambiguate:
+-subsystem:console` is the linker's complaint about a flag the user never typed,
+and said nothing about what to install. `wsharp build` now recognises GNU ld's
+answer on Windows and says that `cc` is MinGW, what to install, and how to set
+`CC` in cmd and in PowerShell, with the linker's own words underneath (#41).
+
+**Guarded by** `link::tests::a_mingw_link_failure_is_told_apart_from_an_msvc_one`,
+which holds the recognition to #41's own linker output and to the MSVC linker's,
+on every platform. Criterion 7's Windows row no longer meets MinGW at all: it
+sets `CC=clang`, the documented toolchain. There is deliberately no `tests/cases`
+entry: a case cannot assert which C compiler is first on `PATH` without becoming
+a case about the machine it ran on.
 
 **Tracked.** [#41](https://github.com/sinisterMage/WSharp/issues/41) for the
-message. The requirement is stated in `README.md`'s "`wsharp build` needs a C
-compiler".
-
-**Guarded by** criterion 7's Windows row, which runs
-`scripts/verify-install.sh` on `windows-latest` — the machine where `cc` is
-MinGW. There is deliberately no `tests/cases` entry: a case cannot assert which
-C compiler is first on `PATH` without becoming a case about the machine it ran
-on, which is `fs_chmod.ws`'s and `net.shutdown`'s discipline.
+message, fixed. The requirement is stated in `README.md`'s "`wsharp build` needs
+a C compiler".
 
 ## No reproducible builds
 

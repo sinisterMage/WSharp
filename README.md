@@ -378,10 +378,13 @@ ld.exe: Error: unable to disambiguate: -subsystem:console (did you mean --subsys
 ```
 
 This is easy to meet without having chosen it, because `cc` is whatever is first
-on `PATH` and Git for Windows and MSYS2 both put one there. Point `CC` at clang
-rather than relying on the order — `set CC=clang` — or use the Visual Studio
-Build Tools. [LIMITATIONS.md](LIMITATIONS.md) has the reason the flags are what
-they are.
+on `PATH` and Git for Windows and MSYS2 both put one there; `wsharp build` says
+so when it happens. Install clang (`winget install LLVM.LLVM`), which links with
+the MSVC libraries the Visual Studio Build Tools provide, and point `CC` at it
+rather than relying on the order: `set CC=clang` in cmd, `$env:CC = "clang"` in
+PowerShell. MSVC's own `cl.exe` cannot stand in for `cc` -- it takes neither
+`-o` nor `-Xlinker`. [LIMITATIONS.md](LIMITATIONS.md) has the reason the flags
+are what they are.
 
 ## Building and running
 
