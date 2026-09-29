@@ -215,10 +215,16 @@ hash being the key. A `1.x` may reorganise what sits around the store entries.
 **Promised.** This is the only emit with a promise attached, and it has three
 parts:
 
-1. **1.0 emits `api` format version 1** (`crates/wsharp-cli/src/api.rs:52`). The
-   output opens with `(api 1)`.
+1. **1.0 emits `api` format version 2** (`api::VERSION` in
+   `crates/wsharp-cli/src/api.rs`). The output opens with `(api 2)`.
 2. Every name a program defines is **absolute** in the output.
-3. It is printed after type checking, so it only ever describes a program the
+3. **The same source emits the same bytes on every machine.** A module is named
+   by what the program is, not by where it sits: `std/net` for a library
+   module, its path from the root file's directory for a file (`app/users.ws`),
+   `pkg+<name>/<path>` for a file in an installed package, and `"main"` for the
+   root. Version 1 named a file by its absolute path, which named the checkout,
+   `WSHARP_HOME` and a store hash with it (#26).
+4. It is printed after type checking, so it only ever describes a program the
    compiler accepted.
 
 A change that could make an existing reader wrong is a bump of `api::VERSION` as
@@ -227,8 +233,8 @@ well as a breaking change under Part one. A golden test
 program, so a format change fails there rather than quietly in somebody's
 generator.
 
-**Not promised.** That version 1 is the last one. A `1.x` may emit version 2;
-what it may not do is emit version 1 with a different meaning.
+**Not promised.** That version 2 is the last one. A `1.x` may emit version 3;
+what it may not do is emit version 2 with a different meaning.
 
 ## Release artefacts and the feed
 

@@ -782,6 +782,11 @@ extra `sin_len` byte out of this code entirely.
 - **`--emit=api` is the only emit with a promise attached.** It is versioned,
   it is printed after type checking so it only ever describes a program the
   compiler accepted, and every name a program defines is absolute in it. A
+  module is named *portably* there -- `load::portable_name`: a file by its path
+  from the root file's directory, a package file as `pkg+<name>/<path>` -- and
+  never by its absolute path, which is what the loader keys on everywhere else;
+  version 1 printed that, and the same source emitted different bytes on every
+  machine (#26). A
   golden test in `crates/wsharp-cli/tests/api.rs` pins the whole output for a
   two-module program, so a format change fails there rather than quietly in
   somebody's generator, and a change that could make an existing reader wrong is

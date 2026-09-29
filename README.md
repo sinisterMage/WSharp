@@ -503,24 +503,25 @@ from disagreeing. So this emit is narrow and versioned:
 
 ```
 $ wsharp check app/main.ws --emit=api
-(api 1)
+(api 2)
 (module "main"
-  (import fw "app/fw")
+  (import fw "fw.ws")
   (pub const ROUTE_Show (str "GET /users/:id"))
-  (pub struct Show (parent "app/fw".Route)
+  (pub struct Show (parent "fw.ws".Route)
     (field id i64)
     (field page (optional i64)))
   (pub fn action
     (param r "main".Show)
-    (ret "app/fw".Response)))
+    (ret "fw.ws".Response)))
 ```
 
 Declarations and their types; no bodies, no expressions, no spans. A module is
-named by the path it resolved to - `std/net` for a library module, the file for
-a local one, `"main"` for the root - with `/` separators on every platform, as
-everything else in this project writes a path. **Every name a program defines is
-absolute** - a type written `fw.Route` prints as
-`"app/fw".Route` and one declared here prints with this module's own path - so a
+named the same on every machine - `std/net` for a library module, a file by its
+path from the root file's directory (`fw.ws`, `app/users.ws`, `../lib/x.ws`), a
+file in an installed package as `pkg+<name>/<path>`, and `"main"` for the root -
+with `/` separators on every platform, so an API document can be committed and
+diffed. **Every name a program defines is absolute** - a type written `fw.Route`
+prints as `"fw.ws".Route` and one declared here prints with this module's own path - so a
 reader never follows an import or guesses a scope, and a bare name is one the
 language provides. Top-level `const` literals come through verbatim, which is
 what lets a convention be overridden in source rather than by a comment. A

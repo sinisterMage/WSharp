@@ -5,6 +5,7 @@
 //! the files, check them, specialise, compile, run -- so it lives here rather
 //! than in either.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -135,13 +136,31 @@ pub fn drive(
         // printed always describes a program the compiler accepted: a generator
         // reading it never has to wonder whether what it is generating from
         // type-checks.
+        //
+        // Every module is named portably -- see `load::portable_name` -- both
+        // where it is declared and wherever an import resolves to it, so the
+        // same source emits the same bytes on every machine (#26).
+        let portable = |path: &String| program.portable.get(path).unwrap_or(path).clone();
+        let names: Vec<String> = program.modules.iter().map(|m| portable(&m.path)).collect();
+        let specifiers: Vec<HashMap<String, String>> = program
+            .modules
+            .iter()
+            .map(|m| {
+                m.imports
+                    .iter()
+                    .map(|(spec, path)| (spec.clone(), portable(path)))
+                    .collect()
+            })
+            .collect();
         let known: Vec<api::Module<'_>> = program
             .modules
             .iter()
-            .map(|m| api::Module {
-                path: &m.path,
+            .zip(&names)
+            .zip(&specifiers)
+            .map(|((m, name), specifiers)| api::Module {
+                path: name,
                 ast: &m.ast,
-                specifiers: &m.imports,
+                specifiers,
             })
             .collect();
         print!("{}", api::emit(&known));
