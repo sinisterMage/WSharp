@@ -489,6 +489,15 @@ extra `sin_len` byte out of this code entirely.
   worker: a collector running the pause would otherwise retire its own buffer
   and leave the mutator's block open, and a block an allocator holds is never
   swept, recycled or evacuated.
+- **Nothing blocks holding a process-wide lock.** `net`'s socket and poller
+  tables are shared by every worker, so a call takes the table's lock only to
+  copy out what it needs -- a descriptor, or a poller's `Arc` -- and lets it go
+  before the call that blocks. `ws_net_wait` held the poller table across
+  `epoll_wait`, so while one worker waited on its own poller every other
+  thread's `net.poller()`, `watch`, `forget`, `wait` and result reads waited
+  out its timeout with it, outside a safe region, and at `-1` for ever. A
+  poller has a lock of its own now, taken after the table's is released, and
+  `net_poller_independent.ws` is the case.
 - **A parked worker's stack is a root set like any other**, and
   `worker::walk_worker_roots` is the single door every root walk now goes
   through, because "whose stack, and where does it start" is precisely what a

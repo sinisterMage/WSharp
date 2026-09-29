@@ -20,7 +20,7 @@
 //! Arguments are copied out of the heap before the region is entered, for the
 //! same reason an allocating builtin copies before it allocates.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::builtins::ERROR_IO_FAILED;
 use crate::io::FallibleI64;
@@ -656,16 +656,31 @@ struct Watch {
     last: Vec<(i64, bool, bool)>,
 }
 
-static POLLERS: Mutex<Handles<Watch>> = Mutex::new(Handles::new());
+/// Every poller, each behind a lock of its own.
+///
+/// **The table's lock is held only to find a poller, never while using one.**
+/// It used to be the only lock, and `ws_net_wait` held it across the wait
+/// itself -- so while one worker waited on its own poller, every other
+/// thread's `net.poller()`, `watch`, `forget`, `wait` and result reads, on any
+/// poller, waited with it; `net.poller()` outside a safe region, and with a
+/// timeout of -1 for ever. So a lookup clones the poller's `Arc` and lets the
+/// table go before locking the poller: the two locks are taken one after the
+/// other and never nested. A poller closed while another thread is waiting on
+/// it leaves the table at once and is dropped -- its descriptor closed -- when
+/// that wait returns, so a wait never polls a descriptor that has been reused.
+static POLLERS: Mutex<Handles<Arc<Mutex<Watch>>>> = Mutex::new(Handles::new());
 
-fn with_pollers<R>(f: impl FnOnce(&mut Handles<Watch>) -> R) -> R {
+fn with_pollers<R>(f: impl FnOnce(&mut Handles<Arc<Mutex<Watch>>>) -> R) -> R {
     let mut guard = POLLERS.lock().unwrap_or_else(|e| e.into_inner());
     f(&mut guard)
 }
 
-/// Run `f` on the poller a handle names.
+/// Run `f` on the poller a handle names, holding that poller's lock and no
+/// other.
 fn with_watch<R>(handle: i64, f: impl FnOnce(&mut Watch) -> R) -> Option<R> {
-    with_pollers(|table| table.get_mut(handle).map(f))
+    let watch = with_pollers(|table| table.get(handle).cloned())?;
+    let mut guard = watch.lock().unwrap_or_else(|e| e.into_inner());
+    Some(f(&mut guard))
 }
 
 /// A new poller, watching nothing.
@@ -678,11 +693,11 @@ pub unsafe extern "C" fn ws_net_poller(out: *mut FallibleI64) {
     let result = match sys::Poller::new() {
         Ok(poller) => {
             let handle = with_pollers(|table| {
-                table.insert(Watch {
+                table.insert(Arc::new(Mutex::new(Watch {
                     poller,
                     watched: Vec::new(),
                     last: Vec::new(),
-                })
+                })))
             });
             FallibleI64::ok(handle)
         }
