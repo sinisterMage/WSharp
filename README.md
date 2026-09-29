@@ -366,6 +366,23 @@ requirement "Building and running" states below for building the compiler
 itself; it applies to a binary install as well, which is the part that used to go
 unsaid.
 
+**On Windows it must be clang or MSVC — MinGW's `gcc` will not link.** The
+released artefact is `x86_64-pc-windows-msvc` and the flags `wsharp build`
+passes are MSVC's, so a `cc` that is MinGW fails with the linker complaining
+about a flag you never typed:
+
+```
+> wsharp build hello.ws -o hello.exe
+error: linking failed:
+ld.exe: Error: unable to disambiguate: -subsystem:console (did you mean --subsystem:console ?)
+```
+
+This is easy to meet without having chosen it, because `cc` is whatever is first
+on `PATH` and Git for Windows and MSYS2 both put one there. Point `CC` at clang
+rather than relying on the order — `set CC=clang` — or use the Visual Studio
+Build Tools. [LIMITATIONS.md](LIMITATIONS.md) has the reason the flags are what
+they are.
+
 ## Building and running
 
 The project needs a C toolchain, because rustc shells out to `cc` to link. On a
