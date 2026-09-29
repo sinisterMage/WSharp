@@ -27,7 +27,8 @@ on:
       # is left alone, so a tag can still be used for something else.
       - "v*"
   # So a release can be retried without deleting and re-pushing a tag. A tag
-  # that has to be moved to fix a workflow is a tag that means two things.
+  # that has to be moved to fix a workflow is a tag that means two things. Only
+  # a release that never became public can be retried: see `unpublished`.
   workflow_dispatch:
     inputs:
       tag:
@@ -52,8 +53,43 @@ env:
   TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  # **A published release is never rebuilt.** The builds are not bit-for-bit
+  # reproducible, and the publish step overwrites an asset of the same name, so
+  # a retry of a tag whose release is already public would replace the bytes
+  # behind a version people have pinned -- with a new digest beside them, so
+  # nothing downstream could tell a changed build from a tampered one. A retry
+  # is for a release that did not finish, which is a draft; a mistake in a
+  # published one is a new version. This runs first so a refusal costs seconds
+  # rather than four builds.
+  unpublished:
+    name: Refuse a tag that is already published
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ask GitHub whether the tag has a published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          # This endpoint answers only for a *published* release: a draft left
+          # by a failed run is a 404 here, and may be retried.
+          out="$(gh api "repos/$GH_REPO/releases/tags/$TAG" --jq .html_url 2>&1)"
+          status=$?
+          if [ "$status" -eq 0 ]; then
+            echo "::error::$TAG is already published at $out. A published release is never rebuilt; tag a new version."
+            exit 1
+          fi
+          case "$out" in
+            *"HTTP 404"*) echo "$TAG has no published release; building it." ;;
+            # Anything else is not knowing, and not knowing must not publish.
+            *) echo "::error::cannot tell whether $TAG is already published: $out"; exit 1 ;;
+          esac
+
   release:
     name: ${{ matrix.triple }}
+    needs: unpublished
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
