@@ -107,7 +107,7 @@ trap 'rm -rf "$WORK"' EXIT
 # to this list is a thing the conformance gate stops checking, so the list is
 # short and each entry says why it is here.
 conform_normalise() {
-    sed -e '/^W# gc: /d' \
+    sed -e '/^W# gc[: ]/d' \
         -e 's|\\|/|g' \
         -e 's|/tmp/[A-Za-z0-9_./-]*|<tmp>|g'
 }

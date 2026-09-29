@@ -516,6 +516,71 @@ fn a_built_program_reports_the_collector_doing_its_work() {
     let _ = std::fs::remove_file(&exe);
 }
 
+/// `WSHARP_GC_PAUSE_LOG` writes one line per pause, and a trailer per worker
+/// saying how many it kept of how many it saw -- which is what
+/// `tests/harness/gc-pauses.sh` pools into criterion 8.2's distribution, so a
+/// writer that dropped lines, or never said it had, would publish a percentile
+/// over less than it claims.
+#[test]
+fn the_pause_log_holds_every_pause() {
+    let dir = native_dir("pause-log");
+    let log = dir.join("pauses.tsv");
+    let _ = std::fs::remove_file(&log);
+    let output = Command::new(env!("CARGO_BIN_EXE_wsharp"))
+        .arg("run")
+        .arg(cases_dir().join("gc_auto_trace.ws"))
+        .env("WSHARP_GC_STATS", "1")
+        .env("WSHARP_GC_PAUSE_LOG", &log)
+        .output()
+        .expect("could not run the compiler");
+    assert!(output.status.success(), "gc_auto_trace.ws failed");
+    let stats = String::from_utf8_lossy(&output.stderr);
+    let line = stats
+        .lines()
+        .find(|l| l.starts_with("W# gc: "))
+        .unwrap_or_else(|| panic!("no statistics line:\n{stats}"));
+    let pauses: usize = line
+        .split(", ")
+        .find_map(|f| f.split_once(" pauses (").map(|(n, _)| n))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("cannot read the pause count from:\n{line}"));
+    assert!(pauses > 0, "the case made no pauses to log:\n{line}");
+
+    let text = std::fs::read_to_string(&log).expect("the pause log was not written");
+    let mut lines = text.lines();
+    assert_eq!(lines.next(), Some("# us\tpause\tworker"), "{text}");
+    let (samples, trailer): (Vec<&str>, Vec<&str>) = lines.partition(|l| !l.starts_with('#'));
+    assert_eq!(samples.len(), pauses, "one line per pause:\n{line}\n{text}");
+    for sample in &samples {
+        let fields: Vec<&str> = sample.split('\t').collect();
+        assert_eq!(fields.len(), 3, "`{sample}` is not three fields");
+        assert!(fields[0].parse::<u64>().is_ok(), "`{sample}`: microseconds");
+        assert!(
+            ["initial", "mark-done", "evac-done"].contains(&fields[1]),
+            "`{sample}`: which pause"
+        );
+        assert!(
+            fields[2].parse::<usize>().is_ok(),
+            "`{sample}`: which worker"
+        );
+    }
+    let kept: usize = trailer
+        .iter()
+        .map(|t| {
+            assert!(!t.contains("TRUNCATED"), "{text}");
+            t.split_whitespace()
+                .nth(3)
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or_else(|| panic!("`{t}` is not a `# worker N: K kept of M` trailer"))
+        })
+        .sum();
+    assert_eq!(
+        kept, pauses,
+        "the trailers must account for every pause:\n{text}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
 #[test]
 fn check_reports_errors_without_running() {
     let path = cases_dir().join("err_type_mismatch.ws");

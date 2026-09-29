@@ -99,6 +99,8 @@ case "$d" in
         # Noise `lib.sh::normalise` is supposed to remove. If it stops removing
         # it, this case turns into a false divergence and the selftest says so.
         echo "W# gc: 3 collections, 1 trace, longest pause 0.4ms"
+        echo "W# gc pauses: 3 samples, p50 96 us, p90 400 us, p99 400 us, max 400 us"
+        echo "W# gc pause buckets (us): 80-95:1 96-111:1 384-447:1"
         ;;
 esac
 

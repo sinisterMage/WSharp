@@ -1211,6 +1211,10 @@ nix-shell --run "cargo test --workspace"
   unit tests drive private `Heap` instances; the few that touch process-wide
   state (the mark parity, the stress flag) take `test_support::SERIAL`,
   because the test binary runs its tests in parallel on one heap.
+- `WSHARP_GC_PAUSE_LOG=<path>` writes every pause on exit -- microseconds, which
+  of the three, which worker -- and `WSHARP_GC_STATS=1` adds a line of p50, p90
+  and p99 over a log-spaced histogram of them (#24). Nothing on the pause path
+  allocates: the log is preallocated per worker and says `TRUNCATED` when full.
 - `WSHARP_GC_STATS=1` prints what the collector did on exit, including traces,
   objects moved, and the number and longest of the pauses;
   `WSHARP_GC_TRACE=1` prints every frame the root walk visits. **Check the

@@ -107,15 +107,16 @@ case_expects_error() {
 # Noise that differs between two runs of the same program for reasons that are
 # not the compiler's fault, removed before two outputs are compared:
 #
-#   - the collector's statistics line (timings, and counts that legitimately
-#     differ between the JIT and a built program),
+#   - the collector's statistics lines, `W# gc:` and the two `W# gc pause...`
+#     lines beside it (timings, and counts that legitimately differ between
+#     the JIT and a built program),
 #   - temporary directory and port numbers a case was told to invent,
 #   - hexadecimal addresses in panic messages.
 #
 # Anything removed here is a thing this harness cannot check. The list is
 # deliberately short for that reason.
 normalise() {
-    sed -e '/^W# gc: /d' \
+    sed -e '/^W# gc[: ]/d' \
         -e 's|/tmp/[A-Za-z0-9_.-]*|<tmp>|g' \
         -e 's|0x[0-9a-f][0-9a-f]*|<addr>|g' \
         -e 's|wsharp-[a-z]*-[0-9][0-9]*|<tmpdir>|g'

@@ -200,13 +200,15 @@ tests/harness/gc-pauses.sh --only gc_ --repeats 5
 tests/harness/gc-pauses.sh --only gc_ --repeats 3 --stress
 ```
 
-**What is measurable today.** `WSHARP_GC_STATS=1` reports three numbers about
-pauses per process -- how many, the longest, the total -- and `gc::record_pause`
-keeps exactly those three counters. There is no histogram and no per-pause log,
-so **a p99 over the pauses inside one run cannot be computed from outside the
-runtime**, however the numbers are rearranged afterwards. What this measures is
-the distribution over *runs*: the longest pause per run, which is the tail metric
-that matters, and the mean per run. The report says which, every time.
+**What is measured.** Every pause of every run. `WSHARP_GC_PAUSE_LOG=<path>`
+(#24) makes the runtime keep one line per pause -- the microseconds, which of the
+three pauses, which worker -- and `gc-pauses.sh` sets it for each run and pools
+the lines into `pauses.tsv`, so the report's first table is a **per-pause**
+distribution, overall and by pause kind, and says whether it reached criterion
+8.2's 1,000 samples. The per-run table beside it -- the longest pause per run,
+and the mean -- answers how bad one program's worst stall is. `WSHARP_GC_STATS=1`
+also prints a log-spaced histogram of every pause, which is enough for a quick
+look and is not what the published numbers are computed from.
 
 Pauses are wall-clock time on the mutator thread, so on a loaded or single-core
 machine they include time the thread was not scheduled. The report prints the
@@ -367,11 +369,9 @@ A suite's limits belong where somebody reading its green run will see them.
 - **Nothing here fuzzes across a worker boundary**, drives many workers, or
   constrains the heap size. Those modes ship, and this harness does not exercise
   them.
-- **`gc-pauses.sh` measures the distribution over runs, not within one.**
-  `WSHARP_GC_STATS=1` reports three counters per process and there is no
-  per-pause log, so a p99 over the pauses inside a single run cannot be computed
-  from outside the runtime at all (#18). The report says which distribution it is
-  reporting, every time.
+- **A pause log holds at most 1,048,576 pauses per worker.** It is preallocated
+  when the worker is made, because nothing may allocate on the pause path; a run
+  that pauses more says `TRUNCATED` in its trailer and `gc-pauses.sh` reports it.
 - **Timing numbers here are not published numbers.** Pause and duration figures
   are for triage — is this a stall or a busy box — and anything quoted as a
   result goes through Ridge's harness under Form B of the proof standard.
