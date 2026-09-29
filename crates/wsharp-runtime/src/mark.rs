@@ -516,12 +516,40 @@ pub fn quiesce(w: &'static Worker) {
             // has returned, so the stack holds no generated frames and the
             // root walk finds nothing.
             Phase::Evacuating => wait_until_on(w, || phase_of(w) != Phase::Evacuating),
-            // Its own worker's, driven from here: `main` is over, so this
-            // thread's stack is the only one that could hold a root and it
+            // This thread's own worker, driven from here: `main` is over, so
+            // this thread's stack is the only one that could hold a root and it
             // holds none.
-            Phase::EvacDone => unsafe { finish_evacuation_on(w) },
+            Phase::EvacDone if std::ptr::eq(w, me()) => unsafe { finish_evacuation() },
+            // Another worker's. Its pause reads its heap, its lists and its
+            // stack, so it may run only where a pause for it may: on its own
+            // thread, or on any while it is parked, as its collector does.
+            // This arm used to call `finish_evacuation_on(w)`, whose body works
+            // on `me()` throughout -- so it finished *this* thread's worker
+            // instead, and then spun on `w`'s phase for ever. A worker still
+            // running at exit is one `stop_all` abandoned, and its pause is its
+            // own, at its next safepoint or never.
+            Phase::EvacDone => {
+                if !serve_parked_here(w) {
+                    return;
+                }
+            }
         }
     }
+}
+
+/// [`serve_parked`] from a thread that is not `w`'s collector -- the exiting
+/// one, for a worker blocked in a system call. The thread acts as `w` for the
+/// length of the pause, which is what a collector thread does for its whole
+/// life, after handing back its own allocation buffer: a pause that retired
+/// "this thread's" buffer while acting as `w` would retire it into `w`'s heap.
+fn serve_parked_here(w: &'static Worker) -> bool {
+    let mine = me();
+    crate::heap::retire_local_buffer();
+    crate::heap::flush_local_counters();
+    crate::worker::install(w);
+    let served = serve_parked(w);
+    crate::worker::install(mine);
+    served
 }
 
 // ---------------------------------------------------------------------------
@@ -728,6 +756,33 @@ mod tests {
     use crate::heap::ws_alloc;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    /// `quiesce` of another worker left in `EvacDone` by a mutator that is
+    /// still running -- which is what a worker `stop_all` abandoned looks like
+    /// at exit -- returns. It used to finish the calling thread's own worker
+    /// instead and then spin on the other's phase; in a debug build the first
+    /// of those is an assertion, because the calling worker had nothing to
+    /// release.
+    #[test]
+    fn quiescing_another_running_worker_mid_evacuation_returns() {
+        let _serial = crate::test_support::SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let other: &'static Worker = std::thread::spawn(Worker::current).join().unwrap();
+        set_phase_of(other, Phase::EvacDone);
+        let (done_tx, done_rx) = mpsc::channel();
+        let quiescer = std::thread::spawn(move || {
+            quiesce(other);
+            let _ = done_tx.send(());
+        });
+        let returned = done_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        set_phase_of(other, Phase::Idle);
+        let _ = quiescer.join();
+        assert!(
+            returned,
+            "quiesce did not return for another worker's EvacDone"
+        );
+    }
 
     /// Start a trace, park the mutator in a "syscall", and wait for the trace
     /// to reach `Idle`. Returns how many of its pauses the collector ran on the
