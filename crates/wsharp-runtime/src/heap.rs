@@ -1031,11 +1031,25 @@ impl Drop for Heap {
     }
 }
 
-/// Add a space to the lock-free directory. Called under the heap lock, so
-/// there is one writer; the count goes last so a reader never sees an entry
-/// that is not yet there.
+/// The directory's one writer at a time.
+///
+/// It used to be "the heap lock", which was one lock when there was one heap.
+/// There is one per worker now, so two workers growing their heaps at once
+/// took two different locks, both read the same count, and one space was
+/// overwritten in the directory and never came back: a space full of live
+/// objects that `in_heap` answered no for and the load barrier could not
+/// resolve (#44). Publishing is once per space, so a lock costs nothing, and
+/// readers still take none.
+static PUBLISHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Add a space to the lock-free directory. Under [`PUBLISHING`], so there is
+/// one writer; the count goes last so a reader never sees an entry that is not
+/// yet there.
 fn publish(meta: &SpaceMeta) {
+    let _writer = PUBLISHING.lock().unwrap_or_else(|e| e.into_inner());
     let index = PUBLISHED_COUNT.load(Ordering::Relaxed);
+    #[cfg(test)]
+    tests::dawdle_in_publish();
     if index >= MAX_SPACES {
         eprintln!("W# heap: out of address space ({MAX_SPACES} spaces of {SPACE_BYTES} bytes)");
         std::process::abort();
@@ -1274,6 +1288,52 @@ mod tests {
         FLAG_LOGGED, TYPE_ID_FIRST_USER, flip_mark_parity, is_marked, test_flag, type_id_of,
     };
     use crate::test_support::SERIAL;
+
+    thread_local! {
+        /// Set by a test that wants `publish` to hold its read of the count
+        /// long enough for another thread to read the same one -- which is
+        /// what two workers growing their heaps at once did by chance.
+        static DAWDLE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn dawdle_in_publish() {
+        if DAWDLE.with(|d| d.get()) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// #44: every space published concurrently is still in the directory.
+    ///
+    /// Four threads publish a space each at the same moment, each pausing
+    /// between reading the count and storing it. With one writer at a time
+    /// that pause is harmless; without, they all read the same count, and
+    /// three of the four spaces are gone from the directory for good.
+    #[test]
+    fn spaces_published_at_once_are_all_in_the_directory() {
+        const THREADS: usize = 4;
+        let start = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    // Leaked, because a published space is never freed: the
+                    // directory holds a pointer to its metadata for ever.
+                    let space: &'static Space = Box::leak(Box::new(Space::new()));
+                    DAWDLE.with(|d| d.set(true));
+                    start.wait();
+                    publish(&space.meta);
+                    space.meta.block_start(0)
+                })
+            })
+            .collect();
+        for t in threads {
+            let first_block = t.join().unwrap();
+            assert!(
+                in_heap(first_block as *const u8),
+                "a space published beside others is missing from the directory"
+            );
+        }
+    }
 
     /// Walking a block reads each object's size from the type registry, so the
     /// tests that walk register a type of the right size.
