@@ -809,10 +809,10 @@ it could not wait, who granted it, and whether the clock reset.
 
 Nine gates, fourteen checks — three gates take two apiece, because a gate with
 one mechanism and one artefact, or one script per repository, is two things that
-can be separately missing. Eleven of the fourteen are written; three are not,
+can be separately missing. Twelve of the fourteen are written; two are not,
 and are named here so that they are owed rather than assumed.
 
-**Read against `main` at `f2f2b40`, and held to the tree by
+**Read against `main` at `4e9249a`, and held to the tree by
 `scripts/gate-table-check.sh` on every pull request.** This table claims which
 files exist, which is a claim that goes stale on any merge that adds one — and
 did, within twenty minutes of revision 2, on six of ten rows. So it carries the
@@ -843,7 +843,7 @@ once.
 | `scripts/freeze-check.sh` | 2 | **written**, on `main` | Ash to run |
 | `scripts/check-change-label.sh`, with `scripts/tests/check-change-label.test.sh` | 2 | **written** (#21), as `change-label` in `.github/workflows/release-gates.yml`. Revision 2 did not list this check at all | Ash, enforcing from now |
 | `scripts/guard-check.sh` | 3 | **not written** | Ash |
-| `scripts/followups-check.sh` | 4 | **not written.** The six sections it would assert against are on `main` (`8451ee8`), so it is now writable — and until it is, criterion 4 is the one gate whose data exists and whose check does not | Ash, against Mira's decisions |
+| `scripts/followups-check.sh`, with `scripts/tests/followups-check.test.sh` | 4 | **written** (#45), as `followups` in `.github/workflows/release-gates.yml`. The only check in this table that asks GitHub rather than the tree, so it exits 2 — never 0 — when it cannot ask | Ash, against Mira's decisions |
 | `tests/harness/nightly.sh` | 5 | **written** (#20), as `parity`, `nightly` and `soak-row` in `.github/workflows/nightly.yml`. What is owed is green runs on a schedule | Dex to run |
 | `scripts/check-doc-examples.sh`, with `scripts/tests/check-doc-examples.test.sh` | 6a | **written** (#21), as `doc-examples` and `examples` in `.github/workflows/release-gates.yml`, and **green** since #33 marked the documented programs up | Ash — held |
 | the 6d CI job | 6d | **written** (#21), as `contributor-commands` in `.github/workflows/release-gates.yml` | Ash — held |
@@ -853,9 +853,9 @@ once.
 | a committed benchmark baseline per release triple | 8 | **not written.** No baseline file exists in the tree, so the 2x threshold in criterion 8 currently has nothing to measure against | Ridge |
 
 A criterion whose check is not written is a criterion nobody can fail, which is
-why this table is here rather than in somebody's head. The three that are not
-written are gates 3, 4 and 8's baselines; everything else now fails on evidence
-rather than on absence.
+why this table is here rather than in somebody's head. The two that are not
+written are gate 3's and gate 8's baselines; everything else now fails on
+evidence rather than on absence.
 
 Two rows used to be one each, and splitting them was the honest fix. Criterion 7
 as a single row said "not written" while `verify-install.sh` was finished, and
