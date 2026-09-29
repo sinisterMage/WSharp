@@ -453,8 +453,11 @@ The process exits with the low byte of `main`'s return value, as a C program
 does, so `return 256;` exits 0. A compile error exits 1. A failure the type
 system allows but the program must not perform - `.?` on a null optional, a
 failed `assert`, integer division by zero, a signed `MIN / -1`, an index
-outside an array, a call no overload matches - prints `W# panic: <reason>` to
-stderr and exits with status 101. Ordinary overflow is not one of them:
+outside an array, a call no overload matches, a field or closure read through
+an element of `array.new(n)` that was never assigned, a recursion deeper than
+the stack - prints `W# panic: <reason>` to stderr and exits with status 101.
+(A never-assigned array element is an empty array, so indexing one is an index
+outside it.) Ordinary overflow is not one of them:
 `+`, `-` and `*` wrap, which for an unsigned type is the definition rather than
 a concession.
 

@@ -76,13 +76,13 @@ mod c {
         pub(super) fn execvp(file: *const u8, argv: *const *const u8) -> c_int;
     }
 
-    /// How each system in this family answers "what am I?", which is the one
-    /// question here with a different shape on every one of them.
-    ///
-    /// macOS has a libc call for it. FreeBSD, DragonFly and NetBSD have a
-    /// `sysctl`, with *different* names for the node -- and NetBSD's is under
-    /// `KERN_PROC_ARGS` rather than `KERN_PROC`, with its arguments in another
-    /// order. OpenBSD has neither, on purpose: it does not keep the path.
+    // How each system in this family answers "what am I?", which is the one
+    // question here with a different shape on every one of them.
+    //
+    // macOS has a libc call for it. FreeBSD, DragonFly and NetBSD have a
+    // `sysctl`, with *different* names for the node -- and NetBSD's is under
+    // `KERN_PROC_ARGS` rather than `KERN_PROC`, with its arguments in another
+    // order. OpenBSD has neither, on purpose: it does not keep the path.
     #[cfg(target_os = "macos")]
     unsafe extern "C" {
         /// Writes a terminated path, and answers -1 with `size` updated to
@@ -1139,4 +1139,82 @@ pub(crate) fn system_roots() -> Option<Vec<u8>> {
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn system_roots() -> Option<Vec<u8>> {
     None
+}
+
+/// What `crate::trap` needs to catch a fault: `sigaction`, `sigaltstack`, one
+/// word of `siginfo_t`, and the calling thread's stack.
+///
+/// **macOS only.** The numbers below are the macOS headers', and the other
+/// four systems in this arm differ in exactly these places -- FreeBSD puts
+/// `sa_flags` before a 128-bit `sa_mask`, NetBSD exports the two calls as
+/// `__sigaction14` and `__sigaltstack14`, OpenBSD answers the stack question
+/// with `pthread_stackseg_np` -- and none of them is a release target or a
+/// machine this project can run. So they say `SUPPORTED = false` and keep the
+/// default disposition: a null reference or a runaway recursion there is still
+/// a signal, which is what it was before `trap` existed, rather than a guess
+/// at a layout that nobody has checked.
+pub(crate) mod trap {
+    use super::c_int;
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub(crate) const SUPPORTED: bool = true;
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub(crate) const SUPPORTED: bool = false;
+
+    pub(crate) const SIGSEGV: c_int = 11;
+    /// A guard page on macOS is mapped with no access, and touching one is a
+    /// `SIGBUS` rather than a `SIGSEGV`; `trap` catches both.
+    pub(crate) const SIGBUS: c_int = 10;
+    pub(crate) const SA_SIGINFO: c_int = 0x40;
+    pub(crate) const SA_ONSTACK: c_int = 0x1;
+    /// `struct sigaction` is the handler, then a 32-bit `sigset_t`, then
+    /// `sa_flags`.
+    pub(crate) const SA_FLAGS_OFFSET: usize = 8 + 4;
+    /// `si_signo`, `si_errno`, `si_code`, `si_pid`, `si_uid` and `si_status`,
+    /// four bytes each, then `si_addr`.
+    pub(crate) const SI_ADDR_OFFSET: usize = 24;
+    /// `stack_t` is `ss_sp`, `ss_size`, `ss_flags`: the size first, unlike
+    /// Linux.
+    pub(crate) const SS_SIZE_OFFSET: usize = 8;
+    pub(crate) const SS_FLAGS_OFFSET: usize = 16;
+    pub(crate) const SS_DISABLE: c_int = 4;
+
+    unsafe extern "C" {
+        pub(crate) fn sigaction(signal: c_int, action: *const u8, previous: *mut u8) -> c_int;
+        pub(crate) fn sigaltstack(stack: *const u8, previous: *mut u8) -> c_int;
+        /// Leaves without running `atexit` handlers or flushing anything,
+        /// which is the only way out of a signal handler that is safe.
+        pub(crate) fn _exit(status: c_int) -> !;
+    }
+
+    /// Write to standard error with no buffer and no lock, which is what a
+    /// signal handler may do.
+    pub(crate) fn write_stderr(bytes: &[u8]) {
+        let _ = unsafe { super::c::write(2, bytes.as_ptr(), bytes.len()) };
+    }
+
+    /// End the process now, from inside a signal handler.
+    pub(crate) fn exit_now(status: c_int) -> ! {
+        unsafe { _exit(status) }
+    }
+
+    /// The calling thread's stack as `[low, high)`. `pthread_get_stackaddr_np`
+    /// answers with the *top* of the stack, which grows down from it.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub(crate) fn stack_bounds() -> Option<(usize, usize)> {
+        unsafe extern "C" {
+            fn pthread_self() -> usize;
+            fn pthread_get_stackaddr_np(thread: usize) -> usize;
+            fn pthread_get_stacksize_np(thread: usize) -> usize;
+        }
+        let thread = unsafe { pthread_self() };
+        let high = unsafe { pthread_get_stackaddr_np(thread) };
+        let size = unsafe { pthread_get_stacksize_np(thread) };
+        (high > size && size != 0).then(|| (high - size, high))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub(crate) fn stack_bounds() -> Option<(usize, usize)> {
+        None
+    }
 }

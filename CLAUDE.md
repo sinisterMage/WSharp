@@ -972,6 +972,25 @@ extra `sin_len` byte out of this code entirely.
   not a spelling. What a package of several files shows is what its facade
   re-exports, which is the same rule `pub` sets one level down: a surface is
   stated rather than leaked.
+- **Two hardware faults are the program's, and `trap` says so.** A read
+  through null -- an element of `array.new(n)` that was never assigned, asked
+  for a field, a closure or an overload -- and a recursion deeper than the stack
+  both end in a fault rather than a check, and `wsharp_runtime::trap` turns each
+  into a W# panic (#48, #67): a signal handler on an alternate stack on Unix, a
+  vectored exception handler on Windows. It is deliberately narrow: only on a
+  thread that called `trap::enter` (the main thread for `main`, every worker),
+  only an access within `NULL_WINDOW` of zero while that thread is not parked
+  in a safe region, or one in or just below its own stack. Anything else goes
+  back to the previous disposition, so a runtime bug is still a crash that looks
+  like one. The Unix handler finds its thread by which registered alternate
+  stack it is running on, not by a thread-local, because the first touch of a
+  thread-local on macOS allocates. Arrays are the exception that is *checked*:
+  a null array is empty everywhere -- `ws_array_len` always said so, and the
+  inline length and bounds check now agree -- so indexing one is an index out of
+  bounds. Frames over a page are probed on entry (`enable_probestack`, inline),
+  so a recursion cannot step over the guard page. The four non-macOS BSDs keep
+  the default disposition: their `sigaction` layouts are not ones anything
+  here can check.
 - **The closure environment is dead after the prologue.** Captures are copied
   into declared locals before the first safepoint and `env` is never read
   again, so it is not a root and need not be. Re-reading it after a call would

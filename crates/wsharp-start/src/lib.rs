@@ -51,9 +51,10 @@
 //! lazily. Unix arguments arrive from the C runtime as bytes. On Windows,
 //! `std::env::args_os` reads the wide command line even without `lang_start`,
 //! avoiding the lossy code-page conversion of the C runtime's narrow `argv`.
-//! The one thing genuinely lost is the main thread's
-//! stack guard page, so a runaway recursion in W# is a segfault rather than a
-//! message. That is what it already was under the JIT.
+//! What Rust's `main` would have added is a handler that names a stack
+//! overflow; `wsharp_runtime::trap` is installed here instead, and does that
+//! for W# -- a runaway recursion or a read through null is a W# panic, under
+//! this backend and the JIT alike.
 
 use core::ffi::{c_char, c_int};
 
@@ -93,6 +94,11 @@ pub unsafe extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int 
         )
     };
 
+    // As `Jit::run`: from here a null read or a runaway recursion is the
+    // program's, and is reported as a W# panic rather than a signal.
+    wsharp_runtime::trap::install();
+    let mutator = wsharp_runtime::trap::enter();
+
     let code = unsafe { ws_main() };
 
     // Every worker still parked on its queue would keep the process alive, and
@@ -106,6 +112,7 @@ pub unsafe extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int 
     // A trace may still be in flight; settle it so the report is stable.
     wsharp_runtime::gc::quiesce();
     wsharp_runtime::gc::report_if_asked();
+    drop(mutator);
 
     // Same convention as a C program: the low byte of `main`'s result.
     (code & 0xff) as c_int

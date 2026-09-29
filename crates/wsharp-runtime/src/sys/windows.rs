@@ -1474,3 +1474,88 @@ mod tests {
         );
     }
 }
+
+/// What `crate::trap` needs to catch a fault: a vectored exception handler, the
+/// two exception codes it answers, and room on the stack to answer them in.
+///
+/// A vectored handler rather than a signal: Windows raises an access violation
+/// or a stack overflow as a structured exception on the faulting thread, and a
+/// handler added with `first` set sees it before any frame-based handler --
+/// which matters here, because generated code registers no unwind information
+/// and so has no frame-based handler to find.
+pub(crate) mod trap {
+    use super::{BOOL, DWORD, GetStdHandle, HANDLE, WriteFile, c_void};
+
+    pub(crate) const SUPPORTED: bool = true;
+    pub(crate) const STATUS_ACCESS_VIOLATION: DWORD = 0xC000_0005;
+    pub(crate) const STATUS_STACK_OVERFLOW: DWORD = 0xC000_00FD;
+    pub(crate) const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+    const STD_ERROR_HANDLE: DWORD = -12i32 as DWORD;
+
+    #[repr(C)]
+    pub(crate) struct EXCEPTION_RECORD {
+        pub(crate) ExceptionCode: DWORD,
+        pub(crate) ExceptionFlags: DWORD,
+        pub(crate) ExceptionRecord: *mut EXCEPTION_RECORD,
+        pub(crate) ExceptionAddress: *mut c_void,
+        pub(crate) NumberParameters: DWORD,
+        /// For an access violation, `[0]` says read, write or execute and `[1]`
+        /// is the address that could not be reached.
+        pub(crate) ExceptionInformation: [usize; 15],
+    }
+
+    #[repr(C)]
+    pub(crate) struct EXCEPTION_POINTERS {
+        pub(crate) ExceptionRecord: *mut EXCEPTION_RECORD,
+        pub(crate) ContextRecord: *mut c_void,
+    }
+
+    pub(crate) type PVECTORED_EXCEPTION_HANDLER =
+        unsafe extern "system" fn(*mut EXCEPTION_POINTERS) -> i32;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub(crate) fn AddVectoredExceptionHandler(
+            first: u32,
+            handler: PVECTORED_EXCEPTION_HANDLER,
+        ) -> *mut c_void;
+        fn SetThreadStackGuarantee(size: *mut u32) -> BOOL;
+        fn GetCurrentProcess() -> HANDLE;
+        fn TerminateProcess(process: HANDLE, code: u32) -> BOOL;
+    }
+
+    /// Write to standard error with no buffer and no lock.
+    pub(crate) fn write_stderr(bytes: &[u8]) {
+        let mut written: DWORD = 0;
+        unsafe {
+            WriteFile(
+                GetStdHandle(STD_ERROR_HANDLE),
+                bytes.as_ptr(),
+                bytes.len() as DWORD,
+                &mut written,
+                core::ptr::null_mut(),
+            )
+        };
+    }
+
+    /// Keep `bytes` of this thread's stack back for the handler.
+    ///
+    /// A stack overflow is raised on the thread that overflowed, with whatever
+    /// stack is left, which by default is barely a page. Rust asks for 20 KiB
+    /// on the threads it starts; a compiled program's main thread is not one of
+    /// them, because `wsharp-start`'s `main` means Rust's never runs.
+    pub(crate) fn reserve_stack(bytes: u32) {
+        let mut size = bytes;
+        unsafe { SetThreadStackGuarantee(&mut size) };
+    }
+
+    /// End the process now, from inside an exception handler. `ExitProcess`
+    /// would run every DLL's detach routine on a thread that has just faulted.
+    pub(crate) fn exit_now(status: i32) -> ! {
+        unsafe { TerminateProcess(GetCurrentProcess(), status as u32) };
+        // `TerminateProcess` on the current process does not return.
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+}

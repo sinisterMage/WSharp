@@ -73,6 +73,11 @@ impl Jit {
     /// compiler, and the type checker has already rejected anything that could
     /// misbehave.
     pub fn run(&self) -> i64 {
+        // From here a null read or a runaway recursion on this thread is the
+        // program's, and is reported as a W# panic rather than a signal. Not
+        // before: a fault while compiling is a compiler bug.
+        wsharp_runtime::trap::install();
+        let mutator = wsharp_runtime::trap::enter();
         // The leading argument is the environment pointer every W# function
         // takes; `main` is a top-level function, so it is null.
         let code = if self.entry_returns_value {
@@ -95,6 +100,7 @@ impl Jit {
         // A trace may still be in flight; settle it so the report is stable.
         wsharp_runtime::gc::quiesce();
         wsharp_runtime::gc::report_if_asked();
+        drop(mutator);
         code
     }
 }
@@ -253,6 +259,16 @@ pub fn compile_jit(
     flags
         .set("opt_level", "speed")
         .map_err(|e| err("flag", e))?;
+    // A frame larger than a page is probed a page at a time on the way in, so a
+    // runaway recursion meets the guard page -- and `trap` reports a stack
+    // overflow -- instead of stepping over it into whatever is mapped below.
+    // Inline, because the outlined form calls a libcall neither backend has.
+    flags
+        .set("enable_probestack", "true")
+        .map_err(|e| err("flag", e))?;
+    flags
+        .set("probestack_strategy", "inline")
+        .map_err(|e| err("flag", e))?;
 
     let isa_builder = cranelift_native::builder()
         .map_err(|e| CodegenError(format!("unsupported host architecture: {e}")))?;
@@ -346,6 +362,16 @@ pub fn compile_object(
         .map_err(|e| err("flag", e))?;
     flags
         .set("opt_level", "speed")
+        .map_err(|e| err("flag", e))?;
+    // A frame larger than a page is probed a page at a time on the way in, so a
+    // runaway recursion meets the guard page -- and `trap` reports a stack
+    // overflow -- instead of stepping over it into whatever is mapped below.
+    // Inline, because the outlined form calls a libcall neither backend has.
+    flags
+        .set("enable_probestack", "true")
+        .map_err(|e| err("flag", e))?;
+    flags
+        .set("probestack_strategy", "inline")
         .map_err(|e| err("flag", e))?;
 
     let isa_builder = cranelift_native::builder()

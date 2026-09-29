@@ -27,6 +27,7 @@ pub mod strings;
 pub(crate) mod sys;
 pub mod time;
 pub mod transfer;
+pub mod trap;
 pub mod types;
 pub mod worker;
 
