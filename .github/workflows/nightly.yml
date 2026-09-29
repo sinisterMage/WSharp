@@ -164,11 +164,10 @@ jobs:
   #
   # **A job of its own rather than a step in `parity`**, at the cost of a second
   # build per triple. Three reasons, and they are all about not masking a result:
-  # `conform.sh` exits 3 for "no snapshots committed, so this cannot be
-  # answered", which is a different sentence from parity's "the modes
-  # disagreed"; a conformance failure must not stop a three-hour parity run from
-  # starting; and the first scheduled run of this job is *expected* to fail with
-  # exit 3 until the bless commit lands, which must not take parity down with it.
+  # `conform.sh` exits 3 for "no snapshots, so this cannot be answered", which
+  # is a different sentence from parity's "the modes disagreed"; and a
+  # conformance failure must not stop a three-hour parity run from starting, or
+  # take it down with it.
   #
   # **All four triples, because a diagnostic is a platform-independent claim
   # that has never been checked as one.** The rendered form is built from a byte
@@ -326,12 +325,11 @@ jobs:
   # passed or failed -- criterion 1 asks whether the subject *reported*, and a
   # failure that went unrecorded reads as a soak that stopped.
   #
-  # **Conformance counts toward the verdict**, which means the compiler subject
-  # reports `fail` on every night until the conformance snapshots are blessed
-  # and committed. That is the accurate reading: criterion 5 is not met while a
-  # gate cannot be answered, and a row that said `ok` on the strength of a
-  # comparison against nothing would be the exact failure this suite is built to
-  # stop. See `tests/conformance/README.md`.
+  # **Conformance counts toward the verdict**, so the compiler subject reports
+  # `fail` on any night a rejection's diagnostic drifts from its snapshot, or a
+  # case cannot be pinned at all -- the four `err_ffi_*` cases, until #37. That
+  # is the accurate reading: criterion 5 is not met while a gate cannot be
+  # answered. See `tests/conformance/README.md`.
   soak-row:
     name: soak row
     needs: [parity, conformance, nightly]

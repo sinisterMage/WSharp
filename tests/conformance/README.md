@@ -124,7 +124,7 @@ Written here rather than left in anyone's head.
   a line of `std/ffi`, not of the user's file, so there is no span to pin; this
   is [#37](https://github.com/sinisterMage/WSharp/issues/37) and the gate is
   correctly red while it stands.
-- **Only the 66 cases in `tests/cases` whose header carries `// error:`.** It
+- **Only the 67 cases in `tests/cases` whose header carries `// error:`.** It
   adds no new rejection cases. The gaps in what the language refuses are still
   gaps; this pins the refusals that exist.
 - **`check` is the snapshot's subject.** `run`'s stderr is compared with

@@ -95,7 +95,7 @@ one whose `= help:` line has vanished, one `check` and `run` refuse differently,
 and one with no snapshot at all — and the selftest asserts the verdict for each,
 that the kept diff names both the old and the new column, that `--bless` then
 verify round-trips, and that an unsnapshotted corpus exits **3** rather than 0.
-Twenty-four assertions, no cargo.
+Twenty-six assertions, no cargo.
 
 ## `conform.sh` — what the language refuses, and in what words
 
@@ -380,9 +380,10 @@ A suite's limits belong where somebody reading its green run will see them.
   triple. 32-bit and non-x86-64/aarch64 targets are out of scope (#11).
 - **`selftest.sh` tests the harness, not the language**, and a green selftest
   says only that the gate can still tell a divergence from agreement.
-- **`conform.sh` has no snapshots committed yet**, so today it proves the
-  comparison works rather than that any W# diagnostic is correct: it exits 3,
-  "cannot answer", until a bless commit lands. It also adds no new rejection
-  cases — it pins the 64 that exist — and does not cover warnings, `// panic:`
-  text, `build`, or any multi-file diagnostic. `tests/conformance/README.md` is
-  the full list.
+- **`conform.sh` pins 63 of the 67 rejection cases.** Their snapshots are in
+  `tests/conformance/expected/` (#55). The four `err_ffi_*` cases report
+  `NOSPAN` -- their diagnostic points into `std/ffi` rather than at the
+  program's own `ffi.bind` call (#37) -- so they have nothing to pin and keep the
+  gate at exit 1 until that is fixed. It adds no new rejection cases, and does
+  not cover warnings, `// panic:` text, `build`, or any multi-file diagnostic.
+  `tests/conformance/README.md` is the full list.
