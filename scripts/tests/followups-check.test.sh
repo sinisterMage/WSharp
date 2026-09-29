@@ -163,6 +163,31 @@ f="$(stub two_documented \
   "$(row 10 closed completed v1.0-limitation 'field access')")"
 expect "two closed and documented" "$d" "$f" 0 "2 of 2 subjects"
 
+# Another issue's entry mentioning this one is not this one's entry. The real
+# file's entry for #47 says on its Tracked line that it is the string case of
+# #9 and #12; matching any mention made it the entry for all three, so deleting
+# #9's own section still read as met.
+d="$(tree cross_reference "9 47")"
+{
+  echo "## A top-level const array cannot hold strings"
+  echo
+  echo "**What.** It does not work."
+  echo
+  echo "**Why.** The fix is more than an afternoon."
+  echo
+  echo "**Workaround.** None."
+  echo
+  echo "**Disposition: documented limitation.** Decided."
+  echo
+  echo "**Tracked.** [#47](https://github.com/sinisterMage/WSharp/issues/47), the string"
+  echo "case of [#9](https://github.com/sinisterMage/WSharp/issues/9)."
+  echo
+} >>"$d/LIMITATIONS.md"
+f="$(stub cross_reference \
+  "$(row 9 closed completed v1.0-limitation 'computed const')" \
+  "$(row 47 closed completed v1.0-limitation 'string const array')")"
+expect "a mention in another entry's Tracked line is not an entry" "$d" "$f" 1 "#9 is closed as a v1.0-limitation and no entry"
+
 # Closed as fixed is the criterion's other allowed state, and it needs no entry:
 # the label is gone because the limitation is.
 d="$(tree fixed "9")"

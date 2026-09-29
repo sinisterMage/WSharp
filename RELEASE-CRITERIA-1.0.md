@@ -809,8 +809,8 @@ it could not wait, who granted it, and whether the clock reset.
 
 Nine gates, fourteen checks — three gates take two apiece, because a gate with
 one mechanism and one artefact, or one script per repository, is two things that
-can be separately missing. Twelve of the fourteen are written; two are not,
-and are named here so that they are owed rather than assumed.
+can be separately missing. Thirteen of the fourteen are written; one is not,
+and is named here so that it is owed rather than assumed.
 
 **Read against `main` at `4e9249a`, and held to the tree by
 `scripts/gate-table-check.sh` on every pull request.** This table claims which
@@ -842,7 +842,7 @@ once.
 | `scripts/soak-report.sh`, with `scripts/soak-report-selftest.sh` | 1 | **written** (#20), and wired up as `soak-row` in `.github/workflows/nightly.yml`. What is owed is 28 days of rows, not the script | Dex to run |
 | `scripts/freeze-check.sh` | 2 | **written**, on `main` | Ash to run |
 | `scripts/check-change-label.sh`, with `scripts/tests/check-change-label.test.sh` | 2 | **written** (#21), as `change-label` in `.github/workflows/release-gates.yml`. Revision 2 did not list this check at all | Ash, enforcing from now |
-| `scripts/guard-check.sh` | 3 | **not written** | Ash |
+| `scripts/guard-check.sh`, with `scripts/tests/guard-check.test.sh` | 3 | **written**, as `guards` in `.github/workflows/release-gates.yml`. Asks GitHub which defects closed after the freeze start and what closed them, so, like criterion 4's, it exits 2 when it cannot ask. The live run waits for `.github/freeze-start`; before Day 0, `--since` runs it over any window | Ash |
 | `scripts/followups-check.sh`, with `scripts/tests/followups-check.test.sh` | 4 | **written** (#45), as `followups` in `.github/workflows/release-gates.yml`. The only check in this table that asks GitHub rather than the tree, so it exits 2 — never 0 — when it cannot ask | Ash, against Mira's decisions |
 | `tests/harness/nightly.sh` | 5 | **written** (#20), as `parity`, `nightly` and `soak-row` in `.github/workflows/nightly.yml`. What is owed is green runs on a schedule | Dex to run |
 | `scripts/check-doc-examples.sh`, with `scripts/tests/check-doc-examples.test.sh` | 6a | **written** (#21), as `doc-examples` and `examples` in `.github/workflows/release-gates.yml`, and **green** since #33 marked the documented programs up | Ash — held |
@@ -853,9 +853,9 @@ once.
 | a committed benchmark baseline per release triple | 8 | **not written.** No baseline file exists in the tree, so the 2x threshold in criterion 8 currently has nothing to measure against | Ridge |
 
 A criterion whose check is not written is a criterion nobody can fail, which is
-why this table is here rather than in somebody's head. The two that are not
-written are gate 3's and gate 8's baselines; everything else now fails on
-evidence rather than on absence.
+why this table is here rather than in somebody's head. The one that is not
+written is gate 8's baselines; everything else now fails on evidence rather than
+on absence.
 
 Two rows used to be one each, and splitting them was the honest fix. Criterion 7
 as a single row said "not written" while `verify-install.sh` was finished, and

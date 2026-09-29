@@ -233,6 +233,25 @@ sections_naming() {
   ' "$DOC"
 }
 
+# The first issue number a section's **Tracked** line names, or nothing.
+#
+# A section is issue N's entry only if this is N. Mentioning #N anywhere is not
+# enough: the entry for #47 says on its Tracked line that it is the string
+# case of #9 and #12, and a match on any mention made it the entry for all
+# three -- deleting #9's own section still read as "criterion 4 met".
+section_tracks() {
+  local heading="$1"
+  awk -v want="$heading" '
+    /^```/ { fence = !fence; next }
+    fence { next }
+    /^#+ / { inside = ($0 ~ /^## /) && (substr($0, 4) == want); next }
+    inside && /^\*\*Tracked[.,:]/ {
+      if (match($0, /#[0-9]+/)) print substr($0, RSTART + 1, RLENGTH - 1)
+      exit
+    }
+  ' "$DOC"
+}
+
 # The fields a named section carries, one per line.
 section_fields() {
   local heading="$1"
@@ -297,13 +316,16 @@ check_subject() {
   # them -- from a section somebody wrote and left unfinished. Without it every
   # subject would be "named somewhere" and the two failures would report each
   # other's message.
-  local best="" best_missing="" heading field found missing entries=0
+  local best="" best_missing="" heading field found missing tracks entries=0
   while IFS= read -r heading; do
     [ -n "$heading" ] || continue
 
     missing=""
     found="$(section_fields "$heading")"
     [ -n "$found" ] || continue
+    # Another issue's entry that mentions this one on the way past.
+    tracks="$(section_tracks "$heading")"
+    [ -z "$tracks" ] || [ "$tracks" = "$number" ] || continue
     entries=$((entries + 1))
 
     for field in "${REQUIRED_FIELDS[@]}"; do
@@ -323,7 +345,8 @@ check_subject() {
     bad "#$number is closed as a $LABEL and no entry in $DOC names it: \"$title\""
     note "        A limitation closed on a comment is an undocumented limitation, which"
     note "        is the one thing a 1.0 is not allowed. Add a \`## \` entry to $DOC whose"
-    note "        **Tracked.** line links issue $number."
+    note "        **Tracked.** line links issue $number first -- or, if it was in fact"
+    note "        fixed, take the $LABEL label off: closed as fixed is the other state."
     return
   fi
 

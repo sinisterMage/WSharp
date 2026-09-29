@@ -585,6 +585,25 @@ extra `sin_len` byte out of this code entirely.
   marker takes only the buffers lock (to drain `satb`) and answers its heap
   questions from the lock-free directory; the sweeper takes only the heap lock,
   per block; the phase is an atomic so safepoint checks take no lock at all.
+  Two process-wide locks are leaves, taken with nothing else held and taking
+  nothing: `worker::SHARED_TRANSITION` around a flag word's update, and
+  `heap::PUBLISHING` around the space directory's one writer -- which used to be
+  "the heap lock", and stopped being one writer when every worker got a heap
+  (#44).
+- **A pause request is raised before its phase is published, and only a pause
+  consumes it.** The collector sets its worker's poll request and then publishes
+  `MarkDone` or `EvacDone` with a release store, so a mutator that acquires the
+  phase at any safepoint runs the pause and clears the request exactly once; a
+  loop poll arriving before the phase is published only *observes* the request
+  and leaves it for the pause, or an abandonment, to clear. Either half reversed
+  loses one: phase first leaves an orphan request, consuming on entry loses an
+  early one (#32). The process-wide flag bytes are the other half: `set_shared`
+  updates a worker's bit, the count and the byte under `SHARED_TRANSITION`,
+  because a clearer's late store of 0 could otherwise hide a newer raise (#64)
+  -- and for `ws_gc_evacuating_flag` a hidden raise is a load barrier skipped
+  while objects move. At exit `quiesce` drives only what it may: the calling
+  thread's own worker, or another that is parked; a worker still running is left
+  to its own next safepoint.
 - **A generic struct stands outside the dispatch lattice.** Type ids are a
   preorder walk of it, fixed before monomorphisation, and a generic struct's
   instantiations are not known until after. So `struct[T] : Base` is rejected,

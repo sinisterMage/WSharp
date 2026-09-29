@@ -97,12 +97,45 @@ jobs:
       # fetcher, because "the gate went green because it could not ask" is the
       # one failure mode a green CI run will never show anybody.
       - name: Test the checker
-        run: bash scripts/tests/followups-check.test.sh
+        run: bash scripts/tests/followups-check.test.sh </dev/null
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
+      # Not on a pull request. Its answer is about issue state, not about the
+      # change under review, and a limitation labelled somewhere else would
+      # otherwise turn every open pull request red until it was documented.
+      # On `main` and on request it runs, and a red there is the gate's answer.
       - name: Hold every tracked limitation to one of its two allowed states
+        if: github.event_name != 'pull_request'
         run: bash scripts/followups-check.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  # Criterion 3. Asks GitHub which defects closed in the freeze window and what
+  # closed them, so -- like `followups` -- it exits 2 rather than 0 when it
+  # cannot ask. The window starts at `.github/freeze-start`; until Day 0 is
+  # declared there is no window, so only the checker's own tests run.
+  guards:
+    name: every fix carries a guard (criterion 3)
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The freeze-start commit's date is read from history.
+          fetch-depth: 0
+
+      - name: Test the checker
+        run: bash scripts/tests/guard-check.test.sh </dev/null
+
+      - name: Every defect fixed in the window carries a guard
+        if: github.event_name != 'pull_request' && hashFiles('.github/freeze-start') != ''
+        run: bash scripts/guard-check.sh
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
