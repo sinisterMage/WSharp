@@ -152,6 +152,78 @@ jobs:
         if: always()
         run: cat target/harness/parity/report.md >>"$GITHUB_STEP_SUMMARY" || true
 
+  # --- criterion 8.3: the 2x check, against a committed baseline ------------
+  #
+  # A performance regression of more than 2x on any case is a P2, which is a
+  # comparison against `benchmarks/baselines/<triple>.tsv`. Where a triple has a
+  # baseline this compares against it; where it has none yet it records one and
+  # uploads it, to be reviewed and committed -- a baseline is the one number
+  # here a person should look at before it becomes the standard. A release
+  # build, because the debug runtime is not what anybody ships. **Not part of the
+  # soak row**: a slowdown is a P2, and criterion 1 asks whether the subject
+  # soaked, not whether it got faster.
+  bench:
+    name: bench (${{ matrix.triple }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+            cc: cc
+          - os: macos-latest
+            triple: aarch64-apple-darwin
+            cc: cc
+          - os: macos-15-intel
+            triple: x86_64-apple-darwin
+            cc: cc
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            cc: clang
+    defaults:
+      run:
+        shell: bash
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Remove the link.exe that is not a linker
+        if: runner.os == 'Windows'
+        run: rm -f "/c/Program Files/Git/usr/bin/link.exe"
+
+      - name: Set up the MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install GNU coreutils
+        if: runner.os == 'macOS'
+        run: brew install coreutils
+
+      - name: Build the compiler and the runtime archive, release
+        run: cargo build --release --workspace --locked
+
+      - name: Hold every case to 2x of the baseline, or record one
+        run: |
+          exe=wsharp; [ "$RUNNER_OS" = Windows ] && exe=wsharp.exe
+          export WSHARP="$PWD/target/release/$exe"
+          base="benchmarks/baselines/${{ matrix.triple }}.tsv"
+          if [ -f "$base" ]; then
+            tests/harness/bench.sh --compare "$base" --triple ${{ matrix.triple }}
+          else
+            tests/harness/bench.sh --record --triple ${{ matrix.triple }} \
+              --out "target/harness/bench/${{ matrix.triple }}.tsv"
+          fi
+
+      - name: Upload a recorded baseline
+        if: always() && hashFiles('target/harness/bench/*.tsv') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-baseline-${{ matrix.triple }}
+          path: target/harness/bench
+
   # --- criterion 5: what the language refuses, and in what words -------------
   #
   # `parity.sh` above pins what W# *accepts* -- three execution modes agreeing
