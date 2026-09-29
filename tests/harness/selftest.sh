@@ -70,6 +70,10 @@ case "$verb" in
         # `-o EXE`: write a script that replays the `build` directive, which is
         # what `parity.sh` then executes.
         [ "${1:-}" = "-o" ] && { exe="$2"; }
+        # `//@compile exit=N`: the compiler itself answers N, before any program
+        # exists -- 124 being the compile running out of time.
+        c="$(sed -n 's|^//@compile .*exit=\([0-9]*\).*|\1|p' "$file" | head -1)"
+        [ -n "$c" ] && exit "$c"
         printf '#!/usr/bin/env bash\nexec %q run --stub-mode-build %q\n' "$0" "$file" >"$exe"
         chmod +x "$exe"
         exit 0
@@ -174,6 +178,31 @@ cat >"$CASES/case_timeout.ws" <<'EOF'
 //@stress out= exit=124
 EOF
 
+# A timeout in one mode says nothing about whether the other two agree, and
+# must not hide it when they do not: stress ran out of time, and run and build
+# disagree on stdout. The divergence is the P1 and wins the row, which still
+# names the timeout.
+cat >"$CASES/timeout_and_diverge.ws" <<'EOF'
+//@run out=hello exit=0
+//@stress out= exit=124
+//@build out=goodbye exit=0
+EOF
+
+# 137 is a SIGKILL from outside -- `timeout` runs without `-k`, so it never
+# sends one itself -- which means the OOM killer, not the bound. A crash of the
+# mode, compared like any other exit status.
+cat >"$CASES/killed.ws" <<'EOF'
+//@run out=hello exit=0
+//@stress out= exit=137
+EOF
+
+# The compile ran out of time, before there was a program to run: the row must
+# say the compiler's bound, not the program's.
+cat >"$CASES/compile_timeout.ws" <<'EOF'
+//@run out=hello exit=0
+//@compile exit=124
+EOF
+
 # The collector's statistics line differs between modes for reasons that are
 # not a defect, and `normalise` removes it. If that stops working, every
 # gc case in the real corpus becomes a false divergence -- so pin it here,
@@ -218,6 +247,9 @@ expect nondet         NONDETERMINISTIC
 expect gcstats_noise  AGREED
 expect timeout        TIMEOUT
 expect diverge_exit_mild DIVERGED
+expect timeout_and_diverge DIVERGED
+expect killed         DIVERGED
+expect compile_timeout TIMEOUT
 
 # The detail column is what a reader acts on, so it is part of the contract:
 # "something diverged" without naming the mode and the stream is not a finding.
@@ -242,6 +274,19 @@ esac
 case "$(detail diverge_exit_mild)" in
     *exit\ status*) ok   "a non-124 exit difference is still an exit-status divergence" ;;
     *) bad "diverge_exit_mild detail was '$(detail diverge_exit_mild)', wanted 'exit status'" ;;
+esac
+
+case "$(detail timeout_and_diverge)" in
+    *run-vs-build*stdout*did\ not\ finish*stress*) ok "a timeout does not hide a divergence between the modes that answered" ;;
+    *) bad "timeout_and_diverge detail was '$(detail timeout_and_diverge)', wanted run-vs-build(stdout); did not finish: stress" ;;
+esac
+case "$(detail killed)" in
+    *exit\ status*) ok "137 is a crash of the mode, not the bound" ;;
+    *) bad "killed detail was '$(detail killed)', wanted an exit-status divergence" ;;
+esac
+case "$(detail compile_timeout)" in
+    *build\(compiling,\ 180s\)*) ok "a compile that ran out of time names the compiler's bound" ;;
+    *) bad "compile_timeout detail was '$(detail compile_timeout)', wanted 'build(compiling, 180s)'" ;;
 esac
 
 # The per-case `// timeout:` override is honoured and reported. The run was given
@@ -269,6 +314,26 @@ if [ "$parity_status" -ne 0 ]; then
 else
     bad "parity.sh exited 0 despite two diverged cases"
 fi
+
+# The bound that reaches `timeout` itself, not only the one the report prints: a
+# `timeout` that records its first argument, over a corpus of the one case that
+# names 999. Every program run must get 999 and the compile 180.
+BOUNDS="$WORK/bounds"; mkdir -p "$BOUNDS/cases"
+cp "$CASES/case_timeout.ws" "$BOUNDS/cases/"
+cat >"$BOUNDS/timeout" <<EOF
+#!/usr/bin/env bash
+echo "\$1" >>"$BOUNDS/seen"
+exec ${TIMEOUT_BIN:-timeout} "\$@"
+EOF
+chmod +x "$BOUNDS/timeout"
+TIMEOUT_BIN="$BOUNDS/timeout" WSHARP="$WORK/wsharp" CASES="$BOUNDS/cases" \
+    WSHARP_HARNESS_REPORTS="$WORK/report-bounds" \
+    bash "$HERE/parity.sh" --timeout 30 >"$WORK/parity-bounds.log" 2>&1
+seen="$(sort "$BOUNDS/seen" | uniq -c | awk '{print $2 "x" $1}' | paste -sd' ' -)"
+case "$seen" in
+    "180x1 999x"*) case "$seen" in *30x*) bad "a 30s bound reached timeout: $seen" ;; *) ok "timeout was handed the case's 999 and the compiler's 180 ($seen)" ;; esac ;;
+    *) bad "timeout was handed '$seen', wanted the compiler's 180 once and 999 for every run" ;;
+esac
 
 # And the inverse: a clean corpus must exit 0, or the gate can never be met.
 CLEAN="$WORK/clean"; mkdir -p "$CLEAN"

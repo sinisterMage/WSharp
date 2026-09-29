@@ -62,7 +62,10 @@ mkdir -p "$OUT/diffs"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wsharp-parity-XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
-# Run one case in one mode, into $WORK/<tag>.{out,err,code}.
+# Run one case in one mode, into $WORK/<tag>.{out,err,code}, and the bound it
+# ran under into $WORK/<tag>.bound -- the case's own `// timeout:` if it named
+# one, the default otherwise, the compiler's for a build that never produced a
+# program -- so a timeout row says the number that was tested against.
 #
 # `build` compiles first; a compile failure is the observable outcome and is
 # recorded as such rather than as a harness error, because a case that must not
@@ -81,12 +84,14 @@ execute() {
             "$TIMEOUT_BIN" "$bound" "$WSHARP" run "$case_file" $args \
                 >"$WORK/$tag.out" 2>"$WORK/$tag.err"
             code=$?
+            echo "${bound}s" >"$WORK/$tag.bound"
             ;;
         stress)
             # shellcheck disable=SC2086
             "$TIMEOUT_BIN" "$bound" "$WSHARP" run --gc-stress "$case_file" $args \
                 >"$WORK/$tag.out" 2>"$WORK/$tag.err"
             code=$?
+            echo "${bound}s" >"$WORK/$tag.bound"
             ;;
         build)
             local exe="$WORK/$tag.exe"
@@ -97,6 +102,8 @@ execute() {
                 >"$WORK/$tag.out" 2>"$WORK/$tag.err"
             code=$?
             if [ "$code" -ne 0 ]; then
+                # The bound that fired, if one did, was the compiler's.
+                echo "compiling, ${BUILD_TIMEOUT}s" >"$WORK/$tag.bound"
                 echo "$code" >"$WORK/$tag.code"
                 return 0
             fi
@@ -106,6 +113,7 @@ execute() {
             "$TIMEOUT_BIN" "$bound" "$exe" $args \
                 >"$WORK/$tag.out" 2>"$WORK/$tag.err"
             code=$?
+            echo "${bound}s" >"$WORK/$tag.bound"
             rm -f "$exe"
             ;;
     esac
@@ -114,16 +122,17 @@ execute() {
 
 # Did the harness's own bound fire on this run, rather than the program exiting?
 #
-# Every mode here runs under `timeout`, and GNU `timeout` answers 124 when it
-# sends its TERM and 137 when it sends KILL. Those two numbers are the
-# harness's, not the program's: reporting one as an exit status makes a mode
-# that ran out of time look like a mode that disagreed, which criterion 5
-# clause 1 routes straight to a P1. It is also indistinguishable, in the row
-# and in the kept diff, from a genuine exit-status divergence -- so the two are
-# separated here, before the comparison, rather than papered over after it.
+# Every mode here runs under `timeout`, which answers 124 when its bound fires.
+# That number is the harness's, not the program's: reporting it as an exit
+# status makes a mode that ran out of time look like a mode that disagreed,
+# which criterion 5 clause 1 routes straight to a P1 -- so the two are separated
+# here, before the comparison, rather than papered over after it.
+#
+# **124 only.** `timeout` runs without `-k`, so it never sends KILL itself, and
+# a 137 is a SIGKILL from somebody else -- the OOM killer, most likely. That is
+# a crash of the mode, and it is compared like any other exit status.
 is_timeout() {
-    local code; code="$(cat "$WORK/$1.code")"
-    [ "$code" = 124 ] || [ "$code" = 137 ]
+    [ "$(cat "$WORK/$1.code")" = 124 ]
 }
 
 # Are two recorded outcomes observably the same? Exit status, then stdout,
@@ -159,8 +168,8 @@ record_timeout() {
     {
         echo "### $name — timeout"
         echo
-        echo "Did not finish inside the per-run bound. The exit codes below are"
-        echo "\`timeout\`'s (124 TERM, 137 KILL), not the program's."
+        echo "Did not finish inside its bound. An exit code of 124 below is"
+        echo "\`timeout\`'s, not the program's."
         echo
         echo "modes that timed out:$modes"
         echo
@@ -194,11 +203,6 @@ for case_file in "$CASES"/*.ws; do
     total=$((total + 1))
     case_started="$(date +%s)"
 
-    # The bound this case actually got: its own `// timeout:` if it named one,
-    # the harness default otherwise. Recorded per case so a timeout row says the
-    # number that was tested against, not a global that may not have applied.
-    case_bound="$(case_timeout "$case_file")"; case_bound="${case_bound:-$TIMEOUT}"
-
     for mode in run stress build; do
         execute "$case_file" "$mode" "$mode.a"
     done
@@ -209,27 +213,35 @@ for case_file in "$CASES"/*.ws; do
     # has not answered. Decided before the comparison, and before any
     # self-consistency re-runs -- those would spend the bound twice more to
     # answer a determinism question a timeout is not.
-    timeouts=""
+    timeouts=""; answered=()
     for mode in run stress build; do
-        is_timeout "$mode.a" && timeouts="$timeouts $mode"
+        if is_timeout "$mode.a"; then
+            # The bound that mode actually ran under: the case's own, or the
+            # compiler's when the build timed out before it had a program.
+            timeouts="$timeouts $mode($(cat "$WORK/$mode.a.bound"))"
+        else
+            answered+=("$mode")
+        fi
     done
     if [ -n "$timeouts" ]; then
         record_timeout "$name" "$timeouts"
     fi
 
-    # `run` is the reference: it is the mode everything else is compared to in
-    # ordinary use.
+    # The modes that answered are still compared. A timeout in one says nothing
+    # about whether the other two agree, and skipping them would let a real
+    # divergence hide behind a slow mode. `run` is the reference when it
+    # answered, being the mode everything else is compared to in ordinary use.
     detail=""; unstable=""
-    for other in stress build; do
-        [ -n "$timeouts" ] && break
-        what="$(same "run.a" "$other.a")" && continue
+    ref="${answered[0]:-}"
+    for other in "${answered[@]:1}"; do
+        what="$(same "$ref.a" "$other.a")" && continue
         # A difference. Before calling it a divergence, ask whether either side
         # even agrees with itself -- a case that prints a port number or a
         # temporary path does not, and that is a different finding with a
         # different owner.
-        if ! self_consistent "$case_file" run; then
-            unstable="$unstable run"
-            record_diff "$name" "nondeterministic-run" "run.a" "run.c"
+        if ! self_consistent "$case_file" "$ref"; then
+            unstable="$unstable $ref"
+            record_diff "$name" "nondeterministic-$ref" "$ref.a" "$ref.c"
             break
         fi
         if ! self_consistent "$case_file" "$other"; then
@@ -237,20 +249,23 @@ for case_file in "$CASES"/*.ws; do
             record_diff "$name" "nondeterministic-$other" "$other.a" "$other.c"
             continue
         fi
-        detail="$detail run-vs-$other($what)"
-        record_diff "$name" "run-vs-$other" "run.a" "$other.a"
+        detail="$detail $ref-vs-$other($what)"
+        record_diff "$name" "$ref-vs-$other" "$ref.a" "$other.a"
     done
 
     case_elapsed=$(( $(date +%s) - case_started ))
-    if [ -n "$timeouts" ]; then
+    # A divergence between the modes that answered outranks a timeout in one
+    # that did not: it is the P1. The timeout is still named in the row.
+    if [ -n "$detail" ]; then
+        diverged=$((diverged + 1))
+        printf '%s\tDIVERGED\t%s\t%s\n' "$name" "$case_elapsed" \
+            "${detail# }${timeouts:+; did not finish:$timeouts}" >>"$TSV"
+    elif [ -n "$timeouts" ]; then
         timedout=$((timedout + 1))
-        printf '%s\tTIMEOUT\t%s\t%s\n' "$name" "$case_elapsed" "did not finish within ${case_bound}s:${timeouts}" >>"$TSV"
+        printf '%s\tTIMEOUT\t%s\t%s\n' "$name" "$case_elapsed" "did not finish:${timeouts}" >>"$TSV"
     elif [ -n "$unstable" ]; then
         flaky=$((flaky + 1))
         printf '%s\tNONDETERMINISTIC\t%s\t%s\n' "$name" "$case_elapsed" "${unstable# }" >>"$TSV"
-    elif [ -n "$detail" ]; then
-        diverged=$((diverged + 1))
-        printf '%s\tDIVERGED\t%s\t%s\n' "$name" "$case_elapsed" "${detail# }" >>"$TSV"
     else
         agreed=$((agreed + 1))
         printf '%s\tAGREED\t%s\t\n' "$name" "$case_elapsed" >>"$TSV"
@@ -288,7 +303,8 @@ elapsed=$(( $(date +%s) - started ))
     if [ "$timedout" -gt 0 ]; then
         echo "## Timed out"
         echo
-        echo "A mode that did not finish inside the ${TIMEOUT}s bound. This is"
+        echo "A mode that did not finish inside its bound -- ${TIMEOUT}s unless the case"
+        echo "names its own with \`// timeout:\`, ${BUILD_TIMEOUT}s to compile -- as each row says. This is"
         echo "**not** a divergence: the mode did not answer, so there is nothing"
         echo "to disagree with. Separate the two before routing -- a case the"
         echo "bound is too small for is corpus cost, and a mode that never"
