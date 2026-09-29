@@ -335,33 +335,49 @@ jobs:
   soak-row:
     name: soak row
     needs: [parity, conformance, nightly]
-    if: always() && github.event_name == 'schedule'
+    # A scheduled night, or one dispatched by hand on `main` at the full budget.
+    # Dispatched nights count because the 03:00 cron has fired hours late or
+    # not at all (#56), and a row records whether the subject *reported* -- a
+    # missing row is the failure `soak-report.sh` exists to make loud. Only at
+    # the full budget, though: a `quick` or shortened dispatch is somebody
+    # debugging, and must neither credit a day with less coverage than a night
+    # nor fail one permanently in an append-only log. Default branch only,
+    # because `$GITHUB_SHA` has to be a commit of `main`.
+    if: >-
+      always() && (github.event_name == 'schedule' ||
+        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
+         !inputs.quick && inputs.fuzz-seconds == '1800'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
 
-      # Written into the workspace first, from the checkout of the commit under
-      # test, so the row is produced by the same `soak-report.sh` the gate will
-      # read it with. Only then is it carried onto the log branch.
+      # Written from the checkout of the commit under test, so the row is
+      # produced by the same `soak-report.sh` the gate will read it with -- but
+      # into `$RUNNER_TEMP`, **not** into `soak/`. The file is untracked on
+      # `main`, and a row left in the working tree made the checkout of the log
+      # branch below refuse to overwrite it: every night after the first failed
+      # there, and the log silently stopped at one row.
       - name: Write the row
         env:
           NIGHT: ${{ needs.nightly.result }}
           PARITY: ${{ needs.parity.result }}
           CONFORM: ${{ needs.conformance.result }}
+          EVENT: ${{ github.event_name }}
         run: |
           verdict=fail
           if [ "$NIGHT" = "success" ] && [ "$PARITY" = "success" ] &&
              [ "$CONFORM" = "success" ]; then
             verdict=ok
           fi
-          scripts/soak-report.sh --append \
+          scripts/soak-report.sh --append --dir "$RUNNER_TEMP/soak" \
             --subject compiler --verdict "$verdict" \
             --commit "$GITHUB_SHA" \
             --platform x86_64-unknown-linux-gnu \
-            --detail "nightly=$NIGHT parity=$PARITY conformance=$CONFORM run=$GITHUB_RUN_ID"
-          cp soak/compiler.tsv "$RUNNER_TEMP/row.tsv"
+            --detail "nightly=$NIGHT parity=$PARITY conformance=$CONFORM event=$EVENT run=$GITHUB_RUN_ID"
+          test "$(wc -l <"$RUNNER_TEMP/soak/compiler.tsv")" -eq 1
+          test -z "$(git status --porcelain)"
 
       # The log lives on a branch of its own. **Not `main`**: a scheduled job
       # that pushed to the default branch every night would put a commit nobody
@@ -382,10 +398,15 @@ jobs:
             rm -rf soak
           fi
           mkdir -p soak
-          # The whole file was copied out, not the one line, because the append
-          # runs against whatever rows the checkout had -- which on the log
-          # branch is all of them, and on `main` is none. Take the tail.
-          tail -1 "$RUNNER_TEMP/row.tsv" >>soak/compiler.tsv
+          cat "$RUNNER_TEMP/soak/compiler.tsv" >>soak/compiler.tsv
           git add soak/compiler.tsv
           git commit -m "soak: compiler row for $(date -u +%Y-%m-%d)"
-          git push origin soak-log
+          # Other subjects append to the same branch, so a push can lose a race.
+          # Rebasing is safe: every commit here appends to a file of its own.
+          for attempt in 1 2 3 4; do
+            git push origin soak-log && exit 0
+            sleep $((attempt * 5))
+            git fetch origin soak-log && git rebase origin/soak-log
+          done
+          echo "could not push the soak row" >&2
+          exit 1
