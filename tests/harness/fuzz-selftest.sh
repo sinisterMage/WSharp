@@ -40,9 +40,15 @@ bad() { printf 'bad   %s\n' "$*"; failures=$((failures + 1)); }
 # can say exactly which of the four situations `check_input` must classify.
 #
 #   MARKER-frontend-too     run hangs, check hangs        -> HANG (compiler hung)
-#   MARKER-valid-loop       run hangs, check+build exit 0  -> NONTERMINATING
+#   MARKER-valid-loop       run hangs, check+build exit 0, the built program
+#                           hangs too                      -> NONTERMINATING
+#   MARKER-jit-only         run hangs, check+build exit 0, the built program
+#                           finishes                       -> HANG (modes disagree)
 #   MARKER-check-refuses    run hangs, check exits 1       -> HANG (run-only)
 #   MARKER-build-hangs      run hangs, check 0, build hangs-> HANG (codegen)
+#
+# `build` writes a two-line script to its `-o`, so the "built program" is real
+# enough to be run under the same bound.
 #
 # A hang is `sleep` long enough for `timeout -s KILL 1` to kill it.
 # ---------------------------------------------------------------------------
@@ -57,7 +63,11 @@ m="$(grep -o 'MARKER-[a-z-]*' "$file" 2>/dev/null | head -1)"
 case "$verb:$m" in
     run:MARKER-frontend-too|check:MARKER-frontend-too) sleep 30 ;;
     run:MARKER-valid-loop)                             sleep 30 ;;
-    check:MARKER-valid-loop|build:MARKER-valid-loop)   exit 0 ;;
+    check:MARKER-valid-loop)                           exit 0 ;;
+    build:MARKER-valid-loop)  printf '#!/bin/sh\nsleep 30\n' >"$3"; chmod +x "$3" ;;
+    run:MARKER-jit-only)                               sleep 30 ;;
+    check:MARKER-jit-only)                             exit 0 ;;
+    build:MARKER-jit-only)    printf '#!/bin/sh\nexit 0\n' >"$3"; chmod +x "$3" ;;
     run:MARKER-check-refuses)                          sleep 30 ;;
     check:MARKER-check-refuses) echo "error: nope" >&2; exit 1 ;;
     run:MARKER-build-hangs)                            sleep 30 ;;
@@ -71,6 +81,7 @@ chmod +x "$WORK/wsharp"
 mkdir -p "$WORK/cases"
 for pair in "frontend-too MARKER-frontend-too" \
             "valid-loop MARKER-valid-loop" \
+            "jit-only MARKER-jit-only" \
             "check-refuses MARKER-check-refuses" \
             "build-hangs MARKER-build-hangs"; do
     set -- $pair
@@ -125,6 +136,11 @@ expect_status  frontend-too  1
 # long. NOT a finding -- this is the #52 false positive.
 expect_verdict valid-loop    NONTERMINATING
 expect_status  valid-loop    0
+
+# `run` hangs, but the same bytes built finish: only the JIT ran long. Two
+# execution modes disagreeing is a P1, so this stays a finding.
+expect_verdict jit-only      HANG
+expect_status  jit-only      1
 
 # `run` executes a program `check` refuses: an anomaly in `run`, still a finding.
 expect_verdict check-refuses HANG

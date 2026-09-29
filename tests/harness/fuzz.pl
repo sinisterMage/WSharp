@@ -320,15 +320,18 @@ sub check_input {
     #
     #   `check` must answer every input. If it hangs, the front end hung.
     #   `build` compiles and links but does *not* execute. If it exits 0, the
-    #   whole compiler pipeline terminated and only the program's execution ran
-    #   long. That is the case that is not a finding.
+    #   whole compiler pipeline terminated.
+    #   The built program, run under the same bound. If it too runs past it,
+    #   the program itself does not finish, under either backend -- the one
+    #   case that is not a finding. If it finishes, only the JIT ran long, which
+    #   is two execution modes disagreeing: a P1, and it stays a finding.
     #
     # Anything else -- the front end hangs, `check` refused a program `run` then
     # executed, `build` hangs, or `build` fails where `run` got as far as
     # executing -- stays a finding. The classification is deliberately
-    # conservative: only a clean `build` exit 0 suppresses, so an environment
-    # problem (a missing runtime archive, a missing `cc`) keeps the finding
-    # rather than silencing it.
+    # conservative: only a clean `build` and a built program that also runs
+    # long suppress, so an environment problem (a missing runtime archive, a
+    # missing `cc`) keeps the finding rather than silencing it.
     if ($v eq 'HANG' && $target eq 'run') {
         my $cf = "$work/checkin$SUFFIX{$target}";
         spew($cf, $bytes);
@@ -348,16 +351,24 @@ sub check_input {
         my ($bstatus, $berrf) = spawn_capture(
             $TIMEOUT_BIN, '-s', 'KILL', $timeout, $wsharp, 'build', $bf, '-o', $bex);
         my ($bv, $bs, $berr) = decide($bstatus, $berrf);
-        unlink $bex;
         if ($bv eq 'HANG') {
+            unlink $bex;
             return ('HANG', 'hang: build (codegen), run also hung',
                     $err . "\n--- build ---\n" . $berr);
         }
-        if (($bstatus >> 8) == 0) {
+        if (($bstatus >> 8) != 0 || !-x $bex) {
+            unlink $bex;
+            return ('HANG', 'hang: run, though build failed',
+                    $err . "\n--- build ---\n" . $berr);
+        }
+        my ($xstatus, $xerrf) = spawn_capture($TIMEOUT_BIN, '-s', 'KILL', $timeout, $bex);
+        my ($xv, $xs, $xerr) = decide($xstatus, $xerrf);
+        unlink $bex;
+        if ($xv eq 'HANG') {
             return ('NONTERMINATING', 'nonterminating', $err);
         }
-        return ('HANG', 'hang: run, though build failed',
-                $err . "\n--- build ---\n" . $berr);
+        return ('HANG', 'hang: run only; the built program finished',
+                $err . "\n--- built program ---\n" . $xerr);
     }
     return ($v, $s, $err);
 }

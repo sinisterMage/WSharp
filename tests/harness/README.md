@@ -177,13 +177,15 @@ most runs produce one and that is the intended outcome.
 an infinite loop, or a blocking call nothing ever answers (`net.accept` on a
 listener with no client is the one the mutator keeps finding). Reporting that as
 a compiler hang is the false positive that made the first two nightlies red
-(#52). So on a `run` timeout the same bytes are put to two oracles: `check`,
-which must answer every input, and `build`, which compiles and links but does not
-execute. Only a clean `build` exit 0 means the whole compiler pipeline
-terminated and the program's own execution ran long -- that is `NONTERMINATING`,
-counted and reported, and it does not fail the campaign. The front end hanging,
-`check` refusing a program `run` then executed, `build` hanging, or `build`
-failing where `run` got as far as executing all stay `HANG` findings, so an
+(#52). So on a `run` timeout the same bytes are put to three oracles: `check`,
+which must answer every input; `build`, which compiles and links but does not
+execute; and the built program, run under the same bound. Only a clean `build`
+whose program *also* runs long means the program itself does not finish, under
+either backend -- that is `NONTERMINATING`, counted and reported, and it does
+not fail the campaign. A built program that finishes means only the JIT ran
+long, which is two execution modes disagreeing -- a P1 -- and stays a finding,
+as do the front end hanging, `check` refusing a program `run` then executed,
+`build` hanging, and `build` failing where `run` got as far as executing, so an
 environment problem keeps the finding rather than silencing it.
 `fuzz-selftest.sh` drives this classification over a stub compiler and needs no
 cargo.
@@ -200,8 +202,10 @@ Three properties are load-bearing:
   usually already the `tests/cases` entry that will guard the fix. The
   unreduced input is kept beside it.
 - **One directory per cause, not per occurrence.** Findings are keyed by
-  signature -- panic site and message, signal number, or `hang` -- with a count,
-  so a mutation class that trips one assertion four hundred times is one finding.
+  signature -- panic site and message, signal number, or for a `run` timeout
+  which oracle explained it -- with a count, so a mutation class that trips one
+  assertion four hundred times is one finding. A hang has no site to key on, so
+  every hang one oracle explains the same way is still one directory.
 
 A stdlib driver is built once per campaign rather than compiled per input.
 Compiling `fuzz_json.ws` takes about 2.5 seconds and parsing a document takes
