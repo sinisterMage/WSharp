@@ -229,11 +229,22 @@ pub fn lookup(t: Table, path: str) ?Value {
 /// up, counting from one, so a caller can point at it.
 pub const Doc = struct { root: Table, ok: bool, message: str, line: i64 };
 
+/// How deeply arrays and inline tables may nest.
+///
+/// The same bound as `std/json`'s and for the same reason, arrived at late.
+/// This reader used to have none, on the argument that a manifest is a file
+/// with an author -- but `parse` is handed whatever a caller has, and a few
+/// thousand `[` took the better part of a minute to refuse and could run the
+/// stack out (#49). No manifest nests an inline value 128 deep; a document
+/// that does is refused with a message rather than walked.
+pub const MAX_DEPTH = 128;
+
 const P = struct {
     b: []u8,
     at: i64,
     n: i64,
     line: i64,
+    depth: i64,
     ok: bool,
     message: str,
     fail_line: i64,
@@ -247,6 +258,7 @@ pub fn parse(src: str) Doc {
         .at = 0,
         .n = array.len(b),
         .line = 1,
+        .depth = 0,
         .ok = true,
         .message = "",
         .fail_line = 0,
@@ -583,10 +595,26 @@ fn value(p: P) Value {
     const c = peek(p);
     if (c == QUOTE) { return of_str(basic_string(p)); }
     if (c == APOS) { return of_str(literal_string(p)); }
-    if (c == LBRACKET) { return array_value(p); }
-    if (c == LBRACE) { return inline_table(p); }
+    if (c == LBRACKET) { return nested(p, true); }
+    if (c == LBRACE) { return nested(p, false); }
     if (c < 0) { fail(p, "expected a value"); return Value{}; }
     return scalar(p);
+}
+
+/// An array or an inline table: the two values that hold values, and so the
+/// only two places the reader recurses. Counted here, once, rather than in
+/// each of them.
+fn nested(p: P, is_array: bool) Value {
+    p.depth += 1;
+    if (p.depth > MAX_DEPTH) {
+        fail(p, text.concat(text.concat("this document nests more than ",
+            text.from_int(MAX_DEPTH)), " deep"));
+        return Value{};
+    }
+    var v = Value{};
+    if (is_array) { v = array_value(p); } else { v = inline_table(p); }
+    p.depth -= 1;
+    return v;
 }
 
 /// An array, which may span lines and may hold anything.

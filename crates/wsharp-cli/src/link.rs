@@ -184,10 +184,51 @@ pub fn link(object: &Path, out: &Path) -> Result<(), String> {
     })?;
 
     if !output.status.success() {
-        return Err(format!(
-            "linking failed:\n{}",
-            String::from_utf8_lossy(&output.stderr).trim_end()
-        ));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if cfg!(target_os = "windows") && gnu_linker_answered(&stderr) {
+            return Err(format!(
+                "linking failed: `{cc}` is a GNU toolchain (MinGW), and on Windows \
+                 `wsharp build` links with the MSVC toolchain's flags, which GNU ld \
+                 refuses.\nInstall clang (`winget install LLVM.LLVM`, which links \
+                 with the Visual Studio Build Tools' libraries) and point CC at it: \
+                 `set CC=clang` in cmd, `$env:CC = \"clang\"` in PowerShell.\n\
+                 The linker said:\n{}",
+                stderr.trim_end()
+            ));
+        }
+        return Err(format!("linking failed:\n{}", stderr.trim_end()));
     }
     Ok(())
+}
+
+/// Whether a failed link's complaint is GNU ld's, which on Windows means `cc`
+/// is MinGW's `gcc` rather than clang (#41). Its own words, not the flag's: the
+/// flag is ours and appears in anybody's echo of the command line, but only
+/// GNU ld calls it ambiguous, and only gcc's driver is `collect2`.
+fn gnu_linker_answered(stderr: &str) -> bool {
+    stderr.contains("unable to disambiguate: -subsystem")
+        || stderr.contains("collect2")
+        || stderr.contains("ld.exe: ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gnu_linker_answered;
+
+    /// The complaint #41 quotes, from the `windows-latest` image whose first
+    /// `cc` is MinGW's, is recognised; the MSVC linker's own failures are not,
+    /// because those are this program's to explain, not the toolchain's.
+    #[test]
+    fn a_mingw_link_failure_is_told_apart_from_an_msvc_one() {
+        let mingw = "ld.exe: Error: unable to disambiguate: -subsystem:console \
+                     (did you mean --subsystem:console ?)\n\
+                     collect2.exe: error: ld returned 1 exit status";
+        assert!(gnu_linker_answered(mingw));
+        let msvc = "LINK : fatal error LNK1561: entry point must be defined\n\
+                    clang: error: linker command failed with exit code 1561";
+        assert!(!gnu_linker_answered(msvc));
+        assert!(!gnu_linker_answered(
+            "error LNK2019: unresolved external symbol __imp__wspawnvp"
+        ));
+    }
 }

@@ -1,0 +1,6 @@
+error: type mismatch: this argument has type `str`, expected `i64`
+   --> tests/cases/err_closure_var_is_monomorphic.ws:10:13
+   |
+10 |     print(f("two"));
+   |             ^^^^^
+exit 1

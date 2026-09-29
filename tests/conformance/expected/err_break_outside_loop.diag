@@ -1,0 +1,6 @@
+error: `break` outside of a loop
+  --> tests/cases/err_break_outside_loop.ws:2:17
+  |
+2 | fn main() i64 { break; return 0; }
+  |                 ^^^^^^
+exit 1

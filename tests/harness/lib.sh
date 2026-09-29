@@ -104,18 +104,35 @@ case_expects_error() {
     grep -q '^[[:space:]]*//[[:space:]]*error:' "$1"
 }
 
+# A per-case wall-clock bound, for a case whose cost is legitimately larger than
+# the harness default. `// timeout: 1200` in the case header; empty otherwise, so
+# the caller keeps its own default.
+#
+# This exists because a single global bound conflates two things that need
+# different answers: a case that is over the bound *because it is wrong* (a hang,
+# which the gate must catch) and a case that is over it *because it is
+# expensive* (1.2 M allocations under `--gc-stress`, which is the case doing its
+# job). Raising the global bound to suit the second would let a real hang on
+# every other case take four times as long to surface. `gc_map_replacement` is
+# the first case to need it (#50); the ten-slowest table in `parity.sh`'s report
+# is what tells you a case has grown into needing one.
+case_timeout() {
+    sed -n 's|^[[:space:]]*//[[:space:]]*timeout:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$|\1|p' "$1" | head -1
+}
+
 # Noise that differs between two runs of the same program for reasons that are
 # not the compiler's fault, removed before two outputs are compared:
 #
-#   - the collector's statistics line (timings, and counts that legitimately
-#     differ between the JIT and a built program),
+#   - the collector's statistics lines, `W# gc:` and the two `W# gc pause...`
+#     lines beside it (timings, and counts that legitimately differ between
+#     the JIT and a built program),
 #   - temporary directory and port numbers a case was told to invent,
 #   - hexadecimal addresses in panic messages.
 #
 # Anything removed here is a thing this harness cannot check. The list is
 # deliberately short for that reason.
 normalise() {
-    sed -e '/^W# gc: /d' \
+    sed -e '/^W# gc[: ]/d' \
         -e 's|/tmp/[A-Za-z0-9_.-]*|<tmp>|g' \
         -e 's|0x[0-9a-f][0-9a-f]*|<addr>|g' \
         -e 's|wsharp-[a-z]*-[0-9][0-9]*|<tmpdir>|g'

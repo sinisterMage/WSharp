@@ -1,0 +1,8 @@
+error: cannot read `./no_such_file.ws`: (os error 2)
+  --> tests/cases/err_import_missing_file.ws:2:14
+  |
+2 | const gone = @import("./no_such_file.ws");
+  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = help: an import path is relative to the file it is written in
+exit 1

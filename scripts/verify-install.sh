@@ -115,7 +115,8 @@ command -v tar  >/dev/null 2>&1 || die "no tar"
 # ---------------------------------------------------------------------------
 # Scratch layout. PREFIX is the documented install prefix; everything else is
 # the harness's own and is excluded from the "nothing outside the prefix"
-# manifest diff by being inside WORK, which is itself excluded.
+# manifest diff by being inside WORK, which is itself pruned from the walk.
+# Pruning WORK is not as simple as naming it -- see the manifest section.
 # ---------------------------------------------------------------------------
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/verify-install.XXXXXX")" || die "mktemp failed"
@@ -166,8 +167,10 @@ fi
 
 # The sidecar is `<digest>  <filename>`. Take the first field only, so a
 # sidecar naming a path rather than a bare name still compares.
-PUBLISHED="$(awk 'NR==1 {print $1}' "$SIDECAR")"
-OBSERVED="$(digest_of "$TARBALL")"
+PUBLISHED="$(awk 'NR==1 {print $1}' "$SIDECAR")" \
+  || die "2. cannot inspect published digest"
+OBSERVED="$(digest_of "$TARBALL")" \
+  || die "2. cannot compute archive digest"
 
 echo "     digest published  $PUBLISHED"
 echo "     digest observed   $OBSERVED"
@@ -181,7 +184,7 @@ echo "     digest observed   $OBSERVED"
 # ---------------------------------------------------------------------------
 
 if [ -z "$PUBLISHED" ]; then
-  fail "2. the sidecar carried no digest"
+  die "2. the sidecar carried no digest"
 elif [ "$OBSERVED" = "$PUBLISHED" ]; then
   ok "2. digest verified before extracting"
 else
@@ -212,15 +215,50 @@ for extra in /usr/local/bin /usr/local/lib /opt; do
   [ -d "$extra" ] && MANIFEST_ROOTS+=("$extra")
 done
 
+# WORK has to be pruned from the walk -- it is the harness's own scratch, and
+# the install prefix is inside it -- and `find` does not necessarily spell it
+# the way we do. On Windows, Git bash mounts `/tmp` onto a directory under
+# `$HOME`, so `$WORK` is `/tmp/verify-install.XXXX` while a walk of `$HOME`
+# yields `/c/Users/.../AppData/Local/Temp/verify-install.XXXX`. A `-path
+# "$WORK"` prune then matches nothing at all: WORK is walked, and every file
+# the harness made -- the extracted prefix included -- is reported as a path
+# created outside the prefix. The check that exists to prove nothing escaped
+# the prefix then fails on the prefix itself. The same thing happens on any
+# system where TMPDIR reaches a manifest root through a symlink.
+#
+# So do not assume a spelling: drop a marker in WORK and ask `find` where it
+# is. Whatever directory the walk reports it in is WORK as the walk sees it.
+readonly WORK_MARKER=".verify-install-work-$$"
+: > "$WORK/$WORK_MARKER" || die "5. cannot create scratch marker"
+
+PRUNE_PATHS=("$WORK")
+# Command substitution in a here-document hides find's exit status. Capture
+# it explicitly: a partial walk is not evidence of a clean install.
+if ! markers="$(find "${MANIFEST_ROOTS[@]}" -name "$WORK_MARKER" -type f)"; then
+  die "5. cannot discover scratch aliases"
+fi
+while IFS= read -r marker; do
+  [ -n "$marker" ] || continue
+  alias_path="$(dirname "$marker")"
+  [ "$alias_path" = "$WORK" ] || PRUNE_PATHS+=("$alias_path")
+done <<EOF
+$markers
+EOF
+
 take_manifest() {
-  # Exclude WORK (the harness's own scratch) and the noisiest caches. `-prune`
-  # rather than a grep, so a large cache is not walked at all.
-  find "${MANIFEST_ROOTS[@]}" \
-    \( -path "$WORK" -o -name '.cache' -o -name '.npm' -o -name '.git' \) -prune \
-    -o -print 2>/dev/null | LC_ALL=C sort
+  # Exclude only WORK under every spelling the walk may use. Directory names
+  # cannot prove who wrote a file: caches and repositories remain observable.
+  local expr=() p
+  for p in "${PRUNE_PATHS[@]}"; do
+    [ "${#expr[@]}" -eq 0 ] || expr+=(-o)
+    expr+=(-path "$p")
+  done
+  find "${MANIFEST_ROOTS[@]}" \( "${expr[@]}" \) -prune \
+    -o -print | LC_ALL=C sort
 }
 
-take_manifest > "$WORK/manifest.before"
+take_manifest > "$WORK/manifest.before" \
+  || die "5. cannot inspect filesystem before install"
 ok "5. filesystem manifest taken before the install ($(wc -l <"$WORK/manifest.before" | tr -d ' ') paths)"
 
 # ---------------------------------------------------------------------------
@@ -233,13 +271,19 @@ readonly PROFILES=(
 )
 
 profile_state() {
-  local p
+  local p digest
   for p in "${PROFILES[@]}"; do
-    if [ -f "$p" ]; then echo "$p $(digest_of "$p")"; else echo "$p absent"; fi
+    if [ -f "$p" ]; then
+      digest="$(digest_of "$p")" || return 1
+      echo "$p $digest" || return 1
+    else
+      echo "$p absent" || return 1
+    fi
   done
 }
 
-profile_state > "$WORK/profiles.before"
+profile_state > "$WORK/profiles.before" \
+  || die "6. cannot inspect shell profiles before install"
 
 # ---------------------------------------------------------------------------
 # 3. Extract into the documented prefix and nowhere else.
@@ -250,6 +294,11 @@ profile_state > "$WORK/profiles.before"
 # strips the leading slash with a warning that is easy to miss.
 # ---------------------------------------------------------------------------
 
+# Process substitution would hide a partial/failed tar listing. Inspect the
+# complete list successfully before considering any extraction.
+if ! tar tzf "$TARBALL" > "$WORK/archive.members"; then
+  die "3. cannot inspect archive members"
+fi
 escapes=0
 while IFS= read -r member; do
   case "$member" in
@@ -257,12 +306,12 @@ while IFS= read -r member; do
     *../*) escapes=$((escapes + 1)); info "parent reference in archive: $member" ;;
     ../*)  escapes=$((escapes + 1)); info "parent reference in archive: $member" ;;
   esac
-done < <(tar tzf "$TARBALL")
+done < "$WORK/archive.members"
 
 if [ "$escapes" -eq 0 ]; then
   ok "3. every archive member is a relative path under the prefix"
 else
-  fail "3. the archive carries $escapes path(s) that would escape the prefix"
+  die "3. refusing to extract: archive carries $escapes path(s) that would escape the prefix"
 fi
 
 if tar xzf "$TARBALL" -C "$PREFIX" 2>"$WORK/tar.err"; then
@@ -362,10 +411,13 @@ fi
 # 5b. Nothing was created outside the prefix.
 # ---------------------------------------------------------------------------
 
-take_manifest > "$WORK/manifest.after"
+take_manifest > "$WORK/manifest.after" \
+  || die "5. cannot inspect filesystem after install"
 
-if new_paths="$(comm -13 "$WORK/manifest.before" "$WORK/manifest.after")" \
-   && [ -z "$new_paths" ]; then
+if ! new_paths="$(comm -13 "$WORK/manifest.before" "$WORK/manifest.after")"; then
+  die "5. cannot compare filesystem manifests"
+fi
+if [ -z "$new_paths" ]; then
   ok "5. nothing was created outside the prefix"
 else
   fail "5. the install created $(echo "$new_paths" | grep -c .) path(s) outside the prefix"
@@ -376,7 +428,8 @@ fi
 # 6b. The shell profile was not edited.
 # ---------------------------------------------------------------------------
 
-profile_state > "$WORK/profiles.after"
+profile_state > "$WORK/profiles.after" \
+  || die "6. cannot inspect shell profiles after install"
 
 if diff -q "$WORK/profiles.before" "$WORK/profiles.after" >/dev/null 2>&1; then
   ok "6. the shell profile was not edited"
@@ -401,7 +454,7 @@ fi
 # print a refusal. Extracts only on a match, into its own empty directory.
 verify_and_extract() {
   local candidate="$1" dest="$2" observed
-  observed="$(digest_of "$candidate")"
+  observed="$(digest_of "$candidate")" || return 3
   if [ "$observed" != "$PUBLISHED" ]; then
     echo "refusing: digest mismatch for $(basename "$candidate")"
     echo "  published $PUBLISHED"
@@ -418,6 +471,7 @@ check_damaged() {
   mkdir -p "$dest"
   out="$(verify_and_extract "$candidate" "$dest" 2>&1)"
   status=$?
+  [ "$status" -ne 3 ] || die "7. cannot compute candidate digest"
 
   if [ "$status" -eq 0 ]; then
     fail "7. a $name download was accepted"
@@ -452,7 +506,8 @@ cp "$TARBALL" "$CORRUPT"
 # Flip a byte in the middle of the compressed stream.
 printf '\xff' | dd of="$CORRUPT" bs=1 seek="$(( full_size / 2 ))" count=1 \
   conv=notrunc status=none 2>/dev/null
-if [ "$(digest_of "$CORRUPT")" = "$PUBLISHED" ]; then
+corrupt_digest="$(digest_of "$CORRUPT")" || die "7. cannot compute corrupted digest"
+if [ "$corrupt_digest" = "$PUBLISHED" ]; then
   # A one-byte flip that lands on the value already there changes nothing.
   printf '\x00' | dd of="$CORRUPT" bs=1 seek="$(( full_size / 2 ))" count=1 \
     conv=notrunc status=none 2>/dev/null

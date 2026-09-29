@@ -36,8 +36,9 @@ struct Registry {
     children: HashMap<i64, Arc<Mutex<Process>>>,
     closing: bool,
 }
+static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
+
 fn registry() -> &'static Mutex<Registry> {
-    static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(Registry::default()))
 }
 fn error(e: io::Error) -> i64 {
@@ -287,7 +288,14 @@ pub fn close_all() {
 /// os.exit must still be usable as the final bound on a stuck operation. The
 /// exiting parent's remaining children are reparented and reaped by the OS.
 pub fn kill_all() {
-    let Ok(mut table) = registry().try_lock() else {
+    // `get`, not `registry()`: a program that never started a process has
+    // nothing to kill, and this is also called from `trap`'s signal handler,
+    // where initialising the table -- and a hash map's random keys -- is not
+    // something to do.
+    let Some(registry) = REGISTRY.get() else {
+        return;
+    };
+    let Ok(mut table) = registry.try_lock() else {
         return;
     };
     table.closing = true;

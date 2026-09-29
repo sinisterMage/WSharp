@@ -1,0 +1,8 @@
+error: a generic struct must have at least one field
+  --> tests/cases/err_generic_struct_no_fields.ws:2:7
+  |
+2 | const Empty = struct[T] { };
+  |       ^^^^^
+  |
+  = help: with no field to mention them, nothing could ever say what its type parameters are
+exit 1

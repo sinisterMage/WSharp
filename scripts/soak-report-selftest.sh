@@ -138,12 +138,75 @@ fi
 # --- no manifest is 'cannot answer', not 'not met' ---------------------------
 rm -rf "$WORK/e"
 mkdir -p "$WORK/e"
-sh "$REPORT" --dir "$WORK/e" --window 5 --end "$END" >"$WORK/out" 2>&1
+sh "$REPORT" --dir "$WORK/e" --subjects "$WORK/e/subjects.tsv" --window 5 --end "$END" \
+	>"$WORK/out" 2>&1
 status=$?
 if [ "$status" = 2 ]; then
 	ok "no subject manifest exits 2, not 1"
 else
 	bad "no subject manifest exited $status, wanted 2"
+fi
+
+# --- a directory of rows alone is read against the repository's manifest ------
+#
+# The shape of the real log: the `soak-log` branch holds `soak/<subject>.tsv`
+# and nothing else, and reading it must not need a manifest copied beside it.
+rm -rf "$WORK/e"
+mkdir -p "$WORK/e"
+sh "$REPORT" --dir "$WORK/e" --window 5 --end "$END" >"$WORK/out" 2>&1
+status=$?
+if [ "$status" = 1 ] && grep -q 'soak/subjects.tsv' "$WORK/out" &&
+	grep -q 'ecosystem' "$WORK/out"; then
+	ok "a directory with rows and no manifest is read against soak/subjects.tsv"
+else
+	bad "a directory with no manifest exited $status, wanted 1 against soak/subjects.tsv"
+	cat "$WORK/out"
+fi
+
+# --- a subject that names its platforms needs a row from each, every day ------
+#
+# "On all four release triples." Three passing rows and a fourth that never
+# arrived is not a day that passed.
+four() {
+	rm -rf "$WORK/d"
+	mkdir -p "$WORK/d"
+	printf 'ecosystem\tAsh\tthe check\tlinux,windows,intel-mac,arm-mac\n' >"$WORK/d/subjects.tsv"
+}
+row() {
+	sh "$REPORT" --dir "$WORK/d" --append --subject ecosystem --verdict "$1" \
+		--commit 0000000000000000000000000000000000000000 \
+		--platform "$2" --detail "clean" --date "$3"
+}
+four
+for d in 22 23 24 25 26; do
+	for p in linux windows intel-mac arm-mac; do row ok "$p" "2026-09-$d"; done
+done
+if [ "$(report)" = 0 ]; then
+	ok "a day every named platform reported passes"
+else
+	bad "a day every named platform reported did not pass"
+	cat "$WORK/out"
+fi
+four
+for d in 22 23 24 25 26; do
+	for p in linux windows intel-mac; do row ok "$p" "2026-09-$d"; done
+done
+row ok arm-mac 2026-09-22
+row ok arm-mac 2026-09-23
+row ok arm-mac 2026-09-25
+row ok arm-mac 2026-09-26
+status=$(report)
+if [ "$status" = 1 ]; then
+	ok "a day one named platform did not report exits 1"
+else
+	bad "a day one named platform did not report exited $status, wanted 1"
+fi
+if grep -q 'incomplete: *2026-09-24, no row for arm-mac' "$WORK/out" &&
+	grep -q '^  ecosystem *\.\.-\.\.$' "$WORK/out"; then
+	ok "the incomplete day and its missing platform are named"
+else
+	bad "the incomplete day was not named with its platform"
+	cat "$WORK/out"
 fi
 
 # --- a malformed verdict is refused at the writer ----------------------------
@@ -162,7 +225,8 @@ fi
 # be, before the window starts. Only that the manifest is readable and names
 # its subjects, so the gate fails for a reason about the project.
 if sh "$REPORT" --window 1 >"$WORK/out" 2>&1 || [ $? = 1 ]; then
-	if grep -q 'compiler' "$WORK/out" && grep -q 'raython' "$WORK/out"; then
+	if grep -q 'compiler' "$WORK/out" && grep -q 'ecosystem' "$WORK/out" &&
+		grep -q 'raython' "$WORK/out"; then
 		ok "soak/subjects.tsv parses and names its subjects"
 	else
 		bad "soak/subjects.tsv did not render its subjects"

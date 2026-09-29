@@ -1,0 +1,8 @@
+error: cannot assign to `g`, which is a generic `fn`
+  --> tests/cases/err_assign_generic_closure.ws:7:5
+  |
+7 |     g = fn (y) { return y; };
+  |     ^
+  |
+  = help: a generic `fn` is a definition rather than a value, so there is nothing to reassign -- bind it with `var` to get one function value instead
+exit 1

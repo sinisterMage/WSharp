@@ -19,6 +19,7 @@ pub mod io;
 pub mod mark;
 pub mod net;
 pub mod os;
+pub mod pause;
 pub mod process;
 pub mod rpc;
 pub mod signals;
@@ -27,6 +28,7 @@ pub mod strings;
 pub(crate) mod sys;
 pub mod time;
 pub mod transfer;
+pub mod trap;
 pub mod types;
 pub mod worker;
 

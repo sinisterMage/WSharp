@@ -807,22 +807,23 @@ it could not wait, who granted it, and whether the clock reset.
 
 ## The state of the checks
 
-Nine gates, fourteen checks — three gates take two apiece, because a gate with
+Nine gates, fifteen checks — several gates take two apiece, because a gate with
 one mechanism and one artefact, or one script per repository, is two things that
-can be separately missing. Eleven of the fourteen are written; three are not,
-and are named here so that they are owed rather than assumed.
+can be separately missing. Fourteen of the fifteen are written; one is not,
+and is named here so that it is owed rather than assumed.
 
-**Read against `main` at `f2f2b40`, and held to the tree by
+**Read against `main` at `4e9249a`, and held to the tree by
 `scripts/gate-table-check.sh` on every pull request.** This table claims which
 files exist, which is a claim that goes stale on any merge that adds one — and
 did, within twenty minutes of revision 2, on six of ten rows. So it carries the
 commit it was read at, and a check now reads every row: a row saying "written"
 whose file is missing, and a row saying "not written" whose file somebody has
-since written, both turn CI red. Eleven of the fourteen rows are checked that
-way, and the script names the other three out loud on every run — criterion 0's
-inline test and criterion 8's baselines, which name no path because none has
-been decided, and criterion 7's `tests/rungs.sh`, which names one in another
-repository. **An unchecked row is where this table can still be wrong**, and
+since written, both turn CI red. Thirteen of the fifteen rows are checked that
+way, and the script names the other two out loud on every run — criterion 0's
+inline test, which names no path, and criterion 7's `tests/rungs.sh`, which
+names one in another repository. (Criterion 8's baselines named no path until
+`benchmarks/baselines/` was decided; the row now names the three still owed, so
+the check will say so the day they land.) **An unchecked row is where this table can still be wrong**, and
 `rungs.sh` is the proof: it was merged into sharpie twenty-one minutes before
 this revision was first drafted saying it was not written, and no check in this
 tree could have noticed. It was caught by reading sharpie, which is the only way
@@ -840,37 +841,36 @@ once.
 | the four-file test in criterion 0 | 0 | **written and run** — inline above | Johnny |
 | `scripts/gate-table-check.sh`, with `scripts/tests/gate-table-check.test.sh` | 0 | **written**, as `gate-table` in `.github/workflows/release-gates.yml`. It reads this table, so the table describes itself and drifting from the tree is now a red CI run | Johnny |
 | `scripts/soak-report.sh`, with `scripts/soak-report-selftest.sh` | 1 | **written** (#20), and wired up as `soak-row` in `.github/workflows/nightly.yml`. What is owed is 28 days of rows, not the script | Dex to run |
+| `scripts/ecosystem-check.sh`, with `scripts/tests/ecosystem-check.test.sh` | 1 | **written**, as `ecosystem` and `soak-row` in `.github/workflows/ecosystem.yml`. One run is sharpie built and tested (plainly, under stress, and its rungs), Foundry's own check fetching every release against its tree hash, and every published release installed, checked, built, run and tested plainly and under stress. The workflow writes one row per release triple, and `soak/subjects.tsv` names all four, so `soak-report.sh` fails a day any one of them did not report. What is owed is 28 days of rows | Ash to run |
 | `scripts/freeze-check.sh` | 2 | **written**, on `main` | Ash to run |
 | `scripts/check-change-label.sh`, with `scripts/tests/check-change-label.test.sh` | 2 | **written** (#21), as `change-label` in `.github/workflows/release-gates.yml`. Revision 2 did not list this check at all | Ash, enforcing from now |
-| `scripts/guard-check.sh` | 3 | **not written** | Ash |
-| `scripts/followups-check.sh` | 4 | **not written.** The six sections it would assert against are on `main` (`8451ee8`), so it is now writable — and until it is, criterion 4 is the one gate whose data exists and whose check does not | Ash, against Mira's decisions |
+| `scripts/guard-check.sh`, with `scripts/tests/guard-check.test.sh` | 3 | **written**, as `guards` in `.github/workflows/release-gates.yml`. Asks GitHub which defects closed after the freeze start and what closed them, so, like criterion 4's, it exits 2 when it cannot ask. The live run waits for `.github/freeze-start`; before Day 0, `--since` runs it over any window | Ash |
+| `scripts/followups-check.sh`, with `scripts/tests/followups-check.test.sh` | 4 | **written** (#45), as `followups` in `.github/workflows/release-gates.yml`. The only check in this table that asks GitHub rather than the tree, so it exits 2 — never 0 — when it cannot ask | Ash, against Mira's decisions |
 | `tests/harness/nightly.sh` | 5 | **written** (#20), as `parity`, `nightly` and `soak-row` in `.github/workflows/nightly.yml`. What is owed is green runs on a schedule | Dex to run |
 | `scripts/check-doc-examples.sh`, with `scripts/tests/check-doc-examples.test.sh` | 6a | **written** (#21), as `doc-examples` and `examples` in `.github/workflows/release-gates.yml`, and **green** since #33 marked the documented programs up | Ash — held |
 | the 6d CI job | 6d | **written** (#21), as `contributor-commands` in `.github/workflows/release-gates.yml` | Ash — held |
 | `scripts/verify-install.sh` | 7 | **written** (#21), as `verify-install` in `.github/workflows/release-gates.yml`, a matrix job. What is owed is a run against a real release | Ash to run |
-| `tests/rungs.sh` | 7 | **written**, in [`sinisterMage/sharpie`](https://github.com/sinisterMage/sharpie) (its PR #2, merged at `6af434d`), not in this repository — so no check here can see its state either way, and this row is one of the three the gate-table check reports as unchecked. What is owed is green runs on four triples | Ash to run |
+| `tests/rungs.sh` | 7 | **written**, in [`sinisterMage/sharpie`](https://github.com/sinisterMage/sharpie) (its PR #2, merged at `6af434d`), not in this repository — so no check here can see its state either way, and this row is one of the two the gate-table check reports as unchecked. What is owed is green runs on four triples | Ash to run |
 | `tests/harness/gc-pauses.sh` | 8 | **written** (#20), and called by `tests/harness/nightly.sh` | Ridge — held |
-| a committed benchmark baseline per release triple | 8 | **not written.** No baseline file exists in the tree, so the 2x threshold in criterion 8 currently has nothing to measure against | Ridge |
+| a committed benchmark baseline per release triple | 8 | **not written** for three of the four: `benchmarks/baselines/x86_64-pc-windows-msvc.tsv`, `benchmarks/baselines/x86_64-apple-darwin.tsv` and `benchmarks/baselines/aarch64-apple-darwin.tsv` are owed. The x86-64 Linux baseline is committed beside where they go, written by the harness's bench.sh with `--record`, which keeps every sample and the Form B fields; `--compare` is the 2x check. The nightly's bench job records the other three on their runners as artifacts, to be reviewed and committed | Ridge |
 
 A criterion whose check is not written is a criterion nobody can fail, which is
-why this table is here rather than in somebody's head. The three that are not
-written are gates 3, 4 and 8's baselines; everything else now fails on evidence
-rather than on absence.
+why this table is here rather than in somebody's head. The one that is not
+written is gate 8's baselines; everything else now fails on evidence rather than
+on absence.
 
 Two rows used to be one each, and splitting them was the honest fix. Criterion 7
 as a single row said "not written" while `verify-install.sh` was finished, and
 criterion 8 as a single row would have said "written" while the baselines were
 not. One row per thing that can be separately missing is the rule, and the reason
-the table has fourteen rows for nine gates.
+the table has fifteen rows for nine gates.
 
-**Three rows name nothing this tree can be asked about, and the check says so on
+**Two rows name nothing this tree can be asked about, and the check says so on
 every run rather than passing them silently.** Criterion 0's four-file test is
-inline above; criterion 8's baselines have no path decided, so the table cannot
-name one, and deciding where a baseline file lives is Ridge's call rather than
-this table's; and criterion 7's `tests/rungs.sh` is another repository's, which
-no check here can stat. "Eleven of fourteen rows were held to the tree" is the
+inline above, and criterion 7's `tests/rungs.sh` is another repository's, which
+no check here can stat. "Thirteen of fifteen rows were held to the tree" is the
 number each run prints, because a check that reports its own coverage cannot
-quietly lose it — and the three it does not cover are exactly where this table
+quietly lose it — and the two it does not cover are exactly where this table
 has to be read rather than trusted.
 
 ## The tag checklist

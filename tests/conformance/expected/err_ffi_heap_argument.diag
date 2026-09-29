@@ -1,0 +1,8 @@
+error: FFI binding requires a C function signature, got `fn(str) i32`
+  --> tests/cases/err_ffi_heap_argument.ws:4:30
+  |
+4 |     const bad: fn(str) i32 = ffi.bind(ffi.Library{ .handle = 0 }, "bad") catch return;
+  |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = help: annotate as `fn(i32, u64) i32`; use integers, bool, f64, u64 pointers, or a void return; W# references, callbacks and variadic functions cannot cross this boundary
+exit 1

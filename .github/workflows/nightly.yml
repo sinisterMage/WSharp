@@ -152,6 +152,78 @@ jobs:
         if: always()
         run: cat target/harness/parity/report.md >>"$GITHUB_STEP_SUMMARY" || true
 
+  # --- criterion 8.3: the 2x check, against a committed baseline ------------
+  #
+  # A performance regression of more than 2x on any case is a P2, which is a
+  # comparison against `benchmarks/baselines/<triple>.tsv`. Where a triple has a
+  # baseline this compares against it; where it has none yet it records one and
+  # uploads it, to be reviewed and committed -- a baseline is the one number
+  # here a person should look at before it becomes the standard. A release
+  # build, because the debug runtime is not what anybody ships. **Not part of the
+  # soak row**: a slowdown is a P2, and criterion 1 asks whether the subject
+  # soaked, not whether it got faster.
+  bench:
+    name: bench (${{ matrix.triple }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+            cc: cc
+          - os: macos-latest
+            triple: aarch64-apple-darwin
+            cc: cc
+          - os: macos-15-intel
+            triple: x86_64-apple-darwin
+            cc: cc
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            cc: clang
+    defaults:
+      run:
+        shell: bash
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Remove the link.exe that is not a linker
+        if: runner.os == 'Windows'
+        run: rm -f "/c/Program Files/Git/usr/bin/link.exe"
+
+      - name: Set up the MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install GNU coreutils
+        if: runner.os == 'macOS'
+        run: brew install coreutils
+
+      - name: Build the compiler and the runtime archive, release
+        run: cargo build --release --workspace --locked
+
+      - name: Hold every case to 2x of the baseline, or record one
+        run: |
+          exe=wsharp; [ "$RUNNER_OS" = Windows ] && exe=wsharp.exe
+          export WSHARP="$PWD/target/release/$exe"
+          base="benchmarks/baselines/${{ matrix.triple }}.tsv"
+          if [ -f "$base" ]; then
+            tests/harness/bench.sh --compare "$base" --triple ${{ matrix.triple }}
+          else
+            tests/harness/bench.sh --record --triple ${{ matrix.triple }} \
+              --out "target/harness/bench/${{ matrix.triple }}.tsv"
+          fi
+
+      - name: Upload a recorded baseline
+        if: always() && hashFiles('target/harness/bench/*.tsv') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-baseline-${{ matrix.triple }}
+          path: target/harness/bench
+
   # --- criterion 5: what the language refuses, and in what words -------------
   #
   # `parity.sh` above pins what W# *accepts* -- three execution modes agreeing
@@ -164,11 +236,10 @@ jobs:
   #
   # **A job of its own rather than a step in `parity`**, at the cost of a second
   # build per triple. Three reasons, and they are all about not masking a result:
-  # `conform.sh` exits 3 for "no snapshots committed, so this cannot be
-  # answered", which is a different sentence from parity's "the modes
-  # disagreed"; a conformance failure must not stop a three-hour parity run from
-  # starting; and the first scheduled run of this job is *expected* to fail with
-  # exit 3 until the bless commit lands, which must not take parity down with it.
+  # `conform.sh` exits 3 for "no snapshots, so this cannot be answered", which
+  # is a different sentence from parity's "the modes disagreed"; and a
+  # conformance failure must not stop a three-hour parity run from starting, or
+  # take it down with it.
   #
   # **All four triples, because a diagnostic is a platform-independent claim
   # that has never been checked as one.** The rendered form is built from a byte
@@ -326,42 +397,56 @@ jobs:
   # passed or failed -- criterion 1 asks whether the subject *reported*, and a
   # failure that went unrecorded reads as a soak that stopped.
   #
-  # **Conformance counts toward the verdict**, which means the compiler subject
-  # reports `fail` on every night until the conformance snapshots are blessed
-  # and committed. That is the accurate reading: criterion 5 is not met while a
-  # gate cannot be answered, and a row that said `ok` on the strength of a
-  # comparison against nothing would be the exact failure this suite is built to
-  # stop. See `tests/conformance/README.md`.
+  # **Conformance counts toward the verdict**, so the compiler subject reports
+  # `fail` on any night a rejection's diagnostic drifts from its snapshot, or a
+  # case cannot be pinned at all. That is the accurate reading: criterion 5 is
+  # not met while a gate cannot be answered. See `tests/conformance/README.md`.
   soak-row:
     name: soak row
     needs: [parity, conformance, nightly]
-    if: always() && github.event_name == 'schedule'
+    # A scheduled night, or one dispatched by hand on `main` at the full budget.
+    # Dispatched nights count because the 03:00 cron has fired hours late or
+    # not at all (#56), and a row records whether the subject *reported* -- a
+    # missing row is the failure `soak-report.sh` exists to make loud. Only at
+    # the full budget, though: a `quick` or shortened dispatch is somebody
+    # debugging, and must neither credit a day with less coverage than a night
+    # nor fail one permanently in an append-only log. Default branch only,
+    # because `$GITHUB_SHA` has to be a commit of `main`.
+    if: >-
+      always() && (github.event_name == 'schedule' ||
+        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
+         !inputs.quick && inputs.fuzz-seconds == '1800'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
 
-      # Written into the workspace first, from the checkout of the commit under
-      # test, so the row is produced by the same `soak-report.sh` the gate will
-      # read it with. Only then is it carried onto the log branch.
+      # Written from the checkout of the commit under test, so the row is
+      # produced by the same `soak-report.sh` the gate will read it with -- but
+      # into `$RUNNER_TEMP`, **not** into `soak/`. The file is untracked on
+      # `main`, and a row left in the working tree made the checkout of the log
+      # branch below refuse to overwrite it: every night after the first failed
+      # there, and the log silently stopped at one row.
       - name: Write the row
         env:
           NIGHT: ${{ needs.nightly.result }}
           PARITY: ${{ needs.parity.result }}
           CONFORM: ${{ needs.conformance.result }}
+          EVENT: ${{ github.event_name }}
         run: |
           verdict=fail
           if [ "$NIGHT" = "success" ] && [ "$PARITY" = "success" ] &&
              [ "$CONFORM" = "success" ]; then
             verdict=ok
           fi
-          scripts/soak-report.sh --append \
+          scripts/soak-report.sh --append --dir "$RUNNER_TEMP/soak" \
             --subject compiler --verdict "$verdict" \
             --commit "$GITHUB_SHA" \
             --platform x86_64-unknown-linux-gnu \
-            --detail "nightly=$NIGHT parity=$PARITY conformance=$CONFORM run=$GITHUB_RUN_ID"
-          cp soak/compiler.tsv "$RUNNER_TEMP/row.tsv"
+            --detail "nightly=$NIGHT parity=$PARITY conformance=$CONFORM event=$EVENT run=$GITHUB_RUN_ID"
+          test "$(wc -l <"$RUNNER_TEMP/soak/compiler.tsv")" -eq 1
+          test -z "$(git status --porcelain)"
 
       # The log lives on a branch of its own. **Not `main`**: a scheduled job
       # that pushed to the default branch every night would put a commit nobody
@@ -382,10 +467,15 @@ jobs:
             rm -rf soak
           fi
           mkdir -p soak
-          # The whole file was copied out, not the one line, because the append
-          # runs against whatever rows the checkout had -- which on the log
-          # branch is all of them, and on `main` is none. Take the tail.
-          tail -1 "$RUNNER_TEMP/row.tsv" >>soak/compiler.tsv
+          cat "$RUNNER_TEMP/soak/compiler.tsv" >>soak/compiler.tsv
           git add soak/compiler.tsv
           git commit -m "soak: compiler row for $(date -u +%Y-%m-%d)"
-          git push origin soak-log
+          # Other subjects append to the same branch, so a push can lose a race.
+          # Rebasing is safe: every commit here appends to a file of its own.
+          for attempt in 1 2 3 4; do
+            git push origin soak-log && exit 0
+            sleep $((attempt * 5))
+            git fetch origin soak-log && git rebase origin/soak-log
+          done
+          echo "could not push the soak row" >&2
+          exit 1

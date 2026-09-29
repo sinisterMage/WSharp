@@ -232,6 +232,9 @@ fn worker_main(code: &'static ServiceCode, args: Vec<Word>, handle: &'static Han
     // A worker of its own, and so a heap of its own: this is the whole point.
     // Created by asking, which also installs it for every allocation below.
     let _worker = Worker::current();
+    // Everything below runs W#, so a null read or a runaway recursion on this
+    // thread is the program's, and is reported as a W# panic.
+    let _mutator = crate::trap::enter();
 
     // The state lives as long as the worker does, and nothing on the stack
     // holds it between calls -- so it is pinned, on the same list `decode`

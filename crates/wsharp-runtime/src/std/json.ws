@@ -278,11 +278,10 @@ pub const Doc = struct { root: Value, ok: bool, message: str, line: i64, at: i64
 
 /// How deeply arrays and objects may nest.
 ///
-/// `std/toml` has no such bound because a manifest is a file somebody wrote.
 /// This is the format that actually arrives from a socket, and the reader is
-/// recursive, so without a bound a few hundred kilobytes of `[` is a stack
-/// overflow -- a crash with no diagnostic -- rather than a document this
-/// refuses. `std/x509`'s `MAX_CHAIN` is the same shape: a named bound, no knob.
+/// recursive, so without a bound a few hundred kilobytes of `[` would run the
+/// stack out rather than be a document this refuses. `std/toml` has the same
+/// bound now, having learnt the same thing later (#49). `std/x509`'s `MAX_CHAIN` is the same shape: a named bound, no knob.
 pub const MAX_DEPTH = 128;
 
 const P = struct {

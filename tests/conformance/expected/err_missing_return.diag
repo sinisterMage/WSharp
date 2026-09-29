@@ -1,0 +1,8 @@
+error: not every path returns a value
+  --> tests/cases/err_missing_return.ws:2:42
+  |
+2 | fn f(c: bool) i64 { if (c) { return 1; } }
+  |                                          ^
+  |
+  = help: this function returns `i64`, so every path needs a `return`
+exit 1

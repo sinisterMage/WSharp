@@ -999,3 +999,60 @@ impl Drop for Poller {
 pub(crate) fn system_roots() -> Option<Vec<u8>> {
     None
 }
+
+/// What `crate::trap` needs to catch a fault: `sigaction`, `sigaltstack`, one
+/// word of `siginfo_t`, and the calling thread's stack.
+///
+/// None of the three structs is declared. `trap` fills a zeroed buffer at the
+/// offsets below and reads one word out of `siginfo_t`, so each is a handful
+/// of numbers taken from this system's headers -- the shape `D_NAME_OFFSET`
+/// already has -- and the buffers are sized well past the real structs, so a
+/// wrong guess about a tail cannot write beyond them.
+pub(crate) mod trap {
+    use super::c_int;
+
+    pub(crate) const SUPPORTED: bool = true;
+    pub(crate) const SIGSEGV: c_int = 11;
+    pub(crate) const SIGBUS: c_int = 7;
+    pub(crate) const SA_SIGINFO: c_int = 4;
+    pub(crate) const SA_ONSTACK: c_int = 0x0800_0000;
+    /// `struct sigaction` is the handler, then a 1024-bit `sigset_t`, then
+    /// `sa_flags` -- the same in glibc and musl, on x86-64 and aarch64.
+    pub(crate) const SA_FLAGS_OFFSET: usize = 8 + 128;
+    /// `si_signo`, `si_errno`, `si_code` and four bytes of padding, then the
+    /// union whose member for a fault begins with `si_addr`.
+    pub(crate) const SI_ADDR_OFFSET: usize = 16;
+    /// `stack_t` is `ss_sp`, `ss_flags`, `ss_size` here; the BSDs put the size
+    /// before the flags, which is the whole reason these are two numbers.
+    pub(crate) const SS_FLAGS_OFFSET: usize = 8;
+    pub(crate) const SS_SIZE_OFFSET: usize = 16;
+    pub(crate) const SS_DISABLE: c_int = 2;
+
+    unsafe extern "C" {
+        pub(crate) fn sigaction(signal: c_int, action: *const u8, previous: *mut u8) -> c_int;
+        pub(crate) fn sigaltstack(stack: *const u8, previous: *mut u8) -> c_int;
+        /// Leaves without running `atexit` handlers or flushing anything,
+        /// which is the only way out of a signal handler that is safe.
+        pub(crate) fn _exit(status: c_int) -> !;
+    }
+
+    /// Write to standard error with no buffer and no lock, which is what a
+    /// signal handler may do.
+    pub(crate) fn write_stderr(bytes: &[u8]) {
+        let _ = unsafe { super::c::write(2, bytes.as_ptr(), bytes.len()) };
+    }
+
+    /// End the process now, from inside a signal handler.
+    pub(crate) fn exit_now(status: c_int) -> ! {
+        unsafe { _exit(status) }
+    }
+
+    /// The calling thread's stack as `[low, high)`.
+    ///
+    /// For the main thread glibc reports the lowest address the stack may grow
+    /// to under `RLIMIT_STACK`, not the lowest it has reached, which is the
+    /// answer wanted: a fault just below it is the kernel refusing to grow it.
+    pub(crate) fn stack_bounds() -> Option<(usize, usize)> {
+        super::current_stack_bounds().ok()
+    }
+}

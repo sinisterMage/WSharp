@@ -1,0 +1,8 @@
+error: `print` is a builtin and cannot be redeclared
+  --> tests/cases/err_redeclare_builtin.ws:2:4
+  |
+2 | fn print(s: str) void { }
+  |    ^^^^^
+  |
+  = help: builtins cannot be overloaded yet; choose another name
+exit 1

@@ -296,6 +296,35 @@ pub fn builtins() -> Vec<Builtin> {
             link: "ws_gc_collections",
             ptr: ws_gc_collections as *const u8,
         },
+        // The pause distribution, in the language, so that "the samples exist"
+        // is a case in `tests/cases` rather than a claim about stderr. A
+        // percentile is not answerable from the count, the total and the
+        // maximum the statistics line used to be, which is the whole of
+        // issue #18.
+        Builtin {
+            module: PRELUDE,
+            name: "gc_pauses",
+            params: &[],
+            ret: BuiltinTy::I64,
+            link: "ws_gc_pauses",
+            ptr: ws_gc_pauses as *const u8,
+        },
+        Builtin {
+            module: PRELUDE,
+            name: "gc_pause_samples",
+            params: &[],
+            ret: BuiltinTy::I64,
+            link: "ws_gc_pause_samples",
+            ptr: ws_gc_pause_samples as *const u8,
+        },
+        Builtin {
+            module: PRELUDE,
+            name: "gc_pause_percentile_us",
+            params: &[BuiltinTy::I64],
+            ret: BuiltinTy::I64,
+            link: "ws_gc_pause_percentile_us",
+            ptr: ws_gc_pause_percentile_us as *const u8,
+        },
     ];
     table.extend(library());
     table.extend(crate::ffi::builtins());
@@ -1782,6 +1811,33 @@ pub extern "C" fn ws_gc_live_bytes() -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn ws_gc_collections() -> i64 {
     crate::gc::collections() as i64
+}
+
+/// How many pauses the collector has run, across every worker.
+///
+/// Deliberately *not* a safepoint: a case compares this with the sample count
+/// on the next line, and a pause between the two reads would make the
+/// comparison a race rather than an assertion.
+#[unsafe(no_mangle)]
+pub extern "C" fn ws_gc_pauses() -> i64 {
+    crate::gc::pauses() as i64
+}
+
+/// How many of those pauses the histogram holds a sample for. Equal to
+/// [`ws_gc_pauses`] -- which is the claim criterion 8 turns on, and what
+/// `tests/cases/gc_pause_samples.ws` checks.
+#[unsafe(no_mangle)]
+pub extern "C" fn ws_gc_pause_samples() -> i64 {
+    crate::gc::pause_samples() as i64
+}
+
+/// The `p`th percentile of every recorded pause, in microseconds, as an upper
+/// bound within 25%. `p` is a percentage; 100 is the maximum. A `p` outside
+/// 0..=100 is clamped, because this is a measurement rather than an argument
+/// worth panicking over.
+#[unsafe(no_mangle)]
+pub extern "C" fn ws_gc_pause_percentile_us(p: i64) -> i64 {
+    crate::gc::pause_percentile_us(p.max(0) as usize) as i64
 }
 
 #[unsafe(no_mangle)]

@@ -175,12 +175,11 @@ check_row() {
   done < <(claimed_jobs "$state")
 
   # A row naming nothing this tree can be asked about is one this check cannot
-  # hold to anything, and three rows are legitimately such a row: criterion 0's
-  # inline test and criterion 8's baselines name no path because none has been
-  # decided, and criterion 7's `tests/rungs.sh` names one in another repository.
-  # Reported rather than passed silently, because "11 of 14 rows are checked" is
-  # the number a reader of this output needs, and a coverage number that is
-  # printed is one that cannot quietly shrink.
+  # hold to anything, and two rows are legitimately such a row: criterion 0's
+  # inline test names no path, and criterion 7's `tests/rungs.sh` names one in
+  # another repository. Reported rather than passed silently, because "12 of 14
+  # rows are checked" is the number a reader of this output needs, and a
+  # coverage number that is printed is one that cannot quietly shrink.
   if [ "$named" -eq 0 ] && [ "$claims" -eq 0 ]; then
     unchecked_count=$((unchecked_count + 1))
     if [ "$external" -gt 0 ]; then

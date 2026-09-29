@@ -1,0 +1,6 @@
+error: type mismatch: this argument has type `Listener`, expected `Socket`
+   --> tests/cases/err_shutdown_listener.ws:30:18
+   |
+30 |     net.shutdown(l, true, true) catch return 2;
+   |                  ^
+exit 1

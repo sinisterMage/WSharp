@@ -27,6 +27,10 @@ pub struct Program {
     /// The root module first, then everything it reached, in the order they
     /// were read.
     pub modules: Vec<Loaded>,
+    /// What each module is called where two machines have to agree about it:
+    /// `--emit=api`'s name for a module, keyed by its module path. See
+    /// [`portable_name`].
+    pub portable: HashMap<String, String>,
     pub map: SourceMap,
     pub diags: Vec<Diagnostic>,
 }
@@ -51,7 +55,9 @@ pub fn load(root: &Path) -> Result<Program, String> {
     // Found from the root *file* rather than from the process's directory,
     // because `wsharp run app/src/main.ws` has no `-C` and need not be run
     // inside the project it is compiling.
-    loader.packages = Packages::found_from(root.parent().unwrap_or(Path::new(".")));
+    let dir = directory_of(root);
+    loader.packages = Packages::found_from(dir);
+    loader.root_dir = Some(canonical(dir));
     loader.add(root, "main".into(), text);
     loader.add_library(&libraries());
     Ok(loader.finish())
@@ -100,6 +106,9 @@ struct Loader {
     /// What `ingot install` left beside the project's manifest. Empty for a
     /// program that is not in a project, which is most of them.
     packages: Packages,
+    /// The root file's directory, which a file module's portable name is
+    /// relative to. `None` when the root is a library module.
+    root_dir: Option<PathBuf>,
 }
 
 /// One package this project has installed, as `ingot.env` records it.
@@ -259,12 +268,25 @@ impl Loader {
             files: HashMap::new(),
             loading: Vec::new(),
             packages: Packages::default(),
+            root_dir: None,
         }
     }
 
     fn finish(self) -> Program {
+        let mut portable: HashMap<String, String> = self
+            .modules
+            .iter()
+            .map(|m| (m.path.clone(), m.path.clone()))
+            .collect();
+        for (file, path) in &self.files {
+            if path != "main" {
+                let name = portable_name(file, path, self.root_dir.as_deref(), &self.packages);
+                portable.insert(path.clone(), name);
+            }
+        }
         Program {
             modules: self.modules,
+            portable,
             map: self.map,
             diags: self.diags,
         }
@@ -518,6 +540,81 @@ fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// The directory a file is in, as something that can be canonicalised.
+///
+/// `Path::parent` answers a bare `main.ws` with the *empty* path rather than
+/// with `None`, so `unwrap_or(".")` never fires for the one spelling that most
+/// needs it. The empty path then fails to canonicalise and has no parent of
+/// its own: the walk up to `ingot.toml` stopped before it started, so `wsharp
+/// run main.ws` inside a project's `src/` could not find its packages, and
+/// `--emit=api` had no directory to name the other modules from and printed
+/// them absolute again.
+fn directory_of(file: &Path) -> &Path {
+    match file.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
+/// What a file module is called where two machines have to agree: in
+/// `--emit=api`, which is committed, diffed and read on a machine other than
+/// the one that wrote it (#26).
+///
+/// A module path is the file's absolute path, which is right for everything
+/// that happens on one machine and wrong for this: it names the checkout and,
+/// through a package, `WSHARP_HOME` and a store hash. So:
+///
+/// * a file in an installed package is `pkg+<name>/<path in the package>` --
+///   the name the lockfile already uses, which a store hash is not, since a
+///   hash also names the installation;
+/// * any other file is its path from the root file's directory, `helper.ws` or
+///   `app/routes/users.ws`, with `..` for one reached by a relative path out of
+///   it -- which is how its import was spelled in the first place.
+///
+/// Always `/`-separated. A path that shares nothing with the root directory
+/// -- another drive -- keeps its module path, because there is no relative
+/// spelling of it.
+fn portable_name(
+    file: &Path,
+    module_path: &str,
+    root_dir: Option<&Path>,
+    packages: &Packages,
+) -> String {
+    if let Some(owner) = packages.owner_of(file)
+        && !packages
+            .entries
+            .first()
+            .is_some_and(|root| std::ptr::eq(root, owner))
+        && let Ok(inside) = file.strip_prefix(&owner.dir)
+    {
+        return format!("pkg+{}/{}", owner.name, slashed(inside));
+    }
+    let Some(root_dir) = root_dir else {
+        return module_path.to_string();
+    };
+    let from: Vec<_> = root_dir.components().collect();
+    let to: Vec<_> = file.components().collect();
+    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    if common == 0 {
+        return module_path.to_string();
+    }
+    let mut parts: Vec<String> = vec!["..".to_string(); from.len() - common];
+    parts.extend(
+        to[common..]
+            .iter()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned()),
+    );
+    parts.join("/")
+}
+
+/// A relative path, written with `/` whatever the platform wrote it with.
+fn slashed(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// What a file module is *called*, given where it is.
 ///
 /// A module path is an identity and a name at once: sema keys its qualified
@@ -650,6 +747,44 @@ mod tests {
         assert_eq!(
             packages.owner_of(outside).map(|p| p.name.as_str()),
             Some("myapp")
+        );
+    }
+
+    /// `--emit=api`'s names for modules say nothing about the machine: a
+    /// project file is named from the root's directory, an installed package by
+    /// its name, and a file reached out of the project by `..` (#26).
+    #[test]
+    fn a_portable_name_is_about_the_program_not_the_machine() {
+        let packages = Packages {
+            entries: parse_env(
+                "myapp\t/work/app\tsrc/myapp.ws\tutil\n\
+                 util\t/home/u/.wsharp/store/sha256/c14b\tsrc/util.ws\n",
+                Path::new("/work/app"),
+            )
+            .expect("a readable environment"),
+            uninstalled: false,
+        };
+        let root = Some(Path::new("/work/app/src"));
+        let name = |file: &str| portable_name(Path::new(file), file, root, &packages);
+        assert_eq!(name("/work/app/src/helper.ws"), "helper.ws");
+        assert_eq!(
+            name("/work/app/src/app/routes/users.ws"),
+            "app/routes/users.ws"
+        );
+        assert_eq!(name("/work/app/lib/shared.ws"), "../lib/shared.ws");
+        assert_eq!(
+            name("/home/u/.wsharp/store/sha256/c14b/src/conn.ws"),
+            "pkg+util/src/conn.ws"
+        );
+        let no_project = Packages::default();
+        assert_eq!(
+            portable_name(
+                Path::new("/tmp/x/helper.ws"),
+                "/tmp/x/helper.ws",
+                Some(Path::new("/tmp/x")),
+                &no_project
+            ),
+            "helper.ws"
         );
     }
 

@@ -8,7 +8,7 @@
 //!
 //! So this is the promise, and it is a narrow one on purpose:
 //!
-//! * **It is versioned.** The first line is `(api 1)`. A change that could make
+//! * **It is versioned.** The first line is `(api 2)`. A change that could make
 //!   an existing reader wrong bumps the number.
 //! * **It is a surface, not a program.** Declarations and their types; no
 //!   bodies, no expressions, no spans.
@@ -25,14 +25,18 @@
 //! end is: a few hundred lines with no dependency, in a language whose `std`
 //! has no JSON either.
 //!
-//! A module is named by the path the loader resolved it to, which for a library
-//! module is `std/net` and for a file is that file, written with `/`
-//! separators on every platform -- see `load::module_path_of`. The one
-//! exception is the root, which is `"main"`: the loader's name for it, and what
-//! every other emit already calls it.
+//! A module is named so that the same source emits the same bytes on every
+//! machine, because an API document is committed, diffed and read somewhere
+//! other than where it was written -- see `load::portable_name`. A library
+//! module is `std/net`; a file is its path from the root file's directory,
+//! `app/controllers/users.ws`, with `..` for one reached out of it; a file in
+//! an installed package is `pkg+<name>/<path in the package>`; and the root is
+//! `"main"`, what every other emit already calls it. Version 1 named a file by
+//! its absolute path, which named the checkout, `WSHARP_HOME` and a store hash
+//! along with the module (#26); that is the whole of the difference.
 //!
 //! ```text
-//! (api 1)
+//! (api 2)
 //! (module "app/controllers/users"
 //!   (import raython "raython/web")
 //!   (pub const ROUTE_Index (str "GET /users"))
@@ -49,7 +53,7 @@ use wsharp_syntax::ast;
 /// The shape of what is printed. Bumped when a change could make an existing
 /// reader wrong; adding a new form inside an existing one does not, because a
 /// reader that does not know a form skips it.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// One module as the emitter sees it: what it is called, and what its local
 /// names for other modules mean.

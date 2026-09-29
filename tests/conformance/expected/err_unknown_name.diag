@@ -1,0 +1,6 @@
+error: cannot find `nope` in this scope
+  --> tests/cases/err_unknown_name.ws:2:24
+  |
+2 | fn main() i64 { return nope; }
+  |                        ^^^^
+exit 1

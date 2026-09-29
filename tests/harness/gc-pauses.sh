@@ -1,30 +1,25 @@
 #!/usr/bin/env bash
 # Collector pause times, and the counts that say whether they mean anything.
 #
-# **What can and cannot be measured today.** `WSHARP_GC_STATS=1` reports three
-# numbers about pauses per process -- how many, the longest, and the total -- and
-# the runtime keeps exactly those three counters (`gc::record_pause` does
-# `fetch_add`, `fetch_add`, `fetch_max`). There is no histogram and no per-pause
-# log, so a p99 *over the pauses inside one run* is not available from outside
-# the runtime, however the numbers are arranged afterwards. Saying otherwise
-# would be inventing a percentile.
+# **Every pause, not one number per run.** Criterion 8.2 asks for p50, p90, p99
+# and max over at least 1,000 *pauses*. Until #24 the runtime kept a count, a
+# total and a maximum per worker and nothing else, so a percentile over the
+# pauses inside a run could not be computed at all. It now keeps every pause on
+# request: `WSHARP_GC_PAUSE_LOG=<path>` writes one line per pause -- the
+# microseconds, which of the three pauses, which worker -- and a trailer per
+# worker saying how many it kept of how many it saw. This script sets it for
+# every run and pools the lines into `pauses.tsv`, which is the raw data the
+# distribution is recomputable from (Form B).
 #
-# So this measures the distribution that is actually there: one sample per run,
-# taken over many runs of every `gc_*` case.
-#
-#   max      the longest pause in that run -- the tail metric. A collector that
-#            averages well and stalls for a second has failed, and this is the
-#            number that says so.
-#   mean     total / count for that run.
-#
-# p50 and p99 are then over those populations, and the report says which.
-# Closing the gap needs a runtime change; that is a request to file, not
-# something to paper over here.
+# The per-run table is kept beside it, because it answers a different question
+# -- how bad is the worst pause in one program -- and because a run whose log
+# went missing still has its statistics line.
 #
 # **The counts are checked, not assumed.** A stack walk that finds no roots
 # makes every root check pass for the wrong reason, and a run with no trace and
 # no pause would report a beautiful zero. Any case whose run reports zero
-# collections, zero roots or zero pauses is called out.
+# collections, zero roots or zero pauses is called out, and so is a log that
+# says it truncated, and a pooled population short of the criterion's 1,000.
 #
 # Usage:
 #   tests/harness/gc-pauses.sh [--repeats N] [--only PATTERN] [--stress]
@@ -41,7 +36,7 @@ while [ $# -gt 0 ]; do
         --repeats) REPEATS="$2"; shift 2 ;;
         --only) ONLY="$2"; shift 2 ;;
         --stress) STRESS=1; shift ;;
-        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
         *) echo "gc-pauses: unknown argument $1" >&2; exit 2 ;;
     esac
 done
@@ -53,6 +48,10 @@ OUT="${WSHARP_HARNESS_REPORTS:-$REPORTS/gc-pauses-$STAMP}"
 mkdir -p "$OUT"
 SAMPLES="$OUT/samples.tsv"
 printf 'case\trepeat\tcollections\troots\ttraces\tmoved\tpauses\tmax_us\ttotal_us\tmean_us\twall_ms\n' >"$SAMPLES"
+PAUSES="$OUT/pauses.tsv"
+printf 'case\trepeat\tus\tpause\tworker\n' >"$PAUSES"
+TRUNCATED="$OUT/truncated.txt"
+: >"$TRUNCATED"
 
 # Pull the numbers out of the statistics line. Parsed by name rather than by
 # position, so a new counter inserted in the middle does not silently shift
@@ -105,9 +104,10 @@ for case_file in "$CASES"/*.ws; do
     [[ "$name" == *$ONLY* ]] || continue
     args="$(case_args "$case_file")"
     for r in $(seq 1 "$REPEATS"); do
+        log="$OUT/pause-$name-$r.log"
         start_ns="$(date +%s%N)"
         # shellcheck disable=SC2086
-        stats="$(WSHARP_GC_STATS=1 "$WSHARP" run "${flags[@]}" "$case_file" $args \
+        stats="$(WSHARP_GC_STATS=1 WSHARP_GC_PAUSE_LOG="$log" "$WSHARP" run "${flags[@]}" "$case_file" $args \
                  2>&1 >/dev/null | parse_stats)"
         end_ns="$(date +%s%N)"
         wall=$(( (end_ns - start_ns) / 1000000 ))
@@ -118,6 +118,11 @@ for case_file in "$CASES"/*.ws; do
             mean=$(( total / pauses ))
         fi
         printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$r" "$stats" "$mean" "$wall" >>"$SAMPLES"
+        if [ -f "$log" ]; then
+            awk -F'\t' -v c="$name" -v r="$r" '!/^#/ && NF == 3 { print c "\t" r "\t" $0 }' "$log" >>"$PAUSES"
+            grep -H "TRUNCATED" "$log" >>"$TRUNCATED" || true
+            rm -f "$log"
+        fi
     done
 done
 
@@ -136,6 +141,22 @@ pct() {
             k = int(p / 100 * n + 0.999999); if (k < 1) k = 1; if (k > n) k = n
             print v[k]
         }' "$SAMPLES"
+}
+
+# The same, over the pooled pauses, optionally of one kind only.
+pause_pct() {
+    local p="$1" kind="${2:-}"
+    awk -F'\t' -v k="$kind" 'NR > 1 && (k == "" || $4 == k) { print $3 + 0 }' "$PAUSES" |
+        sort -n | awk -v p="$p" '
+            { v[++n] = $1 }
+            END {
+                if (n == 0) { print "-"; exit }
+                k = int(p / 100 * n + 0.999999); if (k < 1) k = 1; if (k > n) k = n
+                print v[k]
+            }'
+}
+pause_count() {
+    awk -F'\t' -v k="${1:-}" 'NR > 1 && (k == "" || $4 == k) { n++ } END { print n + 0 }' "$PAUSES"
 }
 
 sum_col() { awk -F'\t' -v c="$1" 'NR>1 && $c!="-" {s+=$c} END {print s+0}' "$SAMPLES"; }
@@ -158,17 +179,12 @@ count_rows() { awk -F'\t' 'NR>1 {n++} END {print n+0}' "$SAMPLES"; }
     echo
     echo "## Method"
     echo
-    echo "One sample per process, from \`WSHARP_GC_STATS=1\`. The runtime keeps a"
-    echo "count, a total and a maximum per worker and no histogram, so the"
-    echo "population below is **per-run**, not per-pause:"
-    echo
-    echo "- \`max\` is the longest pause in that run."
-    echo "- \`mean\` is that run's total divided by its count."
-    echo
-    echo "Percentiles are nearest-rank over the samples in \`samples.tsv\`."
-    echo "**A per-pause p99 within one run cannot be computed from outside the"
-    echo "runtime today** — that needs a pause histogram or a pause log, which is"
-    echo "an observability request rather than a number to estimate."
+    echo "Every pause of every run, from \`WSHARP_GC_PAUSE_LOG\`, pooled into"
+    echo "\`pauses.tsv\`: one row per pause, so the distribution below is"
+    echo "**per-pause**. Beside it, one sample per run from \`WSHARP_GC_STATS=1\`"
+    echo "(\`samples.tsv\`): that run's longest pause, and its total over its count."
+    echo "Percentiles are nearest-rank -- the value at ceil(p/100 * n) of the sorted"
+    echo "samples."
     echo
     echo "A pause is wall-clock time on the mutator thread, so on a loaded or"
     echo "single-core machine it includes time the thread was not scheduled."
@@ -176,7 +192,30 @@ count_rows() { awk -F'\t' 'NR>1 {n++} END {print n+0}' "$SAMPLES"; }
     echo "number as the collector's: a long tail on a busy box is a number to"
     echo "reproduce on a quiet one, not a defect."
     echo
-    echo "## Pause distribution (microseconds)"
+    echo "## Per-pause distribution (microseconds)"
+    echo
+    total_pauses="$(pause_count)"
+    echo "| pauses | n | p50 | p90 | p99 | max |"
+    echo "|---|---|---|---|---|---|"
+    echo "| all | $total_pauses | $(pause_pct 50) | $(pause_pct 90) | $(pause_pct 99) | $(pause_pct 100) |"
+    for kind in initial mark-done evac-done; do
+        echo "| \`$kind\` | $(pause_count "$kind") | $(pause_pct 50 "$kind") | $(pause_pct 90 "$kind") | $(pause_pct 99 "$kind") | $(pause_pct 100 "$kind") |"
+    done
+    echo
+    if [ "$total_pauses" -lt 1000 ]; then
+        echo "**Short of criterion 8.2:** $total_pauses pauses, and the criterion asks for"
+        echo "at least 1,000. Raise \`--repeats\`."
+    else
+        echo "$total_pauses pauses: criterion 8.2's floor of 1,000 is met."
+    fi
+    if [ -s "$TRUNCATED" ]; then
+        echo
+        echo "**A log truncated,** so the population is missing pauses:"
+        echo
+        sed 's/^/- /' "$TRUNCATED"
+    fi
+    echo
+    echo "## Per-run summary (microseconds)"
     echo
     echo "| statistic | p50 | p90 | p99 | max observed |"
     echo "|---|---|---|---|---|"
@@ -209,8 +248,8 @@ count_rows() { awk -F'\t' 'NR>1 {n++} END {print n+0}' "$SAMPLES"; }
         | sort -rn | head -10 \
         | awk -F'\t' '{printf("| `%s` | %s | %s | %s | %s |\n", $2,$3,$1,$4,$5)}'
     echo
-    echo "Raw samples: \`samples.tsv\`."
+    echo "Raw data: \`pauses.tsv\` (one row per pause) and \`samples.tsv\` (one per run)."
 } >"$OUT/report.md"
 
-echo "gc-pauses: $(count_rows) samples; longest pause p50=$(pct 8 50)us p99=$(pct 8 99)us max=$(pct 8 100)us"
+echo "gc-pauses: $(pause_count) pauses over $(count_rows) runs; per pause p50=$(pause_pct 50)us p90=$(pause_pct 90)us p99=$(pause_pct 99)us max=$(pause_pct 100)us"
 echo "gc-pauses: $OUT/report.md"

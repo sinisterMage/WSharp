@@ -1,10 +1,8 @@
 // A fuzz target for `std/toml`: read a file, parse it, say what came of it.
 //
-// The sibling of `fuzz_json.ws` and the same shape. `std/toml` deliberately has
-// no depth bound where `std/json` has `MAX_DEPTH`, on the argument that a
-// manifest is a file with an author -- so a nesting bomb here is an *expected*
-// stack overflow rather than a defect, and the harness's dictionary reflects
-// that by not building one for this target.
+// The sibling of `fuzz_json.ws` and the same shape. Both readers now bound
+// nesting at `MAX_DEPTH`; `std/toml` did not until #49, which this target found:
+// a nesting bomb is refused with a message, like any other malformed document.
 //
 //   wsharp run tests/harness/drivers/fuzz_toml.ws <file>
 const array = @import("std/array");

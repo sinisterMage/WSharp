@@ -1,0 +1,8 @@
+error: `http` is a module, not a value
+  --> tests/cases/err_module_as_value.ws:3:27
+  |
+3 | fn main() i64 { print_int(http); return 0; }
+  |                           ^^^^
+  |
+  = help: name something inside it, as in `http.NotFound404`
+exit 1

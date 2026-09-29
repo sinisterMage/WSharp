@@ -519,25 +519,40 @@ struct Bump {
 
 struct Space {
     meta: Box<SpaceMeta>,
+    /// What the allocator handed back, which `base` is rounded up from.
+    raw: usize,
     layout: Layout,
 }
 
 impl Space {
     fn new() -> Space {
-        // Aligning the whole reservation to the block size is what makes
-        // `(addr - base) >> BLOCK_BITS` a valid block index.
-        let layout =
-            Layout::from_size_align(SPACE_BYTES, BLOCK_BYTES).expect("valid heap space layout");
         // Zeroed so a partially initialised object's fields read as null,
         // which keeps it safe to trace at any moment. Holes are zeroed again
         // when they are refilled, for the same reason.
+        //
+        // **One block more than a space, at the allocator's ordinary
+        // alignment, and rounded up by hand** -- rather than a space aligned
+        // to a block, which is what `(addr - base) >> BLOCK_BITS` needs. The
+        // system allocator answers a zeroed request above its own alignment
+        // with an aligned allocation and a `memset` of the whole of it, so
+        // every worker's first allocation made 64 MiB resident: eight
+        // acceptors were half a gigabyte, and a leak smaller than a space could
+        // not show in the resident set at all. At ordinary alignment the same
+        // request is `calloc`, which hands back fresh pages it knows are zero
+        // and touches none of them (`gc_space_resident.ws`).
+        let layout = Layout::from_size_align(SPACE_BYTES + BLOCK_BYTES, 16)
+            .expect("valid heap space layout");
         let ptr = unsafe { alloc_zeroed(layout) };
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
+        let raw = ptr as usize;
+        let base = (raw + BLOCK_BYTES - 1) & !(BLOCK_BYTES - 1);
         Space {
+            raw,
+            layout,
             meta: Box::new(SpaceMeta {
-                base: ptr as usize,
+                base,
                 states: (0..SPACE_BLOCKS)
                     .map(|_| AtomicU8::new(BlockState::Free as u8))
                     .collect(),
@@ -549,14 +564,13 @@ impl Space {
                     .map(|_| AtomicU64::new(0))
                     .collect(),
             }),
-            layout,
         }
     }
 }
 
 impl Drop for Space {
     fn drop(&mut self) {
-        unsafe { dealloc(self.meta.base as *mut u8, self.layout) };
+        unsafe { dealloc(self.raw as *mut u8, self.layout) };
     }
 }
 
@@ -1031,11 +1045,25 @@ impl Drop for Heap {
     }
 }
 
-/// Add a space to the lock-free directory. Called under the heap lock, so
-/// there is one writer; the count goes last so a reader never sees an entry
-/// that is not yet there.
+/// The directory's one writer at a time.
+///
+/// It used to be "the heap lock", which was one lock when there was one heap.
+/// There is one per worker now, so two workers growing their heaps at once
+/// took two different locks, both read the same count, and one space was
+/// overwritten in the directory and never came back: a space full of live
+/// objects that `in_heap` answered no for and the load barrier could not
+/// resolve (#44). Publishing is once per space, so a lock costs nothing, and
+/// readers still take none.
+static PUBLISHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Add a space to the lock-free directory. Under [`PUBLISHING`], so there is
+/// one writer; the count goes last so a reader never sees an entry that is not
+/// yet there.
 fn publish(meta: &SpaceMeta) {
+    let _writer = PUBLISHING.lock().unwrap_or_else(|e| e.into_inner());
     let index = PUBLISHED_COUNT.load(Ordering::Relaxed);
+    #[cfg(test)]
+    tests::dawdle_in_publish();
     if index >= MAX_SPACES {
         eprintln!("W# heap: out of address space ({MAX_SPACES} spaces of {SPACE_BYTES} bytes)");
         std::process::abort();
@@ -1274,6 +1302,52 @@ mod tests {
         FLAG_LOGGED, TYPE_ID_FIRST_USER, flip_mark_parity, is_marked, test_flag, type_id_of,
     };
     use crate::test_support::SERIAL;
+
+    thread_local! {
+        /// Set by a test that wants `publish` to hold its read of the count
+        /// long enough for another thread to read the same one -- which is
+        /// what two workers growing their heaps at once did by chance.
+        static DAWDLE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn dawdle_in_publish() {
+        if DAWDLE.with(|d| d.get()) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// #44: every space published concurrently is still in the directory.
+    ///
+    /// Four threads publish a space each at the same moment, each pausing
+    /// between reading the count and storing it. With one writer at a time
+    /// that pause is harmless; without, they all read the same count, and
+    /// three of the four spaces are gone from the directory for good.
+    #[test]
+    fn spaces_published_at_once_are_all_in_the_directory() {
+        const THREADS: usize = 4;
+        let start = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    // Leaked, because a published space is never freed: the
+                    // directory holds a pointer to its metadata for ever.
+                    let space: &'static Space = Box::leak(Box::new(Space::new()));
+                    DAWDLE.with(|d| d.set(true));
+                    start.wait();
+                    publish(&space.meta);
+                    space.meta.block_start(0)
+                })
+            })
+            .collect();
+        for t in threads {
+            let first_block = t.join().unwrap();
+            assert!(
+                in_heap(first_block as *const u8),
+                "a space published beside others is missing from the directory"
+            );
+        }
+    }
 
     /// Walking a block reads each object's size from the type registry, so the
     /// tests that walk register a type of the right size.

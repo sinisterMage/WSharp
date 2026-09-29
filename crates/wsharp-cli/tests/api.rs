@@ -26,16 +26,14 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// The emit, with the scratch directory's path replaced by `DIR` -- otherwise
-/// the expectation would be about where the test happened to run.
+/// The emit, exactly as a reader receives it.
 ///
-/// The needle is built the way the loader builds a module path rather than from
-/// `dir` as it was spelled here, and both halves of that matter on Windows:
-/// `canonicalize` resolves the short 8.3 form `temp_dir` may hand back, and
-/// `module_path_of` writes the result with `/` separators. Calling the loader's
-/// own function is the point -- a second copy of that rule here would be a
-/// second thing to keep in step, and this test exists to notice when the first
-/// one changes.
+/// No substitution: this used to replace the scratch directory's path with
+/// `DIR` before comparing, which is exactly the workaround a caller in the real
+/// world does not get -- and so the golden passed on every machine while the
+/// property it should have caught, that one source emits one set of bytes, went
+/// untested (#26). Module names are portable now, and the golden holds them to
+/// it as printed.
 fn emit(dir: &Path, root: &str) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_wsharp"))
         .arg("check")
@@ -48,9 +46,7 @@ fn emit(dir: &Path, root: &str) -> String {
         "`--emit=api` failed:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let canonical = dir.canonicalize().expect("the scratch directory is there");
-    let needle = wsharp_cli::load::module_path_of(&canonical);
-    String::from_utf8_lossy(&out.stdout).replace(&needle, "DIR")
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 #[test]
@@ -81,36 +77,52 @@ fn main() i64 { return 0; }
     )
     .expect("a root module");
 
-    let expected = r#"(api 1)
+    let expected = r#"(api 2)
 (module "main"
-  (import fw "DIR/fw.ws")
+  (import fw "fw.ws")
   (pub const ROUTE_Show (str "GET /users/:id"))
   (const LIMIT (int 64))
-  (pub struct Show (parent "DIR/fw.ws".Route)
+  (pub struct Show (parent "fw.ws".Route)
     (field id i64)
     (field page (optional i64)))
   (pub fn action
     (param r "main".Show)
-    (ret "DIR/fw.ws".Response))
+    (ret "fw.ws".Response))
   (pub fn first (generics T)
     (param xs (array T))
     (ret (optional T)))
   (pub fn risky
     (param n i64)
     (ret (errunion i64 (errors BadFormat))))
-  (pub const alias_ok (alias "DIR/fw.ws".ok))
+  (pub const alias_ok (alias "fw.ws".ok))
   (fn main
     (ret i64)))
-(module "DIR/fw.ws"
+(module "fw.ws"
   (pub struct Route)
   (pub struct Response
     (field code i64)
     (field body str))
   (pub fn ok
     (param b str)
-    (ret "DIR/fw.ws".Response)))
+    (ret "fw.ws".Response)))
 "#;
     assert_eq!(emit(&dir, "app.ws"), expected);
+    // And the same bytes for the root named as a bare file in the working
+    // directory, which is how a generator that writes its own root and then
+    // runs `wsharp check --emit=api root.ws` beside it calls this. Its parent
+    // is the *empty* path rather than none, which used to leave no directory
+    // to name the others from, so every module came out absolute again.
+    let out = Command::new(env!("CARGO_BIN_EXE_wsharp"))
+        .current_dir(&dir)
+        .args(["check", "app.ws", "--emit=api"])
+        .output()
+        .expect("wsharp runs");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        expected,
+        "stderr was:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -140,11 +152,11 @@ fn a_reexport_names_the_module_it_came_from() {
 
     let out = emit(&dir, "root.ws");
     assert!(
-        out.contains("(pub const Pair (alias \"DIR/inner.ws\".Pair))"),
+        out.contains("(pub const Pair (alias \"inner.ws\".Pair))"),
         "a re-exported type names its origin:\n{out}"
     );
     assert!(
-        out.contains("(pub const twice (alias \"DIR/inner.ws\".twice))"),
+        out.contains("(pub const twice (alias \"inner.ws\".twice))"),
         "a re-exported function names its origin:\n{out}"
     );
     let _ = std::fs::remove_dir_all(&dir);

@@ -94,7 +94,7 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/wsharp-conform-XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 # A snapshot must not carry anything that differs between two machines that are
-# both right. Three things do:
+# both right. Four things do:
 #
 #   - the path the case was given, which differs by checkout directory. The case
 #     is invoked by a path relative to the repository root, so the rendered
@@ -102,14 +102,23 @@ trap 'rm -rf "$WORK"' EXIT
 #     Windows runner rendering it with backslashes.
 #   - temporary directories, for a case that names one.
 #   - the collector's statistics line, if the environment turned it on.
+#   - the C library's `strerror` text inside an `(os error N)`. The number is
+#     the errno and is the same fact everywhere; the words in front of it are
+#     the platform's, and Windows and the BSDs phrase the same errno
+#     differently. `err_import_missing_file` is the one case that names a
+#     missing file, and on the first real run the four triples disagreed on
+#     nothing but this string -- which is a property of `strerror`, not of W#.
+#     The errno is kept, so a case that fails for a *different* reason (EACCES
+#     against ENOENT) still differs.
 #
 # Everything else -- every column of every caret -- is compared. Anything added
 # to this list is a thing the conformance gate stops checking, so the list is
 # short and each entry says why it is here.
 conform_normalise() {
-    sed -e '/^W# gc: /d' \
+    sed -e '/^W# gc[: ]/d' \
         -e 's|\\|/|g' \
-        -e 's|/tmp/[A-Za-z0-9_./-]*|<tmp>|g'
+        -e 's|/tmp/[A-Za-z0-9_./-]*|<tmp>|g' \
+        -E -e 's/: [^:()]*\((os error [0-9][0-9]*)\)$/: (\1)/'
 }
 
 # Run one verb over one case and print its stderr, normalised. stdout is

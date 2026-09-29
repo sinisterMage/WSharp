@@ -43,10 +43,23 @@
 #
 # ## Subjects
 #
-# `$SOAK_DIR/subjects.tsv`, so adding a subject is a diff somebody reviews
-# rather than a change to this script:
+# `subjects.tsv`, so adding a subject is a diff somebody reviews rather than a
+# change to this script:
 #
 #     compiler<TAB>Dex<TAB>tests/harness/nightly.sh, once a day
+#     ecosystem<TAB>Ash<TAB>the ecosystem check<TAB>x86_64-unknown-linux-gnu,aarch64-apple-darwin
+#
+# An optional fourth field lists the platforms every day must cover. A day with
+# a row for some of them and not others is *incomplete*, and fails exactly as a
+# missing day does: "on all four release triples" is part of the gate, and a
+# day that three triples reported is a day the fourth did not.
+#
+# The manifest is `--subjects FILE` when given, else `$SOAK_DIR/subjects.tsv`
+# when there is one, else the repository's own `soak/subjects.tsv` beside this
+# script. The last is the ordinary case: the rows live on the `soak-log`
+# branch, which holds rows and nothing else, and the list of subjects is a fact
+# about the project -- so `--dir <a checkout of soak-log>/soak` reads the one
+# with the other. Which manifest was read is printed.
 #
 # ## Exit status
 #
@@ -66,6 +79,7 @@ set -eu
 
 WINDOW="${SOAK_WINDOW_DAYS:-28}"
 SOAK_DIR="${SOAK_DIR:-soak}"
+SUBJECTS=""
 END=""
 MODE=report
 
@@ -81,6 +95,7 @@ while [ $# -gt 0 ]; do
 	case "$1" in
 	--window) WINDOW="$2"; shift 2 ;;
 	--dir) SOAK_DIR="$2"; shift 2 ;;
+	--subjects) SUBJECTS="$2"; shift 2 ;;
 	--end) END="$2"; shift 2 ;;
 	--append) MODE=append; shift ;;
 	--subject) A_SUBJECT="$2"; shift 2 ;;
@@ -89,7 +104,7 @@ while [ $# -gt 0 ]; do
 	--platform) A_PLATFORM="$2"; shift 2 ;;
 	--detail) A_DETAIL="$2"; shift 2 ;;
 	--date) A_DATE="$2"; shift 2 ;;
-	-h | --help) sed -n '2,72p' "$0"; exit 0 ;;
+	-h | --help) sed -n '2,76p' "$0"; exit 0 ;;
 	*) echo "soak-report: unknown argument $1" >&2; exit 2 ;;
 	esac
 done
@@ -126,7 +141,10 @@ fi
 
 # --- reporting ---------------------------------------------------------------
 
-SUBJECTS="$SOAK_DIR/subjects.tsv"
+if [ -z "$SUBJECTS" ]; then
+	SUBJECTS="$SOAK_DIR/subjects.tsv"
+	[ -f "$SUBJECTS" ] || SUBJECTS="$(cd "$(dirname "$0")/.." && pwd)/soak/subjects.tsv"
+fi
 [ -f "$SUBJECTS" ] || {
 	note "cannot answer: no subject manifest at $SUBJECTS"
 	note ""
@@ -154,6 +172,7 @@ done
 
 note "soak window    $WINDOW days ending $END (UTC)"
 note "rows           $SOAK_DIR/<subject>.tsv"
+note "subjects       $SUBJECTS"
 note ""
 
 fail=0
@@ -163,10 +182,11 @@ subject_count=0
 # terminal. One line per subject, one character per day, oldest on the left:
 #
 #     .  reported and passed        x  reported and failed        ?  no row
+#     -  reported by some of the platforms the subject names, all passing
 note "Calendar, oldest day first:"
 note ""
 
-while IFS='	' read -r subject owner what; do
+while IFS='	' read -r subject owner what platforms; do
 	case "$subject" in
 	'' | '#'*) continue ;;
 	esac
@@ -176,6 +196,7 @@ while IFS='	' read -r subject owner what; do
 	calendar=""
 	missing=""
 	failed=""
+	incomplete=""
 	# Oldest first, so the calendar reads left to right like a calendar.
 	i="$WINDOW"
 	while [ "$i" -gt 0 ]; do
@@ -198,15 +219,31 @@ while IFS='	' read -r subject owner what; do
 			calendar="${calendar}x"
 			failed="$failed $day"
 		else
-			calendar="$calendar."
+			# Every row passed; did every platform the subject names write one?
+			absent=""
+			for p in $(printf '%s' "$platforms" | tr ',' ' '); do
+				awk -F'\t' -v d="$day" -v s="$subject" -v p="$p" \
+					'$1==d && $2==s && $5==p {found=1} END {exit !found}' "$file" ||
+					absent="$absent,$p"
+			done
+			if [ -n "$absent" ]; then
+				calendar="${calendar}-"
+				incomplete="$incomplete $day:${absent#,}"
+			else
+				calendar="$calendar."
+			fi
 		fi
 	done
 
 	printf '  %-14s %s\n' "$subject" "$calendar"
 
-	if [ -n "$missing" ] || [ -n "$failed" ]; then
+	if [ -n "$missing" ] || [ -n "$failed" ] || [ -n "$incomplete" ]; then
 		fail=1
 		[ -n "$missing" ] && printf '    %-12s %s\n' "no row:" "${missing# }"
+		for entry in $incomplete; do
+			printf '    %-12s %s, no row for %s\n' "incomplete:" "${entry%%:*}" \
+				"$(printf '%s' "${entry#*:}" | sed 's/,/, /g')"
+		done
 		if [ -n "$failed" ]; then
 			printf '    %-12s %s\n' "failed:" "${failed# }"
 			for day in $failed; do
@@ -221,6 +258,7 @@ done <"$SUBJECTS"
 
 note ""
 note "  .  reported and passed    x  reported and failed    ?  no row"
+note "  -  passed, but a platform the subject names did not report"
 note ""
 
 if [ "$subject_count" -eq 0 ]; then

@@ -236,7 +236,7 @@ const text = @import("std/str");
 fn main() i64 {
     const a = os.args();
     const out = p.run(p.command(a[0], []str{ "check", a[1], "--emit=api" }), 5000) catch return 1;
-    if (!p.success(out.status) or !text.starts_with(out.stdout, "(api 1)\n") or !text.eq(out.stderr, "")) { return 2; }
+    if (!p.success(out.status) or !text.starts_with(out.stdout, "(api 2)\n") or !text.eq(out.stderr, "")) { return 2; }
     return 0;
 }
 "#);

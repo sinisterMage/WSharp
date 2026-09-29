@@ -20,7 +20,7 @@
 //! Arguments are copied out of the heap before the region is entered, for the
 //! same reason an allocating builtin copies before it allocates.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::builtins::ERROR_IO_FAILED;
 use crate::io::FallibleI64;
@@ -51,37 +51,114 @@ struct Entry {
     last_peer: i64,
 }
 
-/// Open sockets, indexed by the handle W# holds.
+/// Things W# names by number: a slot index in the low 32 bits of the handle
+/// and the slot's generation above it.
 ///
-/// A slot is emptied rather than removed when a socket is closed, so a handle
-/// is never reused while a program might still be holding it: closing twice, or
-/// reading from a closed socket, is then a reported error rather than an
-/// operation on whatever opened next.
-static SOCKETS: Mutex<Vec<Option<Entry>>> = Mutex::new(Vec::new());
+/// A closed slot is reused, under the next generation. It used to be emptied
+/// and never reused, so that a handle kept past `close` could never name
+/// whatever opened next -- and so a server grew by one slot for every
+/// connection it ever accepted, for as long as it ran: 25 bytes a connection,
+/// which a 28-day soak turns into its resident set doubling. The generation
+/// keeps the first property without the second: a stale handle's generation is
+/// not the slot's any more, so it names nothing, and closing twice or reading
+/// from a closed socket is still a reported error. A slot's first use is
+/// generation 0, so a program that never closes sees the handles it always did.
+struct Handles<T> {
+    slots: Vec<(u32, Option<T>)>,
+    free: Vec<u32>,
+}
 
-fn with_sockets<R>(f: impl FnOnce(&mut Vec<Option<Entry>>) -> R) -> R {
+impl<T> Handles<T> {
+    const fn new() -> Self {
+        Handles {
+            slots: Vec::new(),
+            free: Vec::new(),
+        }
+    }
+
+    /// Where `handle` points, if it is one this table could have made.
+    fn split(handle: i64) -> Option<(usize, u32)> {
+        if handle < 0 {
+            return None;
+        }
+        Some(((handle & 0xffff_ffff) as usize, (handle >> 32) as u32))
+    }
+
+    fn insert(&mut self, value: T) -> i64 {
+        let index = match self.free.pop() {
+            Some(index) => index as usize,
+            None => {
+                self.slots.push((0, None));
+                self.slots.len() - 1
+            }
+        };
+        let slot = &mut self.slots[index];
+        slot.1 = Some(value);
+        (i64::from(slot.0) << 32) | index as i64
+    }
+
+    fn get(&self, handle: i64) -> Option<&T> {
+        let (index, generation) = Self::split(handle)?;
+        let (current, value) = self.slots.get(index)?;
+        if *current != generation {
+            return None;
+        }
+        value.as_ref()
+    }
+
+    fn get_mut(&mut self, handle: i64) -> Option<&mut T> {
+        let (index, generation) = Self::split(handle)?;
+        let (current, value) = self.slots.get_mut(index)?;
+        if *current != generation {
+            return None;
+        }
+        value.as_mut()
+    }
+
+    /// Forget what `handle` names, and give its slot back under the next
+    /// generation. Removing twice answers `None` the second time.
+    fn remove(&mut self, handle: i64) -> Option<T> {
+        let (index, generation) = Self::split(handle)?;
+        let slot = self.slots.get_mut(index)?;
+        if slot.0 != generation {
+            return None;
+        }
+        let value = slot.1.take()?;
+        // 31 bits, so a handle is never negative -- negative is how a builtin
+        // says it failed.
+        slot.0 = (slot.0 + 1) & 0x7fff_ffff;
+        self.free.push(index as u32);
+        Some(value)
+    }
+
+    fn take_all(&mut self) -> Vec<T> {
+        self.free.clear();
+        self.slots.drain(..).filter_map(|(_, v)| v).collect()
+    }
+}
+
+/// Open sockets, named by the handle W# holds.
+static SOCKETS: Mutex<Handles<Entry>> = Mutex::new(Handles::new());
+
+fn with_sockets<R>(f: impl FnOnce(&mut Handles<Entry>) -> R) -> R {
     let mut guard = SOCKETS.lock().unwrap_or_else(|e| e.into_inner());
     f(&mut guard)
 }
 
 fn insert(fd: Fd, kind: Kind) -> i64 {
     with_sockets(|table| {
-        table.push(Some(Entry {
+        table.insert(Entry {
             fd,
             kind,
             last_peer: -1,
-        }));
-        (table.len() - 1) as i64
+        })
     })
 }
 
 /// The socket a handle names, whatever kind it is. For the operations that do
 /// not care -- asking a port, setting non-blocking, closing.
 fn lookup_any(handle: i64) -> Option<Fd> {
-    if handle < 0 {
-        return None;
-    }
-    with_sockets(|table| Some((*table.get(handle as usize)?)?.fd))
+    with_sockets(|table| Some(table.get(handle)?.fd))
 }
 
 /// Addresses datagrams arrived from, indexed by the peer handle W# holds.
@@ -108,11 +185,8 @@ fn peer_at(handle: i64) -> Option<sys::SockAddr> {
 
 /// The socket a handle names, if it is one and is still open.
 fn lookup(handle: i64, kind: Kind) -> Option<Fd> {
-    if handle < 0 {
-        return None;
-    }
     with_sockets(|table| {
-        let entry = (*table.get(handle as usize)?)?;
+        let entry = table.get(handle)?;
         (entry.kind == kind).then_some(entry.fd)
     })
 }
@@ -406,12 +480,7 @@ pub unsafe extern "C" fn ws_net_shutdown(out: *mut FallibleI64, socket: i64, rea
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_close(socket: i64) {
     unsafe { crate::gc::checkpoint() };
-    let taken = with_sockets(|table| {
-        if socket < 0 {
-            return None;
-        }
-        table.get_mut(socket as usize)?.take()
-    });
+    let taken = with_sockets(|table| table.remove(socket));
     if let Some(entry) = taken {
         // Closing can block on a socket with data still queued.
         crate::worker::blocking(|| sys::close_socket(entry.fd));
@@ -537,7 +606,7 @@ pub unsafe extern "C" fn ws_net_recv_from(out: *mut crate::io::FallibleStr, sock
         Ok((n, from)) => {
             let peer = remember_peer(from);
             with_sockets(|table| {
-                if let Some(Some(entry)) = table.get_mut(socket as usize) {
+                if let Some(entry) = table.get_mut(socket) {
                     entry.last_peer = peer;
                 }
             });
@@ -556,10 +625,7 @@ pub unsafe extern "C" fn ws_net_recv_from(out: *mut crate::io::FallibleStr, sock
 pub unsafe extern "C" fn ws_net_last_peer(out: *mut FallibleI64, socket: i64) {
     unsafe { crate::gc::checkpoint() };
     let peer = with_sockets(|table| {
-        if socket < 0 {
-            return None;
-        }
-        let entry = (*table.get(socket as usize)?)?;
+        let entry = table.get(socket)?;
         (entry.last_peer >= 0).then_some(entry.last_peer)
     });
     let result = match peer {
@@ -590,22 +656,31 @@ struct Watch {
     last: Vec<(i64, bool, bool)>,
 }
 
-static POLLERS: Mutex<Vec<Option<Watch>>> = Mutex::new(Vec::new());
+/// Every poller, each behind a lock of its own.
+///
+/// **The table's lock is held only to find a poller, never while using one.**
+/// It used to be the only lock, and `ws_net_wait` held it across the wait
+/// itself -- so while one worker waited on its own poller, every other
+/// thread's `net.poller()`, `watch`, `forget`, `wait` and result reads, on any
+/// poller, waited with it; `net.poller()` outside a safe region, and with a
+/// timeout of -1 for ever. So a lookup clones the poller's `Arc` and lets the
+/// table go before locking the poller: the two locks are taken one after the
+/// other and never nested. A poller closed while another thread is waiting on
+/// it leaves the table at once and is dropped -- its descriptor closed -- when
+/// that wait returns, so a wait never polls a descriptor that has been reused.
+static POLLERS: Mutex<Handles<Arc<Mutex<Watch>>>> = Mutex::new(Handles::new());
 
-fn with_pollers<R>(f: impl FnOnce(&mut Vec<Option<Watch>>) -> R) -> R {
+fn with_pollers<R>(f: impl FnOnce(&mut Handles<Arc<Mutex<Watch>>>) -> R) -> R {
     let mut guard = POLLERS.lock().unwrap_or_else(|e| e.into_inner());
     f(&mut guard)
 }
 
-/// Run `f` on the poller a handle names.
+/// Run `f` on the poller a handle names, holding that poller's lock and no
+/// other.
 fn with_watch<R>(handle: i64, f: impl FnOnce(&mut Watch) -> R) -> Option<R> {
-    if handle < 0 {
-        return None;
-    }
-    with_pollers(|table| {
-        let slot = table.get_mut(handle as usize)?;
-        slot.as_mut().map(f)
-    })
+    let watch = with_pollers(|table| table.get(handle).cloned())?;
+    let mut guard = watch.lock().unwrap_or_else(|e| e.into_inner());
+    Some(f(&mut guard))
 }
 
 /// A new poller, watching nothing.
@@ -618,12 +693,11 @@ pub unsafe extern "C" fn ws_net_poller(out: *mut FallibleI64) {
     let result = match sys::Poller::new() {
         Ok(poller) => {
             let handle = with_pollers(|table| {
-                table.push(Some(Watch {
+                table.insert(Arc::new(Mutex::new(Watch {
                     poller,
                     watched: Vec::new(),
                     last: Vec::new(),
-                }));
-                (table.len() - 1) as i64
+                })))
             });
             FallibleI64::ok(handle)
         }
@@ -774,14 +848,7 @@ pub unsafe extern "C" fn ws_net_ready_events(out: *mut FallibleI64, poller: i64,
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ws_net_close_poller(poller: i64) {
     unsafe { crate::gc::checkpoint() };
-    with_pollers(|table| {
-        if poller < 0 {
-            return;
-        }
-        if let Some(slot) = table.get_mut(poller as usize) {
-            *slot = None;
-        }
-    });
+    with_pollers(|table| table.remove(poller));
 }
 
 /// Close every socket still open, at exit.
@@ -789,8 +856,8 @@ pub unsafe extern "C" fn ws_net_close_poller(poller: i64) {
 /// Not for tidiness -- the process is ending and the kernel would do it -- but
 /// so that a listener's port is released before the next test binds it.
 pub fn close_all() {
-    let entries = with_sockets(std::mem::take);
-    for entry in entries.into_iter().flatten() {
+    let entries = with_sockets(Handles::take_all);
+    for entry in entries {
         sys::close_socket(entry.fd);
     }
 }
@@ -810,9 +877,32 @@ mod tests {
             "a stream is not a listener, and the table says which is which"
         );
 
-        with_sockets(|table| table[handle as usize] = None);
+        assert!(with_sockets(|table| table.remove(handle)).is_some());
         assert!(lookup(handle, Kind::Stream).is_none());
         assert!(lookup(-1, Kind::Stream).is_none());
         assert!(lookup(i64::MAX, Kind::Stream).is_none());
+    }
+
+    /// A closed slot is reused, so the table stops growing with every
+    /// connection a server has ever accepted -- and the handle it is reused
+    /// under is a new one, so the old handle still names nothing.
+    #[test]
+    fn a_reused_slot_does_not_answer_to_its_old_handle() {
+        let mut table: Handles<u8> = Handles::new();
+        let first = table.insert(1);
+        assert_eq!(first, 0, "a slot's first use is generation 0");
+        for round in 0..10_000u32 {
+            let handle = table.insert(2);
+            assert_eq!(table.get(handle), Some(&2));
+            assert_eq!(table.remove(handle), Some(2));
+            assert_eq!(table.get(handle), None, "round {round}: a closed handle");
+            assert_eq!(table.remove(handle), None, "round {round}: closing twice");
+        }
+        assert_eq!(table.slots.len(), 2, "ten thousand connections, two slots");
+        assert_eq!(table.get(first), Some(&1), "an open handle is untouched");
+        let reused = table.insert(3);
+        assert_eq!(reused & 0xffff_ffff, 1, "the freed slot is taken again");
+        assert_ne!(reused, 1, "under a generation of its own");
+        assert!(reused > 0, "and a handle is never negative");
     }
 }

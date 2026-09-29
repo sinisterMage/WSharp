@@ -1,0 +1,8 @@
+error: cannot assign to `x`, which is `const`
+  --> tests/cases/err_for_loop_var_is_const.ws:3:31
+  |
+3 |     for ([]i64{ 1, 2 }) |x| { x = 3; }
+  |                               ^
+  |
+  = help: declare it with `var` to make it mutable
+exit 1

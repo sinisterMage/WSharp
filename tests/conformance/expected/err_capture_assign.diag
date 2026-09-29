@@ -1,0 +1,8 @@
+error: cannot assign to `count`, which this closure captured
+  --> tests/cases/err_capture_assign.ws:4:31
+  |
+4 |     const bump = fn () void { count = count + 1; };
+  |                               ^^^^^
+  |
+  = help: closures capture by value, so captured bindings are read-only
+exit 1

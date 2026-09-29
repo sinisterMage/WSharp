@@ -1,0 +1,9 @@
+error: `Point` is declared more than once
+  --> tests/cases/err_duplicate_struct.ws:4:7
+  |
+4 | const Point = struct { y: i64 };
+  |       ^^^^^
+  |
+3 | const Point = struct { x: i64 };
+  |       ^^^^^ first declared here
+exit 1

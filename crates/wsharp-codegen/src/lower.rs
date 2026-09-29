@@ -1416,10 +1416,7 @@ impl<M: Module> Trans<'_, '_, M> {
 
             hir::ExprKind::ArrayLen { arr } => {
                 let array = self.expr(arr)[0];
-                let len = self
-                    .b
-                    .ins()
-                    .load(types::I64, MemFlagsData::trusted(), array, AUX_OFFSET);
+                let len = self.array_len(array);
                 SmallVec::from_slice(&[len])
             }
 
@@ -2857,15 +2854,42 @@ impl<M: Module> Trans<'_, '_, M> {
         self.b.ins().iadd(arr, offset)
     }
 
-    /// Panic unless `index` is a valid index into `arr`.
+    /// The length of `arr`, where a null array has none.
     ///
-    /// One *unsigned* compare against the length, which rejects a negative
-    /// index in the same instruction: as a `u64`, `-1` is enormous.
-    fn check_bounds(&mut self, arr: ir::Value, index: ir::Value) {
+    /// Null is what an element of `array.new(n)` holds until it is assigned:
+    /// the element type is a reference and the allocator zeroes the slot. The
+    /// runtime has always read that as empty -- `ws_array_len` answers 0 and
+    /// `str_bytes` no bytes -- and the inline length has to agree, or
+    /// `array.len(a)` says 0 while `a[0]` and `for (a)` read the header of an
+    /// object that is not there, which was a segfault with no diagnostic
+    /// (#67). So a null array is empty everywhere: indexing one is an index
+    /// out of bounds, and iterating one does nothing.
+    fn array_len(&mut self, arr: ir::Value) -> ir::Value {
+        let load = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I64);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        self.brif(arr, load, NO_ARGS, done, &[BlockArg::Value(zero)]);
+
+        self.switch(load);
         let len = self
             .b
             .ins()
             .load(types::I64, MemFlagsData::trusted(), arr, AUX_OFFSET);
+        self.jump_to(done, &[BlockArg::Value(len)]);
+
+        self.switch(done);
+        self.b.block_params(done)[0]
+    }
+
+    /// Panic unless `index` is a valid index into `arr`.
+    ///
+    /// One *unsigned* compare against the length, which rejects a negative
+    /// index in the same instruction: as a `u64`, `-1` is enormous. A null
+    /// array has length 0 (see [`Self::array_len`]), so every index into one
+    /// fails here, before its address is ever formed.
+    fn check_bounds(&mut self, arr: ir::Value, index: ir::Value) {
+        let len = self.array_len(arr);
         let ok = self
             .b
             .ins()

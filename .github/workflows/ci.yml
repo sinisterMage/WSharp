@@ -140,6 +140,12 @@ jobs:
       # every verdict and all three exit statuses.
       - name: conform.sh tells a rotted diagnostic from an intact one
         run: tests/harness/conform-selftest.sh
+      # Same argument for the fuzzer. `fuzz.pl --target run` executes the
+      # program, and a valid program may run for ever; telling that from a
+      # compiler hang is a differential (`check` and `build` on the same bytes),
+      # and a fuzzer that lost it would fail every night on a non-defect (#52).
+      - name: fuzz.pl tells a compiler hang from a program that ran long
+        run: tests/harness/fuzz-selftest.sh
       - name: soak-report.sh answers criterion 1
         run: scripts/soak-report-selftest.sh
 

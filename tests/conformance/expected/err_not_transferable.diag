@@ -1,0 +1,15 @@
+error: `fn(i64) i64` cannot be sent to another worker
+  --> tests/cases/err_not_transferable.ws:6:16
+  |
+6 |     const fs = gc_transfer([]fn(i64) i64{ twice });
+  |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = help: a worker has a heap of its own, so a value is copied to reach it -- and a function value captures an environment that belongs to the heap it was made in
+error: `Holder` cannot be sent to another worker, because `fn(i64) i64` cannot
+  --> tests/cases/err_not_transferable.ws:7:16
+  |
+7 |     const hs = gc_transfer([]Holder{ Holder{ .f = twice } });
+  |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = help: a worker has a heap of its own, so a value is copied to reach it -- and a function value captures an environment that belongs to the heap it was made in
+exit 1

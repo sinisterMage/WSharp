@@ -1,0 +1,8 @@
+error: `try` in a function that cannot fail
+  --> tests/cases/err_try_in_infallible.ws:3:24
+  |
+3 | fn main() i64 { return try risky(1); }
+  |                        ^^^^^^^^^^^^
+  |
+  = help: this function returns `i64`; change it to `!i64` to propagate errors
+exit 1

@@ -1,0 +1,8 @@
+error: comparison operators cannot be chained
+  --> tests/cases/err_chained_comparison.ws:2:27
+  |
+2 | fn main() i64 { if (1 < 2 < 3) { return 1; } return 0; }
+  |                           ^
+  |
+  = help: split the comparison, e.g. `a < b and b < c`
+exit 1

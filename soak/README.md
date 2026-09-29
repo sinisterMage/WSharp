@@ -11,6 +11,19 @@ scripts/soak-report.sh --window 7            # a shorter look
 scripts/soak-report.sh --end 2026-10-24      # a window that ended in the past
 ```
 
+The rows the scheduled jobs write are not here: they are appended to the
+`soak-log` branch, which holds `soak/<subject>.tsv` and nothing else, so that a
+job running every night never puts an unreviewed commit on `main`. Read them
+from a checkout of it; the subjects still come from this directory's
+`subjects.tsv`, which is what `soak-report.sh` falls back to when the directory
+it is pointed at has none:
+
+```sh
+git fetch origin soak-log
+git worktree add ../soak-log origin/soak-log
+scripts/soak-report.sh --dir ../soak-log/soak
+```
+
 It exits 0 only when every subject in `subjects.tsv` has a row for every day of
 the window and every one of those rows passed. **A missing row is a failure**, by
 design: a soak that stopped reporting is a soak that stopped, and a report that
@@ -38,17 +51,21 @@ caught rather than credited to the wrong owner.
 Several rows for one subject on one day are expected — a subject run on four
 triples writes four. The day counts as reported when at least one row exists,
 and fails when **any** row for it failed: a batch that passed on three platforms
-and failed on the fourth did not pass.
+and failed on the fourth did not pass. A subject whose line in `subjects.tsv`
+names its platforms needs a row from **each** of them every day, and a day that
+three of four reported is `-` in the calendar and fails as a missing day does:
+"on all four release triples" is part of the gate, not a hope.
 
 ## Subjects
 
 `subjects.tsv`, so adding one is a diff somebody reviews rather than a change to
-the script.
+the script: name, owner, what it is, and optionally the comma-separated
+platforms every day must cover.
 
 | Subject | Owner | What it is |
 |---|---|---|
 | `compiler` | Dex | `tests/harness/nightly.sh` once a day — parity across the three execution modes, the fuzz corpus, the pause measurements |
-| `ecosystem` | Ash | the `.wsharp` ecosystem check, one full run per day on all four release triples |
+| `ecosystem` | Ash | `scripts/ecosystem-check.sh`, run by `.github/workflows/ecosystem.yml` once a day on each of the four release triples, each of which must report |
 | `raython` | Wren | the Raython sample application, a long-running HTTP server |
 
 A subject with no rows is not a subject that is doing fine — it is a `?` for

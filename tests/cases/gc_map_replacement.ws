@@ -1,7 +1,19 @@
 // expect: 12
+// timeout: 1200
 // Replacing a map in a retained struct used to leave freed fresh objects in
 // the nursery. Normal GC crashed when the marker followed those stale roots;
 // collecting at every allocation hid the failure. Keep the original workload.
+//
+// `timeout: 1200` because the workload is 1.2 M allocations and `--gc-stress`
+// collects at every one of them. On two nights the stress run passed
+// `parity.sh`'s 300 s default on a different set of x86-64 runners each time --
+// how far past it was not measured, because the run was killed there -- while
+// aarch64, which does it in ~256 s, agreed on all three modes; the whole-corpus
+// `--gc-stress` pass in the Rust suite (which has no per-case bound) finishes
+// it, so this is cost and not a hang (#50). 1200 s is four times the default,
+// not a measured figure plus a margin. The bound is named
+// here rather than raised globally so a real hang on any other case still
+// surfaces in 300 s.
 const map = @import("std/map");
 const text = @import("std/str");
 const Entry = struct { size: i64, modified: i64, digest: str };

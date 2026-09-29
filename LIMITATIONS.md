@@ -427,6 +427,56 @@ not — that is the design test, not a workaround for a missing feature.
 **Tracked.** No issue; deliberate, and stated here because it is the constraint
 people meet when they first reach for subtyping across a transport boundary.
 
+## A tail `return f()` fixes an inferred error set to `f`'s
+
+**What.** In a function whose error set is inferred, `return f()` -- returning
+another fallible call's result as it stands -- makes the function's error set
+*equal* to `f`'s, where a `try` anywhere else only adds to it. So an earlier
+`try` of something that raises more is refused, and the diagnostic points at
+that `try` rather than at the `return` that decided the set:
+
+```
+fn first() !i64 { return error.First; }
+fn last() !i64 { return error.Last; }
+fn combine() !i64 {
+    const value = try first();
+    return last();
+}
+```
+
+```
+error: this raises `{First}`, which this function cannot
+  --> probe.ws:4:19
+  |
+4 |     const value = try first();
+  |                   ^^^^^^^^^^^
+  |
+  = help: this function's error set is `{Last}`; widen it, or catch what it does not cover
+```
+
+**Why.** A `return` of an error union unifies the whole type with the
+function's own, error set included, while `try` contributes a subset edge. Making
+a tail call contribute a subset edge too is a change to inference, and in a group
+of mutually recursive functions it would *narrow* sets that are inferred today --
+so a caller comparing an error against a name no longer in the set would stop
+compiling, which Part one of `RELEASE-CRITERIA-1.0.md` counts as breaking. That
+is a language decision, not one to slip in under a freeze.
+
+**Workaround.** `return try last();` -- one word, and it widens the set as a
+`try` does anywhere: both `First` and `Last` then reach the caller. Or write the
+error set down, `!{First, Last}i64`.
+
+**Disposition: documented limitation for 1.0, pending the language owner's
+confirmation on #62.** The rule is also stated in `CLAUDE.md` ("`return f(x)`
+unifies two error sets; `try f(x); return;` widens one"), which is where
+`std/tls`'s dispatchers learnt to be written the second way.
+
+**Guarded by** `tests/cases/err_tail_call_error_set.ws`, the refusal, and
+`tests/cases/tail_call_error_set_try.ws`, the workaround reaching both errors.
+
+**Tracked.** [#62](https://github.com/sinisterMage/WSharp/issues/62), open for
+that decision.
+
 ## There is no `defer`
 
 **What.** No `defer`, no destructor, no RAII. A resource is released by the code
@@ -679,6 +729,74 @@ claimed.
 **Tracked.** [#11](https://github.com/sinisterMage/WSharp/issues/11), closed as a
 documented limitation. `RELEASE-CRITERIA-1.0.md` states that 1.0 does not add a
 supported platform.
+
+## `wsharp build` on Windows needs clang or MSVC, not MinGW
+
+**What.** `wsharp build` links with `cc`, and on Windows the flags it passes are
+MSVC's. If the `cc` it finds is MinGW's `gcc`, the link fails:
+
+```
+> wsharp build hello.ws -o hello.exe
+error: linking failed:
+ld.exe: Error: unable to disambiguate: -subsystem:console (did you mean --subsystem:console ?)
+collect2.exe: error: ld returned 1 exit status
+```
+
+`wsharp run` is unaffected on every platform — it compiles into its own process
+and calls no linker — so this is `build` alone.
+
+The reason it is worth an entry rather than a line in the README is **who meets
+it**. `cc` on a Windows machine is whatever is first on `PATH`, and a developer
+machine with Git for Windows, MSYS2 or a MinGW toolchain installed has one there
+without having chosen it. GitHub's `windows-latest` image is exactly that
+machine, which is how this was found: criterion 7's Windows row failed on it
+while the same release built fine under clang.
+
+**Why.** The Windows flags are not decoration. `-Xlinker -subsystem:console` is
+there because clang picks a subsystem by looking for `main` in the *objects* it
+was handed, and W#'s `main` is in `libwsharp_start.a` — a library — so without
+it the MSVC linker has no entry point at all. `-nodefaultlib:libcmt
+-defaultlib:msvcrt` is there because Rust's MSVC target links the dynamic CRT
+and clang's driver defaults to the static one, and handing a Rust staticlib to
+the static CRT is not a near miss. Both are written out at
+`crates/wsharp-cli/src/link.rs:91`.
+
+Supporting GNU `ld` as well means a second set of flags, selected by detecting
+the linker flavour, and a second Windows link configuration to keep green — on
+a platform where, per the note in `CLAUDE.md`, almost nothing can be checked
+from the machines this project is developed on. The released artefact is
+`x86_64-pc-windows-msvc`, and MSVC is the toolchain that target names.
+
+**Workaround.** Use clang, which drives the MSVC linker and libraries: install
+the Visual Studio Build Tools for those, `winget install LLVM.LLVM` for clang,
+and point `CC` at it (`$env:CC = "clang"` in PowerShell). MSVC's `cl.exe` itself
+cannot be `CC`: it takes neither `-o` nor `-Xlinker`.
+
+```
+> set CC=clang
+> wsharp build hello.ws -o hello.exe
+```
+
+Setting `CC` explicitly is the reliable form on a machine that has both, because
+it does not depend on `PATH` order.
+
+**Disposition: documented limitation for 1.0.** The requirement itself is the
+MSVC target's and is not a defect. The error was: `unable to disambiguate:
+-subsystem:console` is the linker's complaint about a flag the user never typed,
+and said nothing about what to install. `wsharp build` now recognises GNU ld's
+answer on Windows and says that `cc` is MinGW, what to install, and how to set
+`CC` in cmd and in PowerShell, with the linker's own words underneath (#41).
+
+**Guarded by** `link::tests::a_mingw_link_failure_is_told_apart_from_an_msvc_one`,
+which holds the recognition to #41's own linker output and to the MSVC linker's,
+on every platform. Criterion 7's Windows row no longer meets MinGW at all: it
+sets `CC=clang`, the documented toolchain. There is deliberately no `tests/cases`
+entry: a case cannot assert which C compiler is first on `PATH` without becoming
+a case about the machine it ran on.
+
+**Tracked.** [#41](https://github.com/sinisterMage/WSharp/issues/41) for the
+message, fixed. The requirement is stated in `README.md`'s "`wsharp build` needs
+a C compiler".
 
 ## No reproducible builds
 

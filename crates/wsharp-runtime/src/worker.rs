@@ -81,6 +81,11 @@ pub(crate) struct Stats {
     pub(crate) served_pauses: AtomicUsize,
     pub(crate) max_pause_us: AtomicUsize,
     pub(crate) total_pause_us: AtomicUsize,
+    /// Every pause, log-spaced. The count/total/max above answer "how long on
+    /// average" and "how long at worst"; only this answers "how long for the
+    /// 99th mutator out of a hundred", which is the number a latency collector
+    /// is judged on. See [`crate::pause`].
+    pub(crate) pause_us: crate::pause::Histogram,
     /// Live bytes when the last trace finished sweeping: the growth trigger's
     /// point of comparison.
     pub(crate) trace_baseline_bytes: AtomicUsize,
@@ -129,6 +134,10 @@ pub struct Worker {
     /// worker's, which is the reason it cannot be shared.
     pub(crate) parity: AtomicU64,
     pub(crate) stats: Stats,
+    /// Exact per-pause samples, when `WSHARP_GC_PAUSE_LOG` asked for them.
+    /// Allocated here, at worker creation, because the pause path may not
+    /// allocate; `None` is the ordinary case and costs a null check.
+    pub(crate) pause_log: Option<crate::pause::Log>,
 }
 
 // The worker owns raw pointers into a heap that lives as long as the process.
@@ -205,8 +214,10 @@ impl Worker {
                 served_pauses: AtomicUsize::new(0),
                 max_pause_us: AtomicUsize::new(0),
                 total_pause_us: AtomicUsize::new(0),
+                pause_us: crate::pause::Histogram::new(),
                 trace_baseline_bytes: AtomicUsize::new(0),
             },
+            pause_log: crate::pause::Log::for_new_worker(),
         }));
         list.push(worker);
         worker
@@ -502,8 +513,21 @@ pub fn evacuating_flag_address() -> usize {
     &ws_gc_evacuating_flag as *const AtomicU8 as usize
 }
 
+// Serializes both aggregates' writers, including each worker's contribution.
+// At every unlock, count equals the number of true contributions and the flag
+// equals (count != 0). An atomic count alone cannot prevent a delayed flag
+// store from overwriting a later transition. Readers never take this lock.
+// No heap, mark-state or park lock may be acquired while holding this lock.
+static SHARED_TRANSITION: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_SHARED_COUNT: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
 /// Raise or lower one worker's contribution to a shared flag.
 fn set_shared(flag: &AtomicU8, count: &AtomicUsize, own: &AtomicBool, on: bool) {
+    let _transition = SHARED_TRANSITION.lock().unwrap_or_else(|e| e.into_inner());
     if own.swap(on, Ordering::AcqRel) == on {
         return;
     }
@@ -512,6 +536,12 @@ fn set_shared(flag: &AtomicU8, count: &AtomicUsize, own: &AtomicBool, on: bool) 
     } else {
         count.fetch_sub(1, Ordering::AcqRel) - 1
     };
+    #[cfg(test)]
+    AFTER_SHARED_COUNT.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     flag.store(u8::from(now != 0), Ordering::Release);
 }
 
@@ -523,13 +553,10 @@ pub(crate) fn clear_poll(worker: &Worker) {
     set_shared(&ws_gc_poll_flag, &POLL_COUNT, &worker.mark.wanted, false);
 }
 
-/// Whether *this* worker was the one asking, clearing its request if so.
-pub(crate) fn take_safepoint_request(worker: &Worker) -> bool {
-    if !worker.mark.wanted.load(Ordering::Acquire) {
-        return false;
-    }
-    clear_poll(worker);
-    true
+/// Whether this worker has a pending pause. Observing it consumes nothing:
+/// the collector may not have published the phase that services it yet.
+pub(crate) fn wants_a_pause(worker: &Worker) -> bool {
+    worker.mark.wanted.load(Ordering::Acquire)
 }
 
 pub(crate) fn poll_wanted() -> bool {
@@ -664,3 +691,7 @@ mod tests {
         assert!(!poll_wanted());
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/cases/runtime_shared_aggregate.rs"]
+mod aggregate_tests;

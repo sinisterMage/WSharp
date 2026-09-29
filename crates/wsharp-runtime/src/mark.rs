@@ -72,6 +72,7 @@ use crate::evacuate;
 use crate::gc::{self, with_buffers};
 use crate::header::{claim_mark, flip_mark_parity, is_marked, type_id_of};
 use crate::heap::{self, is_collectable};
+use crate::pause::Pause;
 use crate::types;
 use crate::worker::Worker;
 
@@ -170,6 +171,11 @@ fn set_phase_of(w: &'static Worker, phase: Phase) {
     let _guard = state_of(w);
     w.mark.phase.store(phase as u8, Ordering::Release);
     w.mark.changed.notify_all();
+    #[cfg(test)]
+    {
+        drop(_guard);
+        publication_tests::after_phase_store(phase);
+    }
 }
 
 fn wait_until(ready: impl Fn() -> bool) {
@@ -285,7 +291,7 @@ pub(crate) unsafe fn start_with_roots(mut roots: Vec<*mut u8>) {
     me().mark.tracing.store(true, Ordering::Release);
     ensure_thread();
     set_phase(Phase::Marking);
-    gc::record_pause(me(), started);
+    gc::record_pause(me(), started, Pause::Initial);
 }
 
 /// The second pause: finish marking, then move everything the program is
@@ -351,7 +357,7 @@ unsafe fn finish_marking() {
 
     if cset.is_empty() {
         finish_without_evacuation(remembered);
-        gc::record_pause(me(), started);
+        gc::record_pause(me(), started, Pause::MarkDone);
         return;
     }
 
@@ -374,7 +380,7 @@ unsafe fn finish_marking() {
     }
     gc::clear_poll(me());
     set_phase(Phase::Evacuating);
-    gc::record_pause(me(), started);
+    gc::record_pause(me(), started, Pause::MarkDone);
 }
 
 /// A trace with nothing to evacuate skips straight to sweeping.
@@ -429,7 +435,7 @@ unsafe fn finish_evacuation_on(w: &'static Worker) {
 
     gc::clear_poll(me());
     set_phase(Phase::Sweeping);
-    gc::record_pause(me(), started);
+    gc::record_pause(me(), started, Pause::EvacDone);
 }
 
 /// Run whichever pause is wanted. The safepoints call this.
@@ -516,12 +522,40 @@ pub fn quiesce(w: &'static Worker) {
             // has returned, so the stack holds no generated frames and the
             // root walk finds nothing.
             Phase::Evacuating => wait_until_on(w, || phase_of(w) != Phase::Evacuating),
-            // Its own worker's, driven from here: `main` is over, so this
-            // thread's stack is the only one that could hold a root and it
+            // This thread's own worker, driven from here: `main` is over, so
+            // this thread's stack is the only one that could hold a root and it
             // holds none.
-            Phase::EvacDone => unsafe { finish_evacuation_on(w) },
+            Phase::EvacDone if std::ptr::eq(w, me()) => unsafe { finish_evacuation() },
+            // Another worker's. Its pause reads its heap, its lists and its
+            // stack, so it may run only where a pause for it may: on its own
+            // thread, or on any while it is parked, as its collector does.
+            // This arm used to call `finish_evacuation_on(w)`, whose body works
+            // on `me()` throughout -- so it finished *this* thread's worker
+            // instead, and then spun on `w`'s phase for ever. A worker still
+            // running at exit is one `stop_all` abandoned, and its pause is its
+            // own, at its next safepoint or never.
+            Phase::EvacDone => {
+                if !serve_parked_here(w) {
+                    return;
+                }
+            }
         }
     }
+}
+
+/// [`serve_parked`] from a thread that is not `w`'s collector -- the exiting
+/// one, for a worker blocked in a system call. The thread acts as `w` for the
+/// length of the pause, which is what a collector thread does for its whole
+/// life, after handing back its own allocation buffer: a pause that retired
+/// "this thread's" buffer while acting as `w` would retire it into `w`'s heap.
+fn serve_parked_here(w: &'static Worker) -> bool {
+    let mine = me();
+    crate::heap::retire_local_buffer();
+    crate::heap::flush_local_counters();
+    crate::worker::install(w);
+    let served = serve_parked(w);
+    crate::worker::install(mine);
+    served
 }
 
 // ---------------------------------------------------------------------------
@@ -616,10 +650,11 @@ fn mark_concurrently() {
         s.remembered = remembered;
     }
     if completed {
-        // Phase first, poll second: the mutator checks the phase when the poll
-        // fires, and must find the pause wanted.
-        set_phase(Phase::MarkDone);
+        // Soundness boundary: a visible pause phase must already own its poll
+        // request. Allocation and trace builtins service the phase directly;
+        // publishing it first lets them finish before the request is raised.
         gc::request_safepoint(me());
+        set_phase(Phase::MarkDone);
     }
 }
 
@@ -640,8 +675,9 @@ fn evacuate_concurrently() {
         with_buffers(|buffers| buffers.to_scan.append(&mut copies));
     }
     gc::note_moved(me(), moved);
-    set_phase(Phase::EvacDone);
+    // The same request-before-phase invariant as the marking pause.
     gc::request_safepoint(me());
+    set_phase(Phase::EvacDone);
 }
 
 /// Mark everything reachable from `work`, noting every reference into a block
@@ -729,6 +765,33 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
+    /// `quiesce` of another worker left in `EvacDone` by a mutator that is
+    /// still running -- which is what a worker `stop_all` abandoned looks like
+    /// at exit -- returns. It used to finish the calling thread's own worker
+    /// instead and then spin on the other's phase; in a debug build the first
+    /// of those is an assertion, because the calling worker had nothing to
+    /// release.
+    #[test]
+    fn quiescing_another_running_worker_mid_evacuation_returns() {
+        let _serial = crate::test_support::SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let other: &'static Worker = std::thread::spawn(Worker::current).join().unwrap();
+        set_phase_of(other, Phase::EvacDone);
+        let (done_tx, done_rx) = mpsc::channel();
+        let quiescer = std::thread::spawn(move || {
+            quiesce(other);
+            let _ = done_tx.send(());
+        });
+        let returned = done_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        set_phase_of(other, Phase::Idle);
+        let _ = quiescer.join();
+        assert!(
+            returned,
+            "quiesce did not return for another worker's EvacDone"
+        );
+    }
+
     /// Start a trace, park the mutator in a "syscall", and wait for the trace
     /// to reach `Idle`. Returns how many of its pauses the collector ran on the
     /// mutator's behalf.
@@ -801,3 +864,9 @@ mod tests {
         panic!("no pause was ever run for a parked mutator: the safe region is untested");
     }
 }
+
+// Runtime protocol regressions live beside the language cases. They need
+// private phase access and therefore run as part of the runtime unit suite.
+#[cfg(test)]
+#[path = "../../../tests/cases/runtime_poll_publication.rs"]
+mod publication_tests;

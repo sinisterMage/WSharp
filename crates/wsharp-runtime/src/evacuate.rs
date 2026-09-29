@@ -68,16 +68,36 @@ pub unsafe extern "C" fn ws_resolve(p: *mut u8) -> *mut u8 {
 /// is rare -- it takes the collector and the program reaching the same object
 /// at the same moment -- and wasting a copy is much cheaper than a lock.
 ///
+/// **An object that has already been forwarded answers with where it went.**
+/// This is the same rule `heap::evacuate_block`, `note_evacuated_blocks` and
+/// [`forward`] follow, and it is not a shortcut: everything below reads a size
+/// and a type id out of the header, and a forwarded header's bits are an
+/// *address*. Asking `object_size` about one gets an unregistered type id and
+/// so `None`, which used to mean this function handed the caller back the
+/// address it came in with -- the abandoned copy. `ws_resolve` guards the call
+/// and so never saw it; the evacuation pause's root walk does not, and cannot,
+/// because a root set may name one object from several slots: the first slot
+/// forwards it, and every later slot arrives here with the header already an
+/// address. Those slots were then left pointing into a block about to be
+/// released, and the program's next write through one was lost.
+///
 /// # Safety
 /// `p` must be a live object in a block being evacuated.
 pub(crate) unsafe fn evacuate_one(p: *mut u8) -> *mut u8 {
-    let Some(size) = (unsafe { crate::types::object_size(p) }) else {
-        return p;
+    let meta = unsafe { load_meta(p) };
+    if is_forwarded_meta(meta) {
+        return forwarding_target(meta);
+    }
+    // The type and size come from the header word just tested, not from a
+    // second read of it: during `Evacuating` the collector thread may forward
+    // `p` between two reads, and a size taken from an address is noise.
+    let type_id = crate::header::type_id_of_meta(meta);
+    let Some(size) = (unsafe { crate::types::object_size_as(p, type_id) }) else {
+        return unsafe { where_it_is(p) };
     };
-    let type_id = unsafe { type_id_of(p) };
     let copy = heap::alloc_copy_shared(type_id, size);
     if copy.is_null() {
-        return p;
+        return unsafe { where_it_is(p) };
     }
     // The header goes with it: the copy keeps the original's mark bit, its
     // reference count and its flags, and only its address is different.
@@ -96,6 +116,22 @@ pub(crate) unsafe fn evacuate_one(p: *mut u8) -> *mut u8 {
             unsafe { heap::free_object(copy, size) };
             existing
         }
+    }
+}
+
+/// `p`, or its copy if somebody else has moved it since it was last looked at.
+///
+/// What `evacuate_one` answers when it cannot make a copy of its own: `p` is
+/// still the right answer then only if nobody else made one in the meantime.
+///
+/// # Safety
+/// `p` must point at an object with a readable header.
+unsafe fn where_it_is(p: *mut u8) -> *mut u8 {
+    let meta = unsafe { load_meta(p) };
+    if is_forwarded_meta(meta) {
+        forwarding_target(meta)
+    } else {
+        p
     }
 }
 
@@ -285,5 +321,46 @@ pub(crate) unsafe fn verify_no_stale_references() {
             "W# collector: {stale} references still point into evacuated blocks after the fix-up"
         );
         std::process::abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::header::TYPE_ID_FIRST_USER;
+    use crate::heap::ws_alloc;
+    use crate::test_support::SERIAL;
+
+    /// Reaching the same object twice answers with the copy both times.
+    ///
+    /// Two root slots naming one object is ordinary rather than exotic: a
+    /// struct passed down a recursion sits in every frame's parameter slot at
+    /// once, so the root walk that moves everything the program holds arrives
+    /// at the same object several times. The first arrival forwards it; every
+    /// later one finds an address where the header was. Answering those with
+    /// the address handed in -- which is what a `None` from `object_size` used
+    /// to do -- leaves those slots pointing into a block about to be released,
+    /// and the program's next write through one is lost.
+    #[test]
+    fn evacuating_an_object_twice_answers_with_the_copy() {
+        // The type registry is process-wide.
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let id = TYPE_ID_FIRST_USER + 405;
+        types::register_type(id, types::TypeLayout::fixed("Aliased", 32, vec![16]));
+        types::publish();
+
+        // A thread of its own, so this heap and its buffers are this test's.
+        std::thread::spawn(move || {
+            let obj = ws_alloc(id, 32, 0);
+            let first = unsafe { evacuate_one(obj) };
+            assert_ne!(first, obj, "the first arrival is the one that moves it");
+            let second = unsafe { evacuate_one(obj) };
+            assert_eq!(
+                second, first,
+                "the second arrival must follow the forwarding word"
+            );
+        })
+        .join()
+        .expect("the test thread finished");
     }
 }

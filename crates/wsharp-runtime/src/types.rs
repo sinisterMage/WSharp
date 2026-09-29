@@ -205,7 +205,16 @@ pub fn info(id: TypeId) -> Option<&'static TypeInfo> {
 /// `ptr` must point at a live, un-forwarded W# heap object whose type has been
 /// published.
 pub unsafe fn object_size(ptr: *const u8) -> Option<u32> {
-    let info = info(unsafe { crate::header::type_id_of(ptr) })?;
+    unsafe { object_size_as(ptr, crate::header::type_id_of(ptr)) }
+}
+
+/// [`object_size`] for an object whose type id the caller already read, so
+/// that a header which may change underneath it is read once.
+///
+/// # Safety
+/// As [`object_size`].
+pub unsafe fn object_size_as(ptr: *const u8, id: TypeId) -> Option<u32> {
+    let info = info(id)?;
     if !info.has_variable_size() {
         return Some(info.size);
     }

@@ -69,6 +69,93 @@ jobs:
       - name: Hold the state table to the tree
         run: bash scripts/gate-table-check.sh
 
+  # Criterion 4. Every tracked limitation is closed as fixed, or closed with the
+  # `v1.0-limitation` label and an entry in `LIMITATIONS.md`.
+  #
+  # The only gate here whose data is not in this tree: whether an issue is open
+  # is a question for GitHub. So this is the one job that can fail for a reason
+  # saying nothing about the criterion -- a rate limit, a dropped connection --
+  # and `followups-check.sh` exits 2 rather than 0 on every one of them. The
+  # token is what keeps it off the sixty-an-hour anonymous limit that a runner's
+  # address shares with every other job on it.
+  #
+  # `issues: read` rather than the file's default of `contents: read` alone: the
+  # issues are public, but a token narrowed to `contents` is refused when it is
+  # sent, and that refusal would read as a rate limit.
+  followups:
+    name: limitations resolved or documented (criterion 4)
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # The check's own tests, before the check. Most of them drive a stubbed
+      # fetcher, because "the gate went green because it could not ask" is the
+      # one failure mode a green CI run will never show anybody.
+      - name: Test the checker
+        run: bash scripts/tests/followups-check.test.sh </dev/null
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      # Not on a pull request. Its answer is about issue state, not about the
+      # change under review, and a limitation labelled somewhere else would
+      # otherwise turn every open pull request red until it was documented.
+      # On `main` and on request it runs, and a red there is the gate's answer.
+      - name: Hold every tracked limitation to one of its two allowed states
+        if: github.event_name != 'pull_request'
+        run: bash scripts/followups-check.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  # Criterion 1's ecosystem subject. The run itself is `ecosystem.yml`, daily and
+  # on four triples, because it reaches the network for every package; what a
+  # pull request can break without any of that is the script's own logic -- a
+  # step that should fail printing `ok` -- so its offline selftest runs here,
+  # against stubs, in about a minute.
+  ecosystem-selftest:
+    name: the ecosystem check fails when it should (criterion 1)
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test the ecosystem check
+        run: bash scripts/tests/ecosystem-check.test.sh </dev/null
+
+  # Criterion 3. Asks GitHub which defects closed in the freeze window and what
+  # closed them, so -- like `followups` -- it exits 2 rather than 0 when it
+  # cannot ask. The window starts at `.github/freeze-start`; until Day 0 is
+  # declared there is no window, so only the checker's own tests run.
+  guards:
+    name: every fix carries a guard (criterion 3)
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The freeze-start commit's date is read from history.
+          fetch-depth: 0
+
+      - name: Test the checker
+        run: bash scripts/tests/guard-check.test.sh </dev/null
+
+      - name: Every defect fixed in the window carries a guard
+        if: github.event_name != 'pull_request' && hashFiles('.github/freeze-start') != ''
+        run: bash scripts/guard-check.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
   # Criterion 2's mechanism. Every pull request carries exactly one of
   # `change:breaking`, `change:additive`, `change:fix`, `change:none`.
   #
@@ -225,6 +312,21 @@ jobs:
   # Manual, with the version as an input: the gate is about a *published*
   # release, so there is nothing to verify until one exists, and a job that ran
   # on every pull request would be verifying the last release over and over.
+  # The verifier's fault-injection tests are offline -- a local tarball, and
+  # failures injected through PATH wrappers -- so they run on every pull request
+  # rather than waiting for somebody to dispatch the release matrix below. A
+  # verifier that stopped refusing a partial manifest would otherwise be found
+  # out on release day.
+  verify-install-selftest:
+    name: clean-install verifier refuses what it must (criterion 7)
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test manifest inspection failures
+        run: bash scripts/tests/verify-install-inspection.test.sh </dev/null
+
   verify-install:
     name: clean install (criterion 7, ${{ matrix.triple }})
     if: github.event_name == 'workflow_dispatch'
@@ -265,7 +367,45 @@ jobs:
             ca-certificates curl tar gzip git gcc libc6-dev
           ln -sf "$(command -v gcc)" /usr/local/bin/cc
 
+      # The Windows half of the step above, and the same statement: point the
+      # job at the C compiler the install documents, rather than at whatever
+      # `cc` happens to be.
+      #
+      # `cc` on `windows-latest` is MinGW's `gcc`, and `wsharp build` passes
+      # MSVC's linker flags because the released artefact is
+      # `x86_64-pc-windows-msvc` -- so the link fails on `-subsystem:console`.
+      # That is a documented requirement, not a defect in the release: README's
+      # "`wsharp build` needs a C compiler" and LIMITATIONS.md's entry both say
+      # clang or MSVC, and both say to set `CC` rather than to rely on `PATH`
+      # order. This job therefore does exactly what the documentation tells a
+      # reader to do. Doing anything else would make the row a test of the
+      # runner image's `PATH` rather than of the documented install.
+      #
+      # The image ships LLVM, so this installs nothing. It fails loudly if that
+      # ever stops being true, because falling back to MinGW in silence would
+      # turn the row red for a reason that is not about the release.
+      - name: Point cc at the C compiler Windows documents
+        if: runner.os == 'Windows'
+        run: |
+          command -v clang >/dev/null 2>&1 || {
+            echo "no clang on this image: wsharp build on Windows needs clang or MSVC" >&2
+            exit 1
+          }
+          clang --version | head -1
+          echo "CC=clang" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
+
+      # The verifier's own tests, before it is used to answer a release
+      # question -- the same order the change-label and doc-example jobs use.
+      # This job is where the tests have to run rather than on every pull
+      # request: they drive the real script against a published release, so
+      # they need the network and the platform, which is what this matrix is.
+      - name: Test manifest inspection failures
+        run: bash scripts/tests/verify-install-inspection.test.sh
+
+      - name: Test the verifier
+        run: bash scripts/tests/verify-install.test.sh
 
       - name: Verify the W# install
         run: bash scripts/verify-install.sh "${{ inputs.version }}" "${{ matrix.triple }}"

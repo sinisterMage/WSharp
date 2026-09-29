@@ -389,6 +389,15 @@ extra `sin_len` byte out of this code entirely.
   inside it is a safepoint that can run a whole collection, and until `aux`
   holds the count an array claims to be a bare header, so a heap walk would
   step into the middle of it.
+- **A heap space is reserved, not touched.** Its 64 MiB is asked of the
+  allocator zeroed at *ordinary* alignment, one block larger than it needs,
+  and `base` is rounded up to a block by hand. Asking for block alignment
+  directly is what the index arithmetic seems to want, and the system allocator
+  answers a zeroed request above its own alignment with a `memset` of the whole
+  thing: every worker's first allocation made 64 MiB resident, and a leak
+  smaller than a space could not show in the resident set. `calloc` hands back
+  fresh pages it knows are zero and touches none; `gc_space_resident.ws` holds
+  eight workers to half a space each.
 - **The object-start bitmap is what makes the heap walkable.** Objects are not
   laid end to end -- a refilled hole puts new ones among the corpses of old
   ones, and an allocation buffer leaves an unused tail -- so a walk that
@@ -489,6 +498,15 @@ extra `sin_len` byte out of this code entirely.
   worker: a collector running the pause would otherwise retire its own buffer
   and leave the mutator's block open, and a block an allocator holds is never
   swept, recycled or evacuated.
+- **Nothing blocks holding a process-wide lock.** `net`'s socket and poller
+  tables are shared by every worker, so a call takes the table's lock only to
+  copy out what it needs -- a descriptor, or a poller's `Arc` -- and lets it go
+  before the call that blocks. `ws_net_wait` held the poller table across
+  `epoll_wait`, so while one worker waited on its own poller every other
+  thread's `net.poller()`, `watch`, `forget`, `wait` and result reads waited
+  out its timeout with it, outside a safe region, and at `-1` for ever. A
+  poller has a lock of its own now, taken after the table's is released, and
+  `net_poller_independent.ws` is the case.
 - **A parked worker's stack is a root set like any other**, and
   `worker::walk_worker_roots` is the single door every root walk now goes
   through, because "whose stack, and where does it start" is precisely what a
@@ -546,6 +564,24 @@ extra `sin_len` byte out of this code entirely.
   part of an *address*, which can easily name a real type id. Scanning one then
   walks a stranger's bytes with somebody else's layout. The copy is on the same
   list, and the copy is what needs fixing.
+- **A root set may name one object from several slots, so `evacuate_one` must
+  answer a forwarded object with where it went.** That is the rule above read
+  at the *other* end of the pause, and `evacuate_one` was the second place that
+  did not follow it. A struct passed down a recursion sits in every live
+  frame's parameter slot at once, plus the caller's local; the walk that moves
+  everything the roots name (`mark.rs`, `move_root`) therefore arrives at the
+  same object once per slot. It gates on `heap::is_evacuating`, which is a
+  *block-state* test on the address, so a slot still holding the old address
+  passes it however many times the object has already been forwarded. Inside,
+  `types::object_size` read a type id out of what was now an address, got an
+  unregistered one, answered `None` -- and the function handed back the address
+  it came in with. Those slots were left pointing into a block about to be
+  released, and the program's next write through one went to the abandoned copy
+  and was lost. `ws_resolve` never met this because it tests forwarding itself
+  before calling in; the root walk does not, and cannot, because the
+  duplication is what a root set *is*. The symptom was a recursive reader
+  losing its cursor increments and answering with a different number of
+  children on nearly every run (`gc_aliased_cursor.ws`, `gc_aliased_roots.ws`).
 - **Counting's frees wait until the trace's *last* pause, not its second.**
   The evacuation pause reads two lists recorded during the mark -- the slots
   the marker saw pointing into a block being emptied, and the objects the trace
@@ -567,6 +603,25 @@ extra `sin_len` byte out of this code entirely.
   marker takes only the buffers lock (to drain `satb`) and answers its heap
   questions from the lock-free directory; the sweeper takes only the heap lock,
   per block; the phase is an atomic so safepoint checks take no lock at all.
+  Two process-wide locks are leaves -- nothing else is taken while one is held,
+  though a caller may already hold another: `worker::SHARED_TRANSITION` around a
+  flag word's update (see `docs/runtime-shared-flags.md`), and `heap::PUBLISHING`
+  around the space directory's one writer -- which used to be "the heap lock",
+  and stopped being one writer when every worker got a heap (#44).
+- **A pause request is raised before its phase is published, and only a pause
+  consumes it.** The collector sets its worker's poll request and then publishes
+  `MarkDone` or `EvacDone` with a release store, so a mutator that acquires the
+  phase at any safepoint runs the pause and clears the request exactly once; a
+  loop poll arriving before the phase is published only *observes* the request
+  and leaves it for the pause, or an abandonment, to clear. Either half reversed
+  loses one: phase first leaves an orphan request, consuming on entry loses an
+  early one (#32). The process-wide flag bytes are the other half: `set_shared`
+  updates a worker's bit, the count and the byte under `SHARED_TRANSITION`,
+  because a clearer's late store of 0 could otherwise hide a newer raise (#64)
+  -- and for `ws_gc_evacuating_flag` a hidden raise is a load barrier skipped
+  while objects move. At exit `quiesce` drives only what it may: the calling
+  thread's own worker, or another that is parked; a worker still running is left
+  to its own next safepoint.
 - **A generic struct stands outside the dispatch lattice.** Type ids are a
   preorder walk of it, fixed before monomorphisation, and a generic struct's
   instantiations are not known until after. So `struct[T] : Base` is rejected,
@@ -745,6 +800,11 @@ extra `sin_len` byte out of this code entirely.
 - **`--emit=api` is the only emit with a promise attached.** It is versioned,
   it is printed after type checking so it only ever describes a program the
   compiler accepted, and every name a program defines is absolute in it. A
+  module is named *portably* there -- `load::portable_name`: a file by its path
+  from the root file's directory, a package file as `pkg+<name>/<path>` -- and
+  never by its absolute path, which is what the loader keys on everywhere else;
+  version 1 printed that, and the same source emitted different bytes on every
+  machine (#26). A
   golden test in `crates/wsharp-cli/tests/api.rs` pins the whole output for a
   two-module program, so a format change fails there rather than quietly in
   somebody's generator, and a change that could make an existing reader wrong is
@@ -869,14 +929,13 @@ extra `sin_len` byte out of this code entirely.
   `ingot`'s verbs takes a `Fault` and writes into it. The first failure wins in
   all of them: a recursive descent reader that has lost its place invents the
   rest.
-- **A reader of something that arrives off a network is bounded; a reader of a
-  file somebody wrote is not.** `std/json` has `MAX_DEPTH`, and `std/toml` has
-  no counterpart on purpose: both are recursive descent, but a manifest is a
-  file with an author and a JSON document is bytes a stranger sent, so a few
-  hundred kilobytes of `[` would be a stack overflow -- a crash with no
-  diagnostic -- rather than a document refused with a message. `std/x509`'s
-  `MAX_CHAIN` is the same shape, and the shape is a named bound with no knob:
-  the day one is needed is the day to add the parameter.
+- **A recursive reader is bounded.** `std/json` and `std/toml` both have
+  `MAX_DEPTH`, 128, and refuse a document nested deeper with a message. `std/toml`
+  used to have none, on the argument that a manifest is a file with an author;
+  the fuzzer answered that `parse` is handed whatever its caller has, and a few
+  thousand `[` took most of a minute to refuse (#49). `std/x509`'s `MAX_CHAIN`
+  is the same shape, and the shape is a named bound with no knob: the day one is
+  needed is the day to add the parameter.
 - **`bytes.put_utf8` is the single definition of how a code point is encoded.**
   It was private to `std/toml`, with a comment saying it lived there because it
   had one caller; `std/json` is the second, and which byte of a four-byte
@@ -972,6 +1031,25 @@ extra `sin_len` byte out of this code entirely.
   not a spelling. What a package of several files shows is what its facade
   re-exports, which is the same rule `pub` sets one level down: a surface is
   stated rather than leaked.
+- **Two hardware faults are the program's, and `trap` says so.** A read
+  through null -- an element of `array.new(n)` that was never assigned, asked
+  for a field, a closure or an overload -- and a recursion deeper than the stack
+  both end in a fault rather than a check, and `wsharp_runtime::trap` turns each
+  into a W# panic (#48, #67): a signal handler on an alternate stack on Unix, a
+  vectored exception handler on Windows. It is deliberately narrow: only on a
+  thread that called `trap::enter` (the main thread for `main`, every worker),
+  only an access within `NULL_WINDOW` of zero while that thread is not parked
+  in a safe region, or one in or just below its own stack. Anything else goes
+  back to the previous disposition, so a runtime bug is still a crash that looks
+  like one. The Unix handler finds its thread by which registered alternate
+  stack it is running on, not by a thread-local, because the first touch of a
+  thread-local on macOS allocates. Arrays are the exception that is *checked*:
+  a null array is empty everywhere -- `ws_array_len` always said so, and the
+  inline length and bounds check now agree -- so indexing one is an index out of
+  bounds. Frames over a page are probed on entry (`enable_probestack`, inline),
+  so a recursion cannot step over the guard page. The four non-macOS BSDs keep
+  the default disposition: their `sigaction` layouts are not ones anything
+  here can check.
 - **The closure environment is dead after the prologue.** Captures are copied
   into declared locals before the first safepoint and `env` is never read
   again, so it is not a root and need not be. Re-reading it after a call would
@@ -1027,6 +1105,12 @@ nix-shell --run "cargo test --workspace"
 
   `// args: one two` is what the program sees as `os.args()`; it splits on
   whitespace, so an argument containing one cannot yet be written.
+
+  `// timeout: 1200` is read only by `tests/harness/parity.sh`, not by
+  `cases.rs`: it names a per-case wall-clock bound for a case whose cost is
+  legitimately larger than the harness default (`gc_map_replacement` is the only
+  one). It is a hint to the harness and not an expectation, so `cases.rs`
+  ignores it deliberately.
 
   The harness (`crates/wsharp-cli/tests/cases.rs`) runs the built binary as a
   subprocess, so stdout is captured for free and the test does exactly what a
@@ -1156,6 +1240,10 @@ nix-shell --run "cargo test --workspace"
   unit tests drive private `Heap` instances; the few that touch process-wide
   state (the mark parity, the stress flag) take `test_support::SERIAL`,
   because the test binary runs its tests in parallel on one heap.
+- `WSHARP_GC_PAUSE_LOG=<path>` writes every pause on exit -- microseconds, which
+  of the three, which worker -- and `WSHARP_GC_STATS=1` adds a line of p50, p90
+  and p99 over a log-spaced histogram of them (#24). Nothing on the pause path
+  allocates: the log is preallocated per worker and says `TRUNCATED` when full.
 - `WSHARP_GC_STATS=1` prints what the collector did on exit, including traces,
   objects moved, and the number and longest of the pauses;
   `WSHARP_GC_TRACE=1` prints every frame the root walk visits. **Check the

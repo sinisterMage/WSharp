@@ -308,7 +308,9 @@ High-Throughput Garbage Collection*, PLDI 2022).
 describe. The end-to-end suite runs twice, once under it, and traces start on
 the same allocation schedule in both runs so the concurrent paths are covered
 both ways. `WSHARP_GC_STATS=1` prints what the collector did on exit, including
-the number of pauses and the longest one.
+the pause distribution: p50, p90, p99 and the maximum, and beneath them the
+log-spaced buckets those percentiles were computed from, so the summary is
+never the only record of the measurement.
 
 ## Installing
 
@@ -363,6 +365,26 @@ clang. Setting `$CC` to a compiler not called `cc` works too. This is the same
 requirement "Building and running" states below for building the compiler
 itself; it applies to a binary install as well, which is the part that used to go
 unsaid.
+
+**On Windows it must be clang or MSVC — MinGW's `gcc` will not link.** The
+released artefact is `x86_64-pc-windows-msvc` and the flags `wsharp build`
+passes are MSVC's, so a `cc` that is MinGW fails with the linker complaining
+about a flag you never typed:
+
+```
+> wsharp build hello.ws -o hello.exe
+error: linking failed:
+ld.exe: Error: unable to disambiguate: -subsystem:console (did you mean --subsystem:console ?)
+```
+
+This is easy to meet without having chosen it, because `cc` is whatever is first
+on `PATH` and Git for Windows and MSYS2 both put one there; `wsharp build` says
+so when it happens. Install clang (`winget install LLVM.LLVM`), which links with
+the MSVC libraries the Visual Studio Build Tools provide, and point `CC` at it
+rather than relying on the order: `set CC=clang` in cmd, `$env:CC = "clang"` in
+PowerShell. MSVC's own `cl.exe` cannot stand in for `cc` -- it takes neither
+`-o` nor `-Xlinker`. [LIMITATIONS.md](LIMITATIONS.md) has the reason the flags
+are what they are.
 
 ## Building and running
 
@@ -453,8 +475,11 @@ The process exits with the low byte of `main`'s return value, as a C program
 does, so `return 256;` exits 0. A compile error exits 1. A failure the type
 system allows but the program must not perform - `.?` on a null optional, a
 failed `assert`, integer division by zero, a signed `MIN / -1`, an index
-outside an array, a call no overload matches - prints `W# panic: <reason>` to
-stderr and exits with status 101. Ordinary overflow is not one of them:
+outside an array, a call no overload matches, a field or closure read through
+an element of `array.new(n)` that was never assigned, a recursion deeper than
+the stack - prints `W# panic: <reason>` to stderr and exits with status 101.
+(A never-assigned array element is an empty array, so indexing one is an index
+outside it.) Ordinary overflow is not one of them:
 `+`, `-` and `*` wrap, which for an unsigned type is the definition rather than
 a concession.
 
@@ -478,24 +503,25 @@ from disagreeing. So this emit is narrow and versioned:
 
 ```
 $ wsharp check app/main.ws --emit=api
-(api 1)
+(api 2)
 (module "main"
-  (import fw "app/fw")
+  (import fw "fw.ws")
   (pub const ROUTE_Show (str "GET /users/:id"))
-  (pub struct Show (parent "app/fw".Route)
+  (pub struct Show (parent "fw.ws".Route)
     (field id i64)
     (field page (optional i64)))
   (pub fn action
     (param r "main".Show)
-    (ret "app/fw".Response)))
+    (ret "fw.ws".Response)))
 ```
 
 Declarations and their types; no bodies, no expressions, no spans. A module is
-named by the path it resolved to - `std/net` for a library module, the file for
-a local one, `"main"` for the root - with `/` separators on every platform, as
-everything else in this project writes a path. **Every name a program defines is
-absolute** - a type written `fw.Route` prints as
-`"app/fw".Route` and one declared here prints with this module's own path - so a
+named the same on every machine - `std/net` for a library module, a file by its
+path from the root file's directory (`fw.ws`, `app/users.ws`, `../lib/x.ws`), a
+file in an installed package as `pkg+<name>/<path>`, and `"main"` for the root -
+with `/` separators on every platform, so an API document can be committed and
+diffed. **Every name a program defines is absolute** - a type written `fw.Route`
+prints as `"fw.ws".Route` and one declared here prints with this module's own path - so a
 reader never follows an import or guesses a scope, and a bare name is one the
 language provides. Top-level `const` literals come through verbatim, which is
 what lets a convention be overridden in source rather than by a comment. A
@@ -529,6 +555,23 @@ Two flags exist for the collector: `--gc-stress` as above, and the
 `WSHARP_GC_STATS` environment variable, which prints what the collector did on
 exit. `WSHARP_GC_TRACE` prints every frame the root walk visits. Both are off
 when unset, empty or `0`.
+
+Pause times get their own instrument, because a count, a total and a maximum
+support a mean and a maximum and nothing else -- a median or a 99th percentile
+needs the individual samples, and they used to be gone by the time anything
+could read them.
+
+- **The histogram is always on**, in every build, release included. One
+  count-leading-zeros and one relaxed increment per pause, into a fixed array
+  in the worker; it allocates nothing and there is no switch to forget. Four
+  sub-buckets per octave, so a percentile read out of it is an upper bound
+  within 25%, and the bucket line beside it says which bucket it came from.
+- **`WSHARP_GC_PAUSE_LOG=<path>` writes one line per pause** -- microseconds,
+  which of the three pauses, which worker -- for when 25% is not close enough.
+  The buffer is allocated when the worker is created and the pause path only
+  claims a slot and stores a word into it, so nothing allocates and no syscall
+  happens while a pause is being timed; the file is written at exit. It costs
+  4 MiB per worker and is off unless the variable names a path.
 
 ### The standard library
 

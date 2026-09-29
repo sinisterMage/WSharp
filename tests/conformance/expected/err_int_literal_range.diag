@@ -1,0 +1,8 @@
+error: `300` does not fit in `u8`
+  --> tests/cases/err_int_literal_range.ws:5:19
+  |
+5 |     const x: u8 = 300;
+  |                   ^^^
+  |
+  = help: `u8` holds 0 to 255
+exit 1

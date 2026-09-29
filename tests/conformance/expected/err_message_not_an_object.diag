@@ -1,0 +1,15 @@
+error: a message cannot be `i64`
+   --> tests/cases/err_message_not_an_object.ws:10:5
+   |
+10 |     broker.publish(numbers, "a", 1);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: a message is copied by reading its header, so it has to have one -- a struct, a string or an array
+error: `Holder` cannot be sent to another worker, because `fn(i64) i64` cannot
+   --> tests/cases/err_message_not_an_object.ws:13:5
+   |
+13 |     broker.publish(bad, "a", Holder{ .f = twice });
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: a worker has a heap of its own, so a value is copied to reach it -- and a function value captures an environment that belongs to the heap it was made in
+exit 1

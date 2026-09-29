@@ -1,0 +1,8 @@
+error: `@import` is only allowed at the top level
+  --> tests/cases/err_import_not_toplevel.ws:3:18
+  |
+3 |     const http = @import("std/http");
+  |                  ^^^^^^^^^^^^^^^^^^^
+  |
+  = help: bind it once beside the other declarations, as in `const http = @import("std/http");`
+exit 1

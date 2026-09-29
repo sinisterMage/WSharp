@@ -195,7 +195,9 @@ pub extern "C" fn ws_gc_poll() {
     // us here. Idempotent either way: a worker that was not asked for a pause
     // simply goes back to what it was doing.
     let worker = Worker::current();
-    if !crate::worker::take_safepoint_request(worker) {
+    // The request precedes phase publication. An early poll must leave it
+    // pending: only the pause (or abandonment) may clear the request.
+    if !crate::worker::wants_a_pause(worker) {
         return;
     }
     unsafe { mark::safepoint() };
@@ -282,6 +284,11 @@ pub fn collections() -> usize {
     total(|w| w.stats.collections.load(Ordering::Relaxed))
 }
 
+/// How many pauses every worker has run between them.
+pub fn pauses() -> usize {
+    total(|w| w.stats.pauses.load(Ordering::Relaxed))
+}
+
 pub(crate) fn note_trace_started(worker: &Worker) {
     worker.stats.traces.fetch_add(1, Ordering::Relaxed);
 }
@@ -309,13 +316,51 @@ pub(crate) fn set_trace_baseline(worker: &Worker, live_bytes: usize) {
         .store(live_bytes, Ordering::Relaxed);
 }
 
-/// Account for a pause that began at `started`. The maximum is the number
-/// that matters for a collector whose point is low latency.
-pub(crate) fn record_pause(worker: &Worker, started: Instant) {
+/// Account for a pause of `kind` that began at `started`.
+///
+/// The count, the total and the maximum answer "how many", "how much
+/// altogether" and "how bad at worst". They cannot answer "how bad for the
+/// 99th mutator out of a hundred", which is the number a latency collector is
+/// actually judged on, because the individual samples are gone by the time
+/// anything reads them -- issue #18. So the sample also goes into a log-spaced
+/// histogram, and, when `WSHARP_GC_PAUSE_LOG` asked for it, into an exact
+/// per-pause record. Neither allocates. See [`crate::pause`].
+///
+/// The samples are recorded *before* the count, so that a reader which catches
+/// the two mid-update sees one more sample than pause rather than one fewer --
+/// a histogram that is missing a sample it claims to have would be the
+/// misleading direction.
+pub(crate) fn record_pause(worker: &Worker, started: Instant, kind: crate::pause::Pause) {
     let us = started.elapsed().as_micros() as usize;
+    worker.stats.pause_us.record(us);
+    if let Some(log) = worker.pause_log.as_ref() {
+        log.record(us, kind);
+    }
     worker.stats.pauses.fetch_add(1, Ordering::Relaxed);
     worker.stats.total_pause_us.fetch_add(us, Ordering::Relaxed);
     worker.stats.max_pause_us.fetch_max(us, Ordering::Relaxed);
+}
+
+/// Every worker's pause samples, added together.
+///
+/// Summed rather than maximised, unlike the running maximum beside it: each
+/// pause is one sample of one mutator's wait, and the distribution is over all
+/// of them.
+pub fn pause_histogram() -> [usize; crate::pause::BUCKETS] {
+    let mut out = [0usize; crate::pause::BUCKETS];
+    crate::worker::for_each_worker(|w| w.stats.pause_us.add_into(&mut out));
+    out
+}
+
+/// How many pauses the histogram holds samples for.
+pub fn pause_samples() -> usize {
+    crate::pause::samples(&pause_histogram())
+}
+
+/// The `q`th percentile of every recorded pause, in microseconds, as an upper
+/// bound within 25%. `q` is a percentage; 100 is the maximum.
+pub fn pause_percentile_us(q: usize) -> usize {
+    crate::pause::percentile_us(&pause_histogram(), q)
 }
 
 /// Whether an environment variable is set to something other than `0` or the
@@ -386,14 +431,19 @@ pub unsafe fn validate_roots() {
     }
 }
 
-/// Print what the collector has done so far, when `WSHARP_GC_STATS` is set.
+/// The exit report: write `WSHARP_GC_PAUSE_LOG`'s file if it was asked for,
+/// and print what the collector has done so far if `WSHARP_GC_STATS` is set.
 ///
 /// The counts matter as much as the checks: a stack walk that found no roots at
 /// all would make every root check pass for the wrong reason.
 pub fn report_if_asked() {
+    // Independent of `WSHARP_GC_STATS`: the log is its own opt-in, and asking
+    // for raw samples should not also require asking for a summary.
+    crate::pause::write_log_if_asked();
     if !env_flag("WSHARP_GC_STATS") {
         return;
     }
+    let pauses = pause_histogram();
     let heap = crate::heap::total_heap_stats();
     let (funcs, safepoints) = crate::stackwalk::registered();
     eprintln!(
@@ -424,6 +474,27 @@ pub fn report_if_asked() {
         heap.blocks,
         heap.large_objects,
     );
+    // The distribution, on its own two lines rather than appended to the one
+    // above, because the line above is parsed -- by `tests/harness/` and by
+    // `crates/wsharp-cli/tests/cases.rs` -- and widening it would break every
+    // reader at once.
+    //
+    // The percentiles are upper bounds within 25%, and the bucket line beside
+    // them is the raw data they were computed from, so anybody can recompute
+    // them or disagree with the rounding.
+    eprintln!(
+        "W# gc pauses: {} samples, p50 {} us, p90 {} us, p99 {} us, max {} us \
+         (upper bounds, log-spaced buckets within 25%)",
+        crate::pause::samples(&pauses),
+        crate::pause::percentile_us(&pauses, 50),
+        crate::pause::percentile_us(&pauses, 90),
+        crate::pause::percentile_us(&pauses, 99),
+        crate::pause::percentile_us(&pauses, 100),
+    );
+    eprintln!(
+        "W# gc pause buckets (us): {}",
+        crate::pause::render(&pauses)
+    );
 }
 
 /// Let a trace in flight finish or stand down, so that the numbers printed at
@@ -437,6 +508,23 @@ pub fn quiesce() {
 /// A count rather than a byte threshold, because reclamation here is per object
 /// and the interesting cost is the buffer processing.
 const COLLECT_EVERY: usize = 4096;
+
+/// Whether a collection is due, with `fresh` objects allocated since the last
+/// one and `nursery` left over from it.
+///
+/// Every `COLLECT_EVERY` objects, counting the nursery as already spent -- it
+/// is work the last collection could not settle -- but never after fewer new
+/// objects than the nursery holds. A nursery object is one only the stack
+/// refers to, so a deep recursion keeps thousands of them alive at once, and
+/// with the nursery simply added to the count a nursery past `COLLECT_EVERY`
+/// made *every* allocation a collection, each walking the whole deep stack: a
+/// 5,000-deep TOML array took 25 seconds to refuse instead of a fifth of one
+/// (#49). A collection costs in proportion to the nursery and the stack, so
+/// waiting for as many allocations as the nursery holds keeps that cost
+/// amortised, at the price of dead nursery objects waiting that much longer.
+fn collection_due(fresh: usize, nursery: usize) -> bool {
+    fresh >= COLLECT_EVERY.saturating_sub(nursery).max(nursery)
+}
 
 /// Start a mark trace every this many allocations, whatever the heap looks
 /// like: counting cannot reclaim a cycle, and a program can make them steadily
@@ -484,7 +572,7 @@ pub unsafe fn on_allocation(object: *mut u8) {
         if has_references {
             b.logged.push(object);
         }
-        b.fresh.len() + b.nursery.len() >= COLLECT_EVERY
+        collection_due(b.fresh.len(), b.nursery.len())
     });
     let allocations = worker.stats.allocations.fetch_add(1, Ordering::Relaxed) + 1;
     if !(stress() || due) {
@@ -742,6 +830,34 @@ mod tests {
     use crate::header::{TYPE_ID_FIRST_USER, TYPE_ID_STR, meta_word};
     use crate::heap::ws_alloc;
     use crate::test_support::SERIAL;
+
+    /// The trigger waits for `COLLECT_EVERY` objects, less a small nursery,
+    /// and never for fewer than a large nursery holds -- so a deep stack
+    /// full of live, stack-only objects does not make every allocation a
+    /// collection (#49). The last three rows were all due under the rule
+    /// this replaced, `fresh + nursery >= COLLECT_EVERY`.
+    #[test]
+    fn a_large_nursery_does_not_make_every_allocation_a_collection() {
+        let c = COLLECT_EVERY;
+        for (fresh, nursery, due) in [
+            (0, 0, false),
+            (c - 1, 0, false),
+            (c, 0, true),
+            (c / 2 - 1, c / 2 + 1, false),
+            (c / 2 + 1, c / 2 - 1, true),
+            (c / 2, c / 2, true),
+            (1, c, false),
+            (c - 1, c, false),
+            (1, 5 * c, false),
+        ] {
+            assert_eq!(
+                collection_due(fresh, nursery),
+                due,
+                "fresh {fresh}, nursery {nursery}"
+            );
+        }
+        assert!(collection_due(5 * c, 5 * c));
+    }
 
     #[test]
     fn fresh_children_survive_cascading_reclamation() {

@@ -1,0 +1,6 @@
+error: this function takes 2 arguments but 1 was given
+  --> tests/cases/err_arity.ws:3:24
+  |
+3 | fn main() i64 { return add(1); }
+  |                        ^^^^^^
+exit 1

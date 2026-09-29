@@ -95,7 +95,7 @@ one whose `= help:` line has vanished, one `check` and `run` refuse differently,
 and one with no snapshot at all — and the selftest asserts the verdict for each,
 that the kept diff names both the old and the new column, that `--bless` then
 verify round-trips, and that an unsnapshotted corpus exits **3** rather than 0.
-Twenty-four assertions, no cargo.
+Twenty-six assertions, no cargo.
 
 ## `conform.sh` — what the language refuses, and in what words
 
@@ -139,6 +139,30 @@ nothing about the thing that differs.
 
 Divergence is reported per case, with both outputs kept under `diffs/`.
 
+**A mode that hits the per-run bound is a `TIMEOUT`, not a divergence.** Each
+mode runs under `timeout`, which answers 124 (TERM) or 137 (KILL); those are the
+harness's numbers, not the program's. A mode that did not finish has not
+disagreed with anything — it has not answered — so it gets its own verdict and
+its own `diffs/<case>.timeout.txt`, which records every mode's status and says
+which bound each was given. The first scheduled nightly reported
+`gc_map_replacement` as `DIVERGED` on two triples for exactly this reason; the
+row and the diff could not be told apart from a silent miscompile. A timeout
+still fails the run (criterion 5 clause 1 makes a real divergence a P1, and a
+hang with no progress is clause 3), so this changes the *name*, not the gate.
+Separating the two is the first move before routing: a case the bound is too
+small for is corpus cost, and a mode that never finishes at a generous bound is
+a hang.
+
+**A case whose cost is legitimately larger than the default names its own bound**
+with `// timeout: <seconds>` in its header. One global number conflates the two
+things a bound is for: a hang, which the gate must catch on every case, and a
+genuinely expensive case, which is doing its job. Raising the default to suit the
+second would let a real hang on any other case take that much longer to surface.
+`gc_map_replacement` is the first case to need one (1200s, for 1.2 M allocations
+under `--gc-stress`); the ten-slowest table at the bottom of every report is what
+tells you a case has grown into needing one. The timeout row names the number it
+was tested against, not the default.
+
 **A case that disagrees with itself is a different finding.** When a difference
 shows up, each side is re-run twice before it is called a divergence; a mode that
 cannot reproduce its own output is reported as `NONDETERMINISTIC` and classified
@@ -167,10 +191,28 @@ tests/harness/fuzz.pl --target toml  --replay target/harness/.../input.toml
 | `json` | `std/json.parse`, via `drivers/fuzz_json.ws` | `corpus/json/` |
 | `toml` | `std/toml.parse`, via `drivers/fuzz_toml.ws` | `corpus/toml/` |
 
-What counts as a finding: a Rust panic, a signal, no answer inside the timeout,
-and -- for the stdlib parsers only -- a W# panic, because "a parser answers, it
-does not raise" is the rule those modules are written to. A diagnostic is not a
-finding; most runs produce one and that is the intended outcome.
+What counts as a finding: a Rust panic, a signal, a *compiler* hang, and -- for
+the stdlib parsers only -- a W# panic, because "a parser answers, it does not
+raise" is the rule those modules are written to. A diagnostic is not a finding;
+most runs produce one and that is the intended outcome.
+
+**A `run` timeout is classified before it is called a hang.** The `run` target
+*executes* the program, and a valid program may legitimately never terminate --
+an infinite loop, or a blocking call nothing ever answers (`net.accept` on a
+listener with no client is the one the mutator keeps finding). Reporting that as
+a compiler hang is the false positive that made the first two nightlies red
+(#52). So on a `run` timeout the same bytes are put to three oracles: `check`,
+which must answer every input; `build`, which compiles and links but does not
+execute; and the built program, run under the same bound. Only a clean `build`
+whose program *also* runs long means the program itself does not finish, under
+either backend -- that is `NONTERMINATING`, counted and reported, and it does
+not fail the campaign. A built program that finishes means only the JIT ran
+long, which is two execution modes disagreeing -- a P1 -- and stays a finding,
+as do the front end hanging, `check` refusing a program `run` then executed,
+`build` hanging, and `build` failing where `run` got as far as executing, so an
+environment problem keeps the finding rather than silencing it.
+`fuzz-selftest.sh` drives this classification over a stub compiler and needs no
+cargo.
 
 Three properties are load-bearing:
 
@@ -184,8 +226,10 @@ Three properties are load-bearing:
   usually already the `tests/cases` entry that will guard the fix. The
   unreduced input is kept beside it.
 - **One directory per cause, not per occurrence.** Findings are keyed by
-  signature -- panic site and message, signal number, or `hang` -- with a count,
-  so a mutation class that trips one assertion four hundred times is one finding.
+  signature -- panic site and message, signal number, or for a `run` timeout
+  which oracle explained it -- with a count, so a mutation class that trips one
+  assertion four hundred times is one finding. A hang has no site to key on, so
+  every hang one oracle explains the same way is still one directory.
 
 A stdlib driver is built once per campaign rather than compiled per input.
 Compiling `fuzz_json.ws` takes about 2.5 seconds and parsing a document takes
@@ -200,13 +244,15 @@ tests/harness/gc-pauses.sh --only gc_ --repeats 5
 tests/harness/gc-pauses.sh --only gc_ --repeats 3 --stress
 ```
 
-**What is measurable today.** `WSHARP_GC_STATS=1` reports three numbers about
-pauses per process -- how many, the longest, the total -- and `gc::record_pause`
-keeps exactly those three counters. There is no histogram and no per-pause log,
-so **a p99 over the pauses inside one run cannot be computed from outside the
-runtime**, however the numbers are rearranged afterwards. What this measures is
-the distribution over *runs*: the longest pause per run, which is the tail metric
-that matters, and the mean per run. The report says which, every time.
+**What is measured.** Every pause of every run. `WSHARP_GC_PAUSE_LOG=<path>`
+(#24) makes the runtime keep one line per pause -- the microseconds, which of the
+three pauses, which worker -- and `gc-pauses.sh` sets it for each run and pools
+the lines into `pauses.tsv`, so the report's first table is a **per-pause**
+distribution, overall and by pause kind, and says whether it reached criterion
+8.2's 1,000 samples. The per-run table beside it -- the longest pause per run,
+and the mean -- answers how bad one program's worst stall is. `WSHARP_GC_STATS=1`
+also prints a log-spaced histogram of every pause, which is enough for a quick
+look and is not what the published numbers are computed from.
 
 Pauses are wall-clock time on the mutator thread, so on a loaded or single-core
 machine they include time the thread was not scheduled. The report prints the
@@ -364,14 +410,31 @@ A suite's limits belong where somebody reading its green run will see them.
   coverage feedback to steer one.
 - **The `json` and `toml` targets fuzz two parsers.** Every other `std/*` module
   is unfuzzed, and so is `ingot`.
-- **Nothing here fuzzes across a worker boundary**, drives many workers, or
-  constrains the heap size. Those modes ship, and this harness does not exercise
-  them.
-- **`gc-pauses.sh` measures the distribution over runs, not within one.**
-  `WSHARP_GC_STATS=1` reports three counters per process and there is no
-  per-pause log, so a p99 over the pauses inside a single run cannot be computed
-  from outside the runtime at all (#18). The report says which distribution it is
-  reporting, every time.
+- **Nothing here fuzzes across a worker boundary.** That mode ships, and no
+  generated input crosses it.
+- **Many workers is a case, not a dimension.** `tests/cases/gc_many_workers.ws`
+  puts eight heaps and eight collectors in one process, allocating at once, so
+  parity runs it in three modes and the built-program stress pass runs it a
+  fourth time -- but eight is a number somebody wrote down, not a knob this
+  harness sweeps. Nothing here scales the worker count looking for the point
+  where it breaks.
+- **The heap cannot be made small.** `SPACE_BLOCKS` (64 MiB a space),
+  `TRACE_EVERY_ALLOCATIONS` and `TRACE_GROWTH_FLOOR_BYTES` are compile-time
+  constants in `wsharp-runtime`, so the only way to reach a space-exhaustion or
+  block-reuse path is to write a case big enough to reach it on a full-sized
+  heap. `--gc-stress` makes collections *frequent*, which is a different
+  question from making the heap *tight*.
+- **Optimisation level is not a dimension either, and cannot be.** Both backends
+  set Cranelift's `opt_level` to the literal `"speed"`
+  (`wsharp-codegen/src/lib.rs`, twice), and nothing reads an override. So the
+  differential criterion 5 asks for -- the same corpus compiled two ways, where
+  neither has to be known-correct for a disagreement to be a defect -- has no
+  switch to drive. Filed as #39; until it is answered, parity varies the backend
+  and the collector and holds the optimiser fixed, and that is three dimensions
+  where the gate list names four.
+- **A pause log holds at most 1,048,576 pauses per worker.** It is preallocated
+  when the worker is made, because nothing may allocate on the pause path; a run
+  that pauses more says `TRUNCATED` in its trailer and `gc-pauses.sh` reports it.
 - **Timing numbers here are not published numbers.** Pause and duration figures
   are for triage — is this a stall or a busy box — and anything quoted as a
   result goes through Ridge's harness under Form B of the proof standard.
@@ -380,9 +443,9 @@ A suite's limits belong where somebody reading its green run will see them.
   triple. 32-bit and non-x86-64/aarch64 targets are out of scope (#11).
 - **`selftest.sh` tests the harness, not the language**, and a green selftest
   says only that the gate can still tell a divergence from agreement.
-- **`conform.sh` has no snapshots committed yet**, so today it proves the
-  comparison works rather than that any W# diagnostic is correct: it exits 3,
-  "cannot answer", until a bless commit lands. It also adds no new rejection
-  cases — it pins the 64 that exist — and does not cover warnings, `// panic:`
-  text, `build`, or any multi-file diagnostic. `tests/conformance/README.md` is
-  the full list.
+- **`conform.sh` pins every one of the 68 rejection cases**, from snapshots in
+  `tests/conformance/expected/` (#55). The four `err_ffi_*` cases were `NOSPAN`
+  until their diagnostic stopped pointing into `std/ffi` and started pointing at
+  the program's own `ffi.bind` call (#37). It adds no new rejection cases, and
+  does not cover warnings, `// panic:` text, `build`, or any multi-file
+  diagnostic. `tests/conformance/README.md` is the full list.

@@ -2824,11 +2824,11 @@ A manifest is a file somebody wrote. A JSON document is bytes a stranger sent.
 line, and telling the person holding 40 KB of it that the trouble is on line 1
 is worse than saying nothing.
 
-**There is a nesting bound.** `MAX_DEPTH` is 128, and `std/toml` has no
-counterpart on purpose. Both readers are recursive descent; only one of them can
-be handed a few hundred kilobytes of `[`, which without a bound is a stack
-overflow - a crash with no diagnostic - rather than a document refused with a
-message. `std/x509`'s `MAX_CHAIN` is the shape: a named bound and no knob.
+**There is a nesting bound.** `MAX_DEPTH` is 128. `std/toml` had no
+counterpart on purpose at the time, on the argument that only JSON is handed a
+few hundred kilobytes of `[` by a stranger; the fuzzer later showed that a
+reader is handed whatever its caller has, and `std/toml` got the same bound
+(#49). `std/x509`'s `MAX_CHAIN` is the shape: a named bound and no knob.
 
 **An object indexes itself once it is worth it.** `std/toml`'s table scans two
 parallel lists and says out loud that the fix for a large one is a map rather
