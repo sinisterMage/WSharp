@@ -1,3 +1,3 @@
-compiler	Dex	tests/harness/nightly.sh, once a day, x86_64-unknown-linux-gnu
-ecosystem	Ash	scripts/ecosystem-check.sh through .github/workflows/ecosystem.yml, one full run per day on all four release triples	x86_64-unknown-linux-gnu,x86_64-pc-windows-msvc,x86_64-apple-darwin,aarch64-apple-darwin
-raython	Wren	the Raython sample application, a long-running HTTP server
+compiler	nightly.yml	tests/harness/nightly.sh, once a day, x86_64-unknown-linux-gnu
+ecosystem	ecosystem.yml	scripts/ecosystem-check.sh through .github/workflows/ecosystem.yml, one full run per day on all four release triples	x86_64-unknown-linux-gnu,x86_64-pc-windows-msvc,x86_64-apple-darwin,aarch64-apple-darwin
+raython	the Raython deployment	the Raython sample application, a long-running HTTP server

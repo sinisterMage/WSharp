@@ -52,7 +52,7 @@ command -v gh >/dev/null 2>&1 || {
 	note ""
 	note "    \$(git rev-parse HEAD) $(date -u +%Y-%m-%d)"
 	note ""
-	note "Only Johnny declares day 0. See RELEASE-CRITERIA-1.0.md, \"The freeze clock\"."
+	note "Only the repository owner declares day 0. See RELEASE-CRITERIA-1.0.md, \"The freeze clock\"."
 	exit 2
 }
 

@@ -14,7 +14,7 @@
 #
 # ## The row format
 #
-# Each subject's owner appends its own rows; this script only reads them. One
+# Each subject's daily job appends its own rows; this script only reads them. One
 # file per subject under `$SOAK_DIR`, named `<subject>.tsv`, six tab-separated
 # fields and no header:
 #
@@ -23,7 +23,7 @@
 #
 #   date      UTC, `YYYY-MM-DD`, the day the run *covered*
 #   subject   must match the file's name, so a row appended to the wrong file
-#             is caught rather than silently credited to the wrong owner
+#             is caught rather than silently credited to the wrong subject
 #   verdict   `ok` or `fail`; anything else is a malformed row and fails
 #   commit    the full SHA the subject was exercised at
 #   platform  a target triple, or `-` where the subject is not per-platform
@@ -46,8 +46,8 @@
 # `subjects.tsv`, so adding a subject is a diff somebody reviews rather than a
 # change to this script:
 #
-#     compiler<TAB>Dex<TAB>tests/harness/nightly.sh, once a day
-#     ecosystem<TAB>Ash<TAB>the ecosystem check<TAB>x86_64-unknown-linux-gnu,aarch64-apple-darwin
+#     compiler<TAB>nightly.yml<TAB>tests/harness/nightly.sh, once a day
+#     ecosystem<TAB>ecosystem.yml<TAB>the ecosystem check<TAB>x86_64-unknown-linux-gnu,aarch64-apple-darwin
 #
 # An optional fourth field lists the platforms every day must cover. A day with
 # a row for some of them and not others is *incomplete*, and fails exactly as a
@@ -148,9 +148,9 @@ fi
 [ -f "$SUBJECTS" ] || {
 	note "cannot answer: no subject manifest at $SUBJECTS"
 	note ""
-	note "One line per soak subject -- name, owner, what it is:"
+	note "One line per soak subject -- name, what writes its rows, what it is:"
 	note ""
-	note "    compiler<TAB>Dex<TAB>tests/harness/nightly.sh, once a day"
+	note "    compiler<TAB>nightly.yml<TAB>tests/harness/nightly.sh, once a day"
 	note ""
 	note "See RELEASE-CRITERIA-1.0.md, criterion 1."
 	exit 2
@@ -186,7 +186,7 @@ subject_count=0
 note "Calendar, oldest day first:"
 note ""
 
-while IFS='	' read -r subject owner what platforms; do
+while IFS='	' read -r subject writer what platforms; do
 	case "$subject" in
 	'' | '#'*) continue ;;
 	esac
@@ -252,7 +252,7 @@ while IFS='	' read -r subject owner what platforms; do
 					"$file"
 			done
 		fi
-		printf '    %-12s %s\n' "owner:" "$owner${what:+ — $what}"
+		printf '    %-12s %s\n' "written by:" "$writer${what:+ — $what}"
 	fi
 done <"$SUBJECTS"
 

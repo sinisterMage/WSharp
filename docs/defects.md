@@ -12,20 +12,9 @@ discovered at the worst possible moment.
 ## Where a defect lands
 
 **GitHub issues on [`sinisterMage/WSharp`](https://github.com/sinisterMage/WSharp/issues)
-are the record.** Every defect gets one, whoever found it — a user, a driver
-program, the soak harness, or release verification.
-
-The repository is the record rather than any internal tracker for one reason: a
-defect history that lives somewhere private is invisible to the people deciding
-whether to depend on this language, and it evaporates when whatever produced it
-moves on. An issue filed today is still readable in five years by someone asking
-"was this ever broken, and when was it fixed". That is most of what a defect
-record is *for*.
-
-Internal task trackers may mirror an issue where somebody needs to own the fix on
-a schedule. When they do, the task links the issue and the issue is still the
-place the reproduction, the cause and the fix are written down. The mirror
-carries scheduling; it does not carry facts.
+are the public record.** Every defect gets one, whoever found it — a user, a
+driver program, the soak harness, or release verification — and the reproduction,
+the cause and the fix are written down there.
 
 ## What an issue must carry
 
@@ -58,8 +47,8 @@ when it is most expensive.
 
 What matters for intake:
 
-- The **filer proposes** a severity on the report form; the **triage owner for
-  the surface confirms or changes it**, within one working day.
+- The **filer proposes** a severity on the report form; **a maintainer confirms
+  or changes it** at triage, within one working day.
 - **An unconfirmed report counts at the severity the filer proposed.** So "no
   open P1" cannot be satisfied by leaving reports untriaged — which is the
   property that makes the gate mean anything.
@@ -69,17 +58,8 @@ What matters for intake:
   Rarity is not a mitigation: a silently wrong answer that happens once a month
   is still a silently wrong answer.
 
-Triage owners, from the same document:
-
-| Surface | Owner |
-|---|---|
-| Compiler, runtime, stdlib, the collector | Mira (WLA-3, WLA-4) |
-| Release pipeline, install, artefacts, digests, sharpie, the `.wsharp` ecosystem | Ash (WLA-7) |
-| Raython and its sample application | Wren (WLA-8) |
-| Harness, conformance, fuzzing, soak infrastructure | Dex (WLA-6) |
-| Benchmarks, collector measurement, published numbers | Ridge (WLA-5) |
-
-Disagreement about a severity goes to Johnny.
+A maintainer confirms severity at triage; the `area:` labels, below, name the
+surface. Disagreement about a severity goes to the repository owner.
 
 ## Triage
 
@@ -129,8 +109,8 @@ Two rules keep this from becoming a place to hide defects:
    listing mandatory rather than editorial — an open P2 that is neither fixed
    nor listed becomes a P1, because it makes the documentation wrong.
 
-Limitation-only issues are **excluded from the weekly counts** and reported as
-their own line. Mixing them in would make "open P2" mean nothing.
+Limitation-only issues are **excluded from defect counts** and reported
+separately. Mixing them in would make "open P2" mean nothing.
 
 Labels beyond severity: `area: syntax`, `area: sema`, `area: codegen`,
 `area: runtime`, `area: cli`, `area: start`, `area: stdlib` for the crate or
@@ -161,9 +141,8 @@ failed has not been shown to guard anything, and one written afterwards
 frequently does not — it is easy to write a case that passes for a reason
 unrelated to the bug.
 
-The fix itself names, in the issue, which crate was wrong and which invariant it
-violated. `CLAUDE.md` is the list of invariants this project actually runs on; if
-the one that broke is not in it, add it there in the same change.
+The fix itself names, in the issue and the PR, which crate was wrong and which
+invariant it violated.
 
 ## Verification
 
@@ -216,49 +195,13 @@ cargo test -p wsharp-<crate>                                                    
 Touched the runtime or the collector? The `--gc-stress` pass above is the one
 that matters, plus `the_collector_survives_stress_in_a_built_program`.
 
-One more trap, because it costs a confusing five minutes: **`cargo test
---workspace <filter>` fails to compile.** Given a filter argument, cargo builds
-`wsharp-start` with `--test` despite its `test = false`, and that crate defines
-`main`, so the linker is asked to place two and refuses:
-
-```text
-error: entry symbol `main` declared multiple times
-```
-
-Nothing is wrong with your change. Use `-p wsharp-cli --test cases` as above, or
-`--workspace --exclude wsharp-start`. Plain `cargo test --workspace`, with no
-filter, is fine and is what CI runs.
+`cargo test --workspace <filter>` used to fail to link with ``entry symbol
+`main` declared multiple times``, because a filter pulled `wsharp-start` — which
+defines `main` — into a test harness
+([#8](https://github.com/sinisterMage/WSharp/issues/8)). That is fixed, and the
+`contributor-commands` job in `.github/workflows/release-gates.yml` builds a
+filtered workspace test on every pull request so it stays fixed. A filter still
+matches test functions rather than cases, so the trap above applies to it too.
 
 Paste the commands and their output into the issue. Paraphrase loses the detail
 that turns out to matter.
-
-## The weekly report
-
-Posted weekly, on the triage pass. The format:
-
-```markdown
-## Defect report — week ending YYYY-MM-DD
-
-| | P1 | P2 | P3 | Total |
-|---|---|---|---|---|
-| Open at start |  |  |  |  |
-| Opened |  |  |  |  |
-| Fixed |  |  |  |  |
-| **Open now** |  |  |  |  |
-
-**Untriaged:** N (target: 0)
-**Open P1:** N — *list each one, with owner and next action*
-**Tracked limitations:** N open — *not defects, counted separately*
-
-**Load this week:** what was actually exercising the compiler — driver programs,
-soak hours, platforms covered. A defect count means nothing without it.
-
-**Trend:** is the defect rate falling under constant or rising load?
-
-**Notes:** anything the numbers do not say.
-```
-
-The load line is the one that is tempting to skip and carries most of the
-information. Zero defects in a week when nothing ran is not evidence of anything.
-A falling defect rate under constant or rising load is the actual signal that
-v1.0 is close; a flat rate means it is not, however small the absolute number is.

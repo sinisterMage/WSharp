@@ -43,7 +43,8 @@ EOF
 
 # ---------------------------------------------------------------------------
 # Reporting. Every check prints one line beginning "ok" or "FAIL", so the
-# transcript pasted into a task comment is readable without the script.
+# transcript pasted into an issue or a release checklist is readable without
+# the script.
 # ---------------------------------------------------------------------------
 
 failures=0

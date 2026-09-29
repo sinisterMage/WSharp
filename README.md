@@ -978,16 +978,12 @@ Numbered by the original feature list:
 
 Since that list ran out, two things.
 
-**Raython**, an MVC framework, which is a design rather than a program so far
-and whose repository is private. Its author settled every "can W# do this?" by
-running the compiler rather than from memory, and left 28 probes behind as the
-record. The design ends with nine things it wanted from the language and one
-thing that was a bug: a conversion inside an abstract-typed body pinned that
-parameter to the converted type, and with a second overload beside it that got
-past inference and produced IR Cranelift refused. All ten are closed, which is
-where `--emit=api`, `std/map`, a linear `str.join`, `net.shutdown`, `os.exit`,
-`fs.modified_at`, struct `==` and `main` returning ending the process came from.
-Item 14 of [ROADMAP.md](ROADMAP.md) is the write-up.
+**Raython**, an MVC framework designed against W#, exercised the language with 28
+probe programs; the nine things it asked of the language and the one bug it found
+are all closed, which is where `--emit=api`, `std/map`, a linear `str.join`,
+`net.shutdown`, `os.exit`, `fs.modified_at`, struct `==` and `main` returning
+ending the process came from. Item 14 of [ROADMAP.md](ROADMAP.md) is the
+write-up.
 
 And [**sharpie**](https://github.com/sinisterMage/sharpie), a version manager,
 the second real program written in W#. It finds releases by reading this
@@ -1015,7 +1011,7 @@ Four documents govern it, and each has one job:
 
 | File | Answers |
 |---|---|
-| [RELEASE-CRITERIA-1.0.md](RELEASE-CRITERIA-1.0.md) | What 1.0 has to be true of, how each thing is measured, who owns it, and what proof closes it |
+| [RELEASE-CRITERIA-1.0.md](RELEASE-CRITERIA-1.0.md) | What 1.0 has to be true of, how each thing is measured, and what proof closes it |
 | [COMPATIBILITY.md](COMPATIBILITY.md) | What 1.0 promises not to break, surface by surface, and for how long |
 | [LIMITATIONS.md](LIMITATIONS.md) | What W# does not do, with a workaround or the word *None* |
 | [docs/defects.md](docs/defects.md) | Where a defect lands, what severity it gets, and what happens to it after that |

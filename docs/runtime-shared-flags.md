@@ -1,9 +1,12 @@
 # Shared runtime flag publication
 
-Fix for [WSharp #64](https://github.com/sinisterMage/WSharp/issues/64).
-This is separate from the request/phase publication repair in
-[PR #63](https://github.com/sinisterMage/WSharp/pull/63); neither repair alone
-proves the whole collector protocol sound.
+A design note for the two process-wide GC flag words -- `ws_gc_poll_flag` and
+`ws_gc_evacuating_flag` -- and the per-worker contributions behind them
+([#64](https://github.com/sinisterMage/WSharp/issues/64)). It covers how a
+worker's request becomes visible to every thread. The ordering between a
+worker's pause request and the phase that services it is a separate protocol
+([PR #63](https://github.com/sinisterMage/WSharp/pull/63)); the collector needs
+both to hold.
 
 ## Invariant and ordering
 
@@ -16,13 +19,13 @@ publish a value derived from an obsolete count after another writer returns.
 Stronger atomic ordering alone would not make those separate operations one
 transaction.
 
-The mutex synchronizes writers; existing AcqRel bit/count operations and Release
+The mutex synchronizes writers; the AcqRel bit/count operations and Release
 flag publication remain. Runtime readers use Acquire loads. Generated readers
-retain their existing byte-load fast paths and exported symbols. The flag is
-not a snapshot of intermediate count/bit values inside an unfinished transition.
+keep their byte-load fast paths and exported symbols. The flag is not a
+snapshot of intermediate count/bit values inside an unfinished transition.
 The caller must finish request publication before publishing the phase that
 allows servicing it (PR #63), and must finish arming evacuation before resuming
-the mutator. This patch does not change generated-load memory-order assumptions.
+the mutator. The memory-order assumptions of generated loads are unchanged.
 
 The lock protects both aggregates. It never acquires heap, mark-state, worker
 registry or park locks, never allocates, and never invokes production callbacks.
@@ -32,64 +35,39 @@ thread-local callbacks suspend publication for the deterministic scheduler.
 The state contains no managed pointers: the collector's root set does not grow.
 No runtime dependency is added.
 
-## Production impact and limits
+## Why it matters, and what it does not cover
 
 `emit_gc_poll` branches around `ws_gc_poll` when the aggregate byte is zero;
-`gc::ws_gc_poll` also checks it. The old interleaving can therefore suppress a
-pending worker's poll until another transition restores the byte, even though
-that worker's request is still set. `emit_load_barrier` similarly bypasses
-resolution when the evacuation aggregate is zero. Because both use the same
-helper, the stale publication violates the prerequisite for that fast path too.
-These are source-level consequences of the demonstrated aggregate defect, not
-an end-to-end demonstration of memory corruption or a GC safety failure.
+`gc::ws_gc_poll` also checks it. Without the lock, an interleaving of one
+worker's clear with another's raise can leave the byte at zero while a request
+is still set, suppressing that worker's poll until another transition restores
+the byte. `emit_load_barrier` similarly bypasses resolution when the evacuation
+aggregate is zero, and both flags go through the same helper, so a stale byte
+there would skip a load barrier while objects move.
 
-Workers remain process-lifetime allocations. Existing phase, parked-mutator and
+Workers remain process-lifetime allocations. The phase, parked-mutator and
 shutdown/abandon protocols remain responsible for pairing contributions and
-settling workers. This repair neither adds worker deregistration nor validates
+settling workers. The lock neither adds worker deregistration nor validates
 all exit paths. It also does not turn duplicate per-worker request bits into
 queues: callers still must obey the per-worker phase protocol. The mutex adds
-writer contention; measurement belongs to Ridge, and no performance claim is
-made here. Release gate definitions are unchanged; this defect and its guard
-must be assessed through the existing defect/stability gates.
+writer contention; no performance claim is made.
 
-## Deterministic proof
+## Test
 
-The regression lives in `tests/cases/runtime_shared_aggregate.rs` and is included
-by the runtime unit-test module. It calls the actual `set_shared` implementation
-with private atomics so unrelated worker activity cannot change the count.
-The scheduler suspends A after its count update. B probes the serialization
-boundary: without a held lock it completes its transition before A publishes;
-with the lock held it acknowledges contention, then blocks in the real helper
-until A completes. Channels enforce the order, with no sleeps, retries or
-ignored tests. The second case covers a request overlapping another worker's
-request/clear round trip. Both check counts, flags, duplicate transitions and
-final cleanup. The existing shared-worker assertion remains unchanged.
+The regression tests live in `tests/cases/runtime_shared_aggregate.rs`, which
+`crates/wsharp-runtime/src/worker.rs` includes as the `aggregate_tests` unit-test
+module:
 
-Baseline main: `4e9249a6850f9721db13dbd61c63c57250eced11`.
-The fix's parent, containing only the regression and test hook:
-`d70fa36e878349dfdd7fb497b36efbcf508bdd70`.
+- `clearing_worker_cannot_hide_new_request` -- one worker's clear is suspended
+  after its count update while another raises; the flag must still read 1.
+- `raising_worker_survives_other_worker_round_trip` -- a request overlapping
+  another worker's request/clear round trip.
+
+Both call the real `set_shared` with private atomics, so unrelated worker
+activity cannot change the count, and a channel-driven scheduler enforces the
+interleaving with no sleeps or retries. Each checks counts, flags, duplicate
+transitions and final cleanup. Run them with:
 
 ```sh
-cargo test -p wsharp-runtime --lib --locked aggregate_tests -- --test-threads=1
-```
-
-Before (Rust 1.95.0, Debian 13, glibc 2.41): exit 101, 1 passed, 1 failed:
-
-```text
-worker::aggregate_tests::clearing_worker_cannot_hide_new_request ... FAILED
-assertion `left == right` failed: aggregate flag must reflect remaining worker contributions
-  left: 0
- right: 1
-```
-
-After: exit 0, 2 passed, 0 failed. The failure occurs after both threads finish;
-count is 1 and B's contribution is true, but the flag was 0.
-
-Additional checks:
-
-```sh
-cargo test -p wsharp-runtime --lib --locked
-cargo clippy -p wsharp-runtime --all-targets --locked -- -D warnings
-cargo fmt --all --check
-cargo build --workspace --locked
+nix-shell --run "cargo test -p wsharp-runtime --lib aggregate_tests"
 ```

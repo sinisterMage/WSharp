@@ -3,12 +3,9 @@
 **Status: live, against `wsharp 0.2.3`.** Every limitation below was verified
 against that release and the output shown is what it printed.
 
-**The six tracked issues are dispositioned, and all six are documented
-limitations.** Criterion 4 of [RELEASE-CRITERIA-1.0.md](RELEASE-CRITERIA-1.0.md)
-is the gate; each entry now carries a **Disposition** line stating the call and
-the reason for it, so the decision is readable here rather than only in an issue
-thread. Not one of them was closed on a comment: each has the entry below and,
-where one can exist, a named `tests/cases` guard.
+The six issues tracked by criterion 4 of
+[RELEASE-CRITERIA-1.0.md](RELEASE-CRITERIA-1.0.md) are all documented
+limitations; each entry's **Disposition** line says why.
 
 A guard for a limitation is an uncomfortable-looking test — it asserts that
 something does *not* work. That is the point. A limitation nothing checks can
@@ -36,15 +33,12 @@ program at two in the morning.
 | [#14](https://github.com/sinisterMage/WSharp/issues/14) | `net.shutdown` does not stop an acceptor on the BSDs | Documented — kernel behaviour, and the API does not offer the operation | `tests/cases/err_shutdown_listener.ws`, `tests/cases/net_poller.ws` |
 | [#15](https://github.com/sinisterMage/WSharp/issues/15) | `std/tls` cannot verify a chain through a P-521 key | Documented — 521 bits is not a whole number of 32-bit limbs | `tests/cases/x509_p521.ws` |
 
-Each row's reasoning is in its entry below, under **Disposition**. Four of the
-cases named — `err_computed_const.ws`, `const_array_alias.ws`,
-`err_shutdown_listener.ws` and `x509_p521.ws` — were written for this file and did
-not exist before: a limitation nobody checked was a limitation that could drift.
+Each row's reasoning is in its entry below, under **Disposition**.
 
 ## How to read an entry
 
-Every entry carries four things, and an entry missing any of them is not
-finished:
+Every entry carries the fields below — **Disposition** only where an issue asked
+for fix-or-document — and an entry missing one it needs is not finished:
 
 | Field | Means |
 |---|---|
@@ -356,9 +350,9 @@ as uncomparable with a diagnostic naming the field
 is still here.** Until the bound landed, the program above died on a signal
 with no W# diagnostic and no exit
 status a program could act on. By clause 3 of the P1 definition in
-`RELEASE-CRITERIA-1.0.md` that is a P1 whatever the documentation says — Johnny
-ruled on 2026-09-26 that clause 3 carries no exemption for documented behaviour,
-because documentation changes who is surprised, not what the process does. Form
+`RELEASE-CRITERIA-1.0.md` that is a P1 whatever the documentation says: clause 3
+carries no exemption for documented behaviour (decided 2026-09-26), because
+documentation changes who is surprised, not what the process does. Form
 C says the same thing from the other side: a limitation whose behaviour is a
 crash is not documentable, so it gets bounded into a diagnostic first and the
 bound is what gets documented. This entry is that bound.
@@ -466,10 +460,9 @@ is a language decision, not one to slip in under a freeze.
 `try` does anywhere: both `First` and `Last` then reach the caller. Or write the
 error set down, `!{First, Last}i64`.
 
-**Disposition: documented limitation for 1.0, pending the language owner's
-confirmation on #62.** The rule is also stated in `CLAUDE.md` ("`return f(x)`
-unifies two error sets; `try f(x); return;` widens one"), which is where
-`std/tls`'s dispatchers learnt to be written the second way.
+**Disposition: documented limitation for 1.0.** Whether to change the rule is an
+open language decision on #62. `std/tls`'s message dispatchers use `try` for
+exactly this reason.
 
 **Guarded by** `tests/cases/err_tail_call_error_set.ws`, the refusal, and
 `tests/cases/tail_call_error_set_try.ws`, the workaround reaching both errors.
@@ -713,9 +706,9 @@ backend this project actually tests, not a rewrite of the walk.
 **Disposition: documented limitation**, and of the six it is the one that is a
 *scope statement* rather than an unfinished piece. A supported platform is not a
 `cfg` arm: it is a register read, a Cranelift backend this project tests, and a CI
-job on real hardware that a release is held to. Adding one during the 1.0 campaign
-would mean shipping a platform whose collector nobody had watched fail, which is
-the opposite of what the campaign is for.
+job on real hardware that a release is held to. Adding one for 1.0 would mean
+shipping a platform whose collector nobody had watched fail, which is the
+opposite of what 1.0 is for.
 
 **Guarded by** two mechanisms, neither of which is a `tests/cases` entry — a case
 cannot be written for an architecture that does not build. The
@@ -749,8 +742,7 @@ The reason it is worth an entry rather than a line in the README is **who meets
 it**. `cc` on a Windows machine is whatever is first on `PATH`, and a developer
 machine with Git for Windows, MSYS2 or a MinGW toolchain installed has one there
 without having chosen it. GitHub's `windows-latest` image is exactly that
-machine, which is how this was found: criterion 7's Windows row failed on it
-while the same release built fine under clang.
+machine.
 
 **Why.** The Windows flags are not decoration. `-Xlinker -subsystem:console` is
 there because clang picks a subsystem by looking for `main` in the *objects* it
@@ -762,10 +754,10 @@ the static CRT is not a near miss. Both are written out at
 `crates/wsharp-cli/src/link.rs:91`.
 
 Supporting GNU `ld` as well means a second set of flags, selected by detecting
-the linker flavour, and a second Windows link configuration to keep green — on
-a platform where, per the note in `CLAUDE.md`, almost nothing can be checked
-from the machines this project is developed on. The released artefact is
-`x86_64-pc-windows-msvc`, and MSVC is the toolchain that target names.
+the linker flavour, and a second Windows link configuration to keep green.
+Windows is covered by CI, so that would be a second Windows CI configuration as
+well. The released artefact is `x86_64-pc-windows-msvc`, and MSVC is the
+toolchain that target names.
 
 **Workaround.** Use clang, which drives the MSVC linker and libraries: install
 the Visual Studio Build Tools for those, `winget install LLVM.LLVM` for clang,
@@ -789,8 +781,8 @@ answer on Windows and says that `cc` is MinGW, what to install, and how to set
 
 **Guarded by** `link::tests::a_mingw_link_failure_is_told_apart_from_an_msvc_one`,
 which holds the recognition to #41's own linker output and to the MSVC linker's,
-on every platform. Criterion 7's Windows row no longer meets MinGW at all: it
-sets `CC=clang`, the documented toolchain. There is deliberately no `tests/cases`
+on every platform. The Windows clean-machine install check sets `CC=clang`, the
+documented toolchain. There is deliberately no `tests/cases`
 entry: a case cannot assert which C compiler is first on `PATH` without becoming
 a case about the machine it ran on.
 
@@ -805,13 +797,14 @@ bytes. What is published is a digest per artefact, and the promise is that the
 digest matches the bytes served.
 
 **Why.** A Rust release build is not bit-identical across machines without work
-the 1.0 campaign has not scoped.
+1.0 has not scoped.
 
 **Workaround.** Verify the published digest, which both installers do before
 extracting.
 
-**Tracked.** Stated as a non-promise in `RELEASE-CRITERIA-1.0.md`, "What this
-document does not promise".
+**Tracked.** Stated as a non-promise in
+[COMPATIBILITY.md](COMPATIBILITY.md#release-artefacts-and-the-feed), "Release
+artefacts and the feed".
 
 ## The runtime's C symbols are not a stable ABI
 
@@ -819,9 +812,10 @@ document does not promise".
 an internal boundary between the compiler and its own runtime. Linking against
 them from outside is not supported and they may change in a patch release.
 
-**Tracked.** Stated as a non-promise in `RELEASE-CRITERIA-1.0.md`; repeated here
-because the symbols are visible in a built binary and therefore look like an
-interface.
+**Tracked.** Stated as a non-promise in
+[COMPATIBILITY.md](COMPATIBILITY.md#what-is-outside-the-promise-entirely), "What
+is outside the promise entirely"; repeated here because the symbols are visible
+in a built binary and therefore look like an interface.
 
 ---
 

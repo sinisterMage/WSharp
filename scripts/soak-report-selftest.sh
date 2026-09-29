@@ -33,7 +33,7 @@ END=2026-09-26
 fresh() {
 	rm -rf "$WORK/d"
 	mkdir -p "$WORK/d"
-	printf 'compiler\tDex\tthe nightly\n' >"$WORK/d/subjects.tsv"
+	printf 'compiler\tnightly.yml\tthe nightly\n' >"$WORK/d/subjects.tsv"
 }
 
 append() {
@@ -170,7 +170,7 @@ fi
 four() {
 	rm -rf "$WORK/d"
 	mkdir -p "$WORK/d"
-	printf 'ecosystem\tAsh\tthe check\tlinux,windows,intel-mac,arm-mac\n' >"$WORK/d/subjects.tsv"
+	printf 'ecosystem\tecosystem.yml\tthe check\tlinux,windows,intel-mac,arm-mac\n' >"$WORK/d/subjects.tsv"
 }
 row() {
 	sh "$REPORT" --dir "$WORK/d" --append --subject ecosystem --verdict "$1" \

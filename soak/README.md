@@ -2,8 +2,8 @@
 
 Criterion 1 of `RELEASE-CRITERIA-1.0.md` asks whether three subjects were
 exercised continuously for the freeze window. This directory is the answer's
-raw data: one TSV per subject, one row per day, appended by whoever owns that
-subject.
+raw data: one TSV per subject, one row per day, appended by the job that
+exercises that subject.
 
 ```sh
 scripts/soak-report.sh                       # the 28-day window ending today
@@ -33,7 +33,7 @@ that looks like evidence.
 ## Appending a row
 
 `scripts/soak-report.sh --append` is the only writer, so the format has one
-definition. Each owner runs it at the end of their daily job:
+definition. Each subject's daily job runs it at the end:
 
 ```sh
 scripts/soak-report.sh --append \
@@ -46,7 +46,7 @@ scripts/soak-report.sh --append \
 Six tab-separated fields, no header: date, subject, verdict (`ok` or `fail`),
 the full commit SHA, a target triple or `-`, and free-text detail. The subject
 field is checked against the file's name, so a row appended to the wrong file is
-caught rather than credited to the wrong owner.
+caught rather than credited to the wrong subject.
 
 Several rows for one subject on one day are expected — a subject run on four
 triples writes four. The day counts as reported when at least one row exists,
@@ -59,15 +59,15 @@ three of four reported is `-` in the calendar and fails as a missing day does:
 ## Subjects
 
 `subjects.tsv`, so adding one is a diff somebody reviews rather than a change to
-the script: name, owner, what it is, and optionally the comma-separated
-platforms every day must cover.
+the script: name, what writes its rows, what it is, and optionally the
+comma-separated platforms every day must cover.
 
-| Subject | Owner | What it is |
+| Subject | Written by | What it is |
 |---|---|---|
-| `compiler` | Dex | `tests/harness/nightly.sh` once a day — parity across the three execution modes, the fuzz corpus, the pause measurements |
-| `ecosystem` | Ash | `scripts/ecosystem-check.sh`, run by `.github/workflows/ecosystem.yml` once a day on each of the four release triples, each of which must report |
-| `raython` | Wren | the Raython sample application, a long-running HTTP server |
+| `compiler` | `nightly.yml` | `tests/harness/nightly.sh` once a day — parity across the three execution modes, the fuzz corpus, the pause measurements |
+| `ecosystem` | `ecosystem.yml` | `scripts/ecosystem-check.sh`, run by `.github/workflows/ecosystem.yml` once a day on each of the four release triples, each of which must report |
+| `raython` | the Raython deployment | the Raython sample application, a long-running HTTP server |
 
 A subject with no rows is not a subject that is doing fine — it is a `?` for
-every day and it fails the gate. That is the intended reading while `raython`
-does not exist yet.
+every day and it fails the gate. That is the intended reading until the Raython
+sample application is deployed and reporting.
