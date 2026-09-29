@@ -55,6 +55,8 @@ pub fn monomorphize(program: &hir::Program, store: &mut TypeStore) -> MonoResult
         pending: Vec::new(),
         diags: Vec::new(),
         current: None,
+        origins: HashMap::new(),
+        origin: None,
         services: program.services.clone(),
         spawned: HashSet::new(),
     };
@@ -106,6 +108,13 @@ struct Mono<'a> {
     /// The function being specialised: its name, where to point a diagnostic,
     /// and whether one has already been reported for it.
     current: Option<(String, Span, bool)>,
+    /// For each specialisation, the call that first asked for it, and that
+    /// call for the one being built. A generic library function is compiled
+    /// at a type the *caller* chose, so a type it cannot be compiled at is the
+    /// caller's to fix: the diagnostic belongs on their call, not on a line of
+    /// library source they did not write and cannot edit (#37).
+    origins: HashMap<hir::FuncId, Span>,
+    origin: Option<Span>,
     /// The service table, with each entry's functions renumbered as they are
     /// specialised. A service's methods are reachable only through this table,
     /// so `@spawn` is the edge that keeps them alive.
@@ -143,6 +152,7 @@ impl Mono<'_> {
     fn build(&mut self, src_id: hir::FuncId, new_id: hir::FuncId, subst: &Subst) {
         let mut def = self.src.funcs[src_id as usize].clone();
         self.current = Some((def.name.clone(), def.span, false));
+        self.origin = self.origins.get(&new_id).copied();
 
         def.ret = self.apply(&def.ret, subst);
         for i in 0..def.locals.len() {
@@ -344,8 +354,10 @@ impl Mono<'_> {
         };
         if !valid {
             let shown = self.store.show(ty);
+            // `raw_bind` is only ever reached through `std/ffi.bind[T]`, whose
+            // `T` is the program's annotation: point at the program's call.
             let mut diag = Diagnostic::error(
-                span,
+                self.origin.unwrap_or(span),
                 format!("FFI binding requires a C function signature, got `{shown}`"),
             );
             diag.help = Some("annotate as `fn(i32, u64) i32`; use integers, bool, f64, u64 pointers, or a void return; W# references, callbacks and variadic functions cannot cross this boundary".into());
@@ -439,6 +451,7 @@ impl Mono<'_> {
                     hir::Callee::Static { func, targs } => {
                         let inner = self.callee_subst(*func, targs, subst);
                         *func = self.specialize(*func, inner);
+                        self.origins.entry(*func).or_insert(expr.span);
                         targs.clear();
                     }
                     hir::Callee::Dynamic { cases } => {
@@ -448,6 +461,7 @@ impl Mono<'_> {
                         for case in cases {
                             let inner = self.callee_subst(case.func, &case.targs, subst);
                             case.func = self.specialize(case.func, inner);
+                            self.origins.entry(case.func).or_insert(expr.span);
                             case.targs.clear();
                         }
                     }

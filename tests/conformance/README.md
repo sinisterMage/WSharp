@@ -108,13 +108,14 @@ The sixty-third (`err_const_string_array`) was added when `main` gained that
 case (#58) while the bless PR was open; the scheduled run `36306746001`
 proposed it and re-confirmed the other sixty-two with zero mismatches.
 
-Two things remain un-blessed and are the gate's current red rows: the four
-`err_ffi_*` cases report `NOSPAN` (their `-->` names a line of `std/ffi`, not of
-the user's file — filed as [#37](https://github.com/sinisterMage/WSharp/issues/37)),
-and they are deliberately not blessed, because pinning a diagnostic that points
-at the wrong file would pin the defect as correct. The compiler subject's soak
-row reads `fail` while any case is `NOSPAN` — because criterion 5 genuinely is
-not met while that is true.
+The four `err_ffi_*` cases were left un-blessed while they reported `NOSPAN`
+(their `-->` named a line of `std/ffi`, not of the user's file --
+[#37](https://github.com/sinisterMage/WSharp/issues/37)), deliberately, because
+pinning a diagnostic that points at the wrong file would pin the defect as
+correct. They were blessed with the fix that points them at the program's own
+`ffi.bind` call, so every rejection case is now pinned. The compiler subject's
+soak row reads `fail` on any night a case is `NOSPAN` again -- because criterion
+5 genuinely is not met while that is true.
 
 ## What this suite does not cover
 
@@ -124,7 +125,7 @@ Written here rather than left in anyone's head.
   a line of `std/ffi`, not of the user's file, so there is no span to pin; this
   is [#37](https://github.com/sinisterMage/WSharp/issues/37) and the gate is
   correctly red while it stands.
-- **Only the 67 cases in `tests/cases` whose header carries `// error:`.** It
+- **Only the 68 cases in `tests/cases` whose header carries `// error:`.** It
   adds no new rejection cases. The gaps in what the language refuses are still
   gaps; this pins the refusals that exist.
 - **`check` is the snapshot's subject.** `run`'s stderr is compared with

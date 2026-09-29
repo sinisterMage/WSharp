@@ -581,6 +581,41 @@ fn the_pause_log_holds_every_pause() {
     let _ = std::fs::remove_file(&log);
 }
 
+/// An FFI signature the binding cannot take is the *program's* mistake, in its
+/// own annotation, so the diagnostic points at its `ffi.bind` call -- not at
+/// `raw_bind` inside `std/ffi`, a file the reader did not write and cannot
+/// open, which is where it pointed while it was reported from the body being
+/// specialised (#37).
+#[test]
+fn an_ffi_signature_error_points_at_the_program() {
+    for case in [
+        "err_ffi_not_function",
+        "err_ffi_heap_argument",
+        "err_ffi_heap_return",
+        "err_ffi_callback",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_wsharp"))
+            .arg("check")
+            .arg(cases_dir().join(format!("{case}.ws")))
+            .output()
+            .expect("could not run the compiler");
+        assert!(!output.status.success(), "{case} must be refused");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let at = stderr
+            .lines()
+            .find(|l| l.trim_start().starts_with("--> "))
+            .unwrap_or_else(|| panic!("{case}: no location:\n{stderr}"));
+        assert!(
+            at.contains(&format!("{case}.ws:4:")),
+            "{case}: the diagnostic must point at the program's own line 4:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("ffi.bind("),
+            "{case}: and underline its call:\n{stderr}"
+        );
+    }
+}
+
 #[test]
 fn check_reports_errors_without_running() {
     let path = cases_dir().join("err_type_mismatch.ws");

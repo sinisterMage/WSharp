@@ -443,10 +443,9 @@ A suite's limits belong where somebody reading its green run will see them.
   triple. 32-bit and non-x86-64/aarch64 targets are out of scope (#11).
 - **`selftest.sh` tests the harness, not the language**, and a green selftest
   says only that the gate can still tell a divergence from agreement.
-- **`conform.sh` pins 63 of the 67 rejection cases.** Their snapshots are in
-  `tests/conformance/expected/` (#55). The four `err_ffi_*` cases report
-  `NOSPAN` -- their diagnostic points into `std/ffi` rather than at the
-  program's own `ffi.bind` call (#37) -- so they have nothing to pin and keep the
-  gate at exit 1 until that is fixed. It adds no new rejection cases, and does
-  not cover warnings, `// panic:` text, `build`, or any multi-file diagnostic.
-  `tests/conformance/README.md` is the full list.
+- **`conform.sh` pins every one of the 68 rejection cases**, from snapshots in
+  `tests/conformance/expected/` (#55). The four `err_ffi_*` cases were `NOSPAN`
+  until their diagnostic stopped pointing into `std/ffi` and started pointing at
+  the program's own `ffi.bind` call (#37). It adds no new rejection cases, and
+  does not cover warnings, `// panic:` text, `build`, or any multi-file
+  diagnostic. `tests/conformance/README.md` is the full list.

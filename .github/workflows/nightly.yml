@@ -327,9 +327,8 @@ jobs:
   #
   # **Conformance counts toward the verdict**, so the compiler subject reports
   # `fail` on any night a rejection's diagnostic drifts from its snapshot, or a
-  # case cannot be pinned at all -- the four `err_ffi_*` cases, until #37. That
-  # is the accurate reading: criterion 5 is not met while a gate cannot be
-  # answered. See `tests/conformance/README.md`.
+  # case cannot be pinned at all. That is the accurate reading: criterion 5 is
+  # not met while a gate cannot be answered. See `tests/conformance/README.md`.
   soak-row:
     name: soak row
     needs: [parity, conformance, nightly]
