@@ -19,6 +19,7 @@ pub mod io;
 pub mod mark;
 pub mod net;
 pub mod os;
+pub mod pause;
 pub mod process;
 pub mod rpc;
 pub mod signals;

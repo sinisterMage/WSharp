@@ -81,6 +81,11 @@ pub(crate) struct Stats {
     pub(crate) served_pauses: AtomicUsize,
     pub(crate) max_pause_us: AtomicUsize,
     pub(crate) total_pause_us: AtomicUsize,
+    /// Every pause, log-spaced. The count/total/max above answer "how long on
+    /// average" and "how long at worst"; only this answers "how long for the
+    /// 99th mutator out of a hundred", which is the number a latency collector
+    /// is judged on. See [`crate::pause`].
+    pub(crate) pause_us: crate::pause::Histogram,
     /// Live bytes when the last trace finished sweeping: the growth trigger's
     /// point of comparison.
     pub(crate) trace_baseline_bytes: AtomicUsize,
@@ -129,6 +134,10 @@ pub struct Worker {
     /// worker's, which is the reason it cannot be shared.
     pub(crate) parity: AtomicU64,
     pub(crate) stats: Stats,
+    /// Exact per-pause samples, when `WSHARP_GC_PAUSE_LOG` asked for them.
+    /// Allocated here, at worker creation, because the pause path may not
+    /// allocate; `None` is the ordinary case and costs a null check.
+    pub(crate) pause_log: Option<crate::pause::Log>,
 }
 
 // The worker owns raw pointers into a heap that lives as long as the process.
@@ -205,8 +214,10 @@ impl Worker {
                 served_pauses: AtomicUsize::new(0),
                 max_pause_us: AtomicUsize::new(0),
                 total_pause_us: AtomicUsize::new(0),
+                pause_us: crate::pause::Histogram::new(),
                 trace_baseline_bytes: AtomicUsize::new(0),
             },
+            pause_log: crate::pause::Log::for_new_worker(),
         }));
         list.push(worker);
         worker
