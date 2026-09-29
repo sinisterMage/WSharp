@@ -337,6 +337,17 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      # The verifier's own tests, before it is used to answer a release
+      # question -- the same order the change-label and doc-example jobs use.
+      # This job is where the tests have to run rather than on every pull
+      # request: they drive the real script against a published release, so
+      # they need the network and the platform, which is what this matrix is.
+      - name: Test manifest inspection failures
+        run: bash scripts/tests/verify-install-inspection.test.sh
+
+      - name: Test the verifier
+        run: bash scripts/tests/verify-install.test.sh
+
       - name: Verify the W# install
         run: bash scripts/verify-install.sh "${{ inputs.version }}" "${{ matrix.triple }}"
 
