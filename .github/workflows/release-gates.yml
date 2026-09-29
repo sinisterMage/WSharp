@@ -350,6 +350,33 @@ jobs:
             ca-certificates curl tar gzip git gcc libc6-dev
           ln -sf "$(command -v gcc)" /usr/local/bin/cc
 
+      # The Windows half of the step above, and the same statement: point the
+      # job at the C compiler the install documents, rather than at whatever
+      # `cc` happens to be.
+      #
+      # `cc` on `windows-latest` is MinGW's `gcc`, and `wsharp build` passes
+      # MSVC's linker flags because the released artefact is
+      # `x86_64-pc-windows-msvc` -- so the link fails on `-subsystem:console`.
+      # That is a documented requirement, not a defect in the release: README's
+      # "`wsharp build` needs a C compiler" and LIMITATIONS.md's entry both say
+      # clang or MSVC, and both say to set `CC` rather than to rely on `PATH`
+      # order. This job therefore does exactly what the documentation tells a
+      # reader to do. Doing anything else would make the row a test of the
+      # runner image's `PATH` rather than of the documented install.
+      #
+      # The image ships LLVM, so this installs nothing. It fails loudly if that
+      # ever stops being true, because falling back to MinGW in silence would
+      # turn the row red for a reason that is not about the release.
+      - name: Point cc at the C compiler Windows documents
+        if: runner.os == 'Windows'
+        run: |
+          command -v clang >/dev/null 2>&1 || {
+            echo "no clang on this image: wsharp build on Windows needs clang or MSVC" >&2
+            exit 1
+          }
+          clang --version | head -1
+          echo "CC=clang" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       # The verifier's own tests, before it is used to answer a release
