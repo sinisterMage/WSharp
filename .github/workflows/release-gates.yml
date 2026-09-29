@@ -295,6 +295,21 @@ jobs:
   # Manual, with the version as an input: the gate is about a *published*
   # release, so there is nothing to verify until one exists, and a job that ran
   # on every pull request would be verifying the last release over and over.
+  # The verifier's fault-injection tests are offline -- a local tarball, and
+  # failures injected through PATH wrappers -- so they run on every pull request
+  # rather than waiting for somebody to dispatch the release matrix below. A
+  # verifier that stopped refusing a partial manifest would otherwise be found
+  # out on release day.
+  verify-install-selftest:
+    name: clean-install verifier refuses what it must (criterion 7)
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test manifest inspection failures
+        run: bash scripts/tests/verify-install-inspection.test.sh </dev/null
+
   verify-install:
     name: clean install (criterion 7, ${{ matrix.triple }})
     if: github.event_name == 'workflow_dispatch'
