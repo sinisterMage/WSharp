@@ -39,3 +39,4 @@
 2026-11-05	compiler	fail	9ebee16c8e9d03cfa0bab7ed0ba9de4228f10c45	x86_64-unknown-linux-gnu	nightly=success parity=success conformance=failure event=schedule run=42006608307
 2026-11-06	compiler	fail	9ebee16c8e9d03cfa0bab7ed0ba9de4228f10c45	x86_64-unknown-linux-gnu	nightly=failure parity=success conformance=failure event=schedule run=42199124523
 2026-11-07	compiler	fail	9ebee16c8e9d03cfa0bab7ed0ba9de4228f10c45	x86_64-unknown-linux-gnu	nightly=success parity=success conformance=failure event=schedule run=42359249270
+2026-11-08	compiler	fail	9ebee16c8e9d03cfa0bab7ed0ba9de4228f10c45	x86_64-unknown-linux-gnu	nightly=failure parity=success conformance=failure event=schedule run=42467945682
