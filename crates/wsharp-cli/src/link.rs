@@ -76,7 +76,30 @@ fn find_archive() -> Result<PathBuf, String> {
 }
 
 /// Link `object` into an executable at `out`.
-pub fn link(object: &Path, out: &Path) -> Result<(), String> {
+pub fn link(object: &Path, out: &Path, target: wsharp_codegen::ObjectTarget) -> Result<(), String> {
+    if target == wsharp_codegen::ObjectTarget::JoeLinux {
+        let root = std::env::var_os("WSHARP_JOE_SYSROOT")
+            .ok_or("set WSHARP_JOE_SYSROOT to Joe Linux's build/bootstrap/root")?;
+        let archive = std::env::var_os("WSHARP_RUNTIME_LIB")
+            .ok_or("set WSHARP_RUNTIME_LIB to Joe's libwsharp_start.a")?;
+        let cc = Path::new(&root).join("usr/lib/joe-cross/bin/clang");
+        let output = Command::new(&cc)
+            .arg(object)
+            .arg(archive)
+            .arg("-o")
+            .arg(out)
+            .args(["-ldl", "-lm", "-llog", "-lunwind"])
+            .output()
+            .map_err(|e| format!("cannot run {}: {e}", cc.display()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Joe Linux link failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        return Ok(());
+    }
+
     let archive = find_archive()?;
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
 
@@ -85,7 +108,9 @@ pub fn link(object: &Path, out: &Path) -> Result<(), String> {
     // What a Rust staticlib wants underneath it. Modern glibc folds the first
     // three into libc and ignores them; naming them keeps older systems and
     // the BSDs working.
-    if !cfg!(target_os = "windows") {
+    if cfg!(target_os = "android") {
+        command.args(["-lm", "-ldl", "-llog", "-lunwind"]);
+    } else if !cfg!(target_os = "windows") {
         command.args(["-lpthread", "-lm", "-ldl"]);
     }
     // Windows needs to be told this is a console program, and the reason is

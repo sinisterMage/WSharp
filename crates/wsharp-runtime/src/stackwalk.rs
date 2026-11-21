@@ -203,7 +203,10 @@ pub unsafe fn walk_roots(visit: impl FnMut(*mut *mut u8)) {
 pub fn innermost_generated_frame() -> Option<GeneratedFrame> {
     // This frame's own pointer. Every frame the search wants is above it.
     let fp = current_frame_pointer();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "android", target_arch = "aarch64")
+    ))]
     let stack = {
         thread_local! {
             // One OS query per thread, not per allocation. Failure must not
@@ -219,7 +222,10 @@ pub fn innermost_generated_frame() -> Option<GeneratedFrame> {
         // The current frame is already above any guard/uncommitted pages.
         fp..end
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(
+        target_os = "linux",
+        all(target_os = "android", target_arch = "aarch64")
+    )))]
     // Other SysV targets retain their existing native-chain termination.
     let stack = fp..usize::MAX;
     // This frame remains live until the search returns.

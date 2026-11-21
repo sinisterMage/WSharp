@@ -347,6 +347,31 @@ they downloaded against it. That protects against a corrupted or truncated
 transfer and **not** against whoever can serve the tarball, because they can
 serve the sidecar too. Signing is scheduled after 1.0.
 
+### Cross-compiling for Joe Linux
+
+`wsharp build --target aarch64-joe-linux-bionic` produces an AArch64 executable
+for Joe Linux. To link it on the bootstrap host, use a completed stage 1 from
+the `joe-linux-aarch64` checkout. Joe supplies Rust's `aarch64-linux-android`
+standard library, an API 37 bionic sysroot, and a Clang driver configured to
+select `/usr/lib/ld-bionic-aarch64.so.1` as the ELF interpreter.
+
+From the WSharp checkout, with Joe in a sibling directory:
+
+```sh
+cargo build --locked -p wsharp-cli
+scripts/build-joe.sh ../joe-linux-aarch64
+export WSHARP_JOE_SYSROOT="$PWD/../joe-linux-aarch64/build/bootstrap/root"
+WSHARP_RUNTIME_LIB="$PWD/target/aarch64-linux-android/release/libwsharp_start.a" \
+    target/debug/wsharp build examples/fib.ws --target aarch64-joe-linux-bionic -o /tmp/fib
+qemu-aarch64 -L "$WSHARP_JOE_SYSROOT" /tmp/fib
+```
+
+The same build produces a Joe-native compiler at
+`target/aarch64-linux-android/release/wsharp` for running W# programs on Joe.
+The linked runtime reports `aarch64-joe-linux-bionic` through `os.target()`.
+For a relocatable object alone, pass `--emit=obj`. This only needs the host
+WSharp compiler.
+
 ### `wsharp build` needs a C compiler
 
 `wsharp run` needs nothing beyond the tarball: it compiles into its own process

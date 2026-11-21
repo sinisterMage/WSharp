@@ -21,9 +21,15 @@ mod imp {
         Ok(())
     }
     fn nonblocking(p: &impl AsRawFd) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(
+            target_os = "linux",
+            all(target_os = "android", target_arch = "aarch64")
+        ))]
         const NONBLOCK: i32 = 0o4000;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(
+            target_os = "linux",
+            all(target_os = "android", target_arch = "aarch64")
+        )))]
         const NONBLOCK: i32 = 4;
         let fd = p.as_raw_fd();
         let flags = unsafe { fcntl(fd, 3) }; // F_GETFL

@@ -19,14 +19,10 @@
 //!   bit  63     : forwarded
 //! ```
 //!
-//! **Forwarding overwrites the whole word.** When the collector moves an
-//! object it stores `FORWARDED | new_address` over the meta, losing the type id
-//! and the count -- which costs nothing, because both moved with the object and
-//! a forwarded object is dead. Userspace addresses on x86-64 and aarch64 are
-//! below 2^47, so the top bit is free to mean this. Taking that bit from the
-//! reference count rather than adding a fourth header word keeps every object
-//! 8 bytes smaller; a 23-bit count saturates at 8.4 million, and LXR saturates
-//! by design anyway.
+//! When the collector moves an object it stores `FORWARDED | (new_address >> 1)`
+//! in its old meta word. The type id and count move with the object. Alignment
+//! gives us a zero low bit, so shifting back restores the entire pointer,
+//! including the allocator tag in the top byte on bionic.
 //!
 //! The meta word is accessed atomically throughout, because the collector reads
 //! and writes it while the mutator is running.
@@ -303,11 +299,11 @@ pub const fn is_forwarded_meta(meta: u64) -> bool {
 }
 
 pub const fn forwarding_meta(to: usize) -> u64 {
-    FORWARDED | (to as u64)
+    FORWARDED | ((to as u64) >> 1)
 }
 
 pub const fn forwarding_target(meta: u64) -> *mut u8 {
-    (meta & !FORWARDED) as *mut u8
+    (meta << 1) as *mut u8
 }
 
 /// Claim the right to move `ptr` to `to`.
@@ -454,6 +450,12 @@ mod tests {
             // A second attempt loses and is told where the object went.
             assert_eq!(try_forward(p, p as *mut u8), Err(target));
         }
+    }
+
+    #[test]
+    fn forwarding_preserves_allocator_tags() {
+        let tagged = 0xb400_0000_1234_5670;
+        assert_eq!(forwarding_target(forwarding_meta(tagged)) as usize, tagged);
     }
 
     #[test]

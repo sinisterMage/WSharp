@@ -336,6 +336,28 @@ pub struct Object {
     pub clif: String,
 }
 
+/// The ISA used to emit an ahead-of-time object.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ObjectTarget {
+    #[default]
+    Native,
+    JoeLinux,
+}
+
+impl std::str::FromStr for ObjectTarget {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        match name {
+            "native" => Ok(Self::Native),
+            "aarch64-joe-linux-bionic" => Ok(Self::JoeLinux),
+            _ => Err(format!(
+                "unknown target '{name}' (expected native or aarch64-joe-linux-bionic)"
+            )),
+        }
+    }
+}
+
 /// Compile a monomorphised program to an object file.
 ///
 /// The same `build` the JIT uses, so the code is the code either way. What
@@ -346,6 +368,7 @@ pub fn compile_object(
     program: &hir::Program,
     store: &mut TypeStore,
     emit_clif: bool,
+    target: ObjectTarget,
 ) -> Result<Object, CodegenError> {
     let mut flags = settings::builder();
     // Calls resolve through the linker rather than through addresses in this
@@ -374,8 +397,14 @@ pub fn compile_object(
         .set("probestack_strategy", "inline")
         .map_err(|e| err("flag", e))?;
 
-    let isa_builder = cranelift_native::builder()
-        .map_err(|e| CodegenError(format!("unsupported host architecture: {e}")))?;
+    let isa_builder = match target {
+        ObjectTarget::Native => cranelift_native::builder()
+            .map_err(|e| CodegenError(format!("unsupported host architecture: {e}")))?,
+        ObjectTarget::JoeLinux => {
+            cranelift_codegen::isa::lookup_by_name("aarch64-unknown-linux-android")
+                .map_err(|e| err("target ISA", e))?
+        }
+    };
     let isa = isa_builder
         .finish(settings::Flags::new(flags))
         .map_err(|e| err("could not configure the target", e))?;

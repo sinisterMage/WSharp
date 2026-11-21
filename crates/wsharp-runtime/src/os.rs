@@ -58,11 +58,8 @@ pub extern "C" fn ws_os_raw_args() -> *mut u8 {
 
 /// What this build was built for, as a target triple.
 ///
-/// `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, and so on -- spelled the
-/// way the compiler that produced this binary spelled it, because the string is
-/// set from cargo's own `TARGET` by `build.rs` rather than reassembled here.
-/// [`std::env::consts`] cannot answer this: it has `ARCH` and `OS` and no
-/// vendor or environment between them.
+/// Set by the runtime build, including the distribution name when multiple
+/// platforms share a Rust target, as Joe Linux and Android do.
 ///
 /// The question a program asks when it has to fetch something built for the
 /// machine it is running on, which is the whole of a version manager's first

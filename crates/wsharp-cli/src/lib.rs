@@ -46,7 +46,10 @@ pub enum Action {
     /// Compile into this process and run `main`.
     Run,
     /// Compile to a native executable.
-    Build { out: PathBuf },
+    Build {
+        out: PathBuf,
+        target: wsharp_codegen::ObjectTarget,
+    },
 }
 
 /// What a program is rooted at: a file, or one of the library's own modules.
@@ -209,14 +212,15 @@ pub fn drive(
         return Err("`--emit=obj` is `build`'s: there is no object file to stop at here".into());
     }
     let want_clif = emit == Some(Emit::Clif);
-    if let Action::Build { out } = action {
-        let object = wsharp_codegen::compile_object(&mono.program, &mut analysis.store, want_clif)
-            .map_err(|e| e.to_string())?;
+    if let Action::Build { out, target } = action {
+        let object =
+            wsharp_codegen::compile_object(&mono.program, &mut analysis.store, want_clif, target)
+                .map_err(|e| e.to_string())?;
         if want_clif {
             print!("{}", object.clif);
             return Ok(ExitCode::SUCCESS);
         }
-        return finish_build(&object.bytes, &out, emit == Some(Emit::Obj));
+        return finish_build(&object.bytes, &out, emit == Some(Emit::Obj), target);
     }
 
     let options = wsharp_codegen::Options { gc_stress };
@@ -237,7 +241,12 @@ pub fn drive(
 /// The object goes beside the executable rather than in a temporary directory,
 /// so that a failed link leaves something to look at and `--emit=obj` and a
 /// full build put the file in the same place.
-fn finish_build(bytes: &[u8], out: &Path, object_only: bool) -> Result<ExitCode, String> {
+fn finish_build(
+    bytes: &[u8],
+    out: &Path,
+    object_only: bool,
+    target: wsharp_codegen::ObjectTarget,
+) -> Result<ExitCode, String> {
     let object = if object_only {
         out.to_path_buf()
     } else {
@@ -248,7 +257,7 @@ fn finish_build(bytes: &[u8], out: &Path, object_only: bool) -> Result<ExitCode,
     if object_only {
         return Ok(ExitCode::SUCCESS);
     }
-    link::link(&object, out)?;
+    link::link(&object, out, target)?;
     // The object has served its purpose. A failed link keeps it, above.
     let _ = std::fs::remove_file(&object);
     Ok(ExitCode::SUCCESS)

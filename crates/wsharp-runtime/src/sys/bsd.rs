@@ -1169,6 +1169,7 @@ pub(crate) mod trap {
     pub(crate) const SA_ONSTACK: c_int = 0x1;
     /// `struct sigaction` is the handler, then a 32-bit `sigset_t`, then
     /// `sa_flags`.
+    pub(crate) const SA_HANDLER_OFFSET: usize = 0;
     pub(crate) const SA_FLAGS_OFFSET: usize = 8 + 4;
     /// `si_signo`, `si_errno`, `si_code`, `si_pid`, `si_uid` and `si_status`,
     /// four bytes each, then `si_addr`.

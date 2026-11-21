@@ -78,6 +78,9 @@ enum Command {
         /// Compile a library module instead of a file, as `ingot/main` is.
         #[arg(long, conflicts_with = "file")]
         module: Option<String>,
+        /// Target for the object or executable (native or aarch64-joe-linux-bionic).
+        #[arg(long, default_value = "native")]
+        target: wsharp_codegen::ObjectTarget,
         /// Where to write the executable.
         #[arg(short, long)]
         out: PathBuf,
@@ -100,22 +103,18 @@ fn main() -> ExitCode {
     if let Command::Build {
         file,
         module,
+        target,
         out,
         emit,
     } = cli.command
     {
         let result = match (&file, &module) {
-            (Some(path), _) => drive(
-                Root::File(path),
-                emit,
-                false,
-                Action::Build { out: out.clone() },
-            ),
+            (Some(path), _) => drive(Root::File(path), emit, false, Action::Build { out, target }),
             (None, Some(name)) => drive(
                 Root::Module(name),
                 emit,
                 false,
-                Action::Build { out: out.clone() },
+                Action::Build { out, target },
             ),
             (None, None) => Err("`build` needs a file, or `--module`".to_string()),
         };
