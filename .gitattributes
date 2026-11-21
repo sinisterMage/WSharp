@@ -1,0 +1,3 @@
+# The conformance harness compares rendered diagnostics byte for byte.
+tests/conformance/expected/*.diag text eol=lf
+tests/cases/*.ws text eol=lf
