@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-cranelift-codegen.workspace = true
+cranelift-codegen = { workspace = true, features = ["arm64"] }
 cranelift-frontend.workspace = true
 cranelift-jit.workspace = true
 cranelift-module.workspace = true

@@ -87,6 +87,7 @@ mod c {
         /// null-terminated and its first entry is the program's own name.
         pub(super) fn execvp(file: *const u8, argv: *const *const u8) -> c_int;
         /// `errno` is a macro in C, and this is what it expands to.
+        #[cfg_attr(target_os = "android", link_name = "__errno")]
         pub(super) fn __errno_location() -> *mut c_int;
         /// Bytes from the kernel's generator. glibc has exported this since
         /// 2.25 and musl since 1.1.20, which is what keeps it a C library
@@ -534,7 +535,7 @@ use super::SockAddr;
 type socklen_t = u32;
 
 /// `struct addrinfo`, whose *field order is not the same on every platform*:
-/// Linux puts `ai_addr` before `ai_canonname`, and the BSDs and Windows put
+/// glibc and musl put `ai_addr` before `ai_canonname`. Bionic, the BSDs and Windows put
 /// them the other way round. Reading one layout through the other yields a
 /// pointer that is not an address and does not fault, which is the worst kind
 /// of wrong. Each arm therefore declares its own.
@@ -545,7 +546,10 @@ struct addrinfo {
     ai_socktype: c_int,
     ai_protocol: c_int,
     ai_addrlen: socklen_t,
+    #[cfg(target_os = "android")]
+    ai_canonname: *mut u8,
     ai_addr: *mut u8,
+    #[cfg(not(target_os = "android"))]
     ai_canonname: *mut u8,
     ai_next: *mut addrinfo,
 }
@@ -1018,7 +1022,12 @@ pub(crate) mod trap {
     pub(crate) const SA_ONSTACK: c_int = 0x0800_0000;
     /// `struct sigaction` is the handler, then a 1024-bit `sigset_t`, then
     /// `sa_flags` -- the same in glibc and musl, on x86-64 and aarch64.
+    #[cfg(not(target_os = "android"))]
     pub(crate) const SA_FLAGS_OFFSET: usize = 8 + 128;
+    // LP64 bionic puts the flags first, then the aligned handler pointer.
+    #[cfg(target_os = "android")]
+    pub(crate) const SA_FLAGS_OFFSET: usize = 0;
+    pub(crate) const SA_HANDLER_OFFSET: usize = if cfg!(target_os = "android") { 8 } else { 0 };
     /// `si_signo`, `si_errno`, `si_code` and four bytes of padding, then the
     /// union whose member for a fault begins with `si_addr`.
     pub(crate) const SI_ADDR_OFFSET: usize = 16;

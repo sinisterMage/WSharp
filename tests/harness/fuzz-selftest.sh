@@ -70,6 +70,7 @@ case "$verb:$m" in
     build:MARKER-jit-only)    printf '#!/bin/sh\nexit 0\n' >"$3"; chmod +x "$3" ;;
     run:MARKER-check-refuses)                          sleep 30 ;;
     check:MARKER-check-refuses) echo "error: nope" >&2; exit 1 ;;
+    run:MARKER-exit-code) exit 124 ;;
     run:MARKER-build-hangs)                            sleep 30 ;;
     check:MARKER-build-hangs)                          exit 0 ;;
     build:MARKER-build-hangs)                          sleep 30 ;;
@@ -83,7 +84,8 @@ for pair in "frontend-too MARKER-frontend-too" \
             "valid-loop MARKER-valid-loop" \
             "jit-only MARKER-jit-only" \
             "check-refuses MARKER-check-refuses" \
-            "build-hangs MARKER-build-hangs"; do
+            "build-hangs MARKER-build-hangs" \
+            "exit-code MARKER-exit-code"; do
     set -- $pair
     printf '%s\n' "$2" >"$WORK/cases/$1.ws"
 done
@@ -127,6 +129,10 @@ command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1 || {
     exit 2
 }
 if ! command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN=gtimeout; fi
+
+# A W# main can return the same exit code as the timeout monitor.
+expect_verdict exit-code OK
+expect_status  exit-code 0
 
 # `run` hangs and `check` hangs too: the compiler hung. Still a finding.
 expect_verdict frontend-too  HANG

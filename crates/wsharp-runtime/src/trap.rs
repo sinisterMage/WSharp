@@ -188,13 +188,12 @@ mod imp {
     static mut PREVIOUS_BUS: [u64; 32] = [0; 32];
 
     pub(super) fn install() {
-        // A zeroed `struct sigaction` with the handler at the front and the
-        // flags where this system keeps them: an empty mask, no restorer.
+        // Zeroing sigaction starts with an empty mask and no restorer.
         let mut action = [0u64; 32];
         let bytes = action.as_mut_ptr() as *mut u8;
         let handler: extern "C" fn(c_int, *mut u8, *mut c_void) = on_fault;
         unsafe {
-            (bytes as *mut usize).write(handler as usize);
+            (bytes.add(os::SA_HANDLER_OFFSET) as *mut usize).write(handler as usize);
             (bytes.add(os::SA_FLAGS_OFFSET) as *mut c_int).write(os::SA_SIGINFO | os::SA_ONSTACK);
             os::sigaction(os::SIGSEGV, bytes, (&raw mut PREVIOUS_SEGV) as *mut u8);
             os::sigaction(os::SIGBUS, bytes, (&raw mut PREVIOUS_BUS) as *mut u8);

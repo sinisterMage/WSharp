@@ -75,6 +75,33 @@ fn cases_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/cases")
 }
 
+#[test]
+fn joe_object_is_aarch64_elf() {
+    let out = std::env::temp_dir().join(format!("wsharp-joe-{}.o", std::process::id()));
+    let output = Command::new(env!("CARGO_BIN_EXE_wsharp"))
+        .args([
+            "build",
+            "--target",
+            "aarch64-joe-linux-bionic",
+            "--emit=obj",
+        ])
+        .arg(cases_dir().join("os_args.ws"))
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .expect("run wsharp");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = std::fs::read(&out).unwrap();
+    std::fs::remove_file(out).unwrap();
+    assert_eq!(&bytes[..6], b"\x7fELF\x02\x01"); // ELF64, little endian
+    assert_eq!(u16::from_le_bytes([bytes[16], bytes[17]]), 1); // ET_REL
+    assert_eq!(u16::from_le_bytes([bytes[18], bytes[19]]), 183); // EM_AARCH64
+}
+
 fn check_case(path: &Path) -> Result<(), String> {
     check_case_with(path, &[])
 }

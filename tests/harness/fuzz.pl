@@ -82,6 +82,7 @@ my $TIMEOUT_BIN = $ENV{TIMEOUT_BIN} || 'timeout';
 my $target     = 'check';
 my $seed       = 1;
 my $iterations = 200;
+my @monitor    = ($TIMEOUT_BIN, '--verbose', '-s', 'KILL');
 my $timeout    = 20;
 my $maxseconds = 0;
 my $replay     = '';
@@ -243,6 +244,7 @@ sub spawn_capture {
     my $pid = fork();
     die "fuzz: cannot fork: $!\n" unless defined $pid;
     if ($pid == 0) {
+        $ENV{LC_ALL} = 'C';  # timeout's diagnostic is part of the verdict
         open STDOUT, '>', '/dev/null';
         open STDERR, '>', $err;
         exec { $cmd[0] } @cmd;
@@ -264,9 +266,11 @@ sub decide {
     my $sig  = $status & 127;
     my $code = $status >> 8;
 
-    if ($sig == 9) {
-        # SIGKILL here is `timeout -s KILL` and nothing else: the harness is
-        # the only thing that sends it.
+    # GNU timeout receives its own process-group SIGKILL. Ubuntu's uutils
+    # timeout can instead exit 124. A W# program can return that number, so
+    # require the monitor's --verbose signal diagnostic for an exit status.
+    if ($sig == 9 || (($code == 124 || $code == 137)
+                      && $err =~ /^(?:.*\/)?g?timeout: sending signal (?:KILL|9) to command /m)) {
         return ('HANG', 'hang', $err);
     }
     if ($sig != 0) {
@@ -307,7 +311,7 @@ sub check_input {
     # coreutils, `gtimeout`; base macOS has neither, and two of the four release
     # triples are macOS. Read rather than re-derived, so the two halves of the
     # harness cannot disagree about which binary bounds a run.
-    my @cmd = ($TIMEOUT_BIN, '-s', 'KILL', $timeout, $COMMAND{$target}->($f));
+    my @cmd = (@monitor, $timeout, $COMMAND{$target}->($f));
     my ($status, $errfile) = spawn_capture(@cmd);
     my ($v, $s, $err) = decide($status, $errfile);
 
@@ -336,7 +340,7 @@ sub check_input {
         my $cf = "$work/checkin$SUFFIX{$target}";
         spew($cf, $bytes);
         my ($cstatus, $cerrf) = spawn_capture(
-            $TIMEOUT_BIN, '-s', 'KILL', $timeout, $wsharp, 'check', $cf);
+            @monitor, $timeout, $wsharp, 'check', $cf);
         my ($cv, $cs, $cerr) = decide($cstatus, $cerrf);
         if ($cv eq 'HANG') {
             return ('HANG', 'hang: front end too', $err . "\n--- check ---\n" . $cerr);
@@ -349,7 +353,7 @@ sub check_input {
         my $bex = "$work/buildexe";
         spew($bf, $bytes);
         my ($bstatus, $berrf) = spawn_capture(
-            $TIMEOUT_BIN, '-s', 'KILL', $timeout, $wsharp, 'build', $bf, '-o', $bex);
+            @monitor, $timeout, $wsharp, 'build', $bf, '-o', $bex);
         my ($bv, $bs, $berr) = decide($bstatus, $berrf);
         if ($bv eq 'HANG') {
             unlink $bex;
@@ -361,7 +365,7 @@ sub check_input {
             return ('HANG', 'hang: run, though build failed',
                     $err . "\n--- build ---\n" . $berr);
         }
-        my ($xstatus, $xerrf) = spawn_capture($TIMEOUT_BIN, '-s', 'KILL', $timeout, $bex);
+        my ($xstatus, $xerrf) = spawn_capture(@monitor, $timeout, $bex);
         my ($xv, $xs, $xerr) = decide($xstatus, $xerrf);
         unlink $bex;
         if ($xv eq 'HANG') {

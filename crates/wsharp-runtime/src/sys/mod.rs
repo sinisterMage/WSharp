@@ -33,9 +33,15 @@
 //! short reads and the difference between a file and a pipe; each of those is a
 //! thing to get right, per platform, below.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "android", target_arch = "aarch64")
+))]
 pub(crate) mod linux;
-#[cfg(target_os = "linux")]
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "android", target_arch = "aarch64")
+))]
 pub(crate) use linux as imp;
 
 #[cfg(any(
