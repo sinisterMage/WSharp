@@ -958,7 +958,7 @@ impl<M: Module> Trans<'_, '_, M> {
         }
 
         let body = &self.func.body;
-        self.block(body);
+        self.statements(&body.stmts);
 
         // Falling off the end is only legal for a `void` function -- inference
         // rejects anything else, which is also what guarantees every block here
@@ -973,8 +973,8 @@ impl<M: Module> Trans<'_, '_, M> {
 
     // ---- statements -----------------------------------------------------
 
-    fn block(&mut self, block: &hir::Block) {
-        for stmt in &block.stmts {
+    fn statements(&mut self, stmts: &[hir::Stmt]) {
+        for stmt in stmts {
             if self.terminated {
                 // Everything after a `return`, `break` or `continue` in the same
                 // block is unreachable; emitting it would append to a finished
@@ -1049,13 +1049,13 @@ impl<M: Module> Trans<'_, '_, M> {
                 if let Some(local) = capture {
                     self.def_local(*local, &payload);
                 }
-                self.block(then);
+                self.statements(&then.stmts);
                 let then_falls_through = !self.terminated;
                 self.jump_to(merge, NO_ARGS);
 
                 self.switch(else_block);
                 if let Some(els) = els {
-                    self.block(els);
+                    self.statements(&els.stmts);
                 }
                 let else_falls_through = !self.terminated;
                 self.jump_to(merge, NO_ARGS);
@@ -1098,7 +1098,7 @@ impl<M: Module> Trans<'_, '_, M> {
                     continue_to: latch,
                     break_to: exit,
                 });
-                self.block(body);
+                self.statements(&body.stmts);
                 self.loops.pop();
                 self.jump_to(latch, NO_ARGS);
 
@@ -1114,7 +1114,7 @@ impl<M: Module> Trans<'_, '_, M> {
                 self.switch(exit);
             }
 
-            hir::Stmt::Block(b) => self.block(b),
+            hir::Stmt::Block(b) => self.statements(&b.stmts),
 
             hir::Stmt::Break => {
                 let target = self.loops.last().expect("`break` inside a loop").break_to;
@@ -1926,20 +1926,15 @@ impl<M: Module> Trans<'_, '_, M> {
         stmts: &[hir::Stmt],
         value: &Option<Box<hir::Expr>>,
     ) -> Slots {
-        for stmt in stmts {
-            self.stmt(stmt);
+        self.statements(stmts);
+        if self.terminated {
+            let dead = self.b.create_block();
+            self.switch(dead);
+        } else if let Some(value) = value {
+            return self.expr(value);
         }
-        match value {
-            Some(v) => self.expr(v),
-            None => {
-                if self.terminated {
-                    let dead = self.b.create_block();
-                    self.switch(dead);
-                }
-                let tys = self.slots_of(ty);
-                self.zeros(&tys)
-            }
-        }
+        let tys = self.slots_of(ty);
+        self.zeros(&tys)
     }
 
     /// `try e` -- yield the payload, or return the error from this function.    /// `try e` -- yield the payload, or return the error from this function.
